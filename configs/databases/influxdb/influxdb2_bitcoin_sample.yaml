@@ -1,0 +1,25 @@
+type: influxdb
+version: 2
+name: influxdb2-bitcoin-sample
+host: localhost
+port: 18086
+org: tspilot
+bucket: bitcoin
+database: bitcoin
+token: tspilot-dev-token
+username: tspilot
+password: tspilot_password
+ssl_enabled: false
+timeout: 30
+query_timeout: 60
+max_connections: 10
+schema_measurement_names:
+  - coindesk
+influxdb_tasks:
+  - name: Collect Bitcoin sample data
+    every: 15m
+    status: inactive
+    description: Continually imports the InfluxDB Bitcoin sample dataset.
+    sample:
+      set: bitcoin
+      target_bucket: bitcoin

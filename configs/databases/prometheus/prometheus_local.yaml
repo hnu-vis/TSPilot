@@ -1,0 +1,9 @@
+type: prometheus
+name: prometheus-local
+host: localhost
+port: 9090
+query_url: /api/v1
+timeout: 30
+ssl_enabled: false
+use_env_proxy: false
+auth_type: none

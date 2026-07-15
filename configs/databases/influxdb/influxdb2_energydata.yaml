@@ -1,0 +1,51 @@
+type: influxdb
+version: 2
+name: influxdb2-energydata
+host: localhost
+port: 18086
+org: tspilot
+bucket: energydata
+database: energydata
+token: tspilot-dev-token
+username: tspilot
+password: tspilot_password
+ssl_enabled: false
+timeout: 30
+query_timeout: 60
+max_connections: 10
+schema_measurement_names:
+  - home_energy_environment
+reference_dataset:
+  dataset_path: datasets/energydata_complete.csv
+  measurement: home_energy_environment
+  timestamp_column: timestamp
+  source: energydata_complete_csv
+  field_columns:
+    - appliances_energy_wh
+    - lights_energy_wh
+    - kitchen_temperature_celsius
+    - kitchen_humidity_percent
+    - living_room_temperature_celsius
+    - living_room_humidity_percent
+    - laundry_room_temperature_celsius
+    - laundry_room_humidity_percent
+    - office_temperature_celsius
+    - office_humidity_percent
+    - bathroom_temperature_celsius
+    - bathroom_humidity_percent
+    - outside_north_temperature_celsius
+    - outside_north_humidity_percent
+    - ironing_room_temperature_celsius
+    - ironing_room_humidity_percent
+    - teenager_room_2_temperature_celsius
+    - teenager_room_2_humidity_percent
+    - parents_room_temperature_celsius
+    - parents_room_humidity_percent
+    - chievres_temperature_celsius
+    - chievres_pressure_mm_hg
+    - chievres_humidity_percent
+    - chievres_wind_speed_m_s
+    - chievres_visibility_km
+    - chievres_dewpoint_celsius
+    - random_variable_1
+    - random_variable_2

@@ -1,0 +1,347 @@
+from __future__ import annotations
+import asyncio
+from pathlib import Path
+import tempfile
+
+from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
+from core.database.contracts import QueryRequestContext
+from core.database.engine import infer_evidence_family
+from runtime.request_state import enrich_observation_payload, build_request_state, apply_observation
+from schemas.api import ChatRequest
+from schemas.database_context import DatabaseContext
+from schemas.tool import ToolObservation
+from core.database.query_flow import (
+    CompositeDialectRenderer,
+    DatabaseQueryFlow,
+    DefaultFieldMapper,
+    DefaultIntentInterpreter,
+    DefaultLogicalQueryPlanner,
+    DefaultQueryValidator,
+)
+from app.settings import get_settings
+from types import SimpleNamespace
+
+
+def _build_influx_schema() -> DatabaseSchema:
+    return DatabaseSchema(
+        database="bitcoin",
+        metadata={
+            "value_domains": {
+                "coindesk": {
+                    "_field": ["price"],
+                    "code": ["EUR", "GBP", "USD"],
+                    "crypto": ["bitcoin"],
+                }
+            }
+        },
+        tables=[
+            TableSchema(
+                name="coindesk",
+                columns=[
+                    ColumnSchema(name="_time", data_type="datetime"),
+                    ColumnSchema(name="price", data_type="float"),
+                    ColumnSchema(name="code", data_type="string"),
+                    ColumnSchema(name="crypto", data_type="string"),
+                ],
+            )
+        ],
+    )
+
+
+def _build_influx_schema_without_domains() -> DatabaseSchema:
+    return DatabaseSchema(
+        database="bitcoin",
+        tables=[
+            TableSchema(
+                name="coindesk",
+                columns=[
+                    ColumnSchema(name="_time", data_type="datetime"),
+                    ColumnSchema(name="price", data_type="float"),
+                    ColumnSchema(name="code", data_type="string"),
+                    ColumnSchema(name="crypto", data_type="string"),
+                ],
+            )
+        ],
+    )
+
+
+def test_flux_renderer_preserves_absolute_time_range_for_seasonality_request():
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message="请判断 Bitcoin USD 在这个时间范围内有没有明显每天或每周重复的周期性波动。",
+        time_range={
+            "start": "2023-01-04T23:04:00Z",
+            "end": "2023-02-03T22:47:00Z",
+        },
+        constraints={"max_points": 240},
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+
+    rendered = CompositeDialectRenderer({"type": "influxdb", "bucket": "bitcoin"}).render(
+        context=context,
+        plan=plan,
+    )
+
+    assert rendered.query_language == "flux"
+    assert "range(start: 2023-01-04T23:04:00Z, stop: 2023-02-03T22:47:00Z)" in rendered.query_text
+    assert "mean()" not in rendered.query_text
+    assert 'r._field == "price"' in rendered.query_text
+    assert 'r.code == "USD"' in rendered.query_text
+    assert 'r.crypto == "bitcoin"' in rendered.query_text
+
+
+def test_seasonality_request_with_max_points_stays_timeseries():
+    message = (
+        "请重新查询 Bitcoin USD 的原始时间序列用于周期性分析，不要使用 max 这类单值聚合，"
+        "请尽量返回不超过 240 个点，保留时间戳与价格字段，max_points=240。"
+    )
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message=message,
+        time_range={
+            "start": "2023-01-04T23:04:00Z",
+            "end": "2023-02-03T22:47:00Z",
+        },
+        constraints={"max_points": 240, "avoid_aggregations": ["max"]},
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+
+    assert infer_evidence_family(message) == "timeseries"
+    assert intent.query_shape == "raw_timeseries"
+    assert not intent.filters.get("aggregation")
+    assert not any(projection.aggregation for projection in plan.projections)
+
+
+def test_validator_flags_missing_required_value_filters():
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message="请判断 Bitcoin USD 在这个时间范围内有没有明显每天或每周重复的周期性波动。",
+        time_range={
+            "start": "2023-01-04T23:04:00Z",
+            "end": "2023-02-03T22:47:00Z",
+        },
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+    rendered = CompositeDialectRenderer({"type": "influxdb", "bucket": "bitcoin"}).render(
+        context=context,
+        plan=plan,
+    )
+    broken = rendered.__class__(
+        query_text=rendered.query_text
+        .replace('\n  |> filter(fn: (r) => r.code == "USD")', "")
+        .replace('\n  |> filter(fn: (r) => r.crypto == "bitcoin")', ""),
+        query_language=rendered.query_language,
+        structured_request=rendered.structured_request,
+        warnings=list(rendered.warnings),
+    )
+
+    validation = DefaultQueryValidator().validate(
+        context=context,
+        plan=plan,
+        rendered_query=broken,
+    )
+
+    assert not validation.valid
+    assert any(issue.code == "required_filter_missing" for issue in validation.issues)
+
+
+def test_sql_renderer_uses_absolute_time_range_and_requested_aggregation():
+    schema = DatabaseSchema(
+        database="demo",
+        tables=[
+            TableSchema(
+                name="prices",
+                schema="public",
+                columns=[
+                    ColumnSchema(name="timestamp", data_type="timestamp"),
+                    ColumnSchema(name="price", data_type="float"),
+                ],
+            )
+        ],
+    )
+    context = QueryRequestContext(
+        database_id="demo",
+        database_type="timescaledb",
+        message="查询这个时间范围内 price 的平均值",
+        time_range={"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+    )
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+
+    rendered = CompositeDialectRenderer({"type": "timescaledb"}).render(context=context, plan=plan)
+
+    assert "AVG" in rendered.query_text
+    assert "2023-01-01T00:00:00Z" in rendered.query_text
+    assert "2023-01-02T00:00:00Z" in rendered.query_text
+
+
+class _FakeConnector:
+    dialect = "timescaledb"
+
+    async def get_schema(self) -> DatabaseSchema:
+        return DatabaseSchema(
+            database="demo",
+            tables=[
+                TableSchema(
+                    name="prices",
+                    schema="public",
+                    columns=[
+                        ColumnSchema(name="timestamp", data_type="timestamp"),
+                        ColumnSchema(name="price", data_type="float"),
+                    ],
+                )
+            ],
+        )
+
+    async def execute(self, query: str):
+        return QueryResult(
+            columns=["timestamp", "value"],
+            rows=[
+                {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
+                {"timestamp": "2023-01-01T01:00:00Z", "value": 2.0},
+            ],
+            row_count=2,
+            execution_time_ms=5,
+        )
+
+
+class _FakeInfluxProbeConnector:
+    dialect = "flux"
+
+    async def get_schema(self) -> DatabaseSchema:
+        return _build_influx_schema_without_domains()
+
+    async def probe_value_domains(self, *, source_name: str, columns: list[str], limit: int = 100):
+        return {"code": ["USD", "EUR"], "crypto": ["bitcoin"]}
+
+    async def execute(self, query: str):
+        return QueryResult(
+            columns=["time", "value", "code", "crypto"],
+            rows=[
+                {"time": "2023-01-04T23:33:00Z", "value": 16422.3833, "code": "USD", "crypto": "bitcoin"},
+            ],
+            row_count=1,
+            execution_time_ms=8,
+        )
+
+
+def test_database_query_flow_attaches_query_trace():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        flow = DatabaseQueryFlow(
+            connector=_FakeConnector(),
+            config={"type": "timescaledb", "snapshot_dir": tmpdir},
+        )
+        evidence = asyncio.run(
+            flow.run(
+                context=QueryRequestContext(
+                    database_id="demo",
+                    database_type="timescaledb",
+                    message="分析 price 的趋势",
+                    time_range={"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+                )
+            )
+        )
+
+        assert evidence.result_type == "timeseries"
+        assert evidence.diagnostics["query_trace"]["logical_plan"]["time_range"]["start"] == "2023-01-01T00:00:00Z"
+        assert evidence.diagnostics["query_trace"]["rendered_query"]["query_text"]
+        snapshot_ref = evidence.diagnostics["query_trace"]["snapshot_ref"]
+        assert snapshot_ref["artifact_kind"] == "query_result_snapshot"
+        assert evidence.diagnostics["query_snapshot_ref"]["artifact_id"] == snapshot_ref["artifact_id"]
+        assert Path(snapshot_ref["uri"]).exists()
+
+
+def test_database_query_flow_can_probe_value_domains_before_rendering():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        flow = DatabaseQueryFlow(
+            connector=_FakeInfluxProbeConnector(),
+            config={"type": "influxdb", "bucket": "bitcoin", "snapshot_dir": tmpdir},
+        )
+        evidence = asyncio.run(
+            flow.run(
+                context=QueryRequestContext(
+                    database_id="influxdb2-bitcoin-sample",
+                    database_type="influxdb",
+                    message="请判断 Bitcoin USD 在这个时间范围内有没有明显每天或每周重复的周期性波动。",
+                    time_range={"start": "2023-01-04T23:04:00Z", "end": "2023-02-03T22:47:00Z"},
+                )
+            )
+        )
+
+        query_text = evidence.query or ""
+        assert 'r.code == "USD"' in query_text
+        assert 'r.crypto == "bitcoin"' in query_text
+        assert evidence.diagnostics["query_trace"]["logical_plan"]["notes"][-1] == "value_domains_probed=true"
+
+
+def test_query_observation_can_expose_snapshot_ref_after_state_update():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        flow = DatabaseQueryFlow(
+            connector=_FakeConnector(),
+            config={"type": "timescaledb", "snapshot_dir": tmpdir},
+        )
+        evidence = asyncio.run(
+            flow.run(
+                context=QueryRequestContext(
+                    database_id="demo",
+                    database_type="timescaledb",
+                    message="分析 price 的趋势",
+                    time_range={"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+                )
+            )
+        )
+        request_state = build_request_state(
+            ChatRequest(
+                message="分析 price 的趋势",
+                database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
+            ),
+            get_settings(),
+        )
+        tool_spec = SimpleNamespace(result_target="evidence")
+        full_payload = evidence.model_dump(mode="json")
+        apply_observation(
+            request_state,
+            ToolObservation(tool_name="query_database", success=True, summary="ok", payload={}, error=None),
+            full_payload,
+            tool_spec,
+        )
+        enriched = enrich_observation_payload(
+            request_state,
+            ToolObservation(tool_name="query_database", success=True, summary="ok", payload={}, error=None),
+            full_payload,
+            tool_spec,
+        )
+        assert enriched.payload["diagnostics"]["query_snapshot_ref"]["artifact_kind"] == "query_result_snapshot"

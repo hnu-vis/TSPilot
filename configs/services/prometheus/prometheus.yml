@@ -1,0 +1,34 @@
+# Prometheus scrape 配置
+# 用于 TSPilot 的 PromQL 参考数据链路验证
+
+global:
+  # 全局抓取间隔 (默认 15s)
+  scrape_interval: 15s
+  # 评估规则间隔
+  evaluation_interval: 15s
+  # 外部标签
+  external_labels:
+    cluster: 'tspilot'
+    environment: 'development'
+
+# Alertmanager 配置 (可选)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# 规则文件 (可选)
+# rule_files:
+#   - "rules/*.yml"
+
+# 抓取配置
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['prometheus:9090']
+    metrics_path: /metrics
+
+  # 如需额外的容器/主机监控指标，可启用 docker-compose 的 extras profile，
+  # 并按需恢复对应的 scrape job。
