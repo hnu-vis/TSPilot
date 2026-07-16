@@ -6,6 +6,9 @@ from fastapi.testclient import TestClient
 
 from app.server import app
 from app.settings import get_settings
+from runtime.react_loop import ReActLoop
+from runtime.request_state import build_conversation_state, build_request_state
+from schemas.api import ChatRequest
 from tests.fakes import CasualLLM, ComplexReActLLM, FakeLLM, RepeatingTodoLLM, TodoScopeLLM
 
 
@@ -47,6 +50,33 @@ def test_chat_json_path_returns_final_answer():
     assert payload["answer"]["summary"]
 
 
+def test_first_visible_action_does_not_wait_for_separate_intent_llm_call():
+    llm = FakeLLM()
+    client = _build_client(llm)
+    react_loop = deps.get_react_loop()
+    request = ChatRequest(
+        message="请分析 appliances_energy_wh 的趋势",
+        database_context={"database_id": "influxdb2-energydata", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, get_settings())
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    async def first_action_event():
+        async for event in react_loop._iterate(request_state, conversation_state):
+            if event.event_type == "action":
+                return event
+        return None
+
+    import asyncio
+
+    event = asyncio.run(first_action_event())
+
+    assert client
+    assert event is not None
+    assert event.payload["action"] == "sql_query"
+    assert llm.calls == 1
+
+
 def test_chat_sse_path_returns_event_stream():
     client = _build_client(FakeLLM())
     with client.stream(
@@ -73,6 +103,37 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: thought" not in body
     assert "event: action" not in body
     assert "event: observation" not in body
+
+
+def test_sql_tool_result_preview_exposes_query_and_samples():
+    loop = ReActLoop.__new__(ReActLoop)
+    preview = loop._payload_preview(
+        {
+            "tool_name": "sql_query",
+            "success": True,
+            "summary": "ok",
+            "payload_truncated": False,
+            "payload": {
+                "evidence_id": "evi_sql",
+                "query_language": "sql",
+                "query": "SELECT value FROM metrics",
+                "columns": ["value"],
+                "data": {
+                    "rows": [{"value": 12.3}, {"value": 13.4}],
+                    "points": [{"timestamp": "t0", "value": 12.3}],
+                },
+                "diagnostics": {"summary_stats": {"rows_count": 2, "points_count": 1}},
+            },
+        }
+    )
+
+    assert preview["query_language"] == "sql"
+    assert preview["query"] == "SELECT value FROM metrics"
+    assert preview["columns"] == ["value"]
+    assert preview["row_count"] == 2
+    assert preview["point_count"] == 1
+    assert preview["sample_rows"] == [{"value": 12.3}, {"value": 13.4}]
+    assert preview["sample_points"] == [{"timestamp": "t0", "value": 12.3}]
 
 
 def test_chat_json_path_can_answer_without_database_context():

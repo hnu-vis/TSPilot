@@ -10,11 +10,8 @@ class FakeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        intent_response = _maybe_intent_response(user_prompt)
-        if intent_response:
-            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = json.loads(context_json)
+        context = _compat_context(json.loads(context_json))
 
         if context.get("database_context") is None:
             return _turn(
@@ -86,11 +83,8 @@ class CasualLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        intent_response = _maybe_intent_response(user_prompt)
-        if intent_response:
-            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = json.loads(context_json)
+        context = _compat_context(json.loads(context_json))
         return _turn(
             "This is a conversational request without a datasource, so I should answer directly.",
             "format_answer",
@@ -111,11 +105,8 @@ class ComplexReActLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        intent_response = _maybe_intent_response(user_prompt)
-        if intent_response:
-            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = json.loads(context_json)
+        context = _compat_context(json.loads(context_json))
 
         if context.get("database_context") is None:
             return _turn(
@@ -212,11 +203,8 @@ class RepeatingTodoLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        intent_response = _maybe_intent_response(user_prompt)
-        if intent_response:
-            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = json.loads(context_json)
+        context = _compat_context(json.loads(context_json))
 
         latest_observation_summaries = context.get("latest_observation_summaries", [])
         latest_observation = latest_observation_summaries[-1] if latest_observation_summaries else None
@@ -294,11 +282,8 @@ class TodoScopeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        intent_response = _maybe_intent_response(user_prompt)
-        if intent_response:
-            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = json.loads(context_json)
+        context = _compat_context(json.loads(context_json))
 
         if not context.get("todo_list"):
             return _turn(
@@ -399,32 +384,42 @@ def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
     )
 
 
-def _maybe_intent_response(user_prompt: str) -> _FakeResponse | None:
-    if "Parse the user's data-analysis intent" not in user_prompt:
-        return None
-    context_json = user_prompt.split("Context JSON:\n", 1)[1]
-    context = json.loads(context_json)
-    fallback = context.get("fallback_intent_profile") or {}
-    message = str(context.get("message") or "")
-    normalized = message.lower()
-    fact_types = list(fallback.get("requested_fact_types") or [])
-    if "最大" in normalized or "max" in normalized:
-        fact_types = [item for item in fact_types if item != "outlier"]
-        if "extreme" not in fact_types:
-            fact_types.append("extreme")
-    payload = {
-        "primary_goal": message,
-        "analysis_kind": "statistical_summary" if "extreme" in fact_types else fallback.get("analysis_kind", "timeseries_analysis"),
-        "requested_fact_types": fact_types,
-        "requested_metrics": ["max_or_min"] if "extreme" in fact_types else fallback.get("requested_metrics", []),
-        "data_policy": {
-            "preserve_raw_values": "extreme" in fact_types,
-            "filter_outliers": False if "extreme" in fact_types else None,
-        },
-        "required_outputs": ["conclusion", "analysis"] if "extreme" in fact_types else fallback.get("required_outputs", ["conclusion"]),
-        "needs_plan": fallback.get("needs_plan", False),
+def _compat_context(context: dict) -> dict:
+    if "task" not in context:
+        return context
+    task = context.get("task") or {}
+    state = context.get("state") or {}
+    evidence = context.get("evidence") or {}
+    outputs = context.get("outputs") or {}
+    execution = state.get("execution") or {}
+    return {
+        **context,
+        "message": task.get("message"),
+        "database_context": task.get("database_context"),
+        "selected_database": task.get("selected_database"),
+        "selected_database_type": task.get("selected_database_type"),
+        "time_range": task.get("time_range"),
+        "constraints": task.get("constraints") or {},
+        "history": task.get("history") or [],
+        "execution_state": execution,
+        "todo_list": state.get("todo_list"),
+        "plan_current_step": state.get("plan_current_step"),
+        "planning_complete": state.get("planning_complete"),
+        "requested_fact_types": state.get("requested_fact_types"),
+        "focus": state.get("focus"),
+        "latest_database_evidence": evidence.get("latest"),
+        "query_history": evidence.get("prior_queries") or [],
+        "latest_insight": outputs.get("latest_insight"),
+        "analysis_workspace": outputs.get("analysis_workspace") or {},
+        "latest_forecast": outputs.get("latest_forecast"),
+        "latest_anomaly": outputs.get("latest_anomaly"),
+        "latest_rag": outputs.get("latest_rag"),
+        "latest_skill": outputs.get("latest_skill"),
+        "verified_facts": outputs.get("verified_facts") or [],
+        "visualizations": outputs.get("visualizations") or [],
+        "latest_observation_summaries": context.get("recent_observations") or [],
+        "available_actions": context.get("available_actions") or [],
     }
-    return _FakeResponse(json.dumps(payload, ensure_ascii=False))
 
 
 def _analysis_count(context: dict) -> int:

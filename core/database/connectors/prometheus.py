@@ -437,6 +437,7 @@ class PrometheusConnector(DBConnector):
             "dataset_path": raw_dataset_path,
             "resolved_dataset_path": resolved_dataset_path,
             "row_count": row_count,
+            "sample_rows": self._reference_dataset_sample_rows(resolved_dataset_path or raw_dataset_path, limit=3),
             "labels": {
                 key: str(value)
                 for key, value in labels.items()
@@ -461,6 +462,28 @@ class PrometheusConnector(DBConnector):
                 return sum(1 for _ in csv.DictReader(handle))
         except Exception:
             return None
+
+    def _reference_dataset_sample_rows(self, dataset_path: str | None, *, limit: int) -> list[dict[str, Any]]:
+        """Read a bounded set of CSV rows for schema grounding."""
+        if not dataset_path or limit <= 0:
+            return []
+
+        resolved_path = Path(str(dataset_path))
+        if not resolved_path.is_absolute():
+            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
+        if not resolved_path.exists():
+            return []
+
+        rows: list[dict[str, Any]] = []
+        try:
+            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    rows.append(dict(row))
+                    if len(rows) >= limit:
+                        break
+        except Exception:
+            return []
+        return rows
 
     def _get_configured_schema_metric_names(self) -> list[str]:
         """Return schema metric names configured for this logical Prometheus database."""

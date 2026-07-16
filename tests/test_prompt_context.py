@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.database.connector import ColumnSchema, DatabaseSchema, TableSchema
+from core.database.schema import schema_preview
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
@@ -15,7 +17,10 @@ class _EvidenceSpec:
 
 def test_prompt_builder_summarizes_heavy_context():
     settings = get_settings()
-    request = ChatRequest(message="分析季节性")
+    request = ChatRequest(
+        message="分析季节性",
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
     request_state = build_request_state(request, settings)
     conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
@@ -63,14 +68,69 @@ def test_prompt_builder_summarizes_heavy_context():
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
 
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
-    assert context["execution_state"]["artifacts"]["has_database_evidence"] is True
-    assert context["execution_state"]["last_successful_tool"] == "sql_query"
-    assert len(context["latest_database_evidence"]["data"]["points"]) <= 8
-    assert context["query_history"][0]["query"] == "demo"
-    assert context["query_history"][0]["row_count"] == 100
-    assert len(context["query_history"][0]["preview"]["rows"]) <= 3
-    assert context["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
-    assert "chart" not in context["visualizations"][0]
+    assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True
+    assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
+    guidance = " ".join(context["state"]["decision_frame"]["recommended_next_action_types"])
+    assert "continue with explicit read-only queries" in guidance
+    assert "A prior sql_query does not force insight" in context["state"]["decision_frame"]["sql_loop_rule"]
+    assert len(context["evidence"]["latest"]["data"]["points"]) <= 8
+    assert context["evidence"]["prior_queries"] == []
+    assert context["outputs"]["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
+    assert "chart" not in context["outputs"]["visualizations"][0]
+    assert "latest_database_evidence" not in context
+    assert "visualizations" not in context
+
+
+def test_initial_context_includes_bounded_schema_hint_for_reference_dataset():
+    settings = get_settings()
+    request = ChatRequest(
+        message="总共有多少条数据？",
+        database_context={"database_id": "influxdb2-energydata", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    schema_hint = context["task"]["database_context"]["schema_hint"]
+
+    assert schema_hint["query_language"] == "flux"
+    assert schema_hint["tables_or_measurements"][0]["name"] == "home_energy_environment"
+    assert schema_hint["tables_or_measurements"][0]["row_count"] == 19735
+    assert "appliances_energy_wh" in schema_hint["tables_or_measurements"][0]["field_columns"]
+    assert len(schema_hint["tables_or_measurements"][0]["sample_rows"]) == 3
+
+
+def test_schema_preview_promotes_reference_dataset_metadata_to_table_preview():
+    schema = DatabaseSchema(
+        database="demo",
+        tables=[
+            TableSchema(
+                name="metrics",
+                columns=[
+                    ColumnSchema(name="_time", data_type="datetime"),
+                    ColumnSchema(name="value", data_type="float"),
+                    ColumnSchema(name="host", data_type="string"),
+                ],
+            )
+        ],
+        metadata={
+            "reference_dataset": {
+                "measurement": "metrics",
+                "row_count": 42,
+                "time_range": {"start": "2024-01-01T00:00:00Z", "stop": "2024-01-02T00:00:00Z"},
+                "sample_rows": [{"timestamp": "2024-01-01 00:00:00", "value": "1.0"}],
+            },
+            "value_domains": {"metrics": {"_field": ["value"], "host": ["a", "b"]}},
+        },
+    )
+
+    preview = schema_preview(schema)
+    table = preview["tables_or_measurements"][0]
+
+    assert table["row_count"] == 42
+    assert table["field_values"] == ["value"]
+    assert table["sample_rows"] == [{"timestamp": "2024-01-01 00:00:00", "value": "1.0"}]
+    assert preview["labels_or_tags"] == [{"table": "metrics", "name": "host", "values": ["a", "b"]}]
 
 
 def test_prompt_builder_exposes_sql_observation_details():
@@ -99,7 +159,7 @@ def test_prompt_builder_exposes_sql_observation_details():
     )
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    payload = context["latest_observation_summaries"][0]["payload"]
+    payload = context["recent_observations"][0]["payload"]
 
     assert payload["query"] == "SELECT AVG(value) AS avg_value FROM metrics"
     assert payload["query_language"] == "sql"
@@ -136,11 +196,10 @@ def test_prompt_builder_bounds_long_query_context():
     apply_observation(request_state, observation, full_payload, _EvidenceSpec())
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    evidence = context["latest_database_evidence"]
-    history_item = context["query_history"][0]
+    evidence = context["evidence"]["latest"]
 
     assert len(evidence["query"]) < len(long_query)
     assert "truncated" in evidence["query"]
-    assert len(history_item["query"]) < len(long_query)
-    assert "truncated" in history_item["metadata"]["raw_schema"]
+    assert context["evidence"]["prior_queries"] == []
+    assert "truncated" in evidence["metadata"]["raw_schema"]
     assert "truncated_items" in evidence["diagnostics"]["query_trace"]["large"][-1]

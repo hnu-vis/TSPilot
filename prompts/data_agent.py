@@ -18,10 +18,14 @@ class DataAgentPromptBuilder:
             "Respond with exactly one JSON object and nothing else.\n"
             "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
             "Output schema: "
-            "{\"thought\": str, \"action\": str, \"action_input\": object}.\n"
+            "{\"thought\": str, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
+            "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
+            "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
             "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, format_answer.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
+            "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
+            "Use the user's message, current plan, and observations as the source of task intent.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
@@ -29,8 +33,10 @@ class DataAgentPromptBuilder:
             "Todo is initial visible process state, not a model-maintained scheduler. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
             "Tool contracts:\n"
             "- todowrite: create the initial full todo plan only when no plan exists.\n"
-            "- sql_query: query the selected datasource. Use message for automatic query planning, or query/query_language for explicit read-only SQL/Flux/PromQL aggregation, grouping, ranking, filtering, validation, or other exact database-backed analysis. It returns evidence only, not conclusions.\n"
-            "- insight: execute generated Python analysis code over existing full evidence artifacts. It returns structured analysis results, not raw rows.\n"
+            "- sql_query: query the selected datasource. Use message for automatic query planning, or query/query_language for explicit read-only SQL/Flux/PromQL. "
+            "It is the primary database-analysis action for schema/sample inspection, raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
+            "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
+            "- insight: execute generated Python analysis code over existing full evidence artifacts. Use it only when SQL cannot express the needed computation well, or when structured fact extraction/visualization is needed after enough database queries. It returns structured analysis results, not raw rows.\n"
             "- anomaly: detect anomalies from existing time-series evidence only.\n"
             "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
@@ -47,10 +53,12 @@ class DataAgentPromptBuilder:
             "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
-            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object, \"intent_profile\": object|null}.\n"
+            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}.\n"
             "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
             "Do not write an explicit database query from user-facing names when no schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so the datasource-specific fields are grounded.\n"
-            "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, first obtain grounded raw evidence; then call insight with python_rows_v1 analysis_code that computes the result from rows/points. Do not calculate from prompt previews.\n"
+            "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
+            "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
+            "Use insight after the SQL evidence is sufficiently grounded, or when the computation requires Python over full artifacts. Do not calculate final facts from prompt previews alone.\n"
             "For insight, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code_type\": \"python_rows_v1\", \"analysis_code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The generated code may use rows, points, columns, metadata, diagnostics, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}.\n"
             "For format_answer, use: {\"summary_goal\": str, \"direct_answer\": str|null, "
             "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
@@ -62,59 +70,75 @@ class DataAgentPromptBuilder:
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> dict:
+        latest_evidence = (
+            self._summarize_database_evidence(request_state.latest_database_evidence)
+            if request_state.latest_database_evidence
+            else None
+        )
+        latest_evidence_id = latest_evidence.get("evidence_id") if isinstance(latest_evidence, dict) else None
+        prior_queries = [
+            item
+            for item in self._summarize_query_history(request_state)
+            if item.get("evidence_id") != latest_evidence_id
+        ]
         return {
-            "message": request_state.message,
-            "available_actions": self._available_actions(),
-            "execution_state": self._execution_state(request_state),
-            "database_context": (
-                request_state.database_context.model_dump(mode="json")
-                if request_state.database_context
-                else None
-            ),
-            "selected_database": request_state.selected_database,
-            "selected_database_type": request_state.selected_database_type,
-            "time_range": request_state.time_range,
-            "constraints": request_state.constraints,
-            "history": [message.model_dump(mode="json") for message in request_state.history],
-            "intent_profile": request_state.intent_profile,
-            "todo_list": request_state.todo_list,
-            "plan_current_step": request_state.plan_current_step,
-            "planning_complete": request_state.planning_complete,
-            "requested_fact_types": request_state.requested_fact_types,
-            "focus": request_state.focus,
-            "latest_database_evidence": (
-                self._summarize_database_evidence(request_state.latest_database_evidence)
-                if request_state.latest_database_evidence
-                else None
-            ),
-            "query_history": self._summarize_query_history(request_state),
-            "latest_insight": (
-                self._summarize_insight(request_state.latest_insight)
-                if request_state.latest_insight
-                else None
-            ),
-            "analysis_workspace": self._analysis_workspace(request_state),
-            "latest_forecast": (
-                self._summarize_forecast(request_state.latest_forecast)
-                if request_state.latest_forecast
-                else None
-            ),
-            "latest_anomaly": (
-                self._summarize_anomaly(request_state.latest_anomaly)
-                if request_state.latest_anomaly
-                else None
-            ),
-            "latest_rag": request_state.latest_rag,
-            "latest_skill": request_state.latest_skill,
-            "verified_facts": [
-                fact.model_dump(mode="json")
-                for fact in request_state.verified_facts
-            ],
-            "visualizations": [
-                self._summarize_visualization(visualization)
-                for visualization in request_state.visualizations
-            ],
-            "latest_observation_summaries": [
+            "task": {
+                "message": request_state.message,
+                "database_context": (
+                    request_state.database_context.model_dump(mode="json")
+                    if request_state.database_context
+                    else None
+                ),
+                "selected_database": request_state.selected_database,
+                "selected_database_type": request_state.selected_database_type,
+                "time_range": request_state.time_range,
+                "constraints": request_state.constraints,
+                "history": [message.model_dump(mode="json") for message in request_state.history[-4:]],
+            },
+            "state": {
+                "execution": self._execution_state(request_state),
+                "decision_frame": self._decision_frame(request_state),
+                "todo_list": request_state.todo_list,
+                "plan_current_step": request_state.plan_current_step,
+                "planning_complete": request_state.planning_complete,
+                "requested_fact_types": request_state.requested_fact_types,
+                "focus": request_state.focus,
+                "recent_todo_summary": conversation_state.recent_todo_summary,
+                "prompt_context_summary": request_state.prompt_context_summary,
+            },
+            "evidence": {
+                "latest": latest_evidence,
+                "prior_queries": prior_queries[-5:],
+            },
+            "outputs": {
+                "latest_insight": (
+                    self._summarize_insight_status(request_state.latest_insight)
+                    if request_state.latest_insight
+                    else None
+                ),
+                "analysis_workspace": self._analysis_workspace(request_state),
+                "latest_forecast": (
+                    self._summarize_forecast_status(request_state.latest_forecast)
+                    if request_state.latest_forecast
+                    else None
+                ),
+                "latest_anomaly": (
+                    self._summarize_anomaly_status(request_state.latest_anomaly)
+                    if request_state.latest_anomaly
+                    else None
+                ),
+                "latest_rag": request_state.latest_rag,
+                "latest_skill": request_state.latest_skill,
+                "verified_facts": [
+                    fact.model_dump(mode="json")
+                    for fact in request_state.verified_facts
+                ],
+                "visualizations": [
+                    self._summarize_visualization(visualization)
+                    for visualization in request_state.visualizations
+                ],
+            },
+            "recent_observations": [
                 {
                     "tool_name": observation.tool_name,
                     "success": observation.success,
@@ -124,9 +148,7 @@ class DataAgentPromptBuilder:
                 }
                 for observation in request_state.observations[-4:]
             ],
-            "recent_messages": [message.model_dump(mode="json") for message in conversation_state.recent_messages],
-            "recent_todo_summary": conversation_state.recent_todo_summary,
-            "prompt_context_summary": request_state.prompt_context_summary,
+            "available_actions": self._available_actions(),
         }
 
     def _available_actions(self) -> list[dict]:
@@ -176,12 +198,14 @@ class DataAgentPromptBuilder:
     def _execution_state(self, request_state: RequestStateModel) -> dict:
         last_success = next((item for item in reversed(request_state.observations) if item.success), None)
         last_failure = next((item for item in reversed(request_state.observations) if not item.success), None)
-        last_tool = request_state.tool_history[-1].tool_name if request_state.tool_history else None
+        last_call = request_state.tool_history[-1] if request_state.tool_history else None
+        last_tool = last_call.tool_name if last_call else None
         return {
             "iteration": request_state.iteration,
             "max_iterations": request_state.max_iterations,
             "tool_sequence": [call.tool_name for call in request_state.tool_history],
             "last_tool": last_tool,
+            "last_action_reason": last_call.reason if last_call else None,
             "last_successful_tool": last_success.tool_name if last_success else None,
             "last_failure": (
                 {
@@ -204,6 +228,54 @@ class DataAgentPromptBuilder:
                 "analysis_count": len(request_state.analysis_artifacts),
             },
             "plan_progress_owner": "runtime" if request_state.todo_list else "none",
+        }
+
+    def _decision_frame(self, request_state: RequestStateModel) -> dict:
+        current_todo = next(
+            (todo for todo in request_state.todo_list if todo.get("status") == "in_progress"),
+            None,
+        )
+        latest_evidence = request_state.latest_database_evidence
+        latest_query_summary = None
+        if latest_evidence is not None:
+            diagnostics = latest_evidence.diagnostics or {}
+            summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
+            latest_query_summary = {
+                "evidence_id": latest_evidence.evidence_id,
+                "result_type": latest_evidence.result_type,
+                "query_language": latest_evidence.query_language,
+                "columns": latest_evidence.columns[:20],
+                "rows_count": summary_stats.get("rows_count"),
+                "points_count": summary_stats.get("points_count"),
+                "series_count": summary_stats.get("series_count"),
+                "sample_rows_visible": isinstance((latest_evidence.data or {}).get("rows"), list),
+                "sample_points_visible": isinstance((latest_evidence.data or {}).get("points"), list),
+            }
+
+        next_action_guidance = []
+        if request_state.database_context is None:
+            next_action_guidance.append("format_answer: explain that a datasource/context is required for data analysis.")
+        elif latest_evidence is None:
+            next_action_guidance.append("sql_query: obtain grounded schema/sample/raw evidence before analysis.")
+        else:
+            next_action_guidance.extend(
+                [
+                    "sql_query: continue with explicit read-only queries for additional aggregation, filtering, bucketing, or period validation.",
+                    "insight: use Python over full evidence only when SQL is insufficient or structured facts/visualizations are now needed.",
+                    "format_answer: use only when enough database-backed evidence or derived outputs answer the user request.",
+                ]
+            )
+        if request_state.todo_list:
+            next_action_guidance.insert(0, "todowrite is locked after initial planning; runtime advances plan status.")
+
+        return {
+            "current_todo": current_todo,
+            "latest_query_summary": latest_query_summary,
+            "recommended_next_action_types": next_action_guidance,
+            "sql_loop_rule": (
+                "A prior sql_query does not force insight. If the last SQL sample/counts reveal a missing filter, outlier, "
+                "or another database-checkable gap, call sql_query again with a focused read-only query."
+            ),
         }
 
     def build_user_prompt(
@@ -326,6 +398,34 @@ class DataAgentPromptBuilder:
             "latest_analysis_id": request_state.latest_analysis_id,
             "analysis_count": len(analyses),
             "analyses": analyses[-8:],
+        }
+
+    def _summarize_insight_status(self, insight) -> dict:
+        payload = insight.model_dump(mode="json")
+        return {
+            "insight_id": payload.get("insight_id"),
+            "summary": self._truncate_text(payload.get("summary"), 800),
+            "verified_fact_count": len(payload.get("verified_facts", []) or []),
+            "completed_fact_count": len(payload.get("completed_facts", []) or []),
+            "visualization_count": len(payload.get("visualizations", []) or []),
+        }
+
+    def _summarize_forecast_status(self, forecast) -> dict:
+        payload = forecast.model_dump(mode="json")
+        return {
+            "forecast_id": payload.get("forecast_id"),
+            "summary": self._truncate_text(payload.get("summary"), 800),
+            "forecast_point_count": len(payload.get("forecast_points", []) or []),
+            "visualization_count": len(payload.get("visualizations", []) or []),
+        }
+
+    def _summarize_anomaly_status(self, anomaly) -> dict:
+        payload = anomaly.model_dump(mode="json")
+        return {
+            "anomaly_id": payload.get("anomaly_id"),
+            "summary": self._truncate_text(payload.get("summary"), 800),
+            "anomaly_point_count": len(payload.get("anomaly_points", []) or []),
+            "visualization_count": len(payload.get("visualizations", []) or []),
         }
 
     def _summarize_observation_payload(self, payload: dict) -> dict:

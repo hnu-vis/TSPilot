@@ -115,7 +115,7 @@ def test_multiple_generated_insights_accumulate_in_analysis_workspace():
     )
 
     assert set(request_state.analysis_artifacts) == {"ana_first", "ana_second"}
-    workspace = context["analysis_workspace"]
+    workspace = context["outputs"]["analysis_workspace"]
     assert workspace["analysis_count"] == 2
     assert [item["analysis_id"] for item in workspace["analyses"]] == ["ana_first", "ana_second"]
 
@@ -139,4 +139,3 @@ def test_python_rows_runner_rejects_imports_and_requires_result_summary():
             metadata={},
             diagnostics={},
         )
-

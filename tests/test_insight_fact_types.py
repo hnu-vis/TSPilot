@@ -77,7 +77,7 @@ def test_build_insight_result_supports_eleven_fact_families():
     assert result.diagnostics["multi_series_evidence_detected"] is True
 
 
-def test_request_state_infers_richer_requested_fact_types():
+def test_request_state_does_not_infer_outer_intent_requirements():
     request = ChatRequest(
         message="分析趋势、极值、分布、异常、周期、排名、占比和相关性，并比较变化幅度。",
         database_context=None,
@@ -92,18 +92,9 @@ def test_request_state_infers_richer_requested_fact_types():
 
     state = build_request_state(request, get_settings())
 
-    inferred = set(state.requested_fact_types)
-    assert {
-        "trend",
-        "extreme",
-        "distribution",
-        "outlier",
-        "seasonality",
-        "rank",
-        "proportion",
-        "association",
-        "difference",
-    }.issubset(inferred)
+    assert state.intent_profile == {}
+    assert state.requested_fact_types == []
+    assert state.answer_requirements == ["conclusion"]
 
 
 def test_seasonality_uses_daily_weekly_time_profiles_with_outlier_context():

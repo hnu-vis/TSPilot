@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, ChevronDown, FileText, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, Code2, FileText, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
 
@@ -97,6 +97,8 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         </section>
       )}
 
+      {step.sqlDetail && <SqlDetail detail={step.sqlDetail} />}
+
       {step.artifactRefs.length > 0 && (
         <section className="inspector-card">
           <div className="inspector-card-title">
@@ -124,6 +126,63 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   );
 }
 
+function SqlDetail({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+  const rows = detail.sampleRows.length > 0 ? detail.sampleRows : detail.samplePoints;
+  const tableColumns = detail.columns.length > 0 ? detail.columns : inferColumns(rows);
+  return (
+    <section className="inspector-card sql-detail">
+      <div className="inspector-card-title sql-detail-title">
+        <Code2 size={16} />
+        <h3>SQL detail</h3>
+        {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+      </div>
+
+      {detail.query && <pre className="sql-code-block">{detail.query}</pre>}
+
+      {detail.columns.length > 0 && (
+        <div className="column-chip-list" aria-label="Result columns">
+          {detail.columns.map((column) => (
+            <span key={column}>{column}</span>
+          ))}
+        </div>
+      )}
+
+      {rows.length > 0 && tableColumns.length > 0 && (
+        <div className="sample-table-section">
+          <div className="sample-table-caption">
+            <span>
+              <Table2 size={14} />
+              Sample data
+            </span>
+            <strong>{formatCounts(detail)}</strong>
+          </div>
+          <div className="sample-table-wrap">
+            <table className="sample-table">
+              <thead>
+                <tr>
+                  {tableColumns.map((column) => (
+                    <th key={column}>{column}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, index) => (
+                  <tr key={index}>
+                    {tableColumns.map((column) => (
+                      <td key={column}>{formatCell(row[column])}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {detail.truncated && <p className="sample-note">Preview only</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function StatusIcon({ status }: { status: TraceStep['status'] }) {
   if (status === 'error') return <AlertCircle size={16} />;
   return <CheckCircle2 size={16} />;
@@ -140,4 +199,27 @@ function formatLabel(value: string) {
   return value
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function inferColumns(rows: Record<string, unknown>[]) {
+  const columns = new Set<string>();
+  rows.slice(0, 5).forEach((row) => {
+    Object.keys(row).forEach((key) => columns.add(key));
+  });
+  return Array.from(columns).slice(0, 12);
+}
+
+function formatCounts(detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']>) {
+  const parts = [
+    detail.rowCount !== null ? `${detail.rowCount.toLocaleString()} rows` : null,
+    detail.pointCount !== null ? `${detail.pointCount.toLocaleString()} points` : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(' / ') : `${detail.sampleRows.length || detail.samplePoints.length} samples`;
+}
+
+function formatCell(value: unknown) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number') return Number.isFinite(value) ? value.toLocaleString() : String(value);
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
 }

@@ -13,10 +13,14 @@ def missing_requirements(request_state: RequestStateModel) -> list[str]:
         and isinstance(latest_evidence.metadata, dict)
         and latest_evidence.metadata.get("sql_query_mode") == "explicit"
     )
+    has_database_answer_evidence = bool(
+        latest_evidence is not None
+        and latest_evidence.result_type in {"statistics", "table", "schema", "metric_list"}
+    )
     for requirement in request_state.answer_requirements:
         if requirement in {"plan", "conclusion"}:
             continue
-        if has_explicit_sql_query_evidence:
+        if has_explicit_sql_query_evidence or (requirement == "analysis" and has_database_answer_evidence):
             continue
         if not request_state.answer_coverage.get(requirement, False):
             missing.append(requirement)

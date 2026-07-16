@@ -5,6 +5,17 @@ export type DisplayMetric = {
   value: string;
 };
 
+export type SqlDetail = {
+  queryLanguage: string | null;
+  query: string | null;
+  columns: string[];
+  sampleRows: Record<string, unknown>[];
+  samplePoints: Record<string, unknown>[];
+  rowCount: number | null;
+  pointCount: number | null;
+  truncated: boolean;
+};
+
 export type DisplayStep = {
   id: string;
   title: string;
@@ -13,6 +24,7 @@ export type DisplayStep = {
   summary: string;
   metrics: DisplayMetric[];
   artifactRefs: string[];
+  sqlDetail: SqlDetail | null;
   debugPayload: Record<string, unknown> | null;
 };
 
@@ -41,6 +53,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     summary: summaryForStep(step, preview),
     metrics,
     artifactRefs,
+    sqlDetail: sqlDetailFor(tool, preview),
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
   };
 }
@@ -103,8 +116,8 @@ function categoryForTool(tool?: string, phase?: string) {
 function summaryForStep(step: TraceStep, preview: Record<string, unknown> | null) {
   const tool = step.tool;
   if ((tool === 'sql_query' || tool === 'query_database') && preview) {
-    const rowCount = nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']);
-    const pointCount = nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']);
+    const rowCount = numberFrom(preview.row_count) ?? nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']);
+    const pointCount = numberFrom(preview.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']);
     const seriesCount = numberFrom(preview.series_count);
     const parts = [
       rowCount !== null ? `${rowCount} rows` : null,
@@ -135,8 +148,8 @@ function metricsForTool(
   if (!preview && !call) return [];
   const metrics: DisplayMetric[] = [];
 
-  addMetric(metrics, 'Rows', nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']));
-  addMetric(metrics, 'Points', nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
+  addMetric(metrics, 'Rows', numberFrom(preview?.row_count) ?? nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']));
+  addMetric(metrics, 'Points', numberFrom(preview?.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
   addMetric(metrics, 'Series', numberFrom(preview?.series_count) ?? nestedNumber(preview, ['summary_stats', 'series_count']));
   addMetric(metrics, 'Facts', numberFrom(preview?.verified_fact_count));
   addMetric(metrics, 'Samples', numberFrom(preview?.input_row_count));
@@ -165,6 +178,26 @@ function artifactRefsFor(preview: Record<string, unknown> | null, result: Record
     stringFrom(preview?.anomaly_id),
   ];
   return Array.from(new Set(refs.filter((value): value is string => Boolean(value))));
+}
+
+function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): SqlDetail | null {
+  if (tool !== 'sql_query' && tool !== 'query_database') return null;
+  if (!preview) return null;
+  const sampleRows = recordsFrom(preview.sample_rows);
+  const samplePoints = recordsFrom(preview.sample_points);
+  const columns = stringsFrom(preview.columns);
+  const query = stringFrom(preview.query);
+  if (!query && columns.length === 0 && sampleRows.length === 0 && samplePoints.length === 0) return null;
+  return {
+    queryLanguage: stringFrom(preview.query_language),
+    query,
+    columns,
+    sampleRows,
+    samplePoints,
+    rowCount: numberFrom(preview.row_count),
+    pointCount: numberFrom(preview.point_count),
+    truncated: Boolean(preview.truncated || preview.payload_truncated),
+  };
 }
 
 function outputTypes(answer?: FinalAnswer | null) {
@@ -211,6 +244,18 @@ function numberFrom(value: unknown): number | null {
 
 function stringFrom(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function stringsFrom(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+}
+
+function recordsFrom(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(asRecord(item)))
+    : [];
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -6,6 +6,7 @@ from app.settings import get_settings
 from runtime.request_state import build_request_state
 from schemas.api import ChatRequest
 from schemas.analysis import AnalysisResult
+from schemas.database import DatabaseEvidence
 from schemas.insight import VerifiedFact
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
@@ -40,6 +41,44 @@ def test_format_answer_allows_explicit_included_fact_without_unrelated_missing_r
 
     assert result["summary"] == fact.statement
     assert result["sections"][0]["section_type"] == "facts"
+
+
+def test_format_answer_allows_statistics_evidence_for_count_direct_answer():
+    request_state = build_request_state(
+        ChatRequest(
+            message="总共有多少条数据？",
+            database_context={"database_id": "demo", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+    request_state.answer_requirements = ["conclusion", "analysis"]
+    request_state.answer_coverage = {"conclusion": False, "analysis": False}
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_count_stats",
+        result_type="statistics",
+        database="demo",
+        query_language="reference_dataset",
+        query="reference_dataset:value:statistics",
+        summary="Computed statistics over 19735 rows.",
+        data={"statistics": {"count": 19735}},
+        columns=["metric", "value"],
+        metadata={},
+        diagnostics={},
+    )
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(
+                summary_goal="回答总条数",
+                direct_answer="共有 19,735 条数据。",
+                section_plan=["conclusion"],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["summary"] == "共有 19,735 条数据。"
+    assert result["references"][0]["source_id"] == "evi_count_stats"
 
 
 def test_format_answer_assembles_selected_analysis_results():

@@ -1157,6 +1157,138 @@ input:focus-visible {
   white-space: nowrap;
 }
 
+.sql-detail {
+  gap: 10px;
+}
+
+.sql-detail-title {
+  align-items: center;
+}
+
+.query-language-badge {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 2px 7px;
+  color: var(--muted-strong);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.sql-code-block {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: oklch(0.962 0.004 250);
+  margin: 0;
+  padding: 10px;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.column-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.column-chip-list span {
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 4px 6px;
+  color: var(--muted-strong);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sample-table-section {
+  display: grid;
+  gap: 7px;
+}
+
+.sample-table-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sample-table-caption span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-weight: 680;
+}
+
+.sample-table-caption strong {
+  flex: 0 0 auto;
+  color: var(--muted-strong);
+  font-weight: 700;
+}
+
+.sample-table-wrap {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.sample-table {
+  width: 100%;
+  min-width: 320px;
+  border-collapse: collapse;
+  background: var(--surface);
+  font-size: 11px;
+}
+
+.sample-table th,
+.sample-table td {
+  max-width: 180px;
+  border-bottom: 1px solid var(--border);
+  padding: 7px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.sample-table th {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.sample-table td {
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.sample-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.sample-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .reference-list {
   display: grid;
   gap: 8px;

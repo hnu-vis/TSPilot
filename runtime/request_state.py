@@ -1,11 +1,13 @@
 """Request-state helpers."""
 from __future__ import annotations
 
+import csv
+import json
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.settings import Settings
-from core.intent import build_intent_profile_fallback
 from runtime.artifacts import persist_json_artifact
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
@@ -32,19 +34,15 @@ def normalize_chat_request(request: ChatRequest) -> ChatRequest:
 def build_request_state(request: ChatRequest, settings: Settings) -> RequestStateModel:
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     conversation_id = request.conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
-    intent_profile = build_intent_profile_fallback(request.message)
-    requested_fact_types = list(intent_profile.get("requested_fact_types") or [])
-    answer_requirements = (
-        ["conclusion"]
-        if request.database_context is None
-        else list(intent_profile.get("required_outputs") or ["conclusion"])
-    )
+    requested_fact_types: list[str] = []
+    answer_requirements = ["conclusion"]
     focus = request.message
+    database_context = _with_schema_hint(request.database_context, settings)
     return RequestStateModel(
         request_id=request_id,
         conversation_id=conversation_id,
         message=request.message,
-        database_context=request.database_context,
+        database_context=database_context,
         selected_database=request.selected_database,
         selected_database_type=request.selected_database_type,
         time_range=request.time_range,
@@ -52,7 +50,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         history=request.history,
         status="running",
         current_intent="chat_analysis",
-        intent_profile=intent_profile,
+        intent_profile={},
         requested_fact_types=requested_fact_types,
         answer_requirements=answer_requirements,
         answer_coverage={requirement: False for requirement in answer_requirements},
@@ -123,6 +121,134 @@ def build_conversation_state(request: ChatRequest, conversation_id: str) -> Conv
         updated_at=None,
         context_budget=None,
     )
+
+
+def _with_schema_hint(database_context: DatabaseContext | None, settings: Settings) -> DatabaseContext | None:
+    """Attach bounded datasource structure known from local config before the first tool call."""
+    if database_context is None or database_context.schema_hint:
+        return database_context
+    config = _load_cached_database_config(database_context.database_id, settings)
+    if not config:
+        return database_context
+    schema_hint = _build_schema_hint(config, settings)
+    if not schema_hint:
+        return database_context
+    return database_context.model_copy(update={"schema_hint": schema_hint})
+
+
+def _load_cached_database_config(database_id: str, settings: Settings) -> dict | None:
+    cache_path = Path(settings.tspilot_root) / "cache_data" / "database" / "databases.json"
+    try:
+        with cache_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    databases = payload.get("databases") if isinstance(payload, dict) else None
+    config = databases.get(database_id) if isinstance(databases, dict) else None
+    return config if isinstance(config, dict) else None
+
+
+def _build_schema_hint(config: dict, settings: Settings) -> dict:
+    database_type = str(config.get("type") or config.get("db_type") or "unknown")
+    hint = {
+        "source": "local_database_config",
+        "database_id": config.get("id") or config.get("name"),
+        "database_type": database_type,
+        "query_language": _query_language_for_database_type(database_type),
+        "tables_or_measurements": [],
+    }
+    reference_dataset = config.get("reference_dataset")
+    if isinstance(reference_dataset, dict):
+        table_name = (
+            reference_dataset.get("measurement")
+            or reference_dataset.get("metric_name")
+            or reference_dataset.get("table")
+            or reference_dataset.get("series_name")
+        )
+        dataset_path = _resolve_dataset_path(reference_dataset.get("dataset_path"), settings)
+        field_columns = reference_dataset.get("field_columns")
+        if not isinstance(field_columns, list):
+            value_column = reference_dataset.get("value_column")
+            field_columns = [value_column] if value_column else []
+        time_column = reference_dataset.get("timestamp_column")
+        sample_columns = [
+            str(column)
+            for column in [time_column, *field_columns[:8]]
+            if column not in (None, "")
+        ]
+        sample_rows = _project_rows(_read_sample_rows(dataset_path, limit=3), sample_columns)
+        table_hint = {
+            "name": table_name,
+            "row_count": _count_csv_rows(dataset_path),
+            "time_column": time_column,
+            "field_columns": [str(column) for column in field_columns if column not in (None, "")][:60],
+            "sample_rows": sample_rows,
+        }
+        hint["tables_or_measurements"].append({k: v for k, v in table_hint.items() if v not in (None, [], "")})
+        return hint
+
+    configured_names = config.get("schema_measurement_names") or config.get("schema_metric_names")
+    if isinstance(configured_names, str):
+        configured_names = [configured_names]
+    if isinstance(configured_names, list):
+        hint["tables_or_measurements"] = [
+            {"name": str(name)}
+            for name in configured_names[:20]
+            if name not in (None, "")
+        ]
+    return hint if hint["tables_or_measurements"] else {}
+
+
+def _query_language_for_database_type(database_type: str) -> str:
+    normalized = database_type.lower()
+    if normalized == "influxdb":
+        return "flux"
+    if normalized == "prometheus":
+        return "promql"
+    return "sql"
+
+
+def _resolve_dataset_path(raw_path: object, settings: Settings) -> Path | None:
+    if not raw_path:
+        return None
+    path = Path(str(raw_path))
+    if not path.is_absolute():
+        path = (Path(settings.tspilot_root) / path).resolve()
+    return path
+
+
+def _count_csv_rows(path: Path | None) -> int | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+    except Exception:
+        return None
+
+
+def _read_sample_rows(path: Path | None, *, limit: int) -> list[dict]:
+    if path is None or not path.exists() or limit <= 0:
+        return []
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                rows.append(dict(row))
+                if len(rows) >= limit:
+                    break
+    except Exception:
+        return []
+    return rows
+
+
+def _project_rows(rows: list[dict], columns: list[str]) -> list[dict]:
+    if not columns:
+        return rows
+    return [
+        {column: row[column] for column in columns if column in row}
+        for row in rows
+    ]
 
 
 def append_trace(request_state: RequestStateModel, event_type: str, payload: dict) -> TraceEventModel:
@@ -507,4 +633,3 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 def _apply_presentation_payload(request_state: RequestStateModel, full_payload: dict) -> None:
     request_state.final_answer_draft = FinalAnswer.model_validate(full_payload)
     request_state.answer_coverage["conclusion"] = True
-

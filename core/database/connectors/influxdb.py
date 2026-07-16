@@ -786,6 +786,7 @@ class InfluxDBConnector(DBConnector):
             "resolved_dataset_path": resolved_dataset_path,
             "row_count": row_count,
             "time_range": time_range,
+            "sample_rows": self._reference_dataset_sample_rows(dataset_path, limit=3),
         }
 
     def _count_reference_dataset_rows(self, dataset_path: str | None) -> int | None:
@@ -836,6 +837,26 @@ class InfluxDBConnector(DBConnector):
             "start": self._format_flux_bound_timestamp(start),
             "stop": self._format_flux_bound_timestamp(stop),
         }
+
+    def _reference_dataset_sample_rows(self, dataset_path: str | None, *, limit: int) -> list[dict[str, Any]]:
+        """Read a bounded set of CSV rows for schema grounding."""
+        if not dataset_path or limit <= 0:
+            return []
+        resolved_path = Path(str(dataset_path))
+        if not resolved_path.is_absolute():
+            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
+        if not resolved_path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    rows.append(dict(row))
+                    if len(rows) >= limit:
+                        break
+        except Exception:
+            return []
+        return rows
 
     def _parse_reference_timestamp(self, raw_value: Any) -> datetime | None:
         """Parse common CSV timestamp shapes into a naive UTC-compatible datetime."""

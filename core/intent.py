@@ -77,7 +77,29 @@ def _infer_requested_fact_types(message: str) -> list[str]:
     normalized = message.lower()
     requested: list[str] = []
     keyword_map = [
-        ("aggregation", ("平均", "均值", "总和", "sum", "count", "aggregate", "aggregation", "统计")),
+        (
+            "aggregation",
+            (
+                "平均",
+                "均值",
+                "总和",
+                "总数",
+                "总共",
+                "总共有",
+                "条数",
+                "多少条",
+                "多少个",
+                "数量",
+                "几条",
+                "sum",
+                "count",
+                "how many",
+                "number of",
+                "aggregate",
+                "aggregation",
+                "统计",
+            ),
+        ),
         ("extreme", ("最高", "最低", "最大", "最小", "peak", "trough", "extreme", "extrema", "极值")),
         ("trend", ("趋势", "走势", "trend", "movement", "upward", "downward")),
         ("difference", ("差值", "差异", "变化", "变化幅度", "change", "difference", "delta", "compare", "comparison")),
@@ -103,6 +125,7 @@ def _requested_metrics_from_facts(fact_types: list[str]) -> list[str]:
         metrics.append("max_or_min")
     if "aggregation" in fact_types:
         metrics.append("aggregate")
+        metrics.append("count")
     if "rank" in fact_types:
         metrics.append("rank")
     if "distribution" in fact_types:

@@ -7,7 +7,6 @@ from app.settings import Settings
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.request_state import apply_observation, append_trace, build_final_response, enrich_observation_payload
-from core.intent import apply_intent_profile_to_state
 from runtime.trace import TraceEventModel
 from schemas.api import ChatResponse
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -54,11 +53,6 @@ class ReActLoop:
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> AsyncIterator[TraceEventModel]:
-        if (request_state.intent_profile or {}).get("source") == "fallback":
-            intent_profile = await self._data_agent.interpret_intent(request_state)
-            apply_intent_profile_to_state(request_state, intent_profile)
-            sync_from_request(request_state, conversation_state)
-
         while request_state.iteration < request_state.max_iterations:
             request_state.iteration += 1
             try:
@@ -75,7 +69,12 @@ class ReActLoop:
             yield append_trace(
                 request_state,
                 "thought",
-                {"iteration": request_state.iteration, "thought": turn.thought},
+                {
+                    "iteration": request_state.iteration,
+                    "thought": turn.thought,
+                    "action_intention": turn.action_intention,
+                    "action_reason": turn.action_reason,
+                },
             )
             yield append_trace(
                 request_state,
@@ -84,6 +83,8 @@ class ReActLoop:
                     "iteration": request_state.iteration,
                     "action": turn.action,
                     "action_input": turn.action_input,
+                    "action_intention": turn.action_intention,
+                    "action_reason": turn.action_reason,
                 },
             )
 
@@ -105,6 +106,7 @@ class ReActLoop:
                     turn.action_input,
                     request_state,
                     conversation_state,
+                    action_reason=turn.action_reason or turn.thought,
                 )
             except Exception as exc:
                 message = f"Tool '{turn.action}' failed: {exc}"
@@ -203,6 +205,8 @@ class ReActLoop:
                     "tool": action_name,
                     "summary": self._message_for_action(action_name),
                     "iteration": payload.get("iteration"),
+                    "intention": payload.get("action_intention"),
+                    "reason": payload.get("action_reason"),
                     "input_preview": self._input_preview(action_name, payload.get("action_input", {})),
                 },
             )
@@ -354,7 +358,46 @@ class ReActLoop:
             preview["pending_count"] = visible_payload.get("pending_count")
         if "results" in visible_payload:
             preview["result_count"] = len(visible_payload.get("results", []))
+        if payload.get("tool_name") in {"sql_query", "query_database"}:
+            preview.update(self._sql_payload_preview(visible_payload))
         return preview
+
+    def _sql_payload_preview(self, visible_payload: dict) -> dict:
+        data = visible_payload.get("data") if isinstance(visible_payload.get("data"), dict) else {}
+        diagnostics = visible_payload.get("diagnostics") if isinstance(visible_payload.get("diagnostics"), dict) else {}
+        summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+        points = data.get("points") if isinstance(data.get("points"), list) else []
+        columns = visible_payload.get("columns") if isinstance(visible_payload.get("columns"), list) else []
+        row_count = summary_stats.get("rows_count")
+        point_count = summary_stats.get("points_count")
+        if row_count is None and isinstance(visible_payload.get("row_count"), int):
+            row_count = visible_payload.get("row_count")
+        if point_count is None and isinstance(visible_payload.get("point_count"), int):
+            point_count = visible_payload.get("point_count")
+
+        return {
+            "query_language": visible_payload.get("query_language"),
+            "query": self._truncate_preview_text(visible_payload.get("query"), 5000),
+            "columns": columns[:40],
+            "row_count": row_count if row_count is not None else len(rows),
+            "point_count": point_count if point_count is not None else len(points),
+            "sample_rows": rows[:5],
+            "sample_points": points[:5],
+            "truncated": bool(
+                visible_payload.get("payload_truncated")
+                or diagnostics.get("truncated")
+                or diagnostics.get("artifact_ref")
+                or payload_truncated_marker(visible_payload)
+            ),
+        }
+
+    def _truncate_preview_text(self, value, max_chars: int):
+        if not isinstance(value, str):
+            return value
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
 
     def _iteration_from_payload_ref(self, payload_ref: str | None) -> int | None:
         if not payload_ref:
@@ -363,3 +406,11 @@ class ReActLoop:
         if len(parts) >= 4 and parts[2].isdigit():
             return int(parts[2])
         return None
+
+
+def payload_truncated_marker(value) -> bool:
+    if isinstance(value, dict):
+        return any(key in value for key in ("truncated_items", "truncated_keys"))
+    if isinstance(value, list):
+        return any(payload_truncated_marker(item) for item in value)
+    return False

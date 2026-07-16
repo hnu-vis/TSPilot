@@ -53,6 +53,26 @@ def test_parse_turn_rejects_bare_todowrite_input():
         DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(bare_input))
 
 
+def test_parse_turn_accepts_dbgpt_style_step_fields():
+    payload = {
+        "thought": "需要先看原始样本。",
+        "action_intention": "拉取原始数据",
+        "action_reason": "确认过滤条件",
+        "action": "sql_query",
+        "action_input": {
+            "database_context": {"database_id": "demo", "database_type": "sqlite"},
+            "query": "SELECT * FROM metrics LIMIT 5",
+            "query_language": "sql",
+        },
+    }
+
+    turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload, ensure_ascii=False))
+
+    assert turn.action == "sql_query"
+    assert turn.action_intention == "拉取原始数据"
+    assert turn.action_reason == "确认过滤条件"
+
+
 def test_next_turn_repairs_invalid_first_model_output_once():
     valid_turn = {
         "thought": "Use the current state to assemble the answer.",

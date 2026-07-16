@@ -69,7 +69,7 @@ class FormatAnswerTool(BaseTool):
         direct_answer = self._usable_direct_answer(validated_input.direct_answer)
         if analyses:
             summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
-        elif not facts and direct_answer and self._has_explicit_sql_query_evidence(request_state):
+        elif not facts and direct_answer and self._has_database_answer_evidence(request_state):
             summary = direct_answer
         else:
             summary = build_summary(
@@ -312,6 +312,16 @@ class FormatAnswerTool(BaseTool):
             evidence is not None
             and isinstance(evidence.metadata, dict)
             and evidence.metadata.get("sql_query_mode") == "explicit"
+        )
+
+    def _has_database_answer_evidence(self, request_state: RequestStateModel) -> bool:
+        evidence = request_state.latest_database_evidence
+        return bool(
+            self._has_explicit_sql_query_evidence(request_state)
+            or (
+                evidence is not None
+                and evidence.result_type in {"statistics", "table", "schema", "metric_list"}
+            )
         )
 
     def _has_requested_facts(self, request_state: RequestStateModel, include_fact_ids: list[str]) -> bool:

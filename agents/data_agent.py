@@ -8,7 +8,6 @@ from agents.base import BaseAgent
 from prompts.data_agent import DataAgentPromptBuilder
 from schemas.agent_turn import ReActTurn
 from schemas.state import ConversationStateModel, RequestStateModel
-from core.intent import normalize_intent_profile
 
 
 class DataAgent(BaseAgent):
@@ -59,46 +58,6 @@ class DataAgent(BaseAgent):
                     f"first_error={first_error}; second_error={second_error}"
                 ) from second_error
 
-    async def interpret_intent(self, request_state: RequestStateModel) -> dict:
-        fallback = dict(request_state.intent_profile or {})
-        prompt = (
-            "Parse the user's data-analysis intent into exactly one JSON object and nothing else.\n"
-            "Schema: {"
-            "\"primary_goal\": str, "
-            "\"analysis_kind\": \"statistical_summary|timeseries_analysis|anomaly_detection|forecast|retrieval|conversation\", "
-            "\"requested_fact_types\": list[str], "
-            "\"requested_metrics\": list[str], "
-            "\"data_policy\": {\"preserve_raw_values\": bool|null, \"filter_outliers\": bool|null}, "
-            "\"required_outputs\": list[str], "
-            "\"needs_plan\": bool"
-            "}.\n"
-            "Distinguish data-policy instructions from analysis goals. For example, if the user asks for a maximum and says not to filter outliers, "
-            "the goal is an extreme/statistical_summary with preserve_raw_values=true, not anomaly detection.\n"
-            "Do not invent forecast/anomaly/seasonality requirements unless the user asks for them.\n"
-            "Context JSON:\n"
-            + json.dumps(
-                {
-                    "message": request_state.message,
-                    "database_context": request_state.database_context.model_dump(mode="json") if request_state.database_context else None,
-                    "time_range": request_state.time_range,
-                    "constraints": request_state.constraints,
-                    "fallback_intent_profile": fallback,
-                },
-                ensure_ascii=False,
-            )
-        )
-        try:
-            content = await self._invoke_model(
-                [
-                    ("system", "You are an intent parser. Return exactly one JSON object."),
-                    ("user", prompt),
-                ]
-            )
-            parsed = json.loads(content.strip())
-        except Exception:
-            return fallback
-        return normalize_intent_profile(parsed, fallback=fallback)
-
     async def _invoke_model(self, messages) -> str:
         response = await self._llm.ainvoke(messages)
         content = getattr(response, "content", response)
@@ -117,7 +76,7 @@ class DataAgent(BaseAgent):
 
         patterns = [
             re.compile(
-                r"Thought:\s*(?P<thought>.*?)\s*Action:\s*(?P<action>[^\n]+)\s*Action Input:\s*(?P<input>\{.*\})\s*$",
+                r"Thought:\s*(?P<thought>.*?)\s*(?:Action Intention:\s*(?P<intention>.*?)\s*)?(?:Action Reason:\s*(?P<reason>.*?)\s*)?Action:\s*(?P<action>[^\n]+)\s*Action Input:\s*(?P<input>\{.*\})\s*$",
                 re.DOTALL,
             ),
             re.compile(
@@ -144,7 +103,13 @@ class DataAgent(BaseAgent):
             ) from exc
         if not isinstance(action_input, dict):
             raise ValueError("Action Input must decode to a JSON object.")
-        return ReActTurn(thought=thought, action=action, action_input=action_input)
+        return ReActTurn(
+            thought=thought,
+            action_intention=self._regex_group(match, "intention"),
+            action_reason=self._regex_group(match, "reason"),
+            action=action,
+            action_input=action_input,
+        )
 
     def _decode_json_turn(self, stripped: str) -> dict | None:
         try:
@@ -168,4 +133,23 @@ class DataAgent(BaseAgent):
         if not isinstance(action_input, dict):
             raise ValueError(f"Structured model output must include object 'action_input': {original_content}")
         thought = str(decoded.get("thought", "")).strip()
-        return ReActTurn(thought=thought, action=action, action_input=action_input)
+        return ReActTurn(
+            thought=thought,
+            action_intention=self._optional_string(decoded.get("action_intention") or decoded.get("intention")),
+            action_reason=self._optional_string(decoded.get("action_reason") or decoded.get("reason")),
+            action=action,
+            action_input=action_input,
+        )
+
+    def _optional_string(self, value) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _regex_group(self, match, name: str) -> str | None:
+        try:
+            value = match.groupdict().get(name)
+        except IndexError:
+            value = None
+        return self._optional_string(value)

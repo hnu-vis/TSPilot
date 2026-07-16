@@ -11,5 +11,5 @@ class DatabaseContext(BaseModel):
     database_type: str
     display_name: str | None = None
     connection_hint: str | None = None
+    schema_hint: dict | None = None
     selected_at: str | None = None
-

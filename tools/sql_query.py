@@ -185,8 +185,6 @@ class SqlQueryTool(BaseTool):
         self._explicit_query_executor = _ExplicitQueryExecutor(settings)
 
     async def execute(self, validated_input: SqlQueryInput, **kwargs) -> dict:
-        request_state = kwargs.get("request_state")
-        intent_profile = validated_input.intent_profile or getattr(request_state, "intent_profile", {}) or {}
         if validated_input.query and validated_input.query.strip():
             return await self._explicit_query_executor.execute(
                 _ExplicitQueryInput(
@@ -207,7 +205,7 @@ class SqlQueryTool(BaseTool):
                 database_context=validated_input.database_context,
                 time_range=validated_input.time_range,
                 constraints=validated_input.constraints,
-                intent_profile=intent_profile,
+                intent_profile=validated_input.intent_profile,
                 selected_database=validated_input.selected_database,
                 selected_database_type=validated_input.selected_database_type,
                 history=validated_input.history,

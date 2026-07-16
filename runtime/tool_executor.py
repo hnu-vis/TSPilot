@@ -29,6 +29,7 @@ class ToolExecutor:
         action_input: dict,
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
+        action_reason: str | None = None,
     ) -> ExecutionResult:
         tool_spec = self._registry.resolve(action_name)
         validated = tool_spec.input_model.model_validate(action_input)
@@ -37,7 +38,7 @@ class ToolExecutor:
                 tool_name=action_name,
                 tool_input=validated.model_dump(mode="json"),
                 iteration=request_state.iteration,
-                reason=None,
+                reason=action_reason,
             )
         )
 
