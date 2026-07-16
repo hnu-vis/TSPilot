@@ -18,6 +18,7 @@ from tools.base import BaseTool
 class FormatAnswerInput(BaseModel):
     summary_goal: str | None = None
     direct_answer: str | None = None
+    include_analysis_ids: list[str] = Field(default_factory=list)
     include_fact_ids: list[str] = Field(default_factory=list)
     include_visualization_ids: list[str] = Field(default_factory=list)
     section_plan: list[str] = Field(default_factory=list)
@@ -41,7 +42,14 @@ class FormatAnswerTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
-        missing = missing_requirements(request_state)
+        missing = (
+            []
+            if (
+                self._has_requested_analyses(request_state, validated_input.include_analysis_ids)
+                or self._has_requested_facts(request_state, validated_input.include_fact_ids)
+            )
+            else missing_requirements(request_state)
+        )
         if missing:
             raise ValueError(
                 "Final answer cannot be assembled yet. Missing required outputs: "
@@ -52,16 +60,24 @@ class FormatAnswerTool(BaseTool):
             for fact in request_state.verified_facts
             if not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids
         ]
-        summary = build_summary(
+        analyses = self._selected_analyses(request_state, validated_input.include_analysis_ids)
+        fallback_summary = self._fallback_summary(
             request_state,
-            facts,
-            self._fallback_summary(
-                request_state,
-                validated_input.summary_goal,
-                validated_input.direct_answer,
-            ),
+            validated_input.summary_goal,
+            validated_input.direct_answer,
         )
-        if request_state.database_context is None and validated_input.direct_answer:
+        direct_answer = self._usable_direct_answer(validated_input.direct_answer)
+        if analyses:
+            summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
+        elif not facts and direct_answer and self._has_explicit_sql_query_evidence(request_state):
+            summary = direct_answer
+        else:
+            summary = build_summary(
+                request_state,
+                facts,
+                fallback_summary,
+            )
+        if request_state.database_context is None and direct_answer:
             answer = FinalAnswer(
                 title=None,
                 summary=summary,
@@ -84,6 +100,16 @@ class FormatAnswerTool(BaseTool):
                 heading="Verified Facts",
                 content="\n".join(f"- {fact.statement}" for fact in facts),
                 structured_payload={"fact_ids": [fact.fact_id for fact in facts]},
+            )
+        if analyses:
+            sections_by_type["analysis"] = AnswerSection(
+                section_type="analysis",
+                heading="Analysis",
+                content="\n".join(f"- {analysis.summary}" for analysis in analyses),
+                structured_payload={
+                    "analysis_ids": [analysis.analysis_id for analysis in analyses],
+                    "results": [analysis.result for analysis in analyses],
+                },
             )
         if request_state.latest_database_evidence is not None and not facts:
             evidence = request_state.latest_database_evidence
@@ -123,6 +149,7 @@ class FormatAnswerTool(BaseTool):
             content=summary,
             structured_payload={
                 "has_facts": bool(facts),
+                "has_analysis": bool(analyses),
                 "has_anomaly": request_state.latest_anomaly is not None,
                 "has_forecast": request_state.latest_forecast is not None,
             },
@@ -146,6 +173,22 @@ class FormatAnswerTool(BaseTool):
                 evidence=fact.evidence,
             )
             for fact in facts
+        )
+        references.extend(
+            AnswerReference(
+                source_type="analysis",
+                source_id=analysis.analysis_id,
+                label=analysis.analysis_goal,
+                evidence={
+                    "summary": analysis.summary,
+                    "result": analysis.result,
+                    "input_evidence_id": analysis.input_evidence_id,
+                    "input_row_count": analysis.input_row_count,
+                    "code_hash": analysis.code_hash,
+                    "code_type": analysis.code_type,
+                },
+            )
+            for analysis in analyses
         )
         if request_state.latest_forecast is not None:
             references.append(
@@ -258,9 +301,55 @@ class FormatAnswerTool(BaseTool):
             return request_state.latest_rag.get("summary", summary_goal)
         if request_state.latest_skill:
             return request_state.latest_skill.get("summary", summary_goal)
-        if direct_answer and direct_answer.strip():
-            return direct_answer.strip()
+        usable_direct_answer = self._usable_direct_answer(direct_answer)
+        if usable_direct_answer:
+            return usable_direct_answer
         return summary_goal
+
+    def _has_explicit_sql_query_evidence(self, request_state: RequestStateModel) -> bool:
+        evidence = request_state.latest_database_evidence
+        return bool(
+            evidence is not None
+            and isinstance(evidence.metadata, dict)
+            and evidence.metadata.get("sql_query_mode") == "explicit"
+        )
+
+    def _has_requested_facts(self, request_state: RequestStateModel, include_fact_ids: list[str]) -> bool:
+        if not include_fact_ids:
+            return False
+        available = {fact.fact_id for fact in request_state.verified_facts}
+        return all(fact_id in available for fact_id in include_fact_ids)
+
+    def _has_requested_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]) -> bool:
+        if not include_analysis_ids:
+            return False
+        return all(analysis_id in request_state.analysis_artifacts for analysis_id in include_analysis_ids)
+
+    def _selected_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]):
+        if include_analysis_ids:
+            return [
+                request_state.analysis_artifacts[analysis_id]
+                for analysis_id in include_analysis_ids
+                if analysis_id in request_state.analysis_artifacts
+            ]
+        return list(request_state.analysis_artifacts.values())
+
+    def _usable_direct_answer(self, direct_answer: str | None) -> str | None:
+        if not direct_answer or not direct_answer.strip():
+            return None
+        normalized = direct_answer.strip()
+        lowered = normalized.lower()
+        blocked_phrases = (
+            "格式不符合要求",
+            "单一json对象",
+            "json object",
+            "contract violation",
+            "parser error",
+            "repair instruction",
+        )
+        if any(phrase in lowered for phrase in blocked_phrases):
+            return None
+        return normalized
 
     def _evidence_sections(self, evidence) -> list[AnswerSection]:
         if evidence.result_type == "statistics":

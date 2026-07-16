@@ -52,7 +52,7 @@ def test_request_state_keeps_summary_evidence_and_full_artifact():
     settings = get_settings()
     request = ChatRequest(message="分析趋势")
     request_state = build_request_state(request, settings)
-    observation = ToolObservation(tool_name="query_database", success=True, summary="ok", payload={})
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
 
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
@@ -71,14 +71,18 @@ def test_insight_uses_full_evidence_artifact_from_request_state():
     request_state = build_request_state(request, settings)
     request_state.latest_database_evidence = None
     request_state.database_evidence_artifacts = {}
-    observation = ToolObservation(tool_name="query_database", success=True, summary="ok", payload={})
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
     result = asyncio.run(
         InsightTool().execute(
-            InsightInput(requested_fact_types=["trend"]),
+            InsightInput(
+                analysis_goal="count full artifact rows",
+                analysis_code="result = {'summary': f'{len(rows)} rows analyzed', 'metrics': {'row_count': len(rows)}, 'details': {}}",
+            ),
             request_state=request_state,
         )
     )
 
-    assert result["verified_facts"]
+    assert result["input_row_count"] == 40
+    assert result["result"]["metrics"]["row_count"] == 40

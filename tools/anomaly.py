@@ -12,7 +12,7 @@ from tools.base import BaseTool
 
 
 class AnomalyInput(BaseModel):
-    database_evidence: DatabaseEvidence | dict | None = None
+    database_evidence: DatabaseEvidence | dict | str | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
 
@@ -75,4 +75,6 @@ def _resolve_database_evidence(database_evidence, request_state):
         if evidence_id:
             return request_state.database_evidence_artifacts.get(evidence_id) or DatabaseEvidence.model_validate(database_evidence)
         return DatabaseEvidence.model_validate(database_evidence)
+    if isinstance(database_evidence, str):
+        return request_state.database_evidence_artifacts.get(database_evidence)
     return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)

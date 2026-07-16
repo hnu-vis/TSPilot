@@ -1,5 +1,5 @@
 import { ChevronDown, ListChecks, Bot, Loader2, User } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage, TraceStep } from '../types';
 import { FinalAnswer } from './FinalAnswer';
 import { TraceTimeline } from './TraceTimeline';
@@ -12,6 +12,31 @@ type Props = {
 };
 
 export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelectTraceStep }: Props) {
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const scrollKey = useMemo(() => (
+    [
+      messages.length,
+      messages[messages.length - 1]?.id,
+      messages[messages.length - 1]?.content,
+      messages[messages.length - 1]?.isStreaming ? 'streaming' : 'settled',
+      messages[messages.length - 1]?.answer?.summary,
+      traceSteps.length,
+      traceSteps[traceSteps.length - 1]?.id,
+      traceSteps[traceSteps.length - 1]?.summary,
+      traceSteps[traceSteps.length - 1]?.status,
+    ].join('|')
+  ), [messages, traceSteps]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ block: 'end' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollKey]);
+
+  const lastAssistantIndex = findLastAssistantIndex(messages);
+  const latestTodos = useMemo(() => latestTodoList(traceSteps), [traceSteps]);
+
   if (messages.length === 0 && traceSteps.length === 0) {
     return (
       <div className="empty-thread">
@@ -21,9 +46,6 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
       </div>
     );
   }
-
-  const lastAssistantIndex = findLastAssistantIndex(messages);
-  const latestTodos = useMemo(() => latestTodoList(traceSteps), [traceSteps]);
 
   return (
     <div className="chat-thread">
@@ -52,6 +74,7 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
           )}
         </article>
       ))}
+      <div ref={bottomRef} className="thread-bottom-anchor" aria-hidden="true" />
     </div>
   );
 }

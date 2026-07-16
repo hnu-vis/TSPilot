@@ -75,12 +75,6 @@ export function Composer({
             items={databases}
             onChange={onSelectDatabase}
           />
-          <ResourceSelect
-            kind="knowledge"
-            value={selectedKnowledgeId}
-            items={knowledge}
-            onChange={onSelectKnowledge}
-          />
         </div>
         <div className="composer-actions">
           <ModelChip model={model} />

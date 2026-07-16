@@ -7,6 +7,7 @@ from app.settings import Settings
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.request_state import apply_observation, append_trace, build_final_response, enrich_observation_payload
+from core.intent import apply_intent_profile_to_state
 from runtime.trace import TraceEventModel
 from schemas.api import ChatResponse
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -53,6 +54,11 @@ class ReActLoop:
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> AsyncIterator[TraceEventModel]:
+        if (request_state.intent_profile or {}).get("source") == "fallback":
+            intent_profile = await self._data_agent.interpret_intent(request_state)
+            apply_intent_profile_to_state(request_state, intent_profile)
+            sync_from_request(request_state, conversation_state)
+
         while request_state.iteration < request_state.max_iterations:
             request_state.iteration += 1
             try:
@@ -245,7 +251,7 @@ class ReActLoop:
 
     def _phase_for_action(self, action_name: str) -> str:
         mapping = {
-            "query_database": "tool_selection",
+            "sql_query": "tool_selection",
             "insight": "analysis",
             "format_answer": "answer_assembly",
             "forecast": "analysis",
@@ -258,7 +264,7 @@ class ReActLoop:
 
     def _message_for_action(self, action_name: str) -> str:
         mapping = {
-            "query_database": "正在准备查询数据源。",
+            "sql_query": "正在查询数据源。",
             "insight": "正在将证据转换为已验证事实。",
             "format_answer": "正在组装最终回答。",
             "forecast": "正在执行趋势预测。",
@@ -270,22 +276,33 @@ class ReActLoop:
         return mapping.get(action_name, "正在处理请求。")
 
     def _input_preview(self, action_name: str, action_input: dict) -> dict:
-        if action_name == "query_database":
+        if action_name == "sql_query" and not action_input.get("query"):
             database_context = action_input.get("database_context") or {}
             return {
                 "database_id": database_context.get("database_id"),
                 "database_type": database_context.get("database_type"),
                 "time_range": action_input.get("time_range"),
             }
+        if action_name == "sql_query" and action_input.get("query"):
+            database_context = action_input.get("database_context") or {}
+            return {
+                "database_id": database_context.get("database_id"),
+                "database_type": database_context.get("database_type"),
+                "query_language": action_input.get("query_language"),
+                "purpose": action_input.get("purpose"),
+            }
         if action_name == "insight":
             evidence = action_input.get("database_evidence") or {}
+            evidence_id = evidence.get("evidence_id") if isinstance(evidence, dict) else evidence
             return {
-                "evidence_id": evidence.get("evidence_id"),
-                "result_type": evidence.get("result_type"),
-                "requested_fact_types": action_input.get("requested_fact_types", []),
+                "evidence_id": evidence_id,
+                "analysis_goal": action_input.get("analysis_goal") or action_input.get("focus"),
+                "code_type": action_input.get("code_type"),
+                "analysis_code_chars": len(str(action_input.get("analysis_code") or "")),
             }
         if action_name == "format_answer":
             return {
+                "include_analysis_count": len(action_input.get("include_analysis_ids", [])),
                 "include_fact_count": len(action_input.get("include_fact_ids", [])),
                 "include_visualization_count": len(action_input.get("include_visualization_ids", [])),
                 "section_plan": action_input.get("section_plan", []),
@@ -307,9 +324,11 @@ class ReActLoop:
             "payload_truncated": payload.get("payload_truncated", False),
         }
         visible_payload = payload.get("payload") or {}
-        for key in ("evidence_id", "insight_id", "forecast_id", "anomaly_id", "title", "summary"):
+        for key in ("evidence_id", "analysis_id", "analysis_goal", "code_type", "code_hash", "input_row_count", "insight_id", "forecast_id", "anomaly_id", "title", "summary"):
             if key in visible_payload:
                 preview[key] = visible_payload.get(key)
+        if isinstance(visible_payload.get("result"), dict):
+            preview["result_preview"] = visible_payload["result"]
         if "visualizations" in visible_payload:
             preview["visualization_count"] = len(visible_payload.get("visualizations", []))
         if "verified_facts" in visible_payload:

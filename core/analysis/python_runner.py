@@ -1,0 +1,184 @@
+"""Restricted Python execution for generated row analysis."""
+from __future__ import annotations
+
+import ast
+import json
+import math
+import signal
+import statistics
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
+
+
+class AnalysisCodeError(ValueError):
+    """Raised when generated analysis code is unsafe or invalid."""
+
+
+@dataclass
+class ExecutionOutput:
+    result: dict
+    runtime_ms: int
+
+
+_BLOCKED_NAMES = {
+    "__builtins__",
+    "__import__",
+    "breakpoint",
+    "compile",
+    "eval",
+    "exec",
+    "globals",
+    "help",
+    "input",
+    "locals",
+    "open",
+    "quit",
+    "exit",
+    "vars",
+}
+
+_SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "filter": filter,
+    "float": float,
+    "int": int,
+    "isinstance": isinstance,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "pow": pow,
+    "range": range,
+    "round": round,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+}
+
+_BLOCKED_NODE_TYPES = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.ClassDef,
+    ast.Delete,
+    ast.Global,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Lambda,
+    ast.Nonlocal,
+    ast.Raise,
+    ast.Try,
+    ast.With,
+    ast.Yield,
+    ast.YieldFrom,
+)
+
+
+def execute_python_rows_v1(
+    *,
+    code: str,
+    rows: list[dict],
+    points: list[dict],
+    columns: list[str],
+    metadata: dict,
+    diagnostics: dict,
+    timeout_seconds: int = 2,
+) -> ExecutionOutput:
+    """Execute generated analysis code over normalized evidence rows."""
+
+    _validate_code(code)
+    globals_dict = {
+        "__builtins__": _SAFE_BUILTINS,
+        "math": math,
+        "statistics": statistics,
+    }
+    locals_dict: dict[str, Any] = {
+        "rows": [dict(row) for row in rows],
+        "points": [dict(point) for point in points],
+        "columns": list(columns),
+        "metadata": dict(metadata),
+        "diagnostics": dict(diagnostics),
+    }
+    started = time.perf_counter()
+    try:
+        with _time_limit(timeout_seconds):
+            exec(compile(code, "<analysis_code>", "exec"), globals_dict, locals_dict)
+    except TimeoutError as exc:
+        raise AnalysisCodeError(f"analysis_code exceeded {timeout_seconds}s timeout") from exc
+    except AnalysisCodeError:
+        raise
+    except Exception as exc:
+        raise AnalysisCodeError(f"analysis_code execution failed: {exc}") from exc
+    runtime_ms = int((time.perf_counter() - started) * 1000)
+    result = locals_dict.get("result")
+    if not isinstance(result, dict):
+        raise AnalysisCodeError("analysis_code must assign a dict to variable 'result'.")
+    summary = result.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise AnalysisCodeError("analysis result must include non-empty string field 'summary'.")
+    try:
+        json.dumps(result, ensure_ascii=False)
+    except TypeError as exc:
+        raise AnalysisCodeError("analysis result must be JSON serializable.") from exc
+    return ExecutionOutput(result=result, runtime_ms=runtime_ms)
+
+
+def _validate_code(code: str) -> None:
+    if not code or not code.strip():
+        raise AnalysisCodeError("analysis_code cannot be empty.")
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise AnalysisCodeError(f"analysis_code syntax error: {exc}") from exc
+    for node in ast.walk(tree):
+        if isinstance(node, _BLOCKED_NODE_TYPES):
+            raise AnalysisCodeError(f"analysis_code uses blocked syntax: {type(node).__name__}.")
+        if isinstance(node, ast.Name) and (node.id in _BLOCKED_NAMES or node.id.startswith("__")):
+            raise AnalysisCodeError(f"analysis_code uses blocked name: {node.id}.")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            raise AnalysisCodeError(f"analysis_code uses blocked attribute: {node.attr}.")
+        if isinstance(node, ast.Call):
+            _validate_call(node)
+
+
+def _validate_call(node: ast.Call) -> None:
+    func = node.func
+    if isinstance(func, ast.Name) and (func.id in _BLOCKED_NAMES or func.id.startswith("__")):
+        raise AnalysisCodeError(f"analysis_code calls blocked function: {func.id}.")
+    if isinstance(func, ast.Attribute):
+        if func.attr.startswith("__"):
+            raise AnalysisCodeError(f"analysis_code calls blocked attribute: {func.attr}.")
+        if isinstance(func.value, ast.Name) and func.value.id not in {"math", "statistics"}:
+            return
+
+
+@contextmanager
+def _time_limit(seconds: int):
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def _handler(_signum, _frame):
+        raise TimeoutError()
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)

@@ -16,7 +16,7 @@ class AnswerSection(BaseModel):
 
 
 class AnswerReference(BaseModel):
-    source_type: Literal["query", "statistics", "fact", "forecast", "anomaly", "rag", "skill"]
+    source_type: Literal["query", "statistics", "fact", "analysis", "forecast", "anomaly", "rag", "skill"]
     source_id: str | None = None
     label: str
     evidence: dict | None = None
@@ -28,4 +28,3 @@ class FinalAnswer(BaseModel):
     sections: list[AnswerSection] = Field(default_factory=list)
     references: list[AnswerReference] = Field(default_factory=list)
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
-

@@ -19,19 +19,18 @@ class DataAgentPromptBuilder:
             "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
             "Output schema: "
             "{\"thought\": str, \"action\": str, \"action_input\": object}.\n"
-            "Allowed actions: todowrite, query_database, insight, forecast, anomaly, rag, skill, format_answer.\n"
+            "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, format_answer.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
-            "Use todowrite again whenever you need to update todo statuses after a successful step, move the in_progress step, or revise a stale plan.\n"
-            "When a todo plan exists and a non-todowrite tool succeeds, prefer an explicit todowrite update before continuing if the todo status is now stale.\n"
-            "Todo is model-maintained process state for visibility, not a runtime scheduler. You may revise or skip stale todo items when evidence shows the plan should change.\n"
+            "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
+            "Todo is initial visible process state, not a model-maintained scheduler. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
             "Tool contracts:\n"
-            "- todowrite: create or update the full todo plan and statuses. Use for initial planning and explicit progress updates.\n"
-            "- query_database: retrieve evidence from the selected datasource. It returns evidence only, not conclusions.\n"
-            "- insight: convert existing evidence into verified facts.\n"
+            "- todowrite: create the initial full todo plan only when no plan exists.\n"
+            "- sql_query: query the selected datasource. Use message for automatic query planning, or query/query_language for explicit read-only SQL/Flux/PromQL aggregation, grouping, ranking, filtering, validation, or other exact database-backed analysis. It returns evidence only, not conclusions.\n"
+            "- insight: execute generated Python analysis code over existing full evidence artifacts. It returns structured analysis results, not raw rows.\n"
             "- anomaly: detect anomalies from existing time-series evidence only.\n"
             "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
@@ -48,9 +47,13 @@ class DataAgentPromptBuilder:
             "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
-            "For query_database, always include message, database_context, time_range, and constraints when available.\n"
+            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object, \"intent_profile\": object|null}.\n"
+            "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
+            "Do not write an explicit database query from user-facing names when no schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so the datasource-specific fields are grounded.\n"
+            "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, first obtain grounded raw evidence; then call insight with python_rows_v1 analysis_code that computes the result from rows/points. Do not calculate from prompt previews.\n"
+            "For insight, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code_type\": \"python_rows_v1\", \"analysis_code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The generated code may use rows, points, columns, metadata, diagnostics, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}.\n"
             "For format_answer, use: {\"summary_goal\": str, \"direct_answer\": str|null, "
-            "\"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
+            "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
             "Do not output markdown fences."
         )
 
@@ -73,6 +76,7 @@ class DataAgentPromptBuilder:
             "time_range": request_state.time_range,
             "constraints": request_state.constraints,
             "history": [message.model_dump(mode="json") for message in request_state.history],
+            "intent_profile": request_state.intent_profile,
             "todo_list": request_state.todo_list,
             "plan_current_step": request_state.plan_current_step,
             "planning_complete": request_state.planning_complete,
@@ -83,11 +87,13 @@ class DataAgentPromptBuilder:
                 if request_state.latest_database_evidence
                 else None
             ),
+            "query_history": self._summarize_query_history(request_state),
             "latest_insight": (
                 self._summarize_insight(request_state.latest_insight)
                 if request_state.latest_insight
                 else None
             ),
+            "analysis_workspace": self._analysis_workspace(request_state),
             "latest_forecast": (
                 self._summarize_forecast(request_state.latest_forecast)
                 if request_state.latest_forecast
@@ -127,18 +133,18 @@ class DataAgentPromptBuilder:
         return [
             {
                 "action": "todowrite",
-                "use_when": "Create the plan, update completed/in_progress/pending statuses, or revise stale plan state.",
+                "use_when": "Create the initial plan only when todo_list is empty and the request needs visible multi-step analysis.",
                 "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary",
             },
             {
-                "action": "query_database",
-                "use_when": "Database evidence is missing or the existing evidence does not cover the user's data need.",
-                "input": "message, database_context, time_range, constraints",
+                "action": "sql_query",
+                "use_when": "Database evidence is missing, or a read-only follow-up query can compute the exact aggregation, grouping, ranking, filter validation, or diagnostic needed to answer correctly.",
+                "input": "message or query, database_context, time_range, constraints, query_language, purpose",
             },
             {
                 "action": "insight",
                 "use_when": "Evidence is available and the user needs grounded facts such as trend, seasonality, extrema, distribution, or outliers.",
-                "input": "database_evidence, requested_fact_types, focus, constraints",
+                "input": "database_evidence, analysis_goal, code_type, analysis_code, expected_result_schema, constraints",
             },
             {
                 "action": "anomaly",
@@ -163,7 +169,7 @@ class DataAgentPromptBuilder:
             {
                 "action": "format_answer",
                 "use_when": "Enough evidence-backed outputs are available, or the request is conversational / cannot proceed without more context.",
-                "input": "summary_goal, direct_answer, include_fact_ids, include_visualization_ids, section_plan",
+                "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan",
             },
         ]
 
@@ -189,17 +195,15 @@ class DataAgentPromptBuilder:
             "artifacts": {
                 "has_database_evidence": request_state.latest_database_evidence is not None,
                 "has_insight": request_state.latest_insight is not None,
+                "has_analysis": bool(request_state.analysis_artifacts),
                 "has_forecast": request_state.latest_forecast is not None,
                 "has_anomaly": request_state.latest_anomaly is not None,
                 "has_final_answer": request_state.final_answer_draft is not None,
                 "verified_fact_count": len(request_state.verified_facts),
                 "visualization_count": len(request_state.visualizations),
+                "analysis_count": len(request_state.analysis_artifacts),
             },
-            "todo_update_suggested": bool(
-                request_state.todo_list
-                and last_success is not None
-                and last_success.tool_name != "todowrite"
-            ),
+            "plan_progress_owner": "runtime" if request_state.todo_list else "none",
         }
 
     def build_user_prompt(
@@ -228,14 +232,101 @@ class DataAgentPromptBuilder:
                 series_preview.append(item_copy)
             data["series"] = series_preview
         payload["data"] = data
-        payload["diagnostics"] = {
+        payload["query"] = self._truncate_text(payload.get("query"), 4000)
+        payload["summary"] = self._truncate_text(payload.get("summary"), 1200)
+        payload["metadata"] = self._bounded_value(payload.get("metadata") or {}, max_string_chars=600, max_list_items=8, max_dict_items=16)
+        visible_diagnostics = {
             key: value
             for key, value in diagnostics.items()
             if key in {"artifact_kind", "artifact_ref", "summary_stats", "query_trace", "series_count"}
         }
+        if "query_trace" in visible_diagnostics:
+            visible_diagnostics["query_trace"] = self._bounded_value(
+                visible_diagnostics["query_trace"],
+                max_string_chars=1200,
+                max_list_items=6,
+                max_dict_items=16,
+            )
+        payload["diagnostics"] = visible_diagnostics
         if summary_stats:
             payload["summary_stats"] = summary_stats
         return payload
+
+    def _summarize_query_history(self, request_state: RequestStateModel) -> list[dict]:
+        """Expose prior database queries as stable model-visible context."""
+
+        history = []
+        for evidence in request_state.database_evidence_artifacts.values():
+            item = self._summarize_database_evidence(evidence)
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            diagnostics = item.get("diagnostics") if isinstance(item.get("diagnostics"), dict) else {}
+            summary_stats = diagnostics.get("summary_stats") or item.get("summary_stats") or {}
+            row_count = summary_stats.get("rows_count")
+            point_count = summary_stats.get("points_count")
+            series_count = summary_stats.get("series_count")
+            if row_count is None and isinstance(data.get("rows"), list):
+                row_count = len(evidence.data.get("rows", [])) if isinstance(evidence.data, dict) else len(data["rows"])
+            if point_count is None and isinstance(data.get("points"), list):
+                point_count = len(evidence.data.get("points", [])) if isinstance(evidence.data, dict) else len(data["points"])
+            if series_count is None and isinstance(data.get("series"), list):
+                series_count = len(evidence.data.get("series", [])) if isinstance(evidence.data, dict) else len(data["series"])
+            preview = {}
+            if isinstance(data.get("rows"), list):
+                preview["rows"] = data["rows"][:3]
+            if isinstance(data.get("points"), list):
+                preview["points"] = data["points"][:4]
+            if isinstance(data.get("series"), list):
+                preview["series"] = data["series"][:2]
+            history.append(
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "database": item.get("database"),
+                    "query_language": item.get("query_language"),
+                    "query": self._truncate_text(item.get("query"), 2500),
+                    "summary": self._truncate_text(item.get("summary"), 800),
+                    "result_type": item.get("result_type"),
+                    "columns": (item.get("columns") or [])[:20],
+                    "row_count": row_count,
+                    "point_count": point_count,
+                    "series_count": series_count,
+                    "metadata": self._bounded_value(
+                        item.get("metadata") or {},
+                        max_string_chars=400,
+                        max_list_items=6,
+                        max_dict_items=12,
+                    ),
+                    "preview": preview,
+                }
+            )
+        return history[-6:]
+
+    def _analysis_workspace(self, request_state: RequestStateModel) -> dict:
+        analyses = []
+        for analysis in request_state.analysis_artifacts.values():
+            payload = analysis.model_dump(mode="json")
+            analyses.append(
+                {
+                    "analysis_id": payload.get("analysis_id"),
+                    "goal": payload.get("analysis_goal"),
+                    "summary": payload.get("summary"),
+                    "status": payload.get("status"),
+                    "code_type": payload.get("code_type"),
+                    "code_hash": payload.get("code_hash"),
+                    "input_ref": f"evidence:{payload.get('input_evidence_id')}",
+                    "input_row_count": payload.get("input_row_count"),
+                    "result_preview": self._bounded_value(
+                        payload.get("result") or {},
+                        max_string_chars=1000,
+                        max_list_items=8,
+                        max_dict_items=16,
+                    ),
+                }
+            )
+        return {
+            "latest_analysis_id": request_state.latest_analysis_id,
+            "analysis_count": len(analyses),
+            "analyses": analyses[-8:],
+        }
 
     def _summarize_observation_payload(self, payload: dict) -> dict:
         if not isinstance(payload, dict):
@@ -245,6 +336,12 @@ class DataAgentPromptBuilder:
             "recovery_hint",
             "error",
             "evidence_id",
+            "analysis_id",
+            "analysis_goal",
+            "code_type",
+            "code_hash",
+            "input_evidence_id",
+            "input_row_count",
             "insight_id",
             "forecast_id",
             "anomaly_id",
@@ -253,9 +350,38 @@ class DataAgentPromptBuilder:
             "planning_complete",
             "completed_count",
             "pending_count",
+            "query",
+            "query_language",
+            "columns",
+            "metadata",
         ):
             if key in payload:
-                summarized[key] = payload[key]
+                summarized[key] = self._bounded_value(payload[key], max_string_chars=1200, max_list_items=12, max_dict_items=16)
+        if isinstance(payload.get("data"), dict):
+            data = dict(payload["data"])
+            preview = {}
+            if isinstance(data.get("rows"), list):
+                preview["rows"] = data["rows"][:3]
+            if isinstance(data.get("points"), list):
+                preview["points"] = data["points"][:4]
+            if isinstance(data.get("series"), list):
+                preview["series"] = data["series"][:2]
+            if preview:
+                summarized["data_preview"] = preview
+        if isinstance(payload.get("result"), dict):
+            summarized["result_preview"] = self._bounded_value(
+                payload["result"],
+                max_string_chars=1000,
+                max_list_items=8,
+                max_dict_items=16,
+            )
+        if isinstance(payload.get("diagnostics"), dict):
+            diagnostics = dict(payload["diagnostics"])
+            summarized["diagnostics"] = {
+                key: self._bounded_value(value, max_string_chars=1000, max_list_items=8, max_dict_items=16)
+                for key, value in diagnostics.items()
+                if key in {"summary_stats", "query_trace", "sql_query", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
+            }
         if isinstance(payload.get("todos"), list):
             summarized["todos"] = payload["todos"][:8]
         if isinstance(payload.get("verified_facts"), list):
@@ -271,6 +397,51 @@ class DataAgentPromptBuilder:
         if isinstance(payload.get("valid_actions"), list):
             summarized["valid_actions"] = payload["valid_actions"]
         return summarized
+
+    def _truncate_text(self, value, max_chars: int):
+        if not isinstance(value, str):
+            return value
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+
+    def _bounded_value(
+        self,
+        value,
+        *,
+        max_string_chars: int = 800,
+        max_list_items: int = 8,
+        max_dict_items: int = 12,
+    ):
+        if isinstance(value, str):
+            return self._truncate_text(value, max_string_chars)
+        if isinstance(value, list):
+            items = [
+                self._bounded_value(
+                    item,
+                    max_string_chars=max_string_chars,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                )
+                for item in value[:max_list_items]
+            ]
+            if len(value) > max_list_items:
+                items.append({"truncated_items": len(value) - max_list_items})
+            return items
+        if isinstance(value, dict):
+            bounded = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= max_dict_items:
+                    bounded["truncated_keys"] = len(value) - max_dict_items
+                    break
+                bounded[key] = self._bounded_value(
+                    item,
+                    max_string_chars=max_string_chars,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                )
+            return bounded
+        return value
 
     def _summarize_insight(self, insight) -> dict:
         payload = insight.model_dump(mode="json")

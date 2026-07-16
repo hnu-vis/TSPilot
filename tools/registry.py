@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from app.settings import Settings
+from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
 from schemas.insight import InsightResult
 from schemas.output import FinalAnswer
@@ -15,9 +16,9 @@ from tools.base import BaseTool
 from tools.forecast import ForecastInput, ForecastTool
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 from tools.insight import InsightInput, InsightTool
-from tools.query_database import QueryDatabaseInput, QueryDatabaseTool
 from tools.rag import RagInput, RagTool
 from tools.skill import SkillInput, SkillTool
+from tools.sql_query import SqlQueryInput, SqlQueryTool
 from tools.todowrite import TodoWriteInput, TodoWriteResult, TodoWriteTool
 
 
@@ -73,11 +74,11 @@ def build_tool_registry(settings: Settings) -> ToolRegistry:
             supports_streaming=False,
         ),
         ToolSpec(
-            tool_name="query_database",
-            description="Retrieve normalized database evidence.",
-            input_model=QueryDatabaseInput,
+            tool_name="sql_query",
+            description="Unified read-only database query tool. Use natural-language message for automatic planning or explicit query for SQL/Flux/PromQL analysis.",
+            input_model=SqlQueryInput,
             output_model=DatabaseEvidence,
-            tool=QueryDatabaseTool(settings),
+            tool=SqlQueryTool(settings),
             prompt_visible=True,
             runtime_access="request_and_conversation_read",
             result_target="evidence",
@@ -86,9 +87,9 @@ def build_tool_registry(settings: Settings) -> ToolRegistry:
         ),
         ToolSpec(
             tool_name="insight",
-            description="Convert evidence into verified facts.",
+            description="Execute generated Python analysis code over full evidence artifacts.",
             input_model=InsightInput,
-            output_model=InsightResult,
+            output_model=AnalysisResult,
             tool=InsightTool(),
             prompt_visible=True,
             runtime_access="request_state_read",

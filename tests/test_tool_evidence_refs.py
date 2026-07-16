@@ -45,7 +45,11 @@ async def test_analysis_tools_resolve_lightweight_evidence_refs_from_state():
     evidence_ref = {"evidence_id": evidence.evidence_id}
 
     insight = await InsightTool().execute(
-        InsightInput(database_evidence=evidence_ref, requested_fact_types=["trend"]),
+        InsightInput(
+            database_evidence=evidence.evidence_id,
+            analysis_goal="compute point count",
+            analysis_code="result = {'summary': f'{len(rows)} rows available', 'metrics': {'row_count': len(rows)}, 'details': {}}",
+        ),
         request_state=request_state,
     )
     anomaly = await AnomalyTool().execute(
@@ -57,6 +61,6 @@ async def test_analysis_tools_resolve_lightweight_evidence_refs_from_state():
         request_state=request_state,
     )
 
-    assert insight["insight_id"].startswith("ins_evi_ref")
+    assert insight["analysis_id"].startswith("ana_compute_point_count_")
     assert anomaly["anomaly_id"] == "anomaly_evi_ref"
     assert forecast["forecast_id"] == "forecast_evi_ref"

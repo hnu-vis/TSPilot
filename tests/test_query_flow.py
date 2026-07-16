@@ -20,6 +20,7 @@ from core.database.query_flow import (
 )
 from app.settings import get_settings
 from types import SimpleNamespace
+from tools.query_database import QueryDatabaseInput, QueryDatabaseTool
 
 
 def _build_influx_schema() -> DatabaseSchema:
@@ -128,6 +129,51 @@ def test_seasonality_request_with_max_points_stays_timeseries():
     assert intent.query_shape == "raw_timeseries"
     assert not intent.filters.get("aggregation")
     assert not any(projection.aggregation for projection in plan.projections)
+
+
+def test_max_request_with_negated_outlier_filter_uses_scalar_price_max():
+    message = (
+        "请查询 influxdb2-bitcoin-sample 中 Bitcoin USD 在指定时间范围的原始数据最大值是多少，"
+        "并给出最大值对应时间。不要过滤异常值。"
+    )
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message=message,
+        time_range={
+            "start": "2023-01-04T23:04:00Z",
+            "end": "2023-02-03T22:47:00Z",
+        },
+        constraints={"max_points": 240},
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+    rendered = CompositeDialectRenderer({"type": "influxdb", "bucket": "bitcoin"}).render(
+        context=context,
+        plan=plan,
+    )
+
+    assert infer_evidence_family(message) == "statistics"
+    assert intent.query_shape == "scalar_aggregate"
+    assert intent.filters["aggregation"] == "max"
+    assert plan.projections == [
+        plan.projections[0].__class__(
+            source="c1",
+            column="price",
+            alias="max_price",
+            aggregation="max",
+        )
+    ]
+    assert 'r._field == "price"' in rendered.query_text
+    assert 'r._field == "_time"' not in rendered.query_text
+    assert "|> max()" in rendered.query_text
 
 
 def test_validator_flags_missing_required_value_filters():
@@ -345,3 +391,75 @@ def test_query_observation_can_expose_snapshot_ref_after_state_update():
             tool_spec,
         )
         assert enriched.payload["diagnostics"]["query_snapshot_ref"]["artifact_kind"] == "query_result_snapshot"
+
+
+def test_reference_dataset_max_points_does_not_sample_analysis_evidence():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        dataset_path = tmp_path / "series.csv"
+        dataset_path.write_text(
+            "timestamp,value\n"
+            + "\n".join(
+                f"2023-01-01T00:{index:02d}:00Z,{index}"
+                for index in range(10)
+            ),
+            encoding="utf-8",
+        )
+        tool = QueryDatabaseTool(get_settings())
+        evidence = tool._reference_dataset_timeseries(
+            QueryDatabaseInput(
+                message="分析 value 的趋势",
+                database_context=DatabaseContext(database_id="demo", database_type="csv"),
+                constraints={"max_points": 3},
+            ),
+            tmp_path / "database.yaml",
+            {"type": "csv"},
+            {
+                "dataset_path": str(dataset_path),
+                "timestamp_column": "timestamp",
+                "field_columns": ["value"],
+                "source": "test",
+            },
+        )
+
+        assert len(evidence["data"]["points"]) == 10
+        assert len(evidence["data"]["rows"]) == 10
+        assert evidence["diagnostics"]["is_full_fidelity"] is True
+        assert evidence["diagnostics"]["sampling_policy"]["requested_max_points"] == 3
+
+
+def test_prompt_safe_evidence_still_samples_full_artifact_for_react_context():
+    points = [
+        {"timestamp": f"2023-01-01T00:{index:02d}:00Z", "value": float(index)}
+        for index in range(40)
+    ]
+    full_payload = {
+        "evidence_id": "evi_demo_prompt_safe",
+        "result_type": "timeseries",
+        "database": "demo",
+        "query_language": "reference_dataset",
+        "query": "reference_dataset:value",
+        "summary": "Loaded 40 points.",
+        "data": {
+            "points": points,
+            "rows": [{"timestamp": item["timestamp"], "value": item["value"]} for item in points],
+            "time_field": "timestamp",
+            "value_field": "value",
+            "series_name": "value",
+            "labels": {},
+        },
+        "columns": ["timestamp", "value"],
+        "metadata": {"database_type": "csv"},
+        "diagnostics": {"is_full_fidelity": True},
+    }
+    request_state = build_request_state(ChatRequest(message="分析趋势"), get_settings())
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        full_payload,
+        SimpleNamespace(result_target="evidence"),
+    )
+
+    assert len(request_state.database_evidence_artifacts["evi_demo_prompt_safe"].data["points"]) == 40
+    assert len(request_state.latest_database_evidence.data["points"]) == 24
+    assert request_state.latest_database_evidence.diagnostics["summary_stats"]["points_count"] == 40

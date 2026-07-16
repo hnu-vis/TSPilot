@@ -48,6 +48,7 @@ class QueryRequestContext:
     time_range: dict[str, Any] | None = None
     constraints: dict[str, Any] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
+    intent_profile: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

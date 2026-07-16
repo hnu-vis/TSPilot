@@ -7,8 +7,16 @@ from schemas.state import RequestStateModel
 
 def missing_requirements(request_state: RequestStateModel) -> list[str]:
     missing: list[str] = []
+    latest_evidence = request_state.latest_database_evidence
+    has_explicit_sql_query_evidence = bool(
+        latest_evidence is not None
+        and isinstance(latest_evidence.metadata, dict)
+        and latest_evidence.metadata.get("sql_query_mode") == "explicit"
+    )
     for requirement in request_state.answer_requirements:
         if requirement in {"plan", "conclusion"}:
+            continue
+        if has_explicit_sql_query_evidence:
             continue
         if not request_state.answer_coverage.get(requirement, False):
             missing.append(requirement)
@@ -117,6 +125,7 @@ def ordered_sections(sections_by_type: dict[str, AnswerSection], section_plan: l
     default_order = [
         "summary",
         "plan",
+        "analysis",
         "facts",
         "statistics",
         "metric_list",

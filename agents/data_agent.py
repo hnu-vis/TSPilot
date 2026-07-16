@@ -8,6 +8,7 @@ from agents.base import BaseAgent
 from prompts.data_agent import DataAgentPromptBuilder
 from schemas.agent_turn import ReActTurn
 from schemas.state import ConversationStateModel, RequestStateModel
+from core.intent import normalize_intent_profile
 
 
 class DataAgent(BaseAgent):
@@ -44,6 +45,8 @@ class DataAgent(BaseAgent):
                         "Return exactly one JSON object and nothing else. "
                         "The JSON object must use this schema: "
                         "{\"thought\": str, \"action\": str, \"action_input\": object}. "
+                        "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
+                        "Continue solving the original user task using the current context. "
                         f"Parser error: {first_error}",
                     ),
                 ]
@@ -55,6 +58,46 @@ class DataAgent(BaseAgent):
                     f"Model failed to produce exactly one valid ReAct JSON object after repair. "
                     f"first_error={first_error}; second_error={second_error}"
                 ) from second_error
+
+    async def interpret_intent(self, request_state: RequestStateModel) -> dict:
+        fallback = dict(request_state.intent_profile or {})
+        prompt = (
+            "Parse the user's data-analysis intent into exactly one JSON object and nothing else.\n"
+            "Schema: {"
+            "\"primary_goal\": str, "
+            "\"analysis_kind\": \"statistical_summary|timeseries_analysis|anomaly_detection|forecast|retrieval|conversation\", "
+            "\"requested_fact_types\": list[str], "
+            "\"requested_metrics\": list[str], "
+            "\"data_policy\": {\"preserve_raw_values\": bool|null, \"filter_outliers\": bool|null}, "
+            "\"required_outputs\": list[str], "
+            "\"needs_plan\": bool"
+            "}.\n"
+            "Distinguish data-policy instructions from analysis goals. For example, if the user asks for a maximum and says not to filter outliers, "
+            "the goal is an extreme/statistical_summary with preserve_raw_values=true, not anomaly detection.\n"
+            "Do not invent forecast/anomaly/seasonality requirements unless the user asks for them.\n"
+            "Context JSON:\n"
+            + json.dumps(
+                {
+                    "message": request_state.message,
+                    "database_context": request_state.database_context.model_dump(mode="json") if request_state.database_context else None,
+                    "time_range": request_state.time_range,
+                    "constraints": request_state.constraints,
+                    "fallback_intent_profile": fallback,
+                },
+                ensure_ascii=False,
+            )
+        )
+        try:
+            content = await self._invoke_model(
+                [
+                    ("system", "You are an intent parser. Return exactly one JSON object."),
+                    ("user", prompt),
+                ]
+            )
+            parsed = json.loads(content.strip())
+        except Exception:
+            return fallback
+        return normalize_intent_profile(parsed, fallback=fallback)
 
     async def _invoke_model(self, messages) -> str:
         response = await self._llm.ainvoke(messages)

@@ -1,4 +1,5 @@
 import { AlertCircle, CheckCircle2, CircleDot, Loader2 } from 'lucide-react';
+import { toDisplayStep } from '../lib/traceDisplay';
 import type { TraceStep } from '../types';
 
 type Props = {
@@ -13,6 +14,7 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
     <section className="trace-timeline" aria-label="Execution process">
       {steps.map((step) => {
         const StatusIcon = step.status === 'running' ? Loader2 : step.status === 'error' ? AlertCircle : CheckCircle2;
+        const displayStep = toDisplayStep(step);
         return (
           <button
             key={step.id}
@@ -24,8 +26,8 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
               {step.status === 'running' ? <StatusIcon className="spin" size={15} /> : <StatusIcon size={15} />}
             </span>
             <span className="trace-copy">
-              <strong>{formatPhase(step.phase, step.tool)}</strong>
-              <small>{step.summary}</small>
+              <strong>{displayStep.title}</strong>
+              <small>{displayStep.summary}</small>
             </span>
             <CircleDot size={13} className="trace-open-icon" />
           </button>
@@ -33,13 +35,4 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
       })}
     </section>
   );
-}
-
-function formatPhase(phase: string, tool?: string) {
-  if (tool) return tool;
-  if (phase === 'tool_selection') return 'Data';
-  if (phase === 'answer_assembly') return 'Answer';
-  if (phase === 'analysis') return 'Analysis';
-  if (phase === 'intent') return 'Plan';
-  return phase || 'Step';
 }

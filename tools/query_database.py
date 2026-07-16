@@ -33,6 +33,7 @@ class QueryDatabaseInput(BaseModel):
     database_context: DatabaseContext
     time_range: dict | None = None
     constraints: dict = Field(default_factory=dict)
+    intent_profile: dict = Field(default_factory=dict)
     selected_database: str | None = None
     selected_database_type: str | None = None
     history: list[dict] = Field(default_factory=list)
@@ -128,9 +129,8 @@ class QueryDatabaseTool(BaseTool):
         value_fields = self._pick_value_fields(validated_input.message, reference_dataset, rows[0].keys())
         value_field = value_fields[0]
         filtered_rows = self._filter_rows(rows, time_field, validated_input.time_range)
-        max_points = int(validated_input.constraints.get("max_points", 200))
-        sampled_rows = self._sample_rows(filtered_rows, max_points)
-        points = self._to_points(sampled_rows, time_field, value_field)
+        requested_max_points = validated_input.constraints.get("max_points")
+        points = self._to_points(filtered_rows, time_field, value_field)
         evidence = build_reference_dataset_timeseries_evidence(
             database_id=validated_input.database_context.database_id,
             database_type=str(config.get("type")),
@@ -139,10 +139,21 @@ class QueryDatabaseTool(BaseTool):
             value_field=value_field,
             value_fields=value_fields,
             time_field=time_field,
-            rows=self._to_timeseries_rows(sampled_rows, time_field, value_fields),
+            rows=self._to_timeseries_rows(filtered_rows, time_field, value_fields),
             points=points,
             source=reference_dataset.get("source", "reference_dataset"),
         )
+        evidence.diagnostics = {
+            **evidence.diagnostics,
+            "row_count_total": len(filtered_rows),
+            "row_count_materialized": len(points),
+            "is_full_fidelity": True,
+            "sampling_policy": {
+                "analysis_input": "full_filtered_reference_dataset",
+                "prompt_preview": "runtime_prompt_safe_sampling",
+                "requested_max_points": requested_max_points,
+            },
+        }
         return evidence.model_dump(mode="json")
 
     def _reference_dataset_statistics(
@@ -225,6 +236,7 @@ class QueryDatabaseTool(BaseTool):
             time_range=validated_input.time_range,
             constraints=validated_input.constraints,
             history=validated_input.history,
+            intent_profile=validated_input.intent_profile,
         )
 
     def _prometheus_step(self, time_range: dict, constraints: dict) -> str:
@@ -314,13 +326,6 @@ class QueryDatabaseTool(BaseTool):
                 continue
             filtered.append(row)
         return filtered or rows
-
-    def _sample_rows(self, rows: list[dict], max_points: int) -> list[dict]:
-        sampled = rows
-        if len(rows) > max_points:
-            step = max(1, len(rows) // max_points)
-            sampled = rows[::step][:max_points]
-        return sampled
 
     def _to_points(self, rows: list[dict], time_field: str, value_field: str) -> list[dict]:
         points = []

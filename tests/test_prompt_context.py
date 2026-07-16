@@ -18,7 +18,7 @@ def test_prompt_builder_summarizes_heavy_context():
     request = ChatRequest(message="分析季节性")
     request_state = build_request_state(request, settings)
     conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
-    observation = ToolObservation(tool_name="query_database", success=True, summary="ok", payload={})
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     full_payload = {
         "evidence_id": "evi_demo",
         "result_type": "timeseries",
@@ -64,7 +64,83 @@ def test_prompt_builder_summarizes_heavy_context():
 
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
     assert context["execution_state"]["artifacts"]["has_database_evidence"] is True
-    assert context["execution_state"]["last_successful_tool"] == "query_database"
+    assert context["execution_state"]["last_successful_tool"] == "sql_query"
     assert len(context["latest_database_evidence"]["data"]["points"]) <= 8
+    assert context["query_history"][0]["query"] == "demo"
+    assert context["query_history"][0]["row_count"] == 100
+    assert len(context["query_history"][0]["preview"]["rows"]) <= 3
     assert context["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
     assert "chart" not in context["visualizations"][0]
+
+
+def test_prompt_builder_exposes_sql_observation_details():
+    settings = get_settings()
+    request = ChatRequest(message="算平均值")
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    request_state.observations.append(
+        ToolObservation(
+            tool_name="sql_query",
+            success=True,
+            summary="ok",
+            payload={
+                "evidence_id": "evi_sql",
+                "query_language": "sql",
+                "query": "SELECT AVG(value) AS avg_value FROM metrics",
+                "columns": ["avg_value"],
+                "data": {"rows": [{"avg_value": 12.3}, {"avg_value": 13.4}]},
+                "diagnostics": {
+                    "summary_stats": {"rows_count": 2},
+                    "sql_query": {"execution_time_ms": 8},
+                    "irrelevant": "hidden",
+                },
+            },
+        )
+    )
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    payload = context["latest_observation_summaries"][0]["payload"]
+
+    assert payload["query"] == "SELECT AVG(value) AS avg_value FROM metrics"
+    assert payload["query_language"] == "sql"
+    assert payload["columns"] == ["avg_value"]
+    assert payload["data_preview"]["rows"] == [{"avg_value": 12.3}, {"avg_value": 13.4}]
+    assert payload["diagnostics"]["summary_stats"] == {"rows_count": 2}
+    assert "irrelevant" not in payload["diagnostics"]
+
+
+def test_prompt_builder_bounds_long_query_context():
+    settings = get_settings()
+    request = ChatRequest(message="复杂查询")
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    long_query = "SELECT " + ", ".join(f"{i} AS c{i}" for i in range(2000))
+    full_payload = {
+        "evidence_id": "evi_long",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "sql",
+        "query": long_query,
+        "summary": "x" * 5000,
+        "data": {"rows": [{"value": 1.0}]},
+        "columns": ["value"],
+        "metadata": {"raw_schema": "y" * 5000},
+        "diagnostics": {
+            "query_trace": {
+                "rendered_query": {"query_text": long_query},
+                "large": ["z" * 1000 for _ in range(20)],
+            }
+        },
+    }
+    apply_observation(request_state, observation, full_payload, _EvidenceSpec())
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    evidence = context["latest_database_evidence"]
+    history_item = context["query_history"][0]
+
+    assert len(evidence["query"]) < len(long_query)
+    assert "truncated" in evidence["query"]
+    assert len(history_item["query"]) < len(long_query)
+    assert "truncated" in history_item["metadata"]["raw_schema"]
+    assert "truncated_items" in evidence["diagnostics"]["query_trace"]["large"][-1]

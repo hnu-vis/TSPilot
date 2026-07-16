@@ -32,6 +32,7 @@ export default function App() {
   const [activeId, setActiveId] = useState(() => conversations[0]?.id || createConversation().id);
   const [historyQuery, setHistoryQuery] = useState('');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isInspectorCollapsed, setIsInspectorCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [resources, setResources] = useState<ResourceState>({ databases: [], knowledge: [], model: 'backend model' });
   const [, setResourceError] = useState<string | null>(null);
@@ -40,6 +41,10 @@ export default function App() {
   const selectedTraceStep = activeConversation?.selectedTraceStepId
     ? activeConversation.traceSteps.find((step) => step.id === activeConversation.selectedTraceStepId) || null
     : null;
+  const latestAnswer = activeConversation?.messages
+    .slice()
+    .reverse()
+    .find((message) => message.role === 'assistant' && message.answer)?.answer || null;
   const hasConversationContent = Boolean(
     activeConversation && (
       activeConversation.messages.length > 0
@@ -97,17 +102,10 @@ export default function App() {
 
   const handleSelectTraceStep = (id: string) => {
     if (!activeConversation) return;
+    setIsInspectorCollapsed(false);
     updateConversation(activeConversation.id, (conversation) => ({
       ...conversation,
       selectedTraceStepId: id,
-    }));
-  };
-
-  const handleCloseInspector = () => {
-    if (!activeConversation) return;
-    updateConversation(activeConversation.id, (conversation) => ({
-      ...conversation,
-      selectedTraceStepId: null,
     }));
   };
 
@@ -128,6 +126,7 @@ export default function App() {
     setConversations((current) => sortConversations(current.map((conversation) => (
       conversation.id === conversationId ? { ...withAssistantPending, traceSteps: [], selectedTraceStepId: null } : conversation
     ))));
+    setIsInspectorCollapsed(false);
     setIsStreaming(true);
 
     const selectedDatabase = resources.databases.find((database) => database.id === withUserMessage.selectedDatabaseId) || null;
@@ -225,7 +224,7 @@ export default function App() {
   }
 
   return (
-    <div className={`app-shell ${selectedTraceStep ? 'inspector-open' : ''} ${isHistoryOpen ? 'history-open' : ''}`}>
+    <div className={`app-shell ${hasConversationContent ? 'inspector-open' : ''} ${isInspectorCollapsed ? 'inspector-collapsed' : ''} ${isHistoryOpen ? 'history-open' : ''}`}>
       <HistorySidebar
         conversations={sortedConversations}
         activeId={activeConversation.id}
@@ -295,7 +294,13 @@ export default function App() {
         )}
       </main>
 
-      <InspectorPanel step={selectedTraceStep} onClose={handleCloseInspector} />
+      <InspectorPanel
+        steps={activeConversation.traceSteps}
+        selectedStepId={selectedTraceStep?.id || null}
+        answer={latestAnswer}
+        collapsed={isInspectorCollapsed}
+        onToggleCollapsed={() => setIsInspectorCollapsed((collapsed) => !collapsed)}
+      />
     </div>
   );
 }

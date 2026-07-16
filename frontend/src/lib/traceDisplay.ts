@@ -1,0 +1,218 @@
+import type { FinalAnswer, TraceStep } from '../types';
+
+export type DisplayMetric = {
+  label: string;
+  value: string;
+};
+
+export type DisplayStep = {
+  id: string;
+  title: string;
+  category: string;
+  status: TraceStep['status'];
+  summary: string;
+  metrics: DisplayMetric[];
+  artifactRefs: string[];
+  debugPayload: Record<string, unknown> | null;
+};
+
+export type RunOverview = {
+  status: TraceStep['status'] | 'idle';
+  completedSteps: number;
+  totalSteps: number;
+  metrics: DisplayMetric[];
+  outputs: string[];
+  references: string[];
+};
+
+export function toDisplayStep(step: TraceStep): DisplayStep {
+  const result = asRecord(step.toolResult);
+  const call = asRecord(step.toolCall);
+  const preview = asRecord(result?.payload_preview);
+  const tool = step.tool || stringFrom(call?.tool) || step.phase;
+  const metrics = metricsForTool(tool, preview, call);
+  const artifactRefs = artifactRefsFor(preview, result);
+
+  return {
+    id: step.id,
+    title: titleForTool(tool, step.phase),
+    category: categoryForTool(tool, step.phase),
+    status: step.status,
+    summary: summaryForStep(step, preview),
+    metrics,
+    artifactRefs,
+    debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
+  };
+}
+
+export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null): RunOverview {
+  const displaySteps = steps.map(toDisplayStep);
+  const totalSteps = displaySteps.length;
+  const completedSteps = displaySteps.filter((step) => step.status === 'complete').length;
+  const hasError = displaySteps.some((step) => step.status === 'error');
+  const hasRunning = displaySteps.some((step) => step.status === 'running');
+  const status = totalSteps === 0 ? 'idle' : hasError ? 'error' : hasRunning ? 'running' : 'complete';
+  const metrics = compactMetrics([
+    { label: 'Steps', value: totalSteps ? `${completedSteps}/${totalSteps}` : '0' },
+    firstMetric(displaySteps, 'Rows'),
+    firstMetric(displaySteps, 'Points'),
+    firstMetric(displaySteps, 'Series'),
+    firstMetric(displaySteps, 'Facts'),
+    firstMetric(displaySteps, 'Anomalies'),
+    firstMetric(displaySteps, 'Forecast points'),
+  ]);
+  const outputs = outputTypes(answer);
+  const references = (answer?.references || [])
+    .map((reference) => reference.source_id || reference.label)
+    .filter((value): value is string => Boolean(value));
+
+  return {
+    status,
+    completedSteps,
+    totalSteps,
+    metrics,
+    outputs,
+    references,
+  };
+}
+
+export function titleForTool(tool?: string, phase?: string) {
+  if (tool === 'todowrite') return 'Plan the work';
+  if (tool === 'sql_query' || tool === 'query_database') return 'Query data';
+  if (tool === 'insight') return 'Analyze evidence';
+  if (tool === 'anomaly') return 'Check anomalies';
+  if (tool === 'forecast') return 'Forecast trend';
+  if (tool === 'rag') return 'Retrieve knowledge';
+  if (tool === 'skill') return 'Run workflow';
+  if (tool === 'format_answer') return 'Assemble answer';
+  if (phase === 'answer_assembly') return 'Assemble answer';
+  if (phase === 'analysis') return 'Analyze evidence';
+  if (phase === 'tool_selection') return 'Query data';
+  if (phase === 'intent') return 'Plan the work';
+  return 'Process step';
+}
+
+function categoryForTool(tool?: string, phase?: string) {
+  if (tool === 'todowrite' || phase === 'intent') return 'Plan';
+  if (tool === 'sql_query' || tool === 'query_database' || phase === 'tool_selection') return 'Data';
+  if (tool === 'format_answer' || phase === 'answer_assembly') return 'Answer';
+  if (tool === 'rag' || tool === 'skill') return 'Context';
+  return 'Analysis';
+}
+
+function summaryForStep(step: TraceStep, preview: Record<string, unknown> | null) {
+  const tool = step.tool;
+  if ((tool === 'sql_query' || tool === 'query_database') && preview) {
+    const rowCount = nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']);
+    const pointCount = nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']);
+    const seriesCount = numberFrom(preview.series_count);
+    const parts = [
+      rowCount !== null ? `${rowCount} rows` : null,
+      pointCount !== null ? `${pointCount} points` : null,
+      seriesCount !== null ? `${seriesCount} series` : null,
+    ].filter(Boolean);
+    return parts.length ? `Retrieved ${parts.join(', ')}.` : step.summary;
+  }
+  if (tool === 'insight' && preview) {
+    return stringFrom(preview.summary) || stringFrom(preview.result_preview && asRecord(preview.result_preview)?.summary) || step.summary;
+  }
+  if (tool === 'anomaly' && preview) {
+    const anomalyCount = numberFrom(preview.anomaly_count) ?? numberFrom(preview.anomaly_point_count);
+    return anomalyCount !== null ? `Checked the series and found ${anomalyCount} anomaly points.` : step.summary;
+  }
+  if (tool === 'forecast' && preview) {
+    const count = numberFrom(preview.forecast_point_count);
+    return count !== null ? `Generated ${count} forecast points.` : step.summary;
+  }
+  return step.summary;
+}
+
+function metricsForTool(
+  tool: string | undefined,
+  preview: Record<string, unknown> | null,
+  call: Record<string, unknown> | null,
+): DisplayMetric[] {
+  if (!preview && !call) return [];
+  const metrics: DisplayMetric[] = [];
+
+  addMetric(metrics, 'Rows', nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']));
+  addMetric(metrics, 'Points', nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
+  addMetric(metrics, 'Series', numberFrom(preview?.series_count) ?? nestedNumber(preview, ['summary_stats', 'series_count']));
+  addMetric(metrics, 'Facts', numberFrom(preview?.verified_fact_count));
+  addMetric(metrics, 'Samples', numberFrom(preview?.input_row_count));
+  addMetric(metrics, 'Anomalies', numberFrom(preview?.anomaly_count) ?? numberFrom(preview?.anomaly_point_count));
+  addMetric(metrics, 'Forecast points', numberFrom(preview?.forecast_point_count));
+  addMetric(metrics, 'Todos', numberFrom(preview?.todo_total));
+  addMetric(metrics, 'Visuals', numberFrom(preview?.visualization_count));
+
+  const inputPreview = asRecord(call?.input_preview);
+  if (tool === 'format_answer' && inputPreview) {
+    addMetric(metrics, 'Analyses used', numberFrom(inputPreview.include_analysis_count));
+    addMetric(metrics, 'Facts used', numberFrom(inputPreview.include_fact_count));
+  }
+
+  return metrics;
+}
+
+function artifactRefsFor(preview: Record<string, unknown> | null, result: Record<string, unknown> | null) {
+  const refs = [
+    stringFrom(preview?.payload_ref),
+    stringFrom(result?.payload_ref),
+    stringFrom(preview?.evidence_id),
+    stringFrom(preview?.analysis_id),
+    stringFrom(preview?.insight_id),
+    stringFrom(preview?.forecast_id),
+    stringFrom(preview?.anomaly_id),
+  ];
+  return Array.from(new Set(refs.filter((value): value is string => Boolean(value))));
+}
+
+function outputTypes(answer?: FinalAnswer | null) {
+  const sectionTypes = (answer?.sections || []).map((section) => section.section_type);
+  const visualCount = answer?.visualizations?.length || 0;
+  const outputs = Array.from(new Set(sectionTypes.filter((type) => type !== 'summary' && type !== 'conclusion')));
+  if (visualCount > 0) outputs.push(`${visualCount} visualizations`);
+  return outputs;
+}
+
+function firstMetric(steps: DisplayStep[], label: string): DisplayMetric | null {
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const metric = steps[index].metrics.find((item) => item.label === label);
+    if (metric) return metric;
+  }
+  return null;
+}
+
+function compactMetrics(metrics: Array<DisplayMetric | null>): DisplayMetric[] {
+  const seen = new Set<string>();
+  return metrics.filter((metric): metric is DisplayMetric => {
+    if (!metric || seen.has(metric.label)) return false;
+    seen.add(metric.label);
+    return true;
+  });
+}
+
+function addMetric(metrics: DisplayMetric[], label: string, value: number | string | null | undefined) {
+  if (value === null || value === undefined || value === '') return;
+  metrics.push({ label, value: typeof value === 'number' ? value.toLocaleString() : value });
+}
+
+function nestedNumber(root: Record<string, unknown> | null | undefined, path: string[]) {
+  let current: unknown = root;
+  for (const key of path) {
+    current = asRecord(current)?.[key];
+  }
+  return numberFrom(current);
+}
+
+function numberFrom(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function stringFrom(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}

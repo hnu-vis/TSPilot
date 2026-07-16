@@ -37,7 +37,7 @@ def _reference_extractor(task_context: dict, parameters: dict) -> dict:
 def _next_step_advisor(task_context: dict, parameters: dict) -> dict:
     advice = []
     if not task_context.get("latest_database_evidence"):
-        advice.append("query_database")
+        advice.append("sql_query")
     elif not task_context.get("latest_insight"):
         advice.append("insight")
     elif parameters.get("need_forecast"):

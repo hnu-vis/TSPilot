@@ -3,7 +3,10 @@ import type { ChatMessage, Conversation, FinalAnswer, TraceStep } from '../types
 const STORAGE_KEY = 'tspilot:v02:conversations';
 
 const now = () => new Date().toISOString();
-const makeId = (prefix: string) => `${prefix}_${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+const makeId = (prefix: string) => {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  return `${prefix}_${randomUUID ? randomUUID.call(globalThis.crypto) : Math.random().toString(36).slice(2)}`;
+};
 
 function titleFromContent(content: string) {
   const normalized = content.replace(/\s+/g, ' ').trim();

@@ -92,6 +92,13 @@ class ToolExecutor:
             visible["anomaly_points"] = visible["anomaly_points"][:12]
         if isinstance(visible.get("scores"), list):
             visible["scores"] = visible["scores"][:12]
+        if isinstance(visible.get("result"), dict):
+            result = dict(visible["result"])
+            if isinstance(result.get("details"), list):
+                result["details"] = result["details"][:12]
+            if isinstance(result.get("rows"), list):
+                result["rows"] = result["rows"][:12]
+            visible["result"] = result
         if isinstance(visible.get("data"), dict):
             data = dict(visible["data"])
             if isinstance(data.get("points"), list):
@@ -131,6 +138,6 @@ class ToolExecutor:
             visible["diagnostics"] = {
                 key: value
                 for key, value in diagnostics.items()
-                if key in {"artifact_kind", "artifact_ref", "snapshot_ref", "threshold", "series_name", "query_trace"}
+                if key in {"artifact_kind", "artifact_ref", "snapshot_ref", "threshold", "series_name", "query_trace", "runtime_ms", "sandbox"}
             }
         return visible, True

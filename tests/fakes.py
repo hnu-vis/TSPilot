@@ -10,6 +10,9 @@ class FakeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        intent_response = _maybe_intent_response(user_prompt)
+        if intent_response:
+            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = json.loads(context_json)
 
@@ -30,7 +33,7 @@ class FakeLLM:
                 "selected_database_type": context.get("selected_database_type"),
                 "history": context.get("history", []),
             }
-            return _turn("I need evidence before producing facts.", "query_database", action_input)
+            return _turn("I need evidence before producing facts.", "sql_query", action_input)
 
         latest_evidence = context.get("latest_database_evidence") or {}
         result_type = latest_evidence.get("result_type")
@@ -50,30 +53,24 @@ class FakeLLM:
                 action_input,
             )
 
-        if context.get("latest_insight") is None:
-            action_input = {
-                "database_evidence": latest_evidence,
-                "requested_fact_types": context.get("requested_fact_types", []),
-                "focus": context.get("focus"),
-                "constraints": context.get("constraints", {}),
-            }
+        if _analysis_count(context) == 0:
+            action_input = _analysis_action_input(latest_evidence, context.get("message", "Analyze evidence."))
             return _turn(
-                "I have evidence and should convert it into verified facts.",
+                "I have evidence and should run generated analysis code.",
                 "insight",
                 action_input,
             )
 
+        analysis_ids = _analysis_ids(context)
         action_input = {
             "summary_goal": context["message"],
-            "include_fact_ids": [
-                fact["fact_id"]
-                for fact in context["latest_insight"].get("verified_facts", [])
-            ],
+            "include_analysis_ids": analysis_ids,
+            "include_fact_ids": [],
             "include_visualization_ids": [
                 visualization["visualization_id"]
                 for visualization in context.get("visualizations", [])
             ],
-            "section_plan": ["summary", "facts", "visualization"],
+            "section_plan": ["summary", "analysis", "visualization"],
         }
         return _turn(
             "I have enough verified output to assemble the final answer.",
@@ -89,6 +86,9 @@ class CasualLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        intent_response = _maybe_intent_response(user_prompt)
+        if intent_response:
+            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = json.loads(context_json)
         return _turn(
@@ -111,6 +111,9 @@ class ComplexReActLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        intent_response = _maybe_intent_response(user_prompt)
+        if intent_response:
+            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = json.loads(context_json)
 
@@ -151,18 +154,13 @@ class ComplexReActLLM:
                 "selected_database_type": context.get("selected_database_type"),
                 "history": context.get("history", []),
             }
-            return _turn("I have a plan and need time-series evidence next.", "query_database", action_input)
+            return _turn("I have a plan and need time-series evidence next.", "sql_query", action_input)
 
         latest_evidence = context.get("latest_database_evidence") or {}
-        if context.get("latest_insight") is None:
-            action_input = {
-                "database_evidence": latest_evidence,
-                "requested_fact_types": ["trend", "change_percent", "extrema"],
-                "focus": "整体趋势、变化幅度和关键峰值",
-                "constraints": context.get("constraints", {}),
-            }
+        if _analysis_count(context) == 0:
+            action_input = _analysis_action_input(latest_evidence, "整体趋势、变化幅度和关键峰值")
             return _turn(
-                "I need verified facts before any downstream analytics summary.",
+                "I need generated analysis before any downstream analytics summary.",
                 "insight",
                 action_input,
             )
@@ -192,15 +190,13 @@ class ComplexReActLLM:
 
         action_input = {
             "summary_goal": context["message"],
-            "include_fact_ids": [
-                fact["fact_id"]
-                for fact in context.get("latest_insight", {}).get("verified_facts", [])
-            ],
+            "include_analysis_ids": _analysis_ids(context),
+            "include_fact_ids": [],
             "include_visualization_ids": [
                 visualization["visualization_id"]
                 for visualization in context.get("visualizations", [])
             ],
-            "section_plan": ["summary", "facts", "anomaly", "forecast", "visualization"],
+            "section_plan": ["summary", "analysis", "anomaly", "forecast", "visualization"],
         }
         return _turn(
             "I have enough verified evidence, anomaly findings, and forecast output to assemble the answer.",
@@ -216,6 +212,9 @@ class RepeatingTodoLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        intent_response = _maybe_intent_response(user_prompt)
+        if intent_response:
+            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = json.loads(context_json)
 
@@ -243,7 +242,7 @@ class RepeatingTodoLLM:
         if context.get("latest_database_evidence") is None:
             return _turn(
                 "I now need evidence.",
-                "query_database",
+                "sql_query",
                 {
                     "message": context["message"],
                     "database_context": context["database_context"],
@@ -252,38 +251,25 @@ class RepeatingTodoLLM:
                 },
             )
 
-        if context.get("latest_insight") is None:
+        if _analysis_count(context) == 0:
             return _turn(
-                "I should convert evidence into facts.",
+                "I should run generated insight analysis.",
                 "insight",
-                {
-                    "database_evidence": context["latest_database_evidence"],
-                    "requested_fact_types": ["trend", "extrema"],
-                    "focus": "趋势和极值",
-                    "constraints": context.get("constraints", {}),
-                },
+                _analysis_action_input(context["latest_database_evidence"], "趋势和极值"),
             )
 
-        if latest_observation and latest_observation["tool_name"] == "todowrite" and latest_observation["success"] is True:
+        if latest_observation and latest_observation["tool_name"] == "todowrite" and latest_observation["success"] is False:
             return _turn(
-                "The plan update succeeded, so I should do anomaly detection next.",
+                "The runtime rejected another plan update, so I should do anomaly detection next.",
                 "anomaly",
                 {"constraints": {"zscore_threshold": 2.5}},
             )
 
         if context.get("latest_anomaly") is None:
             return _turn(
-                "I should explicitly update the todo plan before continuing.",
-                "todowrite",
-                {
-                    "message": "更新计划状态。",
-                    "todos": [
-                        {"content": "查询时序数据", "task_type": "query", "status": "completed", "priority": 1},
-                        {"content": "分析趋势", "task_type": "insight", "status": "completed", "priority": 2},
-                        {"content": "检查异常", "task_type": "anomaly", "status": "in_progress", "priority": 3},
-                        {"content": "汇总结论", "task_type": "answer", "status": "pending", "priority": 4},
-                    ],
-                },
+                "Runtime already advanced the plan, so I should do anomaly detection next.",
+                "anomaly",
+                {"constraints": {"zscore_threshold": 2.5}},
             )
 
         return _turn(
@@ -291,14 +277,12 @@ class RepeatingTodoLLM:
             "format_answer",
             {
                 "summary_goal": context["message"],
-                "include_fact_ids": [
-                    fact["fact_id"]
-                    for fact in context.get("latest_insight", {}).get("verified_facts", [])
-                ],
+                "include_analysis_ids": _analysis_ids(context),
+                "include_fact_ids": [],
                 "include_visualization_ids": [
                     viz["visualization_id"] for viz in context.get("visualizations", [])
                 ],
-                "section_plan": ["summary", "facts", "anomaly"],
+                "section_plan": ["summary", "analysis", "anomaly"],
             },
         )
 
@@ -310,6 +294,9 @@ class TodoScopeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        intent_response = _maybe_intent_response(user_prompt)
+        if intent_response:
+            return intent_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = json.loads(context_json)
 
@@ -336,7 +323,7 @@ class TodoScopeLLM:
         if latest_observation and latest_observation["tool_name"] == "forecast" and latest_observation["success"] is False:
             return _turn(
                 "Forecast failed because evidence is missing, so I should query the database next.",
-                "query_database",
+                "sql_query",
                 {
                     "message": context["message"],
                     "database_context": context["database_context"],
@@ -355,18 +342,14 @@ class TodoScopeLLM:
                 },
             )
 
-        if context.get("latest_database_evidence") is not None and context.get("latest_insight") is None:
+        if context.get("latest_database_evidence") is not None and _analysis_count(context) == 0:
             return _turn(
-                "I have evidence now and should produce facts.",
+                "I have evidence now and should run generated analysis.",
                 "insight",
-                {
-                    "database_evidence": context.get("latest_database_evidence"),
-                    "requested_fact_types": ["trend"],
-                    "focus": "趋势",
-                },
+                _analysis_action_input(context.get("latest_database_evidence"), "趋势"),
             )
 
-        if context.get("latest_insight") is not None and context.get("latest_anomaly") is None:
+        if _analysis_count(context) > 0 and context.get("latest_anomaly") is None:
             return _turn(
                 "The user asked for anomalies, so I should run anomaly detection before answering.",
                 "anomaly",
@@ -376,20 +359,18 @@ class TodoScopeLLM:
                 },
             )
 
-        if context.get("latest_insight") is not None and context.get("latest_anomaly") is not None:
+        if _analysis_count(context) > 0 and context.get("latest_anomaly") is not None:
             return _turn(
                 "I have enough facts to answer.",
                 "format_answer",
                 {
                     "summary_goal": context["message"],
-                    "include_fact_ids": [
-                        fact["fact_id"]
-                        for fact in context.get("latest_insight", {}).get("verified_facts", [])
-                    ],
+                    "include_analysis_ids": _analysis_ids(context),
+                    "include_fact_ids": [],
                     "include_visualization_ids": [
                         viz["visualization_id"] for viz in context.get("visualizations", [])
                     ],
-                    "section_plan": ["summary", "facts", "anomaly"],
+                    "section_plan": ["summary", "analysis", "anomaly"],
                 },
             )
 
@@ -416,3 +397,61 @@ def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
             ensure_ascii=False,
         )
     )
+
+
+def _maybe_intent_response(user_prompt: str) -> _FakeResponse | None:
+    if "Parse the user's data-analysis intent" not in user_prompt:
+        return None
+    context_json = user_prompt.split("Context JSON:\n", 1)[1]
+    context = json.loads(context_json)
+    fallback = context.get("fallback_intent_profile") or {}
+    message = str(context.get("message") or "")
+    normalized = message.lower()
+    fact_types = list(fallback.get("requested_fact_types") or [])
+    if "最大" in normalized or "max" in normalized:
+        fact_types = [item for item in fact_types if item != "outlier"]
+        if "extreme" not in fact_types:
+            fact_types.append("extreme")
+    payload = {
+        "primary_goal": message,
+        "analysis_kind": "statistical_summary" if "extreme" in fact_types else fallback.get("analysis_kind", "timeseries_analysis"),
+        "requested_fact_types": fact_types,
+        "requested_metrics": ["max_or_min"] if "extreme" in fact_types else fallback.get("requested_metrics", []),
+        "data_policy": {
+            "preserve_raw_values": "extreme" in fact_types,
+            "filter_outliers": False if "extreme" in fact_types else None,
+        },
+        "required_outputs": ["conclusion", "analysis"] if "extreme" in fact_types else fallback.get("required_outputs", ["conclusion"]),
+        "needs_plan": fallback.get("needs_plan", False),
+    }
+    return _FakeResponse(json.dumps(payload, ensure_ascii=False))
+
+
+def _analysis_count(context: dict) -> int:
+    workspace = context.get("analysis_workspace") or {}
+    return int(workspace.get("analysis_count") or 0)
+
+
+def _analysis_ids(context: dict) -> list[str]:
+    workspace = context.get("analysis_workspace") or {}
+    return [
+        analysis.get("analysis_id")
+        for analysis in workspace.get("analyses", [])
+        if analysis.get("analysis_id")
+    ]
+
+
+def _analysis_action_input(evidence, goal: str) -> dict:
+    return {
+        "database_evidence": evidence,
+        "analysis_goal": goal,
+        "code_type": "python_rows_v1",
+        "analysis_code": (
+            "values = [float(row.get('value')) for row in rows if row.get('value') is not None]\n"
+            "summary = f'Analyzed {len(rows)} rows.'\n"
+            "if values:\n"
+            "    summary = f'Analyzed {len(rows)} rows; first={values[0]:.2f}, last={values[-1]:.2f}.'\n"
+            "result = {'summary': summary, 'metrics': {'row_count': len(rows)}, 'details': {}}\n"
+        ),
+        "expected_result_schema": {"summary": "str", "metrics": "dict", "details": "dict"},
+    }

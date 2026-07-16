@@ -73,6 +73,7 @@ class DefaultIntentInterpreter(IntentInterpreter):
         "outlier": ("异常", "离群", "anomaly", "outlier"),
         "forecast": ("预测", "forecast"),
         "difference": ("变化", "增减", "difference", "change"),
+        "extreme": ("最高", "最低", "最大", "最小", "peak", "trough", "extreme", "extrema", "maximum", "minimum"),
         "aggregation": ("平均", "均值", "总和", "最大", "最小", "count", "sum", "avg", "mean"),
     }
 
@@ -87,16 +88,25 @@ class DefaultIntentInterpreter(IntentInterpreter):
         "not use max",
         "without max",
     )
-
     def interpret(self, *, context: QueryRequestContext) -> QueryIntent:
+        intent_profile = context.intent_profile or {}
+        profile_fact_types = [
+            str(item)
+            for item in intent_profile.get("requested_fact_types", [])
+            if item
+        ]
         normalized = context.message.lower()
-        fact_families = self._detect_fact_families(normalized)
+        fact_families = profile_fact_types or self._detect_fact_families(normalized)
         evidence_family = infer_evidence_family(context.message)
         aggregation = self._detect_aggregation(normalized, context.constraints, fact_families)
+        if not aggregation:
+            aggregation = self._aggregation_from_profile(intent_profile, fact_families)
+        if intent_profile.get("analysis_kind") == "statistical_summary" or aggregation:
+            evidence_family = "statistics"
         query_shape = "raw_timeseries"
         requires_raw_points = evidence_family == "timeseries"
         requires_full_fidelity = any(fact in self._RAW_SERIES_FACTS for fact in fact_families)
-        if requires_full_fidelity:
+        if requires_full_fidelity and not aggregation:
             evidence_family = "timeseries"
         if evidence_family == "statistics":
             query_shape = "scalar_aggregate"
@@ -119,6 +129,24 @@ class DefaultIntentInterpreter(IntentInterpreter):
             requires_full_fidelity=requires_full_fidelity,
             filters={"aggregation": aggregation} if aggregation else {},
         )
+
+    def _aggregation_from_profile(
+        self,
+        intent_profile: dict[str, Any],
+        fact_families: list[str],
+    ) -> str | None:
+        metrics = [str(item).lower() for item in intent_profile.get("requested_metrics", []) if item]
+        if "max" in metrics or "maximum" in metrics or "max_or_min" in metrics:
+            return "max"
+        if "min" in metrics or "minimum" in metrics:
+            return "min"
+        if "average" in metrics or "avg" in metrics or "mean" in metrics or "aggregate" in metrics:
+            return "avg"
+        if "extreme" in fact_families:
+            return "max"
+        if "aggregation" in fact_families:
+            return "avg"
+        return None
 
     def _detect_aggregation(
         self,

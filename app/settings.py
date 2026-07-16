@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     database_config_dir: str | None = Field(default=None, alias="TSPILOT_DATABASE_CONFIG_DIR")
     knowledge_base_dir: str | None = Field(default=None, alias="TSPILOT_KNOWLEDGE_BASE_DIR")
 
-    max_iterations: int = 8
+    max_iterations: int = 10
     max_prompt_tokens: int = 12000
     max_history_messages: int = 12
     max_tool_history_items: int = 8

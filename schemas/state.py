@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from schemas.analysis import AnalysisResult
 from schemas.api import Message
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
@@ -28,6 +29,7 @@ class RequestStateModel(BaseModel):
 
     status: Literal["running", "completed", "failed"]
     current_intent: str | None = None
+    intent_profile: dict = Field(default_factory=dict)
     requested_fact_types: list[str] = Field(default_factory=list)
     answer_requirements: list[str] = Field(default_factory=list)
     answer_coverage: dict[str, bool] = Field(default_factory=dict)
@@ -45,6 +47,8 @@ class RequestStateModel(BaseModel):
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
     latest_insight: InsightResult | None = None
     insight_artifacts: dict[str, InsightResult] = Field(default_factory=dict)
+    latest_analysis_id: str | None = None
+    analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None
     forecast_artifacts: dict[str, ForecastResult] = Field(default_factory=dict)
     latest_anomaly: AnomalyResult | None = None
@@ -68,6 +72,7 @@ class ConversationStateModel(BaseModel):
     database_context: DatabaseContext | None = None
     recent_messages: list[Message] = Field(default_factory=list)
     session_summary: str | None = None
+    intent_profile: dict = Field(default_factory=dict)
     todo_list: list[dict] = Field(default_factory=list)
     plan_current_step: int = 0
     planning_complete: bool = False
@@ -76,6 +81,8 @@ class ConversationStateModel(BaseModel):
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
     latest_insight: InsightResult | None = None
     insight_artifacts: dict[str, InsightResult] = Field(default_factory=dict)
+    latest_analysis_id: str | None = None
+    analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None
     forecast_artifacts: dict[str, ForecastResult] = Field(default_factory=dict)
     latest_anomaly: AnomalyResult | None = None

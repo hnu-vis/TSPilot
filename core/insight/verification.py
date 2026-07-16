@@ -1,6 +1,9 @@
 """Verify completed facts against evidence."""
 from __future__ import annotations
 
+from datetime import datetime
+import math
+import re
 import statistics
 
 from core.insight.fact_engine import (
@@ -276,40 +279,93 @@ def _verify_one(
         )
 
     if fact_type == "seasonality":
-        period, autocorrelation = detect_period(values)
-        if period is None:
-            statement = f"{value_field} 在该时间范围内没有明显周期性。"
-            strength = 0.0
-        else:
-            strength = seasonal_strength(values, period)
-            statement = f"{value_field} 呈现约每 {period} 个点重复一次的周期性，强度约为 {strength:.2f}。"
-        return VerifiedFact(
-            fact_id=completed.fact_id,
-            fact_type="seasonality",
-            statement=statement,
-            confidence=max(0.45, min(0.93, max(autocorrelation, strength if period is not None else 0.45))),
-            evidence={
+        seasonality = _time_aware_seasonality(rows, time_field, value_field, indexed, values)
+        if seasonality is None:
+            period, autocorrelation = detect_period(values)
+            if period is None:
+                statement = f"{value_field} 在该时间范围内没有明显周期性。"
+                strength = 0.0
+            else:
+                strength = seasonal_strength(values, period)
+                statement = f"{value_field} 呈现约每 {period} 个点重复一次的周期性，强度约为 {strength:.2f}。"
+            evidence_payload = {
                 "evidence_id": evidence.evidence_id,
                 "period": period,
                 "autocorrelation": round(autocorrelation, 4),
                 "strength": round(strength, 4),
                 "has_seasonality": period is not None and strength > 0.1,
-            },
-            verification_rule="deterministic_autocorrelation_periodicity",
+            }
+            confidence = max(0.45, min(0.93, max(autocorrelation, strength if period is not None else 0.45)))
+            rule = "deterministic_autocorrelation_periodicity"
+        else:
+            has_daily = seasonality["daily"]["has_periodicity"]
+            has_weekly = seasonality["weekly"]["has_periodicity"]
+            if has_daily or has_weekly:
+                parts = []
+                if has_daily:
+                    parts.append(
+                        f"日内周期较明显（小时均值相对振幅 {seasonality['daily']['relative_amplitude']:.2%}，"
+                        f"强度 {seasonality['daily']['strength']:.4f}）"
+                    )
+                if has_weekly:
+                    parts.append(
+                        f"周内周期较明显（星期均值相对振幅 {seasonality['weekly']['relative_amplitude']:.2%}，"
+                        f"强度 {seasonality['weekly']['strength']:.4f}）"
+                    )
+                statement = f"{value_field} 在该时间范围内" + "，".join(parts) + "。"
+            else:
+                statement = (
+                    f"{value_field} 在该时间范围内没有明显每天或每周重复的周期性波动；"
+                    f"日内相对振幅 {seasonality['daily']['relative_amplitude']:.2%}、强度 "
+                    f"{seasonality['daily']['strength']:.4f}，周内相对振幅 "
+                    f"{seasonality['weekly']['relative_amplitude']:.2%}、强度 "
+                    f"{seasonality['weekly']['strength']:.4f}。"
+                )
+            evidence_payload = {
+                "evidence_id": evidence.evidence_id,
+                **seasonality,
+                "has_seasonality": has_daily or has_weekly,
+            }
+            confidence = 0.86 if has_daily or has_weekly else 0.78
+            rule = "deterministic_time_aware_daily_weekly_periodicity"
+        return VerifiedFact(
+            fact_id=completed.fact_id,
+            fact_type="seasonality",
+            statement=statement,
+            confidence=confidence,
+            evidence=evidence_payload,
+            verification_rule=rule,
         )
 
     if fact_type == "proportion":
-        avg_value = statistics.fmean(values)
-        selected = [value for value in values if value >= avg_value]
+        threshold, operator, threshold_source = _threshold_from_focus(completed.focus, completed.statement)
+        if threshold is None:
+            threshold = statistics.fmean(values)
+            operator = ">="
+            threshold_source = "mean_fallback"
+        if operator == ">":
+            selected = [value for value in values if value > threshold]
+            comparator_text = "高于"
+        elif operator == "<":
+            selected = [value for value in values if value < threshold]
+            comparator_text = "低于"
+        elif operator == "<=":
+            selected = [value for value in values if value <= threshold]
+            comparator_text = "低于或等于"
+        else:
+            selected = [value for value in values if value >= threshold]
+            comparator_text = "高于或等于"
         proportion = len(selected) / len(values)
         return VerifiedFact(
             fact_id=completed.fact_id,
             fact_type="proportion",
-            statement=f"{len(selected)}/{len(values)} 个点（{proportion:.1%}）的 {value_field} 高于或等于该区间平均值 {avg_value:.2f}。",
+            statement=f"{len(selected)}/{len(values)} 个点（{proportion:.1%}）的 {value_field} {comparator_text} {threshold:.2f}。",
             confidence=min(0.9, 0.4 + proportion),
             evidence={
                 "evidence_id": evidence.evidence_id,
-                "threshold": round(avg_value, 2),
+                "threshold": round(threshold, 2),
+                "operator": operator,
+                "threshold_source": threshold_source,
                 "count": len(selected),
                 "total": len(values),
                 "proportion": round(proportion, 4),
@@ -318,14 +374,22 @@ def _verify_one(
         )
 
     if fact_type == "categorization":
-        avg_value = statistics.fmean(values)
-        high_count = sum(1 for value in values if value >= avg_value)
-        low_count = len(values) - high_count
-        dominant = "high" if high_count >= low_count else "low"
+        clean_values, lower_bound, upper_bound, outlier_count = _iqr_clean_numeric_values(values)
+        sorted_values = sorted(clean_values or values)
+        q1 = quantile(sorted_values, 0.25)
+        q3 = quantile(sorted_values, 0.75)
+        low_count = sum(1 for value in sorted_values if value <= q1)
+        high_count = sum(1 for value in sorted_values if value >= q3)
+        mid_count = len(sorted_values) - low_count - high_count
+        dominant_counts = {"low": low_count, "middle": mid_count, "high": high_count}
+        dominant = max(dominant_counts, key=dominant_counts.get)
         statement = (
-            f"按是否高于均值 {avg_value:.2f} 分类，{value_field} 中高位点有 {high_count} 个，"
-            f"低位点有 {low_count} 个，整体以{'高位' if dominant == 'high' else '低位'}为主。"
+            f"按四分位阈值分类，{value_field} 低位为 <= {q1:.2f}，中间区间为 "
+            f"{q1:.2f} 到 {q3:.2f}，高位为 >= {q3:.2f}；有效样本中低位 {low_count} 个，"
+            f"中间区间 {mid_count} 个，高位 {high_count} 个。"
         )
+        if outlier_count:
+            statement += f" 另有 {outlier_count} 个 IQR 离群点未用于阈值计算。"
         return VerifiedFact(
             fact_id=completed.fact_id,
             fact_type="categorization",
@@ -333,12 +397,20 @@ def _verify_one(
             confidence=0.78,
             evidence={
                 "evidence_id": evidence.evidence_id,
-                "threshold": round(avg_value, 2),
+                "method": "iqr_cleaned_quartile_buckets",
+                "low_max": round(q1, 2),
+                "middle_min": round(q1, 2),
+                "middle_max": round(q3, 2),
+                "high_min": round(q3, 2),
                 "high_count": high_count,
+                "middle_count": mid_count,
                 "low_count": low_count,
                 "dominant_category": dominant,
+                "effective_count": len(sorted_values),
+                "outlier_count": outlier_count,
+                "outlier_bounds": {"lower": round(lower_bound, 4), "upper": round(upper_bound, 4)},
             },
-            verification_rule="deterministic_bucket_from_mean",
+            verification_rule="deterministic_quartile_bucket_from_points",
         )
 
     return _reject(completed, evidence, "unsupported fact type", "fact_type_support")
@@ -363,3 +435,169 @@ def _linear_slope(xs: list[int], ys: list[float]) -> float:
     numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
     denominator = sum((x - x_mean) ** 2 for x in xs)
     return numerator / denominator if denominator else 0.0
+
+
+def _time_aware_seasonality(
+    rows: list[dict],
+    time_field: str,
+    value_field: str,
+    indexed: list[tuple[int, float]],
+    values: list[float],
+) -> dict | None:
+    timed_values: list[tuple[datetime, float]] = []
+    for index, value in indexed:
+        timestamp = _parse_timestamp(rows[index].get(time_field))
+        if timestamp is not None:
+            timed_values.append((timestamp, value))
+    if len(timed_values) < 24:
+        return None
+
+    clean_values, lower, upper, outlier_count = _iqr_clean_values(timed_values)
+    if len(clean_values) < 24:
+        return None
+    ordered = sorted(clean_values, key=lambda item: item[0])
+    span_days = max((ordered[-1][0] - ordered[0][0]).total_seconds() / 86400.0, 0.0)
+    if span_days < 2:
+        return None
+
+    value_only = [value for _, value in ordered]
+    overall_mean = statistics.fmean(value_only)
+    total_variance = _population_variance(value_only)
+    daily = _periodic_profile(
+        ordered,
+        key_fn=lambda timestamp: timestamp.hour,
+        expected_buckets=24,
+        overall_mean=overall_mean,
+        total_variance=total_variance,
+        min_bucket_count=2,
+        label="hour",
+    )
+    weekly = _periodic_profile(
+        ordered,
+        key_fn=lambda timestamp: timestamp.weekday(),
+        expected_buckets=7,
+        overall_mean=overall_mean,
+        total_variance=total_variance,
+        min_bucket_count=2,
+        label="weekday",
+    )
+    return {
+        "method": "group_by_timestamp_profile",
+        "period": None,
+        "autocorrelation": None,
+        "strength": max(daily["strength"], weekly["strength"]),
+        "daily": daily,
+        "weekly": weekly,
+        "sample_count": len(timed_values),
+        "clean_sample_count": len(ordered),
+        "outlier_count": outlier_count,
+        "outlier_bounds": {"lower": round(lower, 4), "upper": round(upper, 4)},
+    }
+
+
+def _periodic_profile(
+    timed_values: list[tuple[datetime, float]],
+    *,
+    key_fn,
+    expected_buckets: int,
+    overall_mean: float,
+    total_variance: float,
+    min_bucket_count: int,
+    label: str,
+) -> dict:
+    groups: dict[int, list[float]] = {}
+    for timestamp, value in timed_values:
+        groups.setdefault(int(key_fn(timestamp)), []).append(value)
+    bucket_means = {bucket: statistics.fmean(items) for bucket, items in groups.items() if len(items) >= min_bucket_count}
+    bucket_counts = {bucket: len(items) for bucket, items in groups.items()}
+    if not bucket_means:
+        return {
+            "label": label,
+            "bucket_count": 0,
+            "strength": 0.0,
+            "amplitude": 0.0,
+            "relative_amplitude": 0.0,
+            "has_periodicity": False,
+            "bucket_means": {},
+            "bucket_counts": bucket_counts,
+        }
+    means = list(bucket_means.values())
+    amplitude = max(means) - min(means)
+    relative_amplitude = amplitude / abs(overall_mean) if overall_mean else 0.0
+    strength = _population_variance(means) / total_variance if total_variance > 0 else 0.0
+    has_enough_coverage = len(bucket_means) >= max(2, math.ceil(expected_buckets * 0.8))
+    has_periodicity = has_enough_coverage and strength >= 0.08 and relative_amplitude >= 0.05
+    return {
+        "label": label,
+        "bucket_count": len(bucket_means),
+        "strength": round(strength, 6),
+        "amplitude": round(amplitude, 4),
+        "relative_amplitude": round(relative_amplitude, 6),
+        "has_periodicity": has_periodicity,
+        "bucket_means": {str(bucket): round(mean, 4) for bucket, mean in sorted(bucket_means.items())},
+        "bucket_counts": {str(bucket): count for bucket, count in sorted(bucket_counts.items())},
+    }
+
+
+def _iqr_clean_values(timed_values: list[tuple[datetime, float]]) -> tuple[list[tuple[datetime, float]], float, float, int]:
+    values = sorted(value for _, value in timed_values)
+    q1 = quantile(values, 0.25)
+    q3 = quantile(values, 0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return timed_values, q1, q3, 0
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    cleaned = [(timestamp, value) for timestamp, value in timed_values if lower <= value <= upper]
+    return cleaned, lower, upper, len(timed_values) - len(cleaned)
+
+
+def _iqr_clean_numeric_values(values: list[float]) -> tuple[list[float], float, float, int]:
+    sorted_values = sorted(values)
+    q1 = quantile(sorted_values, 0.25)
+    q3 = quantile(sorted_values, 0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return values, q1, q3, 0
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    cleaned = [value for value in values if lower <= value <= upper]
+    return cleaned, lower, upper, len(values) - len(cleaned)
+
+
+def _threshold_from_focus(focus: str | None, statement: str | None) -> tuple[float | None, str, str | None]:
+    text = f"{focus or ''} {statement or ''}"
+    patterns = [
+        (r"(?:高于|大于|超过|above|greater than|over|>)\s*([0-9]+(?:\.[0-9]+)?)", ">", "focus_threshold"),
+        (r"(?:不低于|至少|>=)\s*([0-9]+(?:\.[0-9]+)?)", ">=", "focus_threshold"),
+        (r"(?:低于|小于|below|less than|under|<)\s*([0-9]+(?:\.[0-9]+)?)", "<", "focus_threshold"),
+        (r"(?:不高于|至多|<=)\s*([0-9]+(?:\.[0-9]+)?)", "<=", "focus_threshold"),
+    ]
+    for pattern, operator, source in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1)), operator, source
+    return None, ">=", None
+
+
+def _population_variance(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = statistics.fmean(values)
+    return sum((value - mean) ** 2 for value in values) / len(values)
+
+
+def _parse_timestamp(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None

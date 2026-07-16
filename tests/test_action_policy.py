@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 from runtime.action_policy import validate_action
+from runtime.request_state import apply_observation
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
+from schemas.tool import ToolObservation
+
+
+class _EvidenceSpec:
+    result_target = "evidence"
+
+
+class _AnalysisSpec:
+    result_target = "analysis"
 
 
 def test_policy_does_not_force_todowrite_for_complex_initial_request():
@@ -26,13 +36,13 @@ def test_policy_does_not_force_todowrite_for_complex_initial_request():
         max_iterations=8,
     )
 
-    allowed, reason = validate_action(request_state, "query_database")
+    allowed, reason = validate_action(request_state, "sql_query")
 
     assert allowed is True
     assert reason is None
 
 
-def test_policy_allows_repeated_todowrite_and_todo_mismatch():
+def test_policy_rejects_repeated_todowrite_but_allows_next_action():
     request_state = RequestStateModel(
         request_id="req-policy-todo",
         message="分析趋势和异常。",
@@ -43,7 +53,10 @@ def test_policy_allows_repeated_todowrite_and_todo_mismatch():
         ],
     )
 
-    assert validate_action(request_state, "todowrite") == (True, None)
+    allowed, reason = validate_action(request_state, "todowrite")
+
+    assert allowed is False
+    assert "already exists" in (reason or "")
     assert validate_action(request_state, "forecast") == (True, None)
 
 
@@ -58,3 +71,59 @@ def test_policy_rejects_unknown_action_only():
 
     assert allowed is False
     assert "runtime contract" in (reason or "")
+
+
+def test_runtime_advances_todo_after_successful_actions():
+    request_state = RequestStateModel(
+        request_id="req-policy-progress",
+        message="分析趋势和异常。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询时序数据", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "提炼趋势事实", "task_type": "insight", "status": "pending", "priority": 2},
+            {"content": "检查异常", "task_type": "anomaly", "status": "pending", "priority": 3},
+        ],
+        plan_current_step=1,
+    )
+    evidence = {
+        "evidence_id": "evi_demo",
+        "result_type": "timeseries",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "demo",
+        "summary": "ok",
+        "data": {"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}], "rows": []},
+        "columns": ["timestamp", "value"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        evidence,
+        _EvidenceSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress", "pending"]
+
+    insight = {
+        "analysis_id": "ana_demo",
+        "analysis_goal": "趋势",
+        "code_type": "python_rows_v1",
+        "code_hash": "hash",
+        "input_evidence_id": "evi_demo",
+        "input_row_count": 1,
+        "status": "succeeded",
+        "summary": "ok",
+        "result": {"summary": "ok", "metrics": {}, "details": {}},
+        "diagnostics": {},
+    }
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="insight", success=True, summary="ok", payload={}),
+        insight,
+        _AnalysisSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "completed", "in_progress"]

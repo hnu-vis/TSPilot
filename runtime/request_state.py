@@ -5,7 +5,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from app.settings import Settings
-from core.insight.fact_engine import normalize_requested_fact_types
+from core.intent import build_intent_profile_fallback
 from runtime.artifacts import persist_json_artifact
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
@@ -32,11 +32,12 @@ def normalize_chat_request(request: ChatRequest) -> ChatRequest:
 def build_request_state(request: ChatRequest, settings: Settings) -> RequestStateModel:
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     conversation_id = request.conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
-    requested_fact_types = _infer_requested_fact_types(request.message)
+    intent_profile = build_intent_profile_fallback(request.message)
+    requested_fact_types = list(intent_profile.get("requested_fact_types") or [])
     answer_requirements = (
         ["conclusion"]
         if request.database_context is None
-        else _infer_answer_requirements(request.message)
+        else list(intent_profile.get("required_outputs") or ["conclusion"])
     )
     focus = request.message
     return RequestStateModel(
@@ -51,6 +52,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         history=request.history,
         status="running",
         current_intent="chat_analysis",
+        intent_profile=intent_profile,
         requested_fact_types=requested_fact_types,
         answer_requirements=answer_requirements,
         answer_coverage={requirement: False for requirement in answer_requirements},
@@ -75,6 +77,8 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         database_evidence_artifacts={},
         latest_insight=None,
         insight_artifacts={},
+        latest_analysis_id=None,
+        analysis_artifacts={},
         latest_forecast=None,
         forecast_artifacts={},
         latest_anomaly=None,
@@ -98,6 +102,7 @@ def build_conversation_state(request: ChatRequest, conversation_id: str) -> Conv
         database_context=request.database_context,
         recent_messages=request.history,
         session_summary=None,
+        intent_profile={},
         todo_list=[],
         plan_current_step=0,
         planning_complete=False,
@@ -106,6 +111,8 @@ def build_conversation_state(request: ChatRequest, conversation_id: str) -> Conv
         database_evidence_artifacts={},
         latest_insight=None,
         insight_artifacts={},
+        latest_analysis_id=None,
+        analysis_artifacts={},
         latest_forecast=None,
         forecast_artifacts={},
         latest_anomaly=None,
@@ -162,10 +169,13 @@ def apply_observation(
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name)
 
 
 def enrich_observation_payload(
@@ -181,7 +191,12 @@ def enrich_observation_payload(
         if request_state.latest_database_evidence.evidence_id == full_payload.get("evidence_id"):
             payload = request_state.latest_database_evidence.model_dump(mode="json")
     elif tool_spec.result_target == "analysis":
-        if "insight_id" in full_payload and request_state.latest_insight is not None:
+        if "analysis_id" in full_payload:
+            analysis_id = str(full_payload.get("analysis_id"))
+            analysis = request_state.analysis_artifacts.get(analysis_id)
+            if analysis is not None:
+                payload = _build_prompt_safe_analysis(analysis)
+        elif "insight_id" in full_payload and request_state.latest_insight is not None:
             payload = request_state.latest_insight.model_dump(mode="json")
         elif "forecast_id" in full_payload and request_state.latest_forecast is not None:
             payload = request_state.latest_forecast.model_dump(mode="json")
@@ -236,7 +251,7 @@ def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str
 def _task_type_for_tool(tool_name: str) -> str | None:
     mapping = {
         "todowrite": "plan",
-        "query_database": "query",
+        "sql_query": "query",
         "insight": "insight",
         "anomaly": "anomaly",
         "forecast": "forecast",
@@ -362,6 +377,29 @@ def _build_prompt_safe_insight(insight):
     return InsightResult.model_validate(payload)
 
 
+def _build_prompt_safe_analysis(analysis):
+    from schemas.analysis import AnalysisResult
+
+    payload = analysis.model_dump(mode="json")
+    result = dict(payload.get("result") or {})
+    if isinstance(result.get("details"), list):
+        result["details"] = _sample_edges([item for item in result["details"] if isinstance(item, dict)], limit=12)
+    if isinstance(result.get("rows"), list):
+        result["rows"] = _sample_edges([item for item in result["rows"] if isinstance(item, dict)], limit=12)
+    payload["result"] = result
+    diagnostics = dict(payload.get("diagnostics") or {})
+    diagnostics["artifact_kind"] = "analysis_result"
+    diagnostics["artifact_ref"] = f"analysis:{analysis.analysis_id}"
+    diagnostics["snapshot_ref"] = persist_json_artifact(
+        artifact_id=analysis.analysis_id,
+        artifact_kind="analysis_result",
+        payload=analysis.model_dump(mode="json"),
+        subdir="analysis_snapshots",
+    )
+    payload["diagnostics"] = diagnostics
+    return AnalysisResult.model_validate(payload).model_dump(mode="json")
+
+
 def _build_prompt_safe_forecast(forecast):
     from schemas.timeseries import ForecastResult
 
@@ -410,6 +448,18 @@ def _build_prompt_safe_anomaly(anomaly):
 
 
 def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict) -> None:
+    if "analysis_id" in full_payload:
+        from schemas.analysis import AnalysisResult
+
+        analysis = AnalysisResult.model_validate(full_payload)
+        request_state.analysis_artifacts[analysis.analysis_id] = analysis
+        request_state.latest_analysis_id = analysis.analysis_id
+        request_state.answer_coverage["analysis"] = True
+        for requirement in list(request_state.answer_coverage):
+            if requirement not in {"plan", "forecast", "anomaly"}:
+                request_state.answer_coverage[requirement] = True
+        return
+
     if "insight_id" in full_payload:
         from schemas.insight import InsightResult
 
@@ -458,48 +508,3 @@ def _apply_presentation_payload(request_state: RequestStateModel, full_payload: 
     request_state.final_answer_draft = FinalAnswer.model_validate(full_payload)
     request_state.answer_coverage["conclusion"] = True
 
-
-def _infer_answer_requirements(message: str) -> list[str]:
-    normalized = message.lower()
-    requirements = ["conclusion"]
-    if any(token in normalized for token in ["周期", "季节性", "重复", "seasonality", "seasonal", "periodic", "cycle"]):
-        requirements.append("seasonality")
-    elif any(token in normalized for token in ["趋势", "走势", "trend", "movement", "upward", "downward"]):
-        requirements.append("trend")
-    else:
-        requirements.append("trend")
-    if any(token in normalized for token in ["anomaly", "abnormal", "异常", "尖峰", "离群", "异常点", "outlier", "spike"]):
-        requirements.append("anomaly")
-    if any(token in normalized for token in ["forecast", "predict", "prediction", "预测", "预估"]):
-        requirements.append("forecast")
-    if any(token in normalized for token in ["plan", "规划", "步骤", "todo"]):
-        requirements.append("plan")
-    deduped: list[str] = []
-    for requirement in requirements:
-        if requirement not in deduped:
-            deduped.append(requirement)
-    return deduped
-
-
-def _infer_requested_fact_types(message: str) -> list[str]:
-    normalized = message.lower()
-    requested: list[str] = []
-    keyword_map = [
-        ("aggregation", ("平均", "均值", "总和", "sum", "count", "aggregate", "aggregation", "统计")),
-        ("extreme", ("最高", "最低", "最大", "最小", "peak", "trough", "extreme", "extrema", "极值")),
-        ("trend", ("趋势", "走势", "trend", "movement", "upward", "downward")),
-        ("difference", ("差值", "差异", "变化", "变化幅度", "change", "difference", "delta", "compare", "comparison")),
-        ("rank", ("排名", "排行", "top", "bottom", "rank")),
-        ("distribution", ("分布", "中位数", "四分位", "distribution", "median", "quartile")),
-        ("association", ("相关", "关联", "correlation", "association", "同步")),
-        ("outlier", ("异常", "离群", "尖峰", "异常点", "outlier", "anomaly", "spike", "dip")),
-        ("seasonality", ("周期", "季节性", "重复", "seasonality", "seasonal", "periodic", "cycle")),
-        ("proportion", ("占比", "比例", "percent", "percentage", "ratio", "share")),
-        ("categorization", ("分类", "分桶", "bucket", "categorization", "category")),
-    ]
-    for fact_type, keywords in keyword_map:
-        if any(keyword in normalized for keyword in keywords):
-            requested.append(fact_type)
-    if not requested:
-        requested = ["trend", "difference", "extreme"]
-    return normalize_requested_fact_types(requested)

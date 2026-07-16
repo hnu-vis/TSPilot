@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .connector import QueryResult
 from .repair import classify_query_error, should_retry_query
+from core.intent import AGGREGATION_FACT_TYPES, build_intent_profile_fallback
 from schemas.database import DatabaseEvidence
 
 
@@ -34,26 +35,10 @@ async def execute_range_query(connector, query: str, *, start, end, step: str) -
 
 def infer_evidence_family(message: str) -> str:
     normalized = message.lower()
-    timeseries_priority_keywords = (
-        "周期",
-        "周期性",
-        "每天",
-        "每周",
-        "seasonality",
-        "daily",
-        "weekly",
-        "趋势",
-        "走势",
-        "trend",
-        "预测",
-        "forecast",
-        "异常",
-        "anomaly",
-        "原始时间序列",
-        "raw timeseries",
-    )
-    if any(keyword in normalized for keyword in timeseries_priority_keywords):
-        return "timeseries"
+    intent_profile = build_intent_profile_fallback(message)
+    fact_types = set(intent_profile.get("requested_fact_types") or [])
+    has_statistics_request = bool(fact_types & AGGREGATION_FACT_TYPES)
+    has_timeseries_request = bool(fact_types & {"seasonality", "trend", "outlier", "forecast", "association", "difference"})
 
     metric_keywords = ("metric list", "metrics", "available metrics", "有哪些指标", "有哪些 metric")
     if any(keyword in normalized for keyword in metric_keywords):
@@ -72,33 +57,11 @@ def infer_evidence_family(message: str) -> str:
     if any(keyword in normalized for keyword in schema_keywords):
         return "schema"
 
-    statistics_keywords = (
-        "average",
-        "avg",
-        "mean",
-        "max",
-        "min",
-        "sum",
-        "count",
-        "均值",
-        "平均",
-        "最大",
-        "最小",
-        "总和",
-    )
-    negated_statistics_patterns = (
-        "max_points",
-        "不要使用 max",
-        "不要用 max",
-        "avoid max",
-        "avoid aggregation",
-        "avoid aggregations",
-        "without max",
-    )
-    if any(keyword in normalized for keyword in statistics_keywords) and not any(
-        pattern in normalized for pattern in negated_statistics_patterns
-    ):
+    if has_statistics_request:
         return "statistics"
+
+    if has_timeseries_request:
+        return "timeseries"
 
     table_keywords = ("group by", "table", "rows", "明细", "列表")
     if any(keyword in normalized for keyword in table_keywords):
@@ -127,6 +90,7 @@ def normalize_query_result(
     rows = list(getattr(result, "rows", []) or [])
     columns = _normalize_result_columns(list(getattr(result, "columns", []) or []))
     rows = [_normalize_result_row(dict(row)) for row in rows]
+    result_diagnostics = _result_fidelity_diagnostics(result, len(rows))
     if not rows:
         return DatabaseEvidence(
             evidence_id=f"evi_{database_id}_empty",
@@ -138,7 +102,7 @@ def normalize_query_result(
             data={"rows": []},
             columns=columns,
             metadata={"database_type": database_type},
-            diagnostics={},
+            diagnostics=result_diagnostics,
         )
 
     if "timestamp" in columns and "value" in columns:
@@ -187,7 +151,11 @@ def normalize_query_result(
                     },
                     columns=columns,
                     metadata={"database_type": database_type},
-                    diagnostics={"series_count": len(labels), "series_dimension": category},
+                    diagnostics={
+                        **result_diagnostics,
+                        "series_count": len(labels),
+                        "series_dimension": category,
+                    },
                 )
         points = [
             {"timestamp": str(row["timestamp"]), "value": float(row["value"])}
@@ -210,7 +178,7 @@ def normalize_query_result(
             },
             columns=["timestamp", "value"],
             metadata={"database_type": database_type},
-            diagnostics={},
+            diagnostics=result_diagnostics,
         )
 
     numeric_columns = [
@@ -262,7 +230,11 @@ def normalize_query_result(
             },
             columns=["timestamp", *numeric_columns],
             metadata={"database_type": database_type},
-            diagnostics={"series_count": len(numeric_columns), "selected_fields": numeric_columns},
+            diagnostics={
+                **result_diagnostics,
+                "series_count": len(numeric_columns),
+                "selected_fields": numeric_columns,
+            },
         )
 
     return DatabaseEvidence(
@@ -275,8 +247,24 @@ def normalize_query_result(
         data={"rows": rows},
         columns=columns,
         metadata={"database_type": database_type},
-        diagnostics={},
+        diagnostics=result_diagnostics,
     )
+
+
+def _result_fidelity_diagnostics(result, materialized_row_count: int) -> dict:
+    row_count = getattr(result, "row_count", None)
+    truncated = bool(getattr(result, "truncated", False))
+    total_rows = row_count if isinstance(row_count, int) else materialized_row_count
+    return {
+        "row_count_total": total_rows,
+        "row_count_materialized": materialized_row_count,
+        "is_full_fidelity": not truncated and materialized_row_count == total_rows,
+        "truncated": truncated,
+        "sampling_policy": {
+            "analysis_input": "query_result_rows",
+            "prompt_preview": "runtime_prompt_safe_sampling",
+        },
+    }
 
 
 def _normalize_result_columns(columns: list[str]) -> list[str]:

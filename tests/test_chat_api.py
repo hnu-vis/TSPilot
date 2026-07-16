@@ -43,7 +43,7 @@ def test_chat_json_path_returns_final_answer():
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
-    assert payload["used_tools"] == ["query_database", "insight", "format_answer"]
+    assert payload["used_tools"] == ["sql_query", "insight", "format_answer"]
     assert payload["answer"]["summary"]
 
 
@@ -127,7 +127,7 @@ def test_chat_json_path_supports_complex_multi_step_react():
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == [
         "todowrite",
-        "query_database",
+        "sql_query",
         "insight",
         "anomaly",
         "forecast",
@@ -135,7 +135,7 @@ def test_chat_json_path_supports_complex_multi_step_react():
     ]
     assert payload["answer"]["summary"]
     section_types = [section["section_type"] for section in payload["answer"]["sections"]]
-    assert "facts" in section_types
+    assert "analysis" in section_types
     assert "anomaly" in section_types
     assert "forecast" in section_types
     reference_types = [reference["source_type"] for reference in payload["answer"]["references"]]
@@ -174,7 +174,7 @@ def test_chat_sse_path_supports_complex_multi_step_react():
     assert body.count("event: tool_call") == 6
     assert body.count("event: tool_result") == 6
     assert '"tool": "todowrite"' in body
-    assert '"tool": "query_database"' in body
+    assert '"tool": "sql_query"' in body
     assert '"tool": "insight"' in body
     assert '"tool": "anomaly"' in body
     assert '"tool": "forecast"' in body
@@ -189,7 +189,7 @@ def test_chat_sse_path_supports_complex_multi_step_react():
     assert "event: observation" not in body
 
 
-def test_runtime_allows_explicit_todo_updates():
+def test_runtime_advances_plan_without_repeated_todowrite():
     client = _build_client(RepeatingTodoLLM(), max_iterations=8)
     response = client.post(
         "/api/v1/chat",
@@ -209,13 +209,15 @@ def test_runtime_allows_explicit_todo_updates():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "query_database", "insight", "todowrite", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly", "format_answer"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     todo_updates = [
         event for event in observations
         if event["payload"]["tool_name"] == "todowrite" and event["payload"]["success"] is True
     ]
-    assert len(todo_updates) == 2
+    assert len(todo_updates) == 1
+    final_todo = todo_updates[-1]["payload"]["payload"]["todos"]
+    assert final_todo[0]["status"] == "in_progress"
 
 
 def test_tool_failure_returns_observation_and_model_can_recover():
@@ -238,7 +240,7 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "forecast", "query_database", "insight", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "insight", "anomaly", "format_answer"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     failures = [
         event for event in observations
