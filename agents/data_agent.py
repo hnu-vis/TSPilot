@@ -24,36 +24,53 @@ class DataAgent(BaseAgent):
     ) -> ReActTurn:
         system_prompt = self._prompt_builder.build_system_prompt()
         user_prompt = self._prompt_builder.build_user_prompt(request_state, conversation_state)
-        response = await self._llm.ainvoke(
+        content = await self._invoke_model(
             [
                 ("system", system_prompt),
                 ("user", user_prompt),
             ]
         )
+        try:
+            return self._parse_turn(content)
+        except ValueError as first_error:
+            repaired_content = await self._invoke_model(
+                [
+                    ("system", system_prompt),
+                    ("user", user_prompt),
+                    ("assistant", content),
+                    (
+                        "user",
+                        "Your previous response violated the ReAct output contract. "
+                        "Return exactly one JSON object and nothing else. "
+                        "The JSON object must use this schema: "
+                        "{\"thought\": str, \"action\": str, \"action_input\": object}. "
+                        f"Parser error: {first_error}",
+                    ),
+                ]
+            )
+            try:
+                return self._parse_turn(repaired_content)
+            except ValueError as second_error:
+                raise ValueError(
+                    f"Model failed to produce exactly one valid ReAct JSON object after repair. "
+                    f"first_error={first_error}; second_error={second_error}"
+                ) from second_error
+
+    async def _invoke_model(self, messages) -> str:
+        response = await self._llm.ainvoke(messages)
         content = getattr(response, "content", response)
         if isinstance(content, list):
             content = "".join(
                 item.get("text", "") if isinstance(item, dict) else str(item)
                 for item in content
             )
-        return self._parse_turn(str(content))
+        return str(content)
 
     def _parse_turn(self, content: str) -> ReActTurn:
         stripped = content.strip()
-        try:
-            decoded = json.loads(stripped)
-        except json.JSONDecodeError:
-            decoded = None
-
+        decoded = self._decode_json_turn(stripped)
         if isinstance(decoded, dict):
-            action = str(decoded.get("action", "")).strip()
-            action_input = decoded.get("action_input")
-            if not action:
-                raise ValueError(f"Structured model output was missing 'action': {content}")
-            if not isinstance(action_input, dict):
-                raise ValueError(f"Structured model output must include object 'action_input': {content}")
-            thought = str(decoded.get("thought", "")).strip()
-            return ReActTurn(thought=thought, action=action, action_input=action_input)
+            return self._turn_from_dict(decoded, content)
 
         patterns = [
             re.compile(
@@ -84,4 +101,28 @@ class DataAgent(BaseAgent):
             ) from exc
         if not isinstance(action_input, dict):
             raise ValueError("Action Input must decode to a JSON object.")
+        return ReActTurn(thought=thought, action=action, action_input=action_input)
+
+    def _decode_json_turn(self, stripped: str) -> dict | None:
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            if stripped.startswith("{"):
+                raise ValueError(
+                    "Model output must be exactly one complete JSON object; "
+                    "multiple JSON objects, trailing text, or truncated JSON are not allowed."
+                ) from exc
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded
+        return None
+
+    def _turn_from_dict(self, decoded: dict, original_content: str) -> ReActTurn:
+        action = str(decoded.get("action", "")).strip()
+        action_input = decoded.get("action_input")
+        if not action:
+            raise ValueError(f"Structured model output was missing 'action': {original_content}")
+        if not isinstance(action_input, dict):
+            raise ValueError(f"Structured model output must include object 'action_input': {original_content}")
+        thought = str(decoded.get("thought", "")).strip()
         return ReActTurn(thought=thought, action=action, action_input=action_input)

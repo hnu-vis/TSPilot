@@ -62,6 +62,9 @@ def test_prompt_builder_summarizes_heavy_context():
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
 
+    assert any(action["action"] == "todowrite" for action in context["available_actions"])
+    assert context["execution_state"]["artifacts"]["has_database_evidence"] is True
+    assert context["execution_state"]["last_successful_tool"] == "query_database"
     assert len(context["latest_database_evidence"]["data"]["points"]) <= 8
     assert context["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
     assert "chart" not in context["visualizations"][0]

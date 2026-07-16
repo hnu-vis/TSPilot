@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.server import app
 from app.settings import get_settings
-from tests.fakes import ComplexReActLLM, FakeLLM, RepeatingTodoLLM, TodoScopeLLM
+from tests.fakes import CasualLLM, ComplexReActLLM, FakeLLM, RepeatingTodoLLM, TodoScopeLLM
 
 
 def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
@@ -73,6 +73,35 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: thought" not in body
     assert "event: action" not in body
     assert "event: observation" not in body
+
+
+def test_chat_json_path_can_answer_without_database_context():
+    client = _build_client(CasualLLM())
+    response = client.post("/api/v1/chat", json={"message": "你好"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["response_kind"] == "final_answer"
+    assert payload["used_tools"] == ["format_answer"]
+    assert "TSPilot" in payload["answer"]["summary"]
+    assert payload["answer"]["title"] is None
+    assert payload["answer"]["sections"] == []
+    assert payload["answer"]["references"] == []
+
+
+def test_chat_sse_path_can_answer_without_database_context():
+    client = _build_client(CasualLLM())
+    with client.stream(
+        "POST",
+        "/api/v1/chat",
+        json={"message": "你好", "stream": True},
+    ) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: final_answer" in body
+    assert '"tool": "format_answer"' in body
+    assert "TSPilot" in body
 
 
 def test_chat_json_path_supports_complex_multi_step_react():
@@ -160,7 +189,7 @@ def test_chat_sse_path_supports_complex_multi_step_react():
     assert "event: observation" not in body
 
 
-def test_runtime_rejects_redundant_todowrite_and_recovers():
+def test_runtime_allows_explicit_todo_updates():
     client = _build_client(RepeatingTodoLLM(), max_iterations=8)
     response = client.post(
         "/api/v1/chat",
@@ -180,18 +209,17 @@ def test_runtime_rejects_redundant_todowrite_and_recovers():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "query_database", "insight", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "query_database", "insight", "todowrite", "anomaly", "format_answer"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
-    rejected = [
+    todo_updates = [
         event for event in observations
-        if event["payload"]["tool_name"] == "todowrite" and event["payload"]["success"] is False
+        if event["payload"]["tool_name"] == "todowrite" and event["payload"]["success"] is True
     ]
-    assert rejected
-    assert "does not match the current state" in rejected[-1]["payload"]["summary"]
+    assert len(todo_updates) == 2
 
 
-def test_runtime_enforces_current_todo_step_before_forecast():
-    client = _build_client(TodoScopeLLM(), max_iterations=4)
+def test_tool_failure_returns_observation_and_model_can_recover():
+    client = _build_client(TodoScopeLLM(), max_iterations=6)
     response = client.post(
         "/api/v1/chat",
         json={
@@ -209,10 +237,12 @@ def test_runtime_enforces_current_todo_step_before_forecast():
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["used_tools"] == ["todowrite", "forecast", "query_database", "insight", "anomaly", "format_answer"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
-    mismatches = [
+    failures = [
         event for event in observations
         if event["payload"]["tool_name"] == "forecast" and event["payload"]["success"] is False
     ]
-    assert mismatches
-    assert "current todo step" in mismatches[-1]["payload"]["summary"]
+    assert failures
+    assert "Forecast requires database_evidence" in failures[-1]["payload"]["summary"]

@@ -12,6 +12,7 @@ from schemas.api import ChatResponse
 from schemas.state import ConversationStateModel, RequestStateModel
 from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
+from schemas.tool import ToolObservation
 
 
 class ReActLoop:
@@ -80,9 +81,9 @@ class ReActLoop:
                 },
             )
 
-            allowed, reason, policy = validate_action(request_state, turn.action)
+            allowed, reason = validate_action(request_state, turn.action)
             if not allowed:
-                observation = build_policy_observation(request_state, turn.action, policy, reason or "Invalid action.")
+                observation = build_policy_observation(request_state, turn.action, reason or "Invalid action.")
                 request_state.observations.append(observation)
                 yield append_trace(
                     request_state,
@@ -100,14 +101,31 @@ class ReActLoop:
                     conversation_state,
                 )
             except Exception as exc:
-                request_state.status = "failed"
+                message = f"Tool '{turn.action}' failed: {exc}"
                 request_state.errors.append({"stage": turn.action, "message": str(exc)})
+                observation = ToolObservation(
+                    tool_name=turn.action,
+                    success=False,
+                    summary=message,
+                    payload={
+                        "error": str(exc),
+                        "recovery_hint": (
+                            "Use the current context and this failure observation to choose the next best action. "
+                            "You may correct the tool input, call a prerequisite tool, update todos, or answer with caveats."
+                        ),
+                    },
+                    error=message,
+                    payload_truncated=False,
+                    payload_ref=None,
+                )
+                request_state.observations.append(observation)
                 yield append_trace(
                     request_state,
-                    "error",
-                    {"message": f"Tool '{turn.action}' failed: {exc}"},
+                    "observation",
+                    observation.model_dump(mode="json"),
                 )
-                return
+                sync_from_request(request_state, conversation_state)
+                continue
             apply_observation(
                 request_state,
                 execution_result.observation,
@@ -299,6 +317,16 @@ class ReActLoop:
         if "todos" in visible_payload:
             todos = visible_payload.get("todos", [])
             preview["todo_total"] = len(todos)
+            preview["todos"] = [
+                {
+                    "content": todo.get("content"),
+                    "task_type": todo.get("task_type"),
+                    "status": todo.get("status"),
+                    "priority": todo.get("priority"),
+                }
+                for todo in todos[:12]
+                if isinstance(todo, dict)
+            ]
             preview["in_progress"] = next(
                 (todo.get("content") for todo in todos if todo.get("status") == "in_progress"),
                 None,

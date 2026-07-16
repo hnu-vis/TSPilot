@@ -10,7 +10,7 @@ from tools.base import BaseTool
 
 
 class InsightInput(BaseModel):
-    database_evidence: DatabaseEvidence | None = None
+    database_evidence: DatabaseEvidence | dict | None = None
     requested_fact_types: list[str] = Field(default_factory=list)
     focus: str | None = None
     constraints: dict | None = None
@@ -44,4 +44,9 @@ def _resolve_database_evidence(database_evidence, request_state):
         if latest is None:
             return None
         return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
+    if isinstance(database_evidence, dict):
+        evidence_id = database_evidence.get("evidence_id")
+        if evidence_id:
+            return request_state.database_evidence_artifacts.get(evidence_id) or DatabaseEvidence.model_validate(database_evidence)
+        return DatabaseEvidence.model_validate(database_evidence)
     return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)

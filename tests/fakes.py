@@ -82,6 +82,28 @@ class FakeLLM:
         )
 
 
+class CasualLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        user_prompt = messages[-1][1]
+        context_json = user_prompt.split("Context JSON:\n", 1)[1]
+        context = json.loads(context_json)
+        return _turn(
+            "This is a conversational request without a datasource, so I should answer directly.",
+            "format_answer",
+            {
+                "summary_goal": "Answer the user's conversational request.",
+                "direct_answer": "你好！我是 TSPilot，可以帮你查询和分析时序数据。你可以选择数据库后直接问趋势、异常、预测或指标解释。",
+                "include_fact_ids": [],
+                "include_visualization_ids": [],
+                "section_plan": ["summary"],
+            },
+        )
+
+
 class ComplexReActLLM:
     def __init__(self):
         self.calls = 0
@@ -242,18 +264,26 @@ class RepeatingTodoLLM:
                 },
             )
 
-        if latest_observation and latest_observation["tool_name"] == "todowrite" and latest_observation["success"] is False:
+        if latest_observation and latest_observation["tool_name"] == "todowrite" and latest_observation["success"] is True:
             return _turn(
-                "Planning is already available, so I should do anomaly detection next.",
+                "The plan update succeeded, so I should do anomaly detection next.",
                 "anomaly",
                 {"constraints": {"zscore_threshold": 2.5}},
             )
 
         if context.get("latest_anomaly") is None:
             return _turn(
-                "I want to rewrite the plan again.",
+                "I should explicitly update the todo plan before continuing.",
                 "todowrite",
-                {"message": "重复规划。", "todos": [{"content": "重复规划", "task_type": "plan", "status": "in_progress", "priority": 1}]},
+                {
+                    "message": "更新计划状态。",
+                    "todos": [
+                        {"content": "查询时序数据", "task_type": "query", "status": "completed", "priority": 1},
+                        {"content": "分析趋势", "task_type": "insight", "status": "completed", "priority": 2},
+                        {"content": "检查异常", "task_type": "anomaly", "status": "in_progress", "priority": 3},
+                        {"content": "汇总结论", "task_type": "answer", "status": "pending", "priority": 4},
+                    ],
+                },
             )
 
         return _turn(
@@ -305,12 +335,61 @@ class TodoScopeLLM:
         latest_observation = latest_observation_summaries[-1] if latest_observation_summaries else None
         if latest_observation and latest_observation["tool_name"] == "forecast" and latest_observation["success"] is False:
             return _turn(
-                "The runtime rejected forecast because the current step is insight, so I should follow the plan.",
+                "Forecast failed because evidence is missing, so I should query the database next.",
+                "query_database",
+                {
+                    "message": context["message"],
+                    "database_context": context["database_context"],
+                    "time_range": context.get("time_range"),
+                    "constraints": context.get("constraints", {}),
+                },
+            )
+
+        if latest_observation and latest_observation["tool_name"] == "format_answer" and latest_observation["success"] is False:
+            return _turn(
+                "The answer assembly reported missing anomaly output, so I should run anomaly detection.",
+                "anomaly",
+                {
+                    "database_evidence": context.get("latest_database_evidence"),
+                    "constraints": {"zscore_threshold": 2.5},
+                },
+            )
+
+        if context.get("latest_database_evidence") is not None and context.get("latest_insight") is None:
+            return _turn(
+                "I have evidence now and should produce facts.",
                 "insight",
                 {
                     "database_evidence": context.get("latest_database_evidence"),
                     "requested_fact_types": ["trend"],
                     "focus": "趋势",
+                },
+            )
+
+        if context.get("latest_insight") is not None and context.get("latest_anomaly") is None:
+            return _turn(
+                "The user asked for anomalies, so I should run anomaly detection before answering.",
+                "anomaly",
+                {
+                    "database_evidence": context.get("latest_database_evidence"),
+                    "constraints": {"zscore_threshold": 2.5},
+                },
+            )
+
+        if context.get("latest_insight") is not None and context.get("latest_anomaly") is not None:
+            return _turn(
+                "I have enough facts to answer.",
+                "format_answer",
+                {
+                    "summary_goal": context["message"],
+                    "include_fact_ids": [
+                        fact["fact_id"]
+                        for fact in context.get("latest_insight", {}).get("verified_facts", [])
+                    ],
+                    "include_visualization_ids": [
+                        viz["visualization_id"] for viz in context.get("visualizations", [])
+                    ],
+                    "section_plan": ["summary", "facts", "anomaly"],
                 },
             )
 

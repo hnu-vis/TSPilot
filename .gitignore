@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 
+node_modules/
 
 .pytest_cache/
 .mypy_cache/

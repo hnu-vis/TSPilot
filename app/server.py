@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.settings import get_settings
 from app.routes.chat import router as chat_router
+from app.routes.resources import router as resources_router
 
 
 def create_app() -> FastAPI:
@@ -24,6 +25,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(chat_router)
+    app.include_router(resources_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

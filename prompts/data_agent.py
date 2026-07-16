@@ -16,6 +16,7 @@ class DataAgentPromptBuilder:
             "Do not pre-commit a full workflow. Do not explain multiple future steps.\n"
             "Observation is runtime-owned and must never be emitted.\n"
             "Respond with exactly one JSON object and nothing else.\n"
+            "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
             "Output schema: "
             "{\"thought\": str, \"action\": str, \"action_input\": object}.\n"
             "Allowed actions: todowrite, query_database, insight, forecast, anomaly, rag, skill, format_answer.\n"
@@ -24,18 +25,20 @@ class DataAgentPromptBuilder:
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
-            "Do not repeat todowrite when a plan already exists and a concrete data or analysis action is available.\n"
-            "When a todo plan exists, choose the next action that advances the current in_progress todo step.\n"
-            "Do not expand the workflow beyond the current plan unless the runtime observation explicitly shows the plan is no longer workable.\n"
+            "Use todowrite again whenever you need to update todo statuses after a successful step, move the in_progress step, or revise a stale plan.\n"
+            "When a todo plan exists and a non-todowrite tool succeeds, prefer an explicit todowrite update before continuing if the todo status is now stale.\n"
+            "Todo is model-maintained process state for visibility, not a runtime scheduler. You may revise or skip stale todo items when evidence shows the plan should change.\n"
             "Tool contracts:\n"
-            "- todowrite: create or update a plan. Use only when planning is missing or genuinely needs restructuring.\n"
+            "- todowrite: create or update the full todo plan and statuses. Use for initial planning and explicit progress updates.\n"
             "- query_database: retrieve evidence from the selected datasource. It returns evidence only, not conclusions.\n"
             "- insight: convert existing evidence into verified facts.\n"
             "- anomaly: detect anomalies from existing time-series evidence only.\n"
             "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
             "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
-            "- format_answer: assemble the final answer from verified outputs already available in state.\n"
+            "- format_answer: assemble the final answer from verified outputs already available in state. "
+            "When no datasource is selected and the user asks a greeting, capability question, clarification, or other non-data question, use format_answer directly and provide a concise direct_answer. "
+            "When the user asks a data-analysis question without a datasource, use format_answer to explain that a database/context is needed and suggest selecting one.\n"
             "Choose tools only from their current-state preconditions. Do not call a tool just because it appears in the user request.\n"
             "Action Input must be valid JSON.\n"
             "Use the exact action-input field names defined here.\n"
@@ -43,9 +46,11 @@ class DataAgentPromptBuilder:
             "\"requested_fact_types\": list[str], \"focus\": str|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
             "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int}.\n"
-            "The todo output should represent a compact analysis plan with one current in_progress step and planning_complete=false until the plan is finished.\n"
+            "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
             "For query_database, always include message, database_context, time_range, and constraints when available.\n"
+            "For format_answer, use: {\"summary_goal\": str, \"direct_answer\": str|null, "
+            "\"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
             "Do not output markdown fences."
         )
 
@@ -56,6 +61,8 @@ class DataAgentPromptBuilder:
     ) -> dict:
         return {
             "message": request_state.message,
+            "available_actions": self._available_actions(),
+            "execution_state": self._execution_state(request_state),
             "database_context": (
                 request_state.database_context.model_dump(mode="json")
                 if request_state.database_context
@@ -106,12 +113,93 @@ class DataAgentPromptBuilder:
                     "tool_name": observation.tool_name,
                     "success": observation.success,
                     "summary": observation.summary,
+                    "error": observation.error,
+                    "payload": self._summarize_observation_payload(observation.payload),
                 }
                 for observation in request_state.observations[-4:]
             ],
             "recent_messages": [message.model_dump(mode="json") for message in conversation_state.recent_messages],
             "recent_todo_summary": conversation_state.recent_todo_summary,
             "prompt_context_summary": request_state.prompt_context_summary,
+        }
+
+    def _available_actions(self) -> list[dict]:
+        return [
+            {
+                "action": "todowrite",
+                "use_when": "Create the plan, update completed/in_progress/pending statuses, or revise stale plan state.",
+                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary",
+            },
+            {
+                "action": "query_database",
+                "use_when": "Database evidence is missing or the existing evidence does not cover the user's data need.",
+                "input": "message, database_context, time_range, constraints",
+            },
+            {
+                "action": "insight",
+                "use_when": "Evidence is available and the user needs grounded facts such as trend, seasonality, extrema, distribution, or outliers.",
+                "input": "database_evidence, requested_fact_types, focus, constraints",
+            },
+            {
+                "action": "anomaly",
+                "use_when": "Time-series evidence is available and the user specifically needs anomaly/spike/outlier detection.",
+                "input": "database_evidence, constraints",
+            },
+            {
+                "action": "forecast",
+                "use_when": "Time-series evidence is available and the user specifically asks for prediction or forecast.",
+                "input": "database_evidence, horizon, constraints",
+            },
+            {
+                "action": "rag",
+                "use_when": "The user explicitly needs external or knowledge-base retrieval beyond database evidence.",
+                "input": "query, filters",
+            },
+            {
+                "action": "skill",
+                "use_when": "The user explicitly asks for a named packaged workflow or skill.",
+                "input": "skill_name, parameters",
+            },
+            {
+                "action": "format_answer",
+                "use_when": "Enough evidence-backed outputs are available, or the request is conversational / cannot proceed without more context.",
+                "input": "summary_goal, direct_answer, include_fact_ids, include_visualization_ids, section_plan",
+            },
+        ]
+
+    def _execution_state(self, request_state: RequestStateModel) -> dict:
+        last_success = next((item for item in reversed(request_state.observations) if item.success), None)
+        last_failure = next((item for item in reversed(request_state.observations) if not item.success), None)
+        last_tool = request_state.tool_history[-1].tool_name if request_state.tool_history else None
+        return {
+            "iteration": request_state.iteration,
+            "max_iterations": request_state.max_iterations,
+            "tool_sequence": [call.tool_name for call in request_state.tool_history],
+            "last_tool": last_tool,
+            "last_successful_tool": last_success.tool_name if last_success else None,
+            "last_failure": (
+                {
+                    "tool_name": last_failure.tool_name,
+                    "summary": last_failure.summary,
+                    "error": last_failure.error,
+                }
+                if last_failure
+                else None
+            ),
+            "artifacts": {
+                "has_database_evidence": request_state.latest_database_evidence is not None,
+                "has_insight": request_state.latest_insight is not None,
+                "has_forecast": request_state.latest_forecast is not None,
+                "has_anomaly": request_state.latest_anomaly is not None,
+                "has_final_answer": request_state.final_answer_draft is not None,
+                "verified_fact_count": len(request_state.verified_facts),
+                "visualization_count": len(request_state.visualizations),
+            },
+            "todo_update_suggested": bool(
+                request_state.todo_list
+                and last_success is not None
+                and last_success.tool_name != "todowrite"
+            ),
         }
 
     def build_user_prompt(
@@ -148,6 +236,41 @@ class DataAgentPromptBuilder:
         if summary_stats:
             payload["summary_stats"] = summary_stats
         return payload
+
+    def _summarize_observation_payload(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        summarized = {}
+        for key in (
+            "recovery_hint",
+            "error",
+            "evidence_id",
+            "insight_id",
+            "forecast_id",
+            "anomaly_id",
+            "summary",
+            "current_step",
+            "planning_complete",
+            "completed_count",
+            "pending_count",
+        ):
+            if key in payload:
+                summarized[key] = payload[key]
+        if isinstance(payload.get("todos"), list):
+            summarized["todos"] = payload["todos"][:8]
+        if isinstance(payload.get("verified_facts"), list):
+            summarized["verified_facts"] = [
+                {
+                    "fact_id": fact.get("fact_id"),
+                    "fact_type": fact.get("fact_type"),
+                    "statement": fact.get("statement"),
+                }
+                for fact in payload["verified_facts"][:6]
+                if isinstance(fact, dict)
+            ]
+        if isinstance(payload.get("valid_actions"), list):
+            summarized["valid_actions"] = payload["valid_actions"]
+        return summarized
 
     def _summarize_insight(self, insight) -> dict:
         payload = insight.model_dump(mode="json")

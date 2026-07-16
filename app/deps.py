@@ -29,6 +29,7 @@ def get_llm():
         model=settings.openai_model,
         temperature=settings.openai_temperature,
         streaming=False,
+        model_kwargs={"response_format": {"type": "json_object"}},
     )
 
 

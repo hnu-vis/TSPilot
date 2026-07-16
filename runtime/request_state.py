@@ -33,7 +33,11 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     conversation_id = request.conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
     requested_fact_types = _infer_requested_fact_types(request.message)
-    answer_requirements = _infer_answer_requirements(request.message)
+    answer_requirements = (
+        ["conclusion"]
+        if request.database_context is None
+        else _infer_answer_requirements(request.message)
+    )
     focus = request.message
     return RequestStateModel(
         request_id=request_id,
@@ -162,8 +166,6 @@ def apply_observation(
         _apply_analysis_payload(request_state, full_payload)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-
-    _advance_plan_after_success(request_state, observation.tool_name)
 
 
 def enrich_observation_payload(

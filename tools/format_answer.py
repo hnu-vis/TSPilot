@@ -17,6 +17,7 @@ from tools.base import BaseTool
 
 class FormatAnswerInput(BaseModel):
     summary_goal: str | None = None
+    direct_answer: str | None = None
     include_fact_ids: list[str] = Field(default_factory=list)
     include_visualization_ids: list[str] = Field(default_factory=list)
     section_plan: list[str] = Field(default_factory=list)
@@ -54,8 +55,22 @@ class FormatAnswerTool(BaseTool):
         summary = build_summary(
             request_state,
             facts,
-            self._fallback_summary(request_state, validated_input.summary_goal),
+            self._fallback_summary(
+                request_state,
+                validated_input.summary_goal,
+                validated_input.direct_answer,
+            ),
         )
+        if request_state.database_context is None and validated_input.direct_answer:
+            answer = FinalAnswer(
+                title=None,
+                summary=summary,
+                sections=[],
+                references=[],
+                visualizations=[],
+            )
+            return answer.model_dump(mode="json")
+
         sections_by_type: dict[str, AnswerSection] = {}
         sections_by_type["summary"] = AnswerSection(
             section_type="summary",
@@ -231,13 +246,20 @@ class FormatAnswerTool(BaseTool):
         compact = " ".join(part.strip() for part in parts if part and part.strip())
         return compact or self._fallback_summary(request_state, summary_goal)
 
-    def _fallback_summary(self, request_state: RequestStateModel, summary_goal: str) -> str:
+    def _fallback_summary(
+        self,
+        request_state: RequestStateModel,
+        summary_goal: str,
+        direct_answer: str | None = None,
+    ) -> str:
         if request_state.latest_database_evidence is not None:
             return request_state.latest_database_evidence.summary
         if request_state.latest_rag:
             return request_state.latest_rag.get("summary", summary_goal)
         if request_state.latest_skill:
             return request_state.latest_skill.get("summary", summary_goal)
+        if direct_answer and direct_answer.strip():
+            return direct_answer.strip()
         return summary_goal
 
     def _evidence_sections(self, evidence) -> list[AnswerSection]:
