@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import app.deps as deps
 import app.routes.chat as chat_route
 from fastapi.testclient import TestClient
@@ -103,6 +105,90 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: thought" not in body
     assert "event: action" not in body
     assert "event: observation" not in body
+
+
+def test_chat_json_path_persists_complete_trace_log(tmp_path):
+    settings = get_settings()
+    old_log_dir = settings.conversation_log_dir
+    old_enabled = settings.conversation_log_enabled
+    settings.conversation_log_dir = str(tmp_path)
+    settings.conversation_log_enabled = True
+    try:
+        client = _build_client(FakeLLM())
+        response = client.post(
+            "/api/v1/chat",
+            json={
+                "message": "请分析 appliances_energy_wh 的趋势",
+                "database_context": {
+                    "database_id": "influxdb2-energydata",
+                    "database_type": "influxdb",
+                },
+            },
+        )
+        payload = response.json()
+        log_path = tmp_path / payload["conversation_id"] / f"{payload['request_id']}.json"
+        index_path = tmp_path / "index.jsonl"
+
+        assert response.status_code == 200
+        assert log_path.exists()
+        assert index_path.exists()
+
+        log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+        assert log_payload["schema_version"] == "conversation_trace_v1"
+        assert log_payload["mode"] == "json"
+        assert log_payload["status"] == "completed"
+        assert log_payload["request"]["message"] == "请分析 appliances_energy_wh 的趋势"
+        assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 3
+        assert log_payload["summary"]["used_tools"] == ["sql_query", "insight", "format_answer"]
+        assert log_payload["state"]["tool_history"]
+
+        index_entry = json.loads(index_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert index_entry["request_id"] == payload["request_id"]
+        assert index_entry["log_path"] == str(log_path)
+    finally:
+        settings.conversation_log_dir = old_log_dir
+        settings.conversation_log_enabled = old_enabled
+
+
+def test_chat_sse_path_persists_internal_and_public_trace_logs(tmp_path):
+    settings = get_settings()
+    old_log_dir = settings.conversation_log_dir
+    old_enabled = settings.conversation_log_enabled
+    settings.conversation_log_dir = str(tmp_path)
+    settings.conversation_log_enabled = True
+    try:
+        client = _build_client(FakeLLM())
+        with client.stream(
+            "POST",
+            "/api/v1/chat",
+            json={
+                "message": "请分析 appliances_energy_wh 的趋势",
+                "database_context": {
+                    "database_id": "influxdb2-energydata",
+                    "database_type": "influxdb",
+                },
+                "stream": True,
+            },
+        ) as response:
+            body = "".join(chunk for chunk in response.iter_text())
+
+        request_id_line = next(line for line in body.splitlines() if line.startswith("data: {"))
+        request_id = json.loads(request_id_line.removeprefix("data: "))["request_id"]
+        conversation_id = json.loads(request_id_line.removeprefix("data: "))["conversation_id"]
+        log_path = tmp_path / conversation_id / f"{request_id}.json"
+
+        assert response.status_code == 200
+        assert log_path.exists()
+        log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+        assert log_payload["mode"] == "sse"
+        assert "thought" in [event["event_type"] for event in log_payload["trace"]["internal"]]
+        public_event_types = [event["event_type"] for event in log_payload["trace"]["public"]]
+        assert "thought" not in public_event_types
+        assert "tool_call" in public_event_types
+        assert "final_answer" in public_event_types
+    finally:
+        settings.conversation_log_dir = old_log_dir
+        settings.conversation_log_enabled = old_enabled
 
 
 def test_sql_tool_result_preview_exposes_query_and_samples():
@@ -301,11 +387,11 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "insight", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly", "format_answer"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     failures = [
         event for event in observations
         if event["payload"]["tool_name"] == "forecast" and event["payload"]["success"] is False
     ]
     assert failures
-    assert "Forecast requires database_evidence" in failures[-1]["payload"]["summary"]
+    assert "active plan step" in failures[-1]["payload"]["summary"]

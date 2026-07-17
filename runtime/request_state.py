@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.settings import Settings
+from core.completion import (
+    evaluate_goal_completion,
+    evaluate_step_completion,
+    normalize_todo_for_completion,
+)
+from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
@@ -45,7 +51,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         database_context=database_context,
         selected_database=request.selected_database,
         selected_database_type=request.selected_database_type,
-        time_range=request.time_range,
+        time_range=normalize_time_range(request.time_range),
         constraints=request.constraints,
         history=request.history,
         status="running",
@@ -71,6 +77,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         },
         context_status="ok",
         context_overflow_reason=None,
+        completion_state={},
         latest_database_evidence=None,
         database_evidence_artifacts={},
         latest_insight=None,
@@ -295,13 +302,13 @@ def apply_observation(
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
 
 
 def enrich_observation_payload(
@@ -340,15 +347,25 @@ def enrich_observation_payload(
 
 
 def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) -> None:
-    request_state.todo_list = list(full_payload.get("todos", []))
+    request_state.todo_list = [
+        normalize_todo_for_completion(todo)
+        for todo in list(full_payload.get("todos", []))
+        if isinstance(todo, dict)
+    ]
     request_state.plan_current_step = int(full_payload.get("current_step") or 0)
     request_state.planning_complete = bool(full_payload.get("planning_complete", False))
     if request_state.todo_list:
         request_state.answer_coverage["plan"] = True
+        request_state.max_iterations = max(
+            request_state.max_iterations,
+            min(20, len(request_state.todo_list) * 3 + 2),
+        )
+    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
-def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str) -> None:
+def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str, full_payload: dict) -> None:
     if not request_state.todo_list:
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     task_type = _task_type_for_tool(tool_name)
     if task_type is None:
@@ -360,7 +377,19 @@ def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str
     current_task_type = str(current_todo.get("task_type") or "").strip().lower()
     if current_task_type and current_task_type != "generic" and current_task_type != task_type:
         return
+    evaluation = evaluate_step_completion(request_state, tool_name=tool_name, full_payload=full_payload)
+    request_state.completion_state["latest_step"] = {
+        **evaluation.model_dump(),
+        "tool_name": tool_name,
+        "todo_index": current_index,
+        "todo": current_todo,
+    }
+    if not evaluation.completed:
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
     current_todo["status"] = "completed"
+    current_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else current_todo.get("result_ref")
+    current_todo["completion_reason"] = evaluation.reason
     request_state.todo_list[current_index] = current_todo
     next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
     if next_index is not None:
@@ -372,6 +401,7 @@ def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str
     else:
         request_state.plan_current_step = len(request_state.todo_list)
         request_state.planning_complete = True
+    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
 def _task_type_for_tool(tool_name: str) -> str | None:

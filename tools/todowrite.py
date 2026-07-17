@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, model_validator
 
+from core.completion import normalize_todo_for_completion
 from tools.base import BaseTool
 
 
@@ -12,6 +13,10 @@ class TodoItem(BaseModel):
     status: str = "pending"
     priority: int = 2
     notes: str | None = None
+    acceptance_criteria: str | None = None
+    evidence_needed: list[str] = Field(default_factory=list)
+    result_ref: str | None = None
+    completion_reason: str | None = None
 
 
 class TodoWriteInput(BaseModel):
@@ -101,13 +106,25 @@ class TodoWriteTool(BaseTool):
         except (TypeError, ValueError):
             priority = 2
         notes = raw_todo.get("notes")
-        return TodoItem(
+        raw_evidence_needed = raw_todo.get("evidence_needed")
+        if isinstance(raw_evidence_needed, list):
+            evidence_needed = raw_evidence_needed
+        elif isinstance(raw_evidence_needed, str):
+            evidence_needed = [raw_evidence_needed]
+        else:
+            evidence_needed = []
+        normalized = TodoItem(
             content=content,
             task_type=task_type,
             status=status,
             priority=priority,
             notes=notes,
+            acceptance_criteria=raw_todo.get("acceptance_criteria") or raw_todo.get("criteria"),
+            evidence_needed=evidence_needed,
+            result_ref=raw_todo.get("result_ref"),
+            completion_reason=raw_todo.get("completion_reason"),
         )
+        return TodoItem.model_validate(normalize_todo_for_completion(normalized.model_dump(mode="json")))
 
     def _enforce_single_in_progress(self, todos: list[TodoItem]) -> list[TodoItem]:
         seen_in_progress = False

@@ -1,7 +1,10 @@
 """Forecast tool placeholder."""
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
+from pydantic import field_validator
 
 from core.timeseries.forecast_adapter import linear_forecast
 from core.timeseries.normalization import normalize_timeseries_evidence
@@ -12,10 +15,23 @@ from tools.base import BaseTool
 
 
 class ForecastInput(BaseModel):
-    database_evidence: DatabaseEvidence | dict | None = None
+    database_evidence: DatabaseEvidence | dict | str | None = None
     horizon: int | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
+
+    @field_validator("horizon", mode="before")
+    @classmethod
+    def normalize_horizon(cls, value):
+        if isinstance(value, dict):
+            for key in ("steps", "horizon", "points", "count"):
+                if key in value:
+                    return cls.normalize_horizon(value[key])
+        if isinstance(value, str):
+            match = re.search(r"\d+", value)
+            if match:
+                return int(match.group(0))
+        return value
 
 
 class ForecastTool(BaseTool):
@@ -77,6 +93,13 @@ def _resolve_database_evidence(database_evidence, request_state):
         if latest is None:
             return None
         return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
+    if isinstance(database_evidence, str):
+        evidence_ref = database_evidence.strip()
+        if evidence_ref in {"latest", "latest_database_evidence", "current"}:
+            return _resolve_database_evidence(None, request_state)
+        if evidence_ref.startswith("evidence:"):
+            evidence_ref = evidence_ref.split(":", 1)[1]
+        return request_state.database_evidence_artifacts.get(evidence_ref) or _resolve_database_evidence(None, request_state)
     if isinstance(database_evidence, dict):
         evidence_id = database_evidence.get("evidence_id")
         if evidence_id:

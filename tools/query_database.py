@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import csv
 import math
-from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from app.settings import Settings
+from core.time_range import format_utc_rfc3339, parse_time_to_utc
 from core.database import (
     DatabaseFactory,
     DatabaseSchema,
@@ -335,7 +335,7 @@ class QueryDatabaseTool(BaseTool):
                 value = float(raw_value)
             except ValueError:
                 continue
-            points.append({"timestamp": self._parse_time(row[time_field]).isoformat(), "value": value})
+            points.append({"timestamp": format_utc_rfc3339(self._parse_time(row[time_field])), "value": value})
         if not points:
             raise ValueError(f"No numeric points could be extracted from '{value_field}'.")
         return points
@@ -343,7 +343,7 @@ class QueryDatabaseTool(BaseTool):
     def _to_timeseries_rows(self, rows: list[dict], time_field: str, value_fields: list[str]) -> list[dict]:
         normalized_rows: list[dict] = []
         for row in rows:
-            normalized = {time_field: self._parse_time(row[time_field]).isoformat()}
+            normalized = {time_field: format_utc_rfc3339(self._parse_time(row[time_field]))}
             has_numeric = False
             for field in value_fields:
                 raw_value = row.get(field)
@@ -360,7 +360,4 @@ class QueryDatabaseTool(BaseTool):
         return normalized_rows
 
     def _parse_time(self, value: str) -> datetime:
-        normalized = str(value).strip().replace("Z", "+00:00")
-        if "T" not in normalized and " " in normalized:
-            normalized = normalized.replace(" ", "T")
-        return datetime.fromisoformat(normalized)
+        return parse_time_to_utc(value)

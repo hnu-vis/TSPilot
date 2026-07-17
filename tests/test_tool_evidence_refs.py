@@ -46,21 +46,22 @@ async def test_analysis_tools_resolve_lightweight_evidence_refs_from_state():
 
     insight = await InsightTool().execute(
         InsightInput(
-            database_evidence=evidence.evidence_id,
+            database_evidence=f"evidence:{evidence.evidence_id}",
             analysis_goal="compute point count",
             analysis_code="result = {'summary': f'{len(rows)} rows available', 'metrics': {'row_count': len(rows)}, 'details': {}}",
         ),
         request_state=request_state,
     )
     anomaly = await AnomalyTool().execute(
-        AnomalyInput(database_evidence=evidence_ref),
+        AnomalyInput(database_evidence="latest_database_evidence"),
         request_state=request_state,
     )
     forecast = await ForecastTool().execute(
-        ForecastInput(database_evidence=evidence_ref, horizon=2),
+        ForecastInput(database_evidence=evidence_ref, horizon={"steps": "next 2 points"}),
         request_state=request_state,
     )
 
     assert insight["analysis_id"].startswith("ana_compute_point_count_")
     assert anomaly["anomaly_id"] == "anomaly_evi_ref"
     assert forecast["forecast_id"] == "forecast_evi_ref"
+    assert forecast["horizon"] == 2

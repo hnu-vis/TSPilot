@@ -42,6 +42,7 @@ class RequestStateModel(BaseModel):
     context_budget: dict = Field(default_factory=dict)
     context_status: Literal["ok", "summarized", "truncated", "overflowed"] = "ok"
     context_overflow_reason: str | None = None
+    completion_state: dict = Field(default_factory=dict)
 
     latest_database_evidence: DatabaseEvidence | None = None
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)

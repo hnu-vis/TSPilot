@@ -68,7 +68,12 @@ class FormatAnswerTool(BaseTool):
         )
         direct_answer = self._usable_direct_answer(validated_input.direct_answer)
         if analyses:
-            summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
+            analysis_summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
+            summary = build_summary(
+                request_state,
+                facts,
+                analysis_summary or fallback_summary,
+            )
         elif not facts and direct_answer and self._has_database_answer_evidence(request_state):
             summary = direct_answer
         else:

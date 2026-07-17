@@ -120,7 +120,34 @@ def test_multiple_generated_insights_accumulate_in_analysis_workspace():
     assert [item["analysis_id"] for item in workspace["analyses"]] == ["ana_first", "ana_second"]
 
 
-def test_python_rows_runner_rejects_imports_and_requires_result_summary():
+def test_python_rows_runner_allows_safe_imports_and_lambda_sorting():
+    output = execute_python_rows_v1(
+        code=(
+            "import statistics as stats\n"
+            "from collections import Counter\n"
+            "from math import sqrt\n"
+            "from datetime import datetime\n"
+            "ordered = sorted(rows, key=lambda row: row['value'])\n"
+            "values = [row['value'] for row in ordered]\n"
+            "counter = Counter([datetime.fromisoformat('2023-01-01T00:00:00').year])\n"
+            "evidence_rows = database_evidence['data']['rows']\n"
+            "result = {'summary': f'mean={stats.mean(values):.1f}', "
+            "'metrics': {'mean': stats.mean(values), 'sqrt': sqrt(4), 'year': counter[2023], 'rows': len(evidence_rows)}, 'details': {}}\n"
+        ),
+        rows=[{"value": 3.0}, {"value": 1.0}, {"value": 2.0}],
+        points=[],
+        columns=["value"],
+        metadata={},
+        diagnostics={},
+    )
+
+    assert output.result["summary"] == "mean=2.0"
+    assert output.result["metrics"]["sqrt"] == 2.0
+    assert output.result["metrics"]["year"] == 1
+    assert output.result["metrics"]["rows"] == 3
+
+
+def test_python_rows_runner_rejects_unsafe_imports_and_requires_result_summary():
     with pytest.raises(AnalysisCodeError):
         execute_python_rows_v1(
             code="import os\nresult = {'summary': 'bad', 'metrics': {}, 'details': {}}",

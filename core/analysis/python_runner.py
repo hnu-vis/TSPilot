@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import collections
+import datetime
 import json
 import math
 import signal
@@ -75,9 +77,6 @@ _BLOCKED_NODE_TYPES = (
     ast.ClassDef,
     ast.Delete,
     ast.Global,
-    ast.Import,
-    ast.ImportFrom,
-    ast.Lambda,
     ast.Nonlocal,
     ast.Raise,
     ast.Try,
@@ -85,6 +84,13 @@ _BLOCKED_NODE_TYPES = (
     ast.Yield,
     ast.YieldFrom,
 )
+
+_SAFE_IMPORT_MODULES = {
+    "collections": collections,
+    "datetime": datetime,
+    "math": math,
+    "statistics": statistics,
+}
 
 
 def execute_python_rows_v1(
@@ -99,6 +105,7 @@ def execute_python_rows_v1(
 ) -> ExecutionOutput:
     """Execute generated analysis code over normalized evidence rows."""
 
+    code, imported_names = _prepare_code(code)
     _validate_code(code)
     globals_dict = {
         "__builtins__": _SAFE_BUILTINS,
@@ -109,9 +116,21 @@ def execute_python_rows_v1(
         "rows": [dict(row) for row in rows],
         "points": [dict(point) for point in points],
         "columns": list(columns),
+        "database_evidence": {
+            "data": {"rows": [dict(row) for row in rows], "points": [dict(point) for point in points]},
+            "columns": list(columns),
+            "metadata": dict(metadata),
+            "diagnostics": dict(diagnostics),
+        },
         "metadata": dict(metadata),
         "diagnostics": dict(diagnostics),
+        "mean": statistics.mean,
+        "median": statistics.median,
+        "stdev": statistics.stdev,
+        "pstdev": statistics.pstdev,
+        "sqrt": math.sqrt,
     }
+    locals_dict.update(imported_names)
     started = time.perf_counter()
     try:
         with _time_limit(timeout_seconds):
@@ -134,6 +153,50 @@ def execute_python_rows_v1(
     except TypeError as exc:
         raise AnalysisCodeError("analysis result must be JSON serializable.") from exc
     return ExecutionOutput(result=result, runtime_ms=runtime_ms)
+
+
+def _prepare_code(code: str) -> tuple[str, dict[str, Any]]:
+    if not code or not code.strip():
+        raise AnalysisCodeError("analysis_code cannot be empty.")
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise AnalysisCodeError(f"analysis_code syntax error: {exc}") from exc
+
+    imported_names: dict[str, Any] = {}
+    sanitized_body = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            _collect_safe_import(node, imported_names)
+            continue
+        if isinstance(node, ast.ImportFrom):
+            _collect_safe_import_from(node, imported_names)
+            continue
+        sanitized_body.append(node)
+    tree.body = sanitized_body
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree), imported_names
+
+
+def _collect_safe_import(node: ast.Import, imported_names: dict[str, Any]) -> None:
+    for alias in node.names:
+        module_name = alias.name
+        if module_name not in _SAFE_IMPORT_MODULES:
+            raise AnalysisCodeError(f"analysis_code imports unsupported module: {module_name}.")
+        imported_names[alias.asname or module_name] = _SAFE_IMPORT_MODULES[module_name]
+
+
+def _collect_safe_import_from(node: ast.ImportFrom, imported_names: dict[str, Any]) -> None:
+    module_name = node.module or ""
+    if node.level or module_name not in _SAFE_IMPORT_MODULES:
+        raise AnalysisCodeError(f"analysis_code imports unsupported module: {module_name}.")
+    module = _SAFE_IMPORT_MODULES[module_name]
+    for alias in node.names:
+        if alias.name == "*":
+            raise AnalysisCodeError("analysis_code cannot use wildcard imports.")
+        if not hasattr(module, alias.name):
+            raise AnalysisCodeError(f"analysis_code imports unsupported name: {module_name}.{alias.name}.")
+        imported_names[alias.asname or alias.name] = getattr(module, alias.name)
 
 
 def _validate_code(code: str) -> None:

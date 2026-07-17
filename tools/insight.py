@@ -76,7 +76,12 @@ def _resolve_database_evidence(database_evidence, request_state):
             return None
         return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
     if isinstance(database_evidence, str):
-        return request_state.database_evidence_artifacts.get(database_evidence)
+        evidence_ref = database_evidence.strip()
+        if evidence_ref in {"latest", "latest_database_evidence", "current"}:
+            return _resolve_database_evidence(None, request_state)
+        if evidence_ref.startswith("evidence:"):
+            evidence_ref = evidence_ref.split(":", 1)[1]
+        return request_state.database_evidence_artifacts.get(evidence_ref) or _resolve_database_evidence(None, request_state)
     if isinstance(database_evidence, dict):
         evidence_id = database_evidence.get("evidence_id")
         if evidence_id:
@@ -125,4 +130,3 @@ def _analysis_id(evidence_id: str, goal: str, code_hash: str) -> str:
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     slug = re.sub(r"[^a-zA-Z0-9_]+", "_", goal.strip().lower())[:32].strip("_")
     return f"ana_{slug or 'analysis'}_{digest}"
-

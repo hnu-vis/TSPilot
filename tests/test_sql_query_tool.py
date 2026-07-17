@@ -11,6 +11,7 @@ from schemas.database import DatabaseEvidence
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
 from tools.sql_query import SqlQueryInput, SqlQueryTool
+from tools.query_database import QueryDatabaseTool
 from tools.registry import ToolSpec
 
 
@@ -31,6 +32,23 @@ class _FakeConnector:
             row_count=1,
             execution_time_ms=3,
         )
+
+
+def test_reference_dataset_filter_handles_naive_rows_and_utc_request_range():
+    tool = QueryDatabaseTool(get_settings())
+    rows = [
+        {"timestamp": "2016-01-11 16:50:00", "value": "1"},
+        {"timestamp": "2016-01-11 17:00:00", "value": "2"},
+        {"timestamp": "2016-01-11 17:10:00", "value": "3"},
+    ]
+
+    filtered = tool._filter_rows(
+        rows,
+        "timestamp",
+        {"start": "2016-01-11T17:00:00Z", "end": "2016-01-11T17:10:00Z"},
+    )
+
+    assert [row["value"] for row in filtered] == ["2", "3"]
 
 
 @pytest.mark.asyncio

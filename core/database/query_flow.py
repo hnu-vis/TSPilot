@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.time_range import normalize_time_range, normalize_time_value, parse_time_to_utc
 from schemas.database import DatabaseEvidence
 
 from .connector import DatabaseSchema, QueryResult
@@ -65,6 +66,11 @@ class DefaultIntentInterpreter(IntentInterpreter):
         "总和": "sum",
         "count": "count",
         "计数": "count",
+        "数量": "count",
+        "总数": "count",
+        "总条数": "count",
+        "多少条": "count",
+        "几条": "count",
     }
 
     _FACT_KEYWORDS = {
@@ -283,10 +289,11 @@ class DefaultLogicalQueryPlanner(LogicalQueryPlanner):
     def _apply_time_range(self, plan: DatabaseQueryPlan, time_range: dict[str, Any] | None) -> None:
         if not time_range:
             return
+        normalized = normalize_time_range(time_range) or {}
         plan.time_range = TimeRangePlan(
-            start=time_range.get("start"),
-            end=time_range.get("end"),
-            timezone=time_range.get("timezone"),
+            start=normalized.get("start"),
+            end=normalized.get("end"),
+            timezone=normalized.get("timezone"),
         )
 
     def _apply_projections(
@@ -462,10 +469,26 @@ class CompositeDialectRenderer(DialectRenderer):
             return f'range(start: {self._flux_time(time_range.start)})'
         if time_range.lookback:
             return f"range(start: -{time_range.lookback})"
-        return "range(start: -7d)"
+        default_range = self._default_flux_time_range()
+        if default_range.get("start") and default_range.get("end"):
+            return f'range(start: {self._flux_time(default_range["start"])}, stop: {self._flux_time(default_range["end"])})'
+        if default_range.get("start"):
+            return f'range(start: {self._flux_time(default_range["start"])})'
+        return "range(start: 1970-01-01T00:00:00Z)"
+
+    def _default_flux_time_range(self) -> dict[str, Any]:
+        configured = self._config.get("default_query_time_range") or self._config.get("default_time_range")
+        if isinstance(configured, dict):
+            return normalize_time_range(configured) or {}
+        reference_dataset = self._config.get("reference_dataset")
+        if isinstance(reference_dataset, dict):
+            configured = reference_dataset.get("time_range")
+            if isinstance(configured, dict):
+                return normalize_time_range(configured) or {}
+        return {"start": "1970-01-01T00:00:00Z"}
 
     def _flux_time(self, value: str) -> str:
-        return value if value.endswith("Z") else f"{value}Z"
+        return normalize_time_value(value)
 
     def _flux_operator(self, operator: str) -> str:
         return "==" if operator == "=" else operator
@@ -823,4 +846,4 @@ class DatabaseQueryFlow:
     def _parse_time(self, value: str):
         from datetime import datetime
 
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parse_time_to_utc(value)

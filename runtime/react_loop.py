@@ -6,6 +6,7 @@ from typing import AsyncIterator
 from app.settings import Settings
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
+from runtime.conversation_log import ConversationTraceLogger
 from runtime.request_state import apply_observation, append_trace, build_final_response, enrich_observation_payload
 from runtime.trace import TraceEventModel
 from schemas.api import ChatResponse
@@ -22,6 +23,7 @@ class ReActLoop:
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
+        self._trace_logger = ConversationTraceLogger(settings)
 
     async def run(
         self,
@@ -29,24 +31,59 @@ class ReActLoop:
         conversation_state: ConversationStateModel,
     ) -> ChatResponse:
         trace_events = [event async for event in self._iterate(request_state, conversation_state)]
-        return build_final_response(request_state, trace_events)
+        response = build_final_response(request_state, trace_events)
+        self._trace_logger.persist(
+            request_state=request_state,
+            response=response,
+            internal_trace=trace_events,
+            mode="json",
+        )
+        return response
 
     async def run_sse(
         self,
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> AsyncIterator[TraceEventModel]:
-        yield append_trace(
-            request_state,
-            "conversation_id",
-            {
-                "conversation_id": request_state.conversation_id,
-                "request_id": request_state.request_id,
-            },
-        )
-        async for event in self._iterate(request_state, conversation_state):
-            async for mapped in self._map_trace_to_sse(request_state, event):
-                yield mapped
+        internal_trace: list[TraceEventModel] = []
+        public_trace: list[TraceEventModel] = []
+        logged = False
+        try:
+            conversation_event = append_trace(
+                request_state,
+                "conversation_id",
+                {
+                    "conversation_id": request_state.conversation_id,
+                    "request_id": request_state.request_id,
+                },
+            )
+            public_trace.append(conversation_event)
+            yield conversation_event
+            async for event in self._iterate(request_state, conversation_state):
+                internal_trace.append(event)
+                async for mapped in self._map_trace_to_sse(request_state, event):
+                    public_trace.append(mapped)
+                    yield mapped
+            response = build_final_response(request_state, internal_trace)
+            self._trace_logger.persist(
+                request_state=request_state,
+                response=response,
+                internal_trace=internal_trace,
+                public_trace=public_trace,
+                mode="sse",
+            )
+            logged = True
+        finally:
+            if not logged and internal_trace:
+                response = build_final_response(request_state, internal_trace)
+                self._trace_logger.persist(
+                    request_state=request_state,
+                    response=response,
+                    internal_trace=internal_trace,
+                    public_trace=public_trace,
+                    mode="sse",
+                    interrupted=True,
+                )
 
     async def _iterate(
         self,

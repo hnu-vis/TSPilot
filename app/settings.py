@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     tspilot_root: str = Field(default_factory=_default_tspilot_root, alias="TSPILOT_ROOT")
     database_config_dir: str | None = Field(default=None, alias="TSPILOT_DATABASE_CONFIG_DIR")
     knowledge_base_dir: str | None = Field(default=None, alias="TSPILOT_KNOWLEDGE_BASE_DIR")
+    conversation_log_enabled: bool = Field(default=True, alias="TSPILOT_CONVERSATION_LOG_ENABLED")
+    conversation_log_dir: str | None = Field(default=None, alias="TSPILOT_CONVERSATION_LOG_DIR")
 
     max_iterations: int = 10
     max_prompt_tokens: int = 12000
@@ -62,6 +64,12 @@ class Settings(BaseSettings):
         if self.knowledge_base_dir:
             return Path(self.knowledge_base_dir).resolve()
         return Path(self.tspilot_root).resolve()
+
+    @property
+    def resolved_conversation_log_dir(self) -> Path:
+        if self.conversation_log_dir:
+            return Path(self.conversation_log_dir).resolve()
+        return (Path(self.tspilot_root) / "cache_data" / "conversation_logs").resolve()
 
 
 @lru_cache(maxsize=1)

@@ -1142,6 +1142,10 @@ input:focus-visible {
   gap: 6px;
 }
 
+.chip-list.compact {
+  gap: 5px;
+}
+
 .chip-list span {
   display: block;
   min-width: 0;
@@ -1157,7 +1161,8 @@ input:focus-visible {
   white-space: nowrap;
 }
 
-.sql-detail {
+.sql-detail,
+.data-preview {
   gap: 10px;
 }
 
@@ -1356,17 +1361,63 @@ input:focus-visible {
   transform: rotate(180deg);
 }
 
-.debug-details pre {
+.advanced-details {
+  background: transparent;
+}
+
+.advanced-details summary {
+  min-height: 38px;
+  background: var(--surface);
+}
+
+.advanced-body {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding: 10px;
+}
+
+.advanced-section {
+  display: grid;
+  gap: 8px;
+}
+
+.advanced-section + .advanced-section {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.advanced-section-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted-strong);
+}
+
+.advanced-section-title h4 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.debug-details pre,
+.debug-json {
   max-height: 420px;
   overflow: auto;
-  border-top: 1px solid var(--border);
   margin: 0;
-  background: oklch(0.962 0.004 250);
-  padding: 12px;
   color: var(--foreground);
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.55;
+}
+
+.debug-json {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: oklch(0.962 0.004 250);
+  padding: 12px;
 }
 
 .detail-row {

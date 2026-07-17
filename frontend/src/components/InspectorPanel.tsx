@@ -97,47 +97,24 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         </section>
       )}
 
-      {step.sqlDetail && <SqlDetail detail={step.sqlDetail} />}
+      {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
 
-      {step.artifactRefs.length > 0 && (
-        <section className="inspector-card">
-          <div className="inspector-card-title">
-            <FileText size={16} />
-            <h3>Artifacts from this step</h3>
-          </div>
-          <div className="chip-list">
-            {step.artifactRefs.map((reference) => (
-              <span key={reference}>{reference}</span>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {step.debugPayload && (
-        <details className="debug-details">
-          <summary>
-            <ChevronDown size={15} />
-            Developer details
-          </summary>
-          <pre>{JSON.stringify(step.debugPayload, null, 2)}</pre>
-        </details>
+      {(step.sqlDetail?.query || step.artifactRefs.length > 0 || step.debugPayload) && (
+        <AdvancedDetails step={step} />
       )}
     </>
   );
 }
 
-function SqlDetail({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
   const rows = detail.sampleRows.length > 0 ? detail.sampleRows : detail.samplePoints;
   const tableColumns = detail.columns.length > 0 ? detail.columns : inferColumns(rows);
   return (
-    <section className="inspector-card sql-detail">
+    <section className="inspector-card data-preview">
       <div className="inspector-card-title sql-detail-title">
-        <Code2 size={16} />
-        <h3>SQL detail</h3>
-        {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+        <Table2 size={16} />
+        <h3>Data preview</h3>
       </div>
-
-      {detail.query && <pre className="sql-code-block">{detail.query}</pre>}
 
       {detail.columns.length > 0 && (
         <div className="column-chip-list" aria-label="Result columns">
@@ -180,6 +157,53 @@ function SqlDetail({ detail }: { detail: NonNullable<ReturnType<typeof toDisplay
         </div>
       )}
     </section>
+  );
+}
+
+function AdvancedDetails({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  return (
+    <details className="debug-details advanced-details">
+      <summary>
+        <ChevronDown size={15} />
+        Advanced
+      </summary>
+      <div className="advanced-body">
+        {step.sqlDetail?.query && (
+          <section className="advanced-section">
+            <div className="advanced-section-title">
+              <Code2 size={14} />
+              <h4>Query</h4>
+              {step.sqlDetail.queryLanguage && <span className="query-language-badge">{step.sqlDetail.queryLanguage}</span>}
+            </div>
+            <pre className="sql-code-block">{step.sqlDetail.query}</pre>
+          </section>
+        )}
+
+        {step.artifactRefs.length > 0 && (
+          <section className="advanced-section">
+            <div className="advanced-section-title">
+              <FileText size={14} />
+              <h4>References</h4>
+            </div>
+            <div className="chip-list compact">
+              {step.artifactRefs.map((reference) => (
+                <span key={reference}>{reference}</span>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {step.debugPayload && (
+          <section className="advanced-section">
+            <div className="advanced-section-title">
+              <Code2 size={14} />
+              <h4>Raw event</h4>
+            </div>
+            <pre className="debug-json">{JSON.stringify(step.debugPayload, null, 2)}</pre>
+          </section>
+        )}
+      </div>
+    </details>
   );
 }
 

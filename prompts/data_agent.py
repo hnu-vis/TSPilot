@@ -31,6 +31,8 @@ class DataAgentPromptBuilder:
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
             "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
             "Todo is initial visible process state, not a model-maintained scheduler. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
+            "When a todo step is in_progress, its task_type is the active runtime contract. Choose the matching action for that step: query->sql_query, insight->insight, anomaly->anomaly, forecast->forecast, answer->format_answer. "
+            "Only choose sql_query during a non-query step when the active step still lacks database/query evidence such as schema, sample rows, count, aggregate, or time_series.\n"
             "Tool contracts:\n"
             "- todowrite: create the initial full todo plan only when no plan exists.\n"
             "- sql_query: query the selected datasource. Use message for automatic query planning, or query/query_language for explicit read-only SQL/Flux/PromQL. "
@@ -50,7 +52,7 @@ class DataAgentPromptBuilder:
             "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
             "\"requested_fact_types\": list[str], \"focus\": str|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
-            "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int}.\n"
+            "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null, \"evidence_needed\": list[str]}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
             "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}.\n"
@@ -156,7 +158,7 @@ class DataAgentPromptBuilder:
             {
                 "action": "todowrite",
                 "use_when": "Create the initial plan only when todo_list is empty and the request needs visible multi-step analysis.",
-                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary",
+                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary; todos may include acceptance_criteria and evidence_needed",
             },
             {
                 "action": "sql_query",
@@ -253,10 +255,15 @@ class DataAgentPromptBuilder:
             }
 
         next_action_guidance = []
+        active_contract = self._active_plan_contract(request_state, current_todo)
         if request_state.database_context is None:
             next_action_guidance.append("format_answer: explain that a datasource/context is required for data analysis.")
         elif latest_evidence is None:
             next_action_guidance.append("sql_query: obtain grounded schema/sample/raw evidence before analysis.")
+        elif active_contract.get("expected_action"):
+            next_action_guidance.append(
+                f"{active_contract['expected_action']}: active plan step task_type={active_contract['task_type']}."
+            )
         else:
             next_action_guidance.extend(
                 [
@@ -270,12 +277,57 @@ class DataAgentPromptBuilder:
 
         return {
             "current_todo": current_todo,
+            "completion_state": request_state.completion_state,
             "latest_query_summary": latest_query_summary,
+            "active_plan_contract": active_contract,
             "recommended_next_action_types": next_action_guidance,
             "sql_loop_rule": (
                 "A prior sql_query does not force insight. If the last SQL sample/counts reveal a missing filter, outlier, "
-                "or another database-checkable gap, call sql_query again with a focused read-only query."
+                "or another database-checkable gap, call sql_query again with a focused read-only query. "
+                "Do not use this rule to bypass a non-query active plan step whose database evidence is already present."
             ),
+        }
+
+    def _active_plan_contract(self, request_state: RequestStateModel, current_todo: dict | None) -> dict:
+        if current_todo is None:
+            return {
+                "task_type": None,
+                "expected_action": None,
+                "missing_evidence": [],
+                "can_query_for_missing_evidence": False,
+            }
+        task_type = str(current_todo.get("task_type") or "").strip().lower()
+        expected_action = {
+            "query": "sql_query",
+            "insight": "insight",
+            "anomaly": "anomaly",
+            "forecast": "forecast",
+            "answer": "format_answer",
+            "rag": "rag",
+            "skill": "skill",
+            "plan": "todowrite",
+        }.get(task_type)
+        completion_state = request_state.completion_state.get("latest_goal")
+        missing = []
+        if isinstance(completion_state, dict):
+            missing = [
+                str(item)
+                for item in completion_state.get("missing_evidence", [])
+                if item not in (None, "")
+            ]
+        if not missing:
+            missing = [
+                str(item)
+                for item in current_todo.get("evidence_needed", [])
+                if item not in (None, "")
+            ]
+        query_needs = {"schema", "sample_rows", "count", "aggregate", "filtered_table", "time_series", "database_evidence"}
+        analysis_step_needs_base_evidence = task_type in {"insight", "anomaly", "forecast"} and request_state.latest_database_evidence is None
+        return {
+            "task_type": task_type or None,
+            "expected_action": expected_action,
+            "missing_evidence": missing,
+            "can_query_for_missing_evidence": any(need in query_needs for need in missing) or analysis_step_needs_base_evidence,
         }
 
     def build_user_prompt(

@@ -100,6 +100,35 @@ def test_flux_renderer_preserves_absolute_time_range_for_seasonality_request():
     assert 'r.crypto == "bitcoin"' in rendered.query_text
 
 
+def test_flux_renderer_uses_all_history_range_when_time_range_is_missing():
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message="总共有多少条数据",
+        time_range=None,
+        constraints={},
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=schema, intent=intent)
+    plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=schema,
+        intent=intent,
+        field_mappings=mappings,
+    )
+
+    rendered = CompositeDialectRenderer({"type": "influxdb", "bucket": "bitcoin"}).render(
+        context=context,
+        plan=plan,
+    )
+
+    assert "range(start: 1970-01-01T00:00:00Z)" in rendered.query_text
+    assert "range(start: -7d)" not in rendered.query_text
+    assert "count()" in rendered.query_text
+    assert "mean()" not in rendered.query_text
+
+
 def test_seasonality_request_with_max_points_stays_timeseries():
     message = (
         "请重新查询 Bitcoin USD 的原始时间序列用于周期性分析，不要使用 max 这类单值聚合，"
