@@ -99,10 +99,41 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
 
+      {step.completionDetail && <CompletionPreview detail={step.completionDetail} />}
+
       {(step.sqlDetail?.query || step.artifactRefs.length > 0 || step.debugPayload) && (
         <AdvancedDetails step={step} />
       )}
     </>
+  );
+}
+
+function CompletionPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['completionDetail']> }) {
+  const status =
+    detail.completed === true ? 'Complete' : detail.completed === false ? 'Needs more evidence' : 'Tracking';
+  return (
+    <section className="inspector-card">
+      <div className="inspector-card-title">
+        <CheckCircle2 size={16} />
+        <h3>Completion</h3>
+      </div>
+      <div className={`status-line ${detail.completed === false ? 'error' : 'complete'}`}>{status}</div>
+      {detail.todoProgress && detail.todoProgress.total > 0 && (
+        <p className="step-summary">
+          Todo progress: {detail.todoProgress.completed}/{detail.todoProgress.total}
+          {detail.todoProgress.inProgress ? ` · ${detail.todoProgress.inProgress}` : ''}
+        </p>
+      )}
+      {detail.reason && <p className="step-summary">{detail.reason}</p>}
+      {detail.missingItems.length > 0 && (
+        <div className="chip-list compact">
+          {detail.missingItems.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      )}
+      {detail.nextActionHint && <p className="sample-note">{detail.nextActionHint}</p>}
+    </section>
   );
 }
 

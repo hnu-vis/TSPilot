@@ -13,17 +13,17 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
   return (
     <section className="trace-timeline" aria-label="Execution process">
       {steps.map((step) => {
-        const StatusIcon = step.status === 'running' ? Loader2 : step.status === 'error' ? AlertCircle : CheckCircle2;
         const displayStep = toDisplayStep(step);
+        const StatusIcon = displayStep.status === 'running' ? Loader2 : displayStep.status === 'error' ? AlertCircle : CheckCircle2;
         return (
           <button
             key={step.id}
             type="button"
-            className={`trace-step ${selectedId === step.id ? 'selected' : ''}`}
+            className={`trace-step ${displayStep.status} ${selectedId === step.id ? 'selected' : ''}`}
             onClick={() => onSelect(step.id)}
           >
             <span className="trace-icon">
-              {step.status === 'running' ? <StatusIcon className="spin" size={15} /> : <StatusIcon size={15} />}
+              {displayStep.status === 'running' ? <StatusIcon className="spin" size={15} /> : <StatusIcon size={15} />}
             </span>
             <span className="trace-copy">
               <strong>{displayStep.title}</strong>

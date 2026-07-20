@@ -16,6 +16,18 @@ export type SqlDetail = {
   truncated: boolean;
 };
 
+export type CompletionDetail = {
+  completed: boolean | null;
+  reason: string | null;
+  missingItems: string[];
+  nextActionHint: string | null;
+  todoProgress: {
+    total: number;
+    completed: number;
+    inProgress: string | null;
+  } | null;
+};
+
 export type DisplayStep = {
   id: string;
   title: string;
@@ -25,6 +37,7 @@ export type DisplayStep = {
   metrics: DisplayMetric[];
   artifactRefs: string[];
   sqlDetail: SqlDetail | null;
+  completionDetail: CompletionDetail | null;
   debugPayload: Record<string, unknown> | null;
 };
 
@@ -44,18 +57,28 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const tool = step.tool || stringFrom(call?.tool) || step.phase;
   const metrics = metricsForTool(tool, preview, call);
   const artifactRefs = artifactRefsFor(preview, result);
+  const completionDetail = completionDetailFor(preview);
+  const status = statusForStep(step, completionDetail);
 
   return {
     id: step.id,
     title: titleForTool(tool, step.phase),
     category: categoryForTool(tool, step.phase),
-    status: step.status,
+    status,
     summary: summaryForStep(step, preview),
     metrics,
     artifactRefs,
     sqlDetail: sqlDetailFor(tool, preview),
+    completionDetail,
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
   };
+}
+
+function statusForStep(step: TraceStep, completionDetail: CompletionDetail | null): TraceStep['status'] {
+  if (step.status === 'running') return 'running';
+  if (step.status === 'error') return 'error';
+  if (completionDetail?.completed === false) return 'error';
+  return step.status;
 }
 
 export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null): RunOverview {
@@ -114,6 +137,10 @@ function categoryForTool(tool?: string, phase?: string) {
 }
 
 function summaryForStep(step: TraceStep, preview: Record<string, unknown> | null) {
+  const completionDetail = completionDetailFor(preview);
+  if (completionDetail?.completed === false) {
+    return completionDetail.reason || completionDetail.nextActionHint || 'Needs more evidence.';
+  }
   const tool = step.tool;
   if ((tool === 'sql_query' || tool === 'query_database') && preview) {
     const rowCount = numberFrom(preview.row_count) ?? nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']);
@@ -156,6 +183,14 @@ function metricsForTool(
   addMetric(metrics, 'Anomalies', numberFrom(preview?.anomaly_count) ?? numberFrom(preview?.anomaly_point_count));
   addMetric(metrics, 'Forecast points', numberFrom(preview?.forecast_point_count));
   addMetric(metrics, 'Todos', numberFrom(preview?.todo_total));
+  const todoProgress = asRecord(preview?.todo_progress);
+  if (todoProgress) {
+    const completed = numberFrom(todoProgress.completed);
+    const total = numberFrom(todoProgress.total);
+    if (completed !== null && total !== null && total > 0) {
+      addMetric(metrics, 'Todo progress', `${completed}/${total}`);
+    }
+  }
   addMetric(metrics, 'Visuals', numberFrom(preview?.visualization_count));
 
   const inputPreview = asRecord(call?.input_preview);
@@ -197,6 +232,39 @@ function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown>
     rowCount: numberFrom(preview.row_count),
     pointCount: numberFrom(preview.point_count),
     truncated: Boolean(preview.truncated || preview.payload_truncated),
+  };
+}
+
+function completionDetailFor(preview: Record<string, unknown> | null): CompletionDetail | null {
+  if (!preview) return null;
+  const verdict =
+    asRecord(preview.completion_verdict) ||
+    asRecord(preview.answerability_verdict) ||
+    asRecord(preview.plan_requirement);
+  const todoProgress = asRecord(preview.todo_progress);
+  if (!verdict && !todoProgress) return null;
+  const completed =
+    typeof verdict?.completed === 'boolean'
+      ? verdict.completed
+      : typeof verdict?.can_answer === 'boolean'
+        ? verdict.can_answer
+        : typeof verdict?.requires_plan === 'boolean'
+          ? !verdict.requires_plan
+          : null;
+  return {
+    completed,
+    reason: stringFrom(verdict?.reason),
+    missingItems: stringsFrom(verdict?.missing_items).length
+      ? stringsFrom(verdict?.missing_items)
+      : stringsFrom(verdict?.deliverables),
+    nextActionHint: stringFrom(verdict?.next_action_hint),
+    todoProgress: todoProgress
+      ? {
+          total: numberFrom(todoProgress.total) || 0,
+          completed: numberFrom(todoProgress.completed) || 0,
+          inProgress: stringFrom(todoProgress.in_progress),
+        }
+      : null,
   };
 }
 

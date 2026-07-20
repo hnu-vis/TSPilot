@@ -242,7 +242,7 @@ class FormatAnswerTool(BaseTool):
             )
         ]
         answer = FinalAnswer(
-            title="TSPilot v0.2 Analysis",
+            title=None,
             summary=summary,
             sections=sections,
             references=references,
@@ -367,10 +367,11 @@ class FormatAnswerTool(BaseTool):
         return normalized
 
     def _evidence_sections(self, evidence) -> list[AnswerSection]:
+        sections = self._query_sections(evidence)
         if evidence.result_type == "statistics":
             stats = evidence.data.get("statistics", {})
             lines = [f"- {key}: {value}" for key, value in stats.items()]
-            return [
+            return sections + [
                 AnswerSection(
                     section_type="statistics",
                     heading="Statistics",
@@ -381,7 +382,7 @@ class FormatAnswerTool(BaseTool):
         if evidence.result_type == "metric_list":
             metrics = evidence.data.get("metrics", [])
             preview = metrics[:20]
-            return [
+            return sections + [
                 AnswerSection(
                     section_type="metric_list",
                     heading="Available Metrics",
@@ -392,7 +393,7 @@ class FormatAnswerTool(BaseTool):
         if evidence.result_type == "schema":
             tables = evidence.data.get("tables_or_measurements", [])
             preview = [table.get("name") for table in tables[:20]]
-            return [
+            return sections + [
                 AnswerSection(
                     section_type="schema",
                     heading="Schema Preview",
@@ -402,7 +403,7 @@ class FormatAnswerTool(BaseTool):
             ]
         if evidence.result_type == "table":
             rows = evidence.data.get("rows", [])
-            return [
+            return sections + [
                 AnswerSection(
                     section_type="table",
                     heading="Table Result",
@@ -410,4 +411,42 @@ class FormatAnswerTool(BaseTool):
                     structured_payload={"row_count": len(rows), "columns": evidence.columns},
                 )
             ]
-        return []
+        return sections
+
+    def _query_sections(self, evidence) -> list[AnswerSection]:
+        query = str(evidence.query or "").strip()
+        if not query or self._is_internal_query(evidence):
+            return []
+        language = self._markdown_language(evidence.query_language)
+        fence = f"```{language}\n{query}\n```" if language else f"```\n{query}\n```"
+        return [
+            AnswerSection(
+                section_type="query",
+                heading="Query",
+                content=fence,
+                structured_payload={
+                    "query_language": evidence.query_language,
+                    "database": evidence.database,
+                },
+            )
+        ]
+
+    def _is_internal_query(self, evidence) -> bool:
+        language = str(evidence.query_language or "").strip().lower()
+        query = str(evidence.query or "").strip().lower()
+        return language == "reference_dataset" or query.startswith("reference_dataset:")
+
+    def _markdown_language(self, query_language: str | None) -> str | None:
+        normalized = str(query_language or "").strip().lower()
+        if not normalized:
+            return None
+        aliases = {
+            "postgres": "sql",
+            "postgresql": "sql",
+            "timescaledb": "sql",
+            "questdb": "sql",
+            "clickhouse": "sql",
+            "influxdb": "flux",
+            "prometheus": "promql",
+        }
+        return aliases.get(normalized, normalized)

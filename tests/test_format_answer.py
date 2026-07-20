@@ -81,6 +81,70 @@ def test_format_answer_allows_statistics_evidence_for_count_direct_answer():
     assert result["references"][0]["source_id"] == "evi_count_stats"
 
 
+def test_format_answer_renders_real_query_as_fenced_code_section():
+    request_state = build_request_state(
+        ChatRequest(
+            message="查询最近的数据",
+            database_context={"database_id": "demo", "database_type": "timescaledb"},
+        ),
+        get_settings(),
+    )
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_recent_rows",
+        result_type="table",
+        database="demo",
+        query_language="timescaledb",
+        query="SELECT time, value FROM metrics ORDER BY time DESC LIMIT 10",
+        summary="Loaded 10 recent rows.",
+        data={"rows": [{"time": "2026-01-01T00:00:00Z", "value": 1.0}]},
+        columns=["time", "value"],
+        metadata={"sql_query_mode": "llm"},
+        diagnostics={},
+    )
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(summary_goal="展示查询结果"),
+            request_state=request_state,
+        )
+    )
+
+    assert result["sections"][1]["section_type"] == "query"
+    assert result["sections"][1]["content"].startswith("```sql\nSELECT")
+    assert result["sections"][2]["section_type"] == "table"
+
+
+def test_format_answer_does_not_render_internal_reference_dataset_query_section():
+    request_state = build_request_state(
+        ChatRequest(
+            message="总共有多少条数据？",
+            database_context={"database_id": "demo", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_count_stats",
+        result_type="statistics",
+        database="demo",
+        query_language="reference_dataset",
+        query="reference_dataset:value:statistics",
+        summary="Computed statistics over 19735 rows.",
+        data={"statistics": {"count": 19735}},
+        columns=["metric", "value"],
+        metadata={},
+        diagnostics={},
+    )
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(summary_goal="回答总条数"),
+            request_state=request_state,
+        )
+    )
+
+    assert "query" not in [section["section_type"] for section in result["sections"]]
+
+
 def test_format_answer_assembles_selected_analysis_results():
     request_state = build_request_state(
         ChatRequest(message="汇总两个分析结果"),

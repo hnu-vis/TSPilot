@@ -50,8 +50,14 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
   return (
     <div className="chat-thread">
       {messages.map((message, index) => (
-        <article key={message.id} className={`message ${message.role}`}>
+        <article key={message.id} className={`message ${message.role} ${message.answer ? 'has-answer' : ''}`}>
           <div className="avatar">{message.role === 'user' ? <User size={16} /> : <Bot size={16} />}</div>
+          {index === lastAssistantIndex && latestTodos.length > 0 && message.answer && (
+            <TodoList todos={latestTodos} />
+          )}
+          {index === lastAssistantIndex && traceSteps.length > 0 && message.answer && (
+            <TraceTimeline steps={traceSteps} selectedId={selectedTraceStepId} onSelect={onSelectTraceStep} />
+          )}
           <div className="bubble">
             {message.answer ? (
               <FinalAnswer answer={message.answer} />
@@ -66,10 +72,10 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
               <p>{message.content}</p>
             )}
           </div>
-          {index === lastAssistantIndex && latestTodos.length > 0 && (
+          {index === lastAssistantIndex && latestTodos.length > 0 && !message.answer && (
             <TodoList todos={latestTodos} />
           )}
-          {index === lastAssistantIndex && traceSteps.length > 0 && (
+          {index === lastAssistantIndex && traceSteps.length > 0 && !message.answer && (
             <TraceTimeline steps={traceSteps} selectedId={selectedTraceStepId} onSelect={onSelectTraceStep} />
           )}
         </article>
