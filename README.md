@@ -44,9 +44,13 @@ scripts/dev.sh
 Defaults:
 
 - Backend: `http://127.0.0.1:5680`
-- Frontend: `http://127.0.0.1:5670`
+- Frontend listens on `0.0.0.0:5670`
+- Local frontend URL: `http://127.0.0.1:5670`
+- LAN frontend URL on this machine: `http://10.110.1.71:5670`
 
 The script starts both services and stops both when you press `Ctrl+C`.
+
+The backend intentionally defaults to `127.0.0.1` because the Vite dev server proxies `/api` and `/health` to it. External browsers only need to reach the frontend port.
 
 ## Start Services Separately
 
@@ -60,8 +64,41 @@ Frontend:
 
 ```bash
 cd frontend
-npm run dev -- --host 127.0.0.1 --port 5670
+npm run dev -- --host 0.0.0.0 --port 5670
 ```
+
+Do not start the frontend with `--host 127.0.0.1` if you need LAN/external access. In Vite, the last `--host` argument wins, so a command such as `vite --host 0.0.0.0 --host 127.0.0.1` will only listen on localhost.
+
+## Access From Another Machine
+
+Use the host's LAN IP and frontend port:
+
+```text
+http://10.110.1.71:5670/
+```
+
+If you use another port, replace `5670` with `FRONTEND_PORT`.
+
+To start on a custom externally reachable port:
+
+```bash
+FRONTEND_HOST=0.0.0.0 FRONTEND_PORT=5174 scripts/dev.sh
+```
+
+Check whether the frontend is really listening externally:
+
+```bash
+ss -ltnp | grep ':5670'
+curl --noproxy '*' -I http://10.110.1.71:5670/
+```
+
+Expected listener:
+
+```text
+0.0.0.0:5670
+```
+
+If you see `127.0.0.1:5670`, the frontend is only available locally.
 
 ## Useful Checks
 
@@ -69,6 +106,12 @@ Backend health:
 
 ```bash
 curl --noproxy '*' http://127.0.0.1:5680/health
+```
+
+Frontend from the host LAN IP:
+
+```bash
+curl --noproxy '*' -I http://10.110.1.71:5670/
 ```
 
 List configured database resources:
@@ -88,4 +131,13 @@ Run backend tests:
 - If `scripts/dev.sh` cannot find Python, set `BACKEND_PYTHON=/path/to/python`.
 - If ports are occupied, set `BACKEND_PORT` or `FRONTEND_PORT` before running the script.
 - If the frontend cannot reach the API, confirm the backend health endpoint returns `{"status":"ok"}`.
+- If external access fails, confirm the frontend listener is `0.0.0.0:5670`, not `127.0.0.1:5670`.
+- If your browser or shell uses an HTTP proxy, add `10.110.1.71` or your LAN CIDR to the proxy bypass list. For shell checks:
+
+  ```bash
+  export NO_PROXY="$NO_PROXY,10.110.1.71"
+  export no_proxy="$no_proxy,10.110.1.71"
+  ```
+
+- If another machine still cannot connect after the service listens on `0.0.0.0`, check firewall/security-group rules for the frontend port.
 - If model calls fail, verify `OPENAI_API_KEY`, `OPENAI_API_BASE`, and `OPENAI_MODEL` in `.env`.

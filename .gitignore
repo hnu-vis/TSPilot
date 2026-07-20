@@ -11,6 +11,7 @@ node_modules/
 
 .venv/
 venv/
+screenshots
 env/
 .e2e-venv
 
