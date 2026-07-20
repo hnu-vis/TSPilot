@@ -59,7 +59,7 @@ class ToolRegistry:
         return self._specs[action_name]
 
 
-def build_tool_registry(settings: Settings) -> ToolRegistry:
+def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
     specs = [
         ToolSpec(
             tool_name="todowrite",
@@ -78,7 +78,7 @@ def build_tool_registry(settings: Settings) -> ToolRegistry:
             description="Unified read-only database query tool. Use natural-language message for automatic planning or explicit query for SQL/Flux/PromQL analysis.",
             input_model=SqlQueryInput,
             output_model=DatabaseEvidence,
-            tool=SqlQueryTool(settings),
+            tool=SqlQueryTool(settings, llm=llm),
             prompt_visible=True,
             runtime_access="request_and_conversation_read",
             result_target="evidence",

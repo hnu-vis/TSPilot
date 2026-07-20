@@ -45,7 +45,9 @@ class QueryDatabaseTool(BaseTool):
 
     async def execute(self, validated_input: QueryDatabaseInput, **kwargs) -> dict:
         config_path, config = await self._load_database_config(validated_input.database_context.database_id)
-        evidence_family = infer_evidence_family(validated_input.message)
+        evidence_family = str(validated_input.constraints.get("expected_result_type") or "").strip()
+        if evidence_family not in {"schema", "metric_list", "statistics", "table", "timeseries"}:
+            evidence_family = infer_evidence_family(validated_input.message)
         if evidence_family == "metric_list":
             return await self._metric_list_evidence(validated_input, config)
         if evidence_family == "schema":
@@ -126,6 +128,7 @@ class QueryDatabaseTool(BaseTool):
         if not rows:
             raise ValueError(f"Reference dataset '{dataset_path}' is empty.")
         time_field = reference_dataset.get("timestamp_column", next(iter(rows[0].keys())))
+        reference_dataset = self._reference_dataset_with_query_hints(reference_dataset, validated_input.constraints)
         value_fields = self._pick_value_fields(validated_input.message, reference_dataset, rows[0].keys())
         value_field = value_fields[0]
         filtered_rows = self._filter_rows(rows, time_field, validated_input.time_range)
@@ -168,6 +171,7 @@ class QueryDatabaseTool(BaseTool):
         if not rows:
             raise ValueError(f"Reference dataset '{dataset_path}' is empty.")
         time_field = reference_dataset.get("timestamp_column", next(iter(rows[0].keys())))
+        reference_dataset = self._reference_dataset_with_query_hints(reference_dataset, validated_input.constraints)
         value_field = self._pick_value_field(validated_input.message, reference_dataset, rows[0].keys())
         filtered_rows = self._filter_rows(rows, time_field, validated_input.time_range)
         values = []
@@ -291,7 +295,23 @@ class QueryDatabaseTool(BaseTool):
     def _pick_value_field(self, message: str, reference_dataset: dict, columns) -> str:
         return self._pick_value_fields(message, reference_dataset, columns)[0]
 
+    def _reference_dataset_with_query_hints(self, reference_dataset: dict, constraints: dict) -> dict:
+        selected_fields = constraints.get("selected_fields")
+        if not isinstance(selected_fields, list) or not selected_fields:
+            return reference_dataset
+        return {**reference_dataset, "selected_fields": selected_fields}
+
     def _pick_value_fields(self, message: str, reference_dataset: dict, columns) -> list[str]:
+        selected_from_constraints = reference_dataset.get("selected_fields")
+        if isinstance(selected_from_constraints, list):
+            available = {str(column) for column in columns}
+            selected = [
+                str(field)
+                for field in selected_from_constraints
+                if field not in (None, "") and str(field) in available and str(field) != reference_dataset.get("timestamp_column")
+            ]
+            if selected:
+                return selected
         text = message.lower()
         configured = list(reference_dataset.get("field_columns", []))
         selected: list[str] = []

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from core.completion import normalize_todo_for_completion
+import pytest
+
+from core.completion import CompletionEvaluation, normalize_todo_for_completion
+from core.runtime_evaluator import PlanRequirementVerdict
+from runtime.react_loop import ReActLoop
 from runtime.action_policy import validate_action
-from runtime.request_state import apply_observation
+from runtime.request_state import apply_observation, apply_observation_async
+from schemas.agent_turn import ReActTurn
+from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
@@ -14,6 +20,49 @@ class _EvidenceSpec:
 
 class _AnalysisSpec:
     result_target = "analysis"
+
+
+class _CompletionEvaluator:
+    def __init__(self, completed: bool):
+        self.completed = completed
+        self.last_step_verdict = {
+            "completed": completed,
+            "reason": "test verdict",
+            "missing_items": [] if completed else ["missing exact result"],
+        }
+
+    async def evaluate_step_completion(self, **kwargs):
+        return CompletionEvaluation(
+            completed=self.completed,
+            reason="test verdict",
+            missing_evidence=[] if self.completed else ["missing exact result"],
+            evidence_refs=["evidence:evi_demo"] if self.completed else [],
+        )
+
+
+class _OneTurnAgent:
+    async def next_turn(self, request_state, conversation_state):
+        return ReActTurn(
+            thought="try query first",
+            action="sql_query",
+            action_input={"message": request_state.message, "database_context": request_state.database_context.model_dump(mode="json")},
+        )
+
+
+class _PlanEvaluator:
+    last_step_verdict = None
+
+    async def evaluate_plan_requirement(self, **kwargs):
+        return PlanRequirementVerdict(
+            requires_plan=True,
+            reason="multiple deliverables",
+            deliverables=["count", "earliest rows"],
+        )
+
+
+class _UnusedExecutor:
+    async def execute(self, *args, **kwargs):
+        raise AssertionError("tool executor should not run when plan is required")
 
 
 def test_policy_does_not_force_todowrite_for_complex_initial_request():
@@ -174,6 +223,107 @@ def test_todo_plan_expands_iteration_budget_for_multistep_workflow():
     )
 
     assert request_state.max_iterations == 17
+
+
+@pytest.mark.asyncio
+async def test_llm_completion_verdict_false_keeps_todo_in_progress():
+    request_state = RequestStateModel(
+        request_id="req-llm-completion-false",
+        message="返回总数和最早5条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
+        ],
+    )
+    payload = {
+        "evidence_id": "evi_demo",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "from(...)",
+        "summary": "Loaded 5 rows.",
+        "data": {"rows": [{"value": 1}]},
+        "columns": ["value"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+
+    await apply_observation_async(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="rows", payload=payload),
+        payload,
+        _EvidenceSpec(),
+        completion_evaluator=_CompletionEvaluator(completed=False),
+    )
+
+    assert request_state.todo_list[0]["status"] == "in_progress"
+    assert request_state.todo_list[1]["status"] == "pending"
+    assert request_state.completion_state["latest_step"]["completed"] is False
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["missing exact result"]
+
+
+@pytest.mark.asyncio
+async def test_llm_completion_verdict_true_advances_todo():
+    request_state = RequestStateModel(
+        request_id="req-llm-completion-true",
+        message="返回总数和最早5条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
+        ],
+    )
+    payload = {
+        "evidence_id": "evi_demo",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "from(...) |> count()",
+        "summary": "Loaded 1 row.",
+        "data": {"rows": [{"count": 10}]},
+        "columns": ["count"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+
+    await apply_observation_async(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="count", payload=payload),
+        payload,
+        _EvidenceSpec(),
+        completion_evaluator=_CompletionEvaluator(completed=True),
+    )
+
+    assert request_state.todo_list[0]["status"] == "completed"
+    assert request_state.todo_list[1]["status"] == "in_progress"
+    assert request_state.completion_state["latest_step"]["completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_direct_query_when_llm_requires_plan():
+    request_state = RequestStateModel(
+        request_id="req-plan-gate",
+        message="请完成以下任务: 1.返回总数; 2.返回最早5条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        max_iterations=1,
+    )
+    loop = ReActLoop(
+        data_agent=_OneTurnAgent(),
+        tool_executor=_UnusedExecutor(),
+        settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
+        runtime_evaluator=_PlanEvaluator(),
+    )
+
+    events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
+    observation = next(event for event in events if event.event_type == "observation")
+
+    assert observation.payload["success"] is False
+    assert "todo plan is required" in observation.payload["summary"].lower()
+    assert request_state.tool_history == []
 
 
 def test_policy_blocks_format_answer_until_database_goal_has_evidence():

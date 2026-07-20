@@ -10,6 +10,12 @@ class FakeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = _compat_context(json.loads(context_json))
 
@@ -83,6 +89,12 @@ class CasualLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = _compat_context(json.loads(context_json))
         return _turn(
@@ -105,6 +117,12 @@ class ComplexReActLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = _compat_context(json.loads(context_json))
 
@@ -203,6 +221,12 @@ class RepeatingTodoLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = _compat_context(json.loads(context_json))
 
@@ -282,6 +306,12 @@ class TodoScopeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
         context = _compat_context(json.loads(context_json))
 
@@ -382,6 +412,105 @@ def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
             ensure_ascii=False,
         )
     )
+
+
+def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
+    if "LLM SQL Query Generation JSON:" not in user_prompt:
+        return None
+    payload = json.loads(user_prompt.split("LLM SQL Query Generation JSON:\n", 1)[1])
+    request = payload.get("request") or {}
+    schema_preview = request.get("schema_preview") or {}
+    database_type = str(request.get("database_type") or "").lower()
+    tables = schema_preview.get("tables_or_measurements") or []
+    table = tables[0] if tables and isinstance(tables[0], dict) else {}
+    table_name = table.get("name") or "measurement"
+    fields = table.get("field_columns") or []
+    field = fields[0] if fields else "value"
+    time_range = request.get("time_range") or {}
+    start = time_range.get("start") or "1970-01-01T00:00:00Z"
+    end = time_range.get("end")
+    if database_type == "influxdb":
+        query = (
+            f'from(bucket: "energydata")\n'
+            f'  |> range(start: {start}{", stop: " + end if end else ""})\n'
+            f'  |> filter(fn: (r) => r._measurement == "{table_name}")\n'
+            f'  |> filter(fn: (r) => r._field == "{field}")'
+        )
+        language = "flux"
+    elif database_type == "prometheus":
+        query = str(table_name)
+        language = "promql"
+    else:
+        query = f'SELECT "timestamp", "{field}" AS value FROM "{table_name}"'
+        language = "sql"
+    return _FakeResponse(
+        json.dumps(
+            {
+                "query": query,
+                "query_language": language,
+                "purpose": "load grounded evidence",
+                "expected_result_type": "timeseries",
+                "selected_fields": [field],
+                "assumptions": [],
+                "confidence": 0.9,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _runtime_evaluation_response(user_prompt: str) -> _FakeResponse | None:
+    if "TSPilot Plan Requirement JSON:" in user_prompt:
+        payload = json.loads(user_prompt.split("TSPilot Plan Requirement JSON:\n", 1)[1])
+        context = payload.get("context") or {}
+        message = str(context.get("message") or "")
+        requires_plan = "完成以下任务" in message or message.count(";") >= 3
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "requires_plan": requires_plan,
+                    "reason": "multiple independently verifiable deliverables" if requires_plan else "single-step request",
+                    "deliverables": ["count", "head", "tail", "bounds"] if requires_plan else [],
+                    "confidence": 0.9,
+                    "next_action_hint": "call todowrite" if requires_plan else None,
+                },
+                ensure_ascii=False,
+            )
+        )
+    if "TSPilot Step Completion JSON:" in user_prompt:
+        payload = json.loads(user_prompt.split("TSPilot Step Completion JSON:\n", 1)[1])
+        context = payload.get("context") or {}
+        tool_payload = context.get("tool_payload") or {}
+        evidence_id = tool_payload.get("evidence_id")
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "completed": bool(evidence_id or context.get("tool_name") in {"insight", "anomaly", "forecast", "format_answer"}),
+                    "reason": "latest tool output satisfies the active todo",
+                    "missing_items": [],
+                    "satisfied_items": ["active_todo"],
+                    "evidence_refs": [f"evidence:{evidence_id}"] if evidence_id else [],
+                    "next_action_hint": None,
+                    "confidence": 0.9,
+                },
+                ensure_ascii=False,
+            )
+        )
+    if "TSPilot Answerability JSON:" in user_prompt:
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "can_answer": True,
+                    "reason": "available outputs are sufficient for this test scenario",
+                    "missing_items": [],
+                    "answerable_from": ["evidence:latest"],
+                    "next_action_hint": None,
+                    "confidence": 0.9,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return None
 
 
 def _compat_context(context: dict) -> dict:

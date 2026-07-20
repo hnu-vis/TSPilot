@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     conversation_log_enabled: bool = Field(default=True, alias="TSPILOT_CONVERSATION_LOG_ENABLED")
     conversation_log_dir: str | None = Field(default=None, alias="TSPILOT_CONVERSATION_LOG_DIR")
 
-    max_iterations: int = 10
+    max_iterations: int = 30
     max_prompt_tokens: int = 12000
     max_history_messages: int = 12
     max_tool_history_items: int = 8

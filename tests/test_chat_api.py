@@ -23,6 +23,7 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     deps.get_data_agent.cache_clear()
     deps.get_tool_registry.cache_clear()
     deps.get_tool_executor.cache_clear()
+    deps.get_runtime_evaluator.cache_clear()
     chat_route.get_react_loop = deps.get_react_loop
     return TestClient(app)
 
