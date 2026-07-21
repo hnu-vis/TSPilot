@@ -55,6 +55,11 @@ The current reusable plan model lives in:
 
 - [core/database/query_plan.py](/home/feilvvl/TSPilot-v0.2/core/database/query_plan.py)
 
+The schema analysis and determination flow is captured as the `schema linking`
+feature:
+
+- [core/database/SPEC/schema_linking_SPEC.md](/home/feilvvl/TSPilot-v0.2/core/database/SPEC/schema_linking_SPEC.md)
+
 ## Runtime orchestration
 
 Recommended orchestration inside `query_database`:
@@ -80,6 +85,7 @@ Existing files already provide partial building blocks:
 - schema grounding:
   - [core/database/schema.py](/home/feilvvl/TSPilot-v0.2/core/database/schema.py)
   - [core/database/schema_linker.py](/home/feilvvl/TSPilot-v0.2/core/database/schema_linker.py)
+  - [core/database/SPEC/schema_linking_SPEC.md](/home/feilvvl/TSPilot-v0.2/core/database/SPEC/schema_linking_SPEC.md)
 - logical plan:
   - [core/database/query_plan.py](/home/feilvvl/TSPilot-v0.2/core/database/query_plan.py)
 - rendering:

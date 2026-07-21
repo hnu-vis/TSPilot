@@ -7,9 +7,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.settings import Settings
 from core.database import DatabaseFactory, execute_query, normalize_query_result
+from core.database.connector import DatabaseSchema
+from core.database.contracts import QueryRequestContext, RenderedQuery
 from core.database.llm_query import LLMGeneratedQuery, LLMQueryGenerationResult, LLMQueryGenerator
+from core.database.query_flow import DefaultIntentInterpreter, DefaultQueryValidator
 from core.database.repair import classify_query_error, repair_read_only_query
 from core.database.schema import schema_preview
+from core.database.schema_linking import SchemaLinkingPipeline
+from schemas.state import RequestStateModel
 from schemas.database_context import DatabaseContext
 from tools.base import BaseTool
 
@@ -53,6 +58,7 @@ class _ExplicitQueryExecutor(BaseTool):
 
     def __init__(self, settings: Settings):
         self._settings = settings
+        self._schema_linking_pipeline = SchemaLinkingPipeline()
 
     async def execute(self, validated_input: _ExplicitQueryInput, **kwargs) -> dict:
         return await self.execute_query_input(validated_input, mode="explicit")
@@ -75,6 +81,14 @@ class _ExplicitQueryExecutor(BaseTool):
         config = await self._load_database_config(validated_input.database_context.database_id)
         connector = await DatabaseFactory.create_connector(**config)
         async with connector:
+            request_state = kwargs.get("request_state")
+            await self._validate_required_filters(
+                connector=connector,
+                config=config,
+                validated_input=validated_input,
+                query=query,
+                request_state=request_state if isinstance(request_state, RequestStateModel) else None,
+            )
             result, executed_query, repair_diagnostics = await self._execute_with_repair(
                 connector=connector,
                 query=query,
@@ -189,6 +203,54 @@ class _ExplicitQueryExecutor(BaseTool):
             return "promql"
         return "sql"
 
+    async def _validate_required_filters(
+        self,
+        *,
+        connector,
+        config: dict,
+        validated_input: _ExplicitQueryInput,
+        query: str,
+        request_state: RequestStateModel | None,
+    ) -> None:
+        message = (request_state.message if request_state is not None else None) or validated_input.purpose or ""
+        if not message.strip():
+            return
+        try:
+            schema = await connector.get_schema()
+        except Exception:
+            return
+        context = QueryRequestContext(
+            database_id=validated_input.database_context.database_id,
+            database_type=str(config.get("type", validated_input.database_context.database_type)),
+            message=message,
+            constraints=validated_input.constraints,
+            intent_profile=request_state.intent_profile if request_state is not None else {},
+        )
+        intent = DefaultIntentInterpreter().interpret(context=context)
+        linking_result = self._schema_linking_pipeline.ground(
+            context=context,
+            schema=schema,
+            intent=intent,
+        )
+        if not linking_result.required_filters:
+            return
+        rendered = RenderedQuery(
+            query_text=query,
+            query_language=validated_input.query_language or self._infer_query_language(config),
+        )
+        validation = DefaultQueryValidator().validate(
+            context=context,
+            plan=linking_result.plan,
+            rendered_query=rendered,
+        )
+        missing = [issue for issue in validation.issues if issue.code == "required_filter_missing"]
+        if missing:
+            details = "; ".join(issue.message for issue in missing)
+            raise ValueError(
+                "Explicit query is missing filters required by the user request. "
+                f"{details} Preserve those filters or use sql_query automatic planning."
+            )
+
 
 class SqlQueryTool(BaseTool):
     """Unified database query tool for planned and explicit read-only queries."""
@@ -215,16 +277,19 @@ class SqlQueryTool(BaseTool):
                 **kwargs,
             )
 
-        return await self._execute_llm_planned_query(validated_input)
+        return await self._execute_llm_planned_query(validated_input, **kwargs)
 
-    async def _execute_llm_planned_query(self, validated_input: SqlQueryInput) -> dict:
+    async def _execute_llm_planned_query(self, validated_input: SqlQueryInput, **kwargs) -> dict:
         if self._llm_query_generator is None:
             raise RuntimeError("sql_query automatic mode requires an LLM query generator.")
 
         config_path, config = await self._planned_query_tool._load_database_config(
             validated_input.database_context.database_id
         )
-        preview = await self._load_schema_preview(validated_input, config)
+        schema, preview = await self._load_schema_and_preview(validated_input, config)
+        linking_diagnostics = self._schema_linking_for_generation(validated_input, config, schema)
+        if linking_diagnostics:
+            preview = {**preview, "schema_linking": linking_diagnostics}
         generation = await self._llm_query_generator.generate(
             database_id=validated_input.database_context.database_id,
             database_type=str(config.get("type", validated_input.database_context.database_type)),
@@ -235,7 +300,13 @@ class SqlQueryTool(BaseTool):
             history=validated_input.history,
         )
         try:
-            return await self._execute_generated_query(validated_input, config, generation)
+            return await self._execute_generated_query(
+                validated_input,
+                config,
+                generation,
+                schema_linking_diagnostics=linking_diagnostics,
+                **kwargs,
+            )
         except ValueError:
             raise
         except Exception as exc:
@@ -255,18 +326,54 @@ class SqlQueryTool(BaseTool):
                 config,
                 repair_generation,
                 previous_error=exc,
+                schema_linking_diagnostics=linking_diagnostics,
+                **kwargs,
             )
 
-    async def _load_schema_preview(self, validated_input: SqlQueryInput, config: dict) -> dict:
-        if validated_input.database_context.schema_hint:
-            return validated_input.database_context.schema_hint
+    async def _load_schema_and_preview(self, validated_input: SqlQueryInput, config: dict) -> tuple[DatabaseSchema | None, dict]:
         reference_dataset = config.get("reference_dataset")
         if isinstance(reference_dataset, dict):
-            return self._reference_dataset_schema_preview(config)
-        connector = await DatabaseFactory.create_connector(**config)
-        async with connector:
-            schema = await connector.get_schema()
-        return schema_preview(schema)
+            return None, self._reference_dataset_schema_preview(config)
+        try:
+            connector = await DatabaseFactory.create_connector(**config)
+            async with connector:
+                schema = await connector.get_schema()
+            return schema, schema_preview(schema)
+        except Exception:
+            if validated_input.database_context.schema_hint:
+                return None, validated_input.database_context.schema_hint
+            raise
+
+    async def _load_schema_preview(self, validated_input: SqlQueryInput, config: dict) -> dict:
+        _, preview = await self._load_schema_and_preview(validated_input, config)
+        return preview
+
+    def _schema_linking_for_generation(
+        self,
+        validated_input: SqlQueryInput,
+        config: dict,
+        schema: DatabaseSchema | None,
+    ) -> dict | None:
+        if schema is None:
+            return None
+        message = validated_input.message or ""
+        if not message.strip():
+            return None
+        context = QueryRequestContext(
+            database_id=validated_input.database_context.database_id,
+            database_type=str(config.get("type", validated_input.database_context.database_type)),
+            message=message,
+            time_range=validated_input.time_range,
+            constraints=validated_input.constraints,
+            history=validated_input.history,
+            intent_profile=validated_input.intent_profile,
+        )
+        intent = DefaultIntentInterpreter().interpret(context=context)
+        return SchemaLinkingPipeline().ground(
+            context=context,
+            schema=schema,
+            intent=intent,
+        ).diagnostics()
 
     def _reference_dataset_schema_preview(self, config: dict) -> dict:
         reference_dataset = config.get("reference_dataset") if isinstance(config.get("reference_dataset"), dict) else {}
@@ -307,10 +414,12 @@ class SqlQueryTool(BaseTool):
         generation: LLMQueryGenerationResult,
         *,
         previous_error: Exception | None = None,
+        schema_linking_diagnostics: dict | None = None,
+        **kwargs,
     ) -> dict:
         generated = generation.generated_query
         if isinstance(config.get("reference_dataset"), dict):
-            return await self._execute_reference_dataset_query(validated_input, config, generated, generation, previous_error)
+            return await self._execute_reference_dataset_query(validated_input, config, generated, generation, previous_error, **kwargs)
         return await self._explicit_query_executor.execute_query_input(
             _ExplicitQueryInput(
                 database_context=validated_input.database_context,
@@ -324,7 +433,11 @@ class SqlQueryTool(BaseTool):
                 "generation_mode": "llm",
                 "expected_result_type": generated.expected_result_type,
             },
-            extra_diagnostics=self._generation_diagnostics(generation, previous_error=previous_error),
+            extra_diagnostics={
+                **self._generation_diagnostics(generation, previous_error=previous_error),
+                **({"schema_linking_generation": schema_linking_diagnostics} if schema_linking_diagnostics else {}),
+            },
+            **kwargs,
         )
 
     async def _execute_reference_dataset_query(
@@ -334,6 +447,7 @@ class SqlQueryTool(BaseTool):
         generated: LLMGeneratedQuery,
         generation: LLMQueryGenerationResult,
         previous_error: Exception | None,
+        **kwargs,
     ) -> dict:
         from tools.query_database import QueryDatabaseInput
 
@@ -358,7 +472,8 @@ class SqlQueryTool(BaseTool):
                 selected_database=validated_input.selected_database,
                 selected_database_type=validated_input.selected_database_type,
                 history=validated_input.history,
-            )
+            ),
+            **kwargs,
         )
         evidence["query"] = generated.query
         evidence["query_language"] = generated.query_language or self._infer_query_language(config)

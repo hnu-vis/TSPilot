@@ -18,6 +18,7 @@ from core.database.query_flow import (
     DefaultLogicalQueryPlanner,
     DefaultQueryValidator,
 )
+from core.database.schema_linking import SchemaLinkingPipeline
 from app.settings import get_settings
 from types import SimpleNamespace
 from tools.query_database import QueryDatabaseInput, QueryDatabaseTool
@@ -247,6 +248,33 @@ def test_validator_flags_missing_required_value_filters():
     assert any(issue.code == "required_filter_missing" for issue in validation.issues)
 
 
+def test_schema_linking_pipeline_outputs_plan_and_required_filters_once():
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message="查询 Bitcoin USD 价格的最晚一条原始记录",
+    )
+    schema = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+
+    result = SchemaLinkingPipeline().ground(context=context, schema=schema, intent=intent)
+
+    assert result.linking.sources[0].name == "coindesk"
+    assert result.field_mappings[0].field_name == "price"
+    assert result.plan.schema_linking == result.linking.to_dict()
+    assert {(item.column, item.value) for item in result.required_filters} == {
+        ("code", "USD"),
+        ("crypto", "bitcoin"),
+    }
+    assert {
+        (item["column"], tuple(item["values"]))
+        for item in result.diagnostics()["candidate_filters"]
+    } == {
+        ("code", ("EUR", "GBP", "USD")),
+        ("crypto", ("bitcoin",)),
+    }
+
+
 def test_sql_renderer_uses_absolute_time_range_and_requested_aggregation():
     schema = DatabaseSchema(
         database="demo",
@@ -333,6 +361,16 @@ class _FakeInfluxProbeConnector:
         )
 
 
+class _CountingSchemaLinkingPipeline(SchemaLinkingPipeline):
+    def __init__(self):
+        super().__init__()
+        self.ground_calls = 0
+
+    def ground(self, *, context, schema, intent):
+        self.ground_calls += 1
+        return super().ground(context=context, schema=schema, intent=intent)
+
+
 def test_database_query_flow_attaches_query_trace():
     with tempfile.TemporaryDirectory() as tmpdir:
         flow = DatabaseQueryFlow(
@@ -357,6 +395,28 @@ def test_database_query_flow_attaches_query_trace():
         assert snapshot_ref["artifact_kind"] == "query_result_snapshot"
         assert evidence.diagnostics["query_snapshot_ref"]["artifact_id"] == snapshot_ref["artifact_id"]
         assert Path(snapshot_ref["uri"]).exists()
+
+
+def test_database_query_flow_uses_schema_linking_pipeline_once_in_default_path():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pipeline = _CountingSchemaLinkingPipeline()
+        flow = DatabaseQueryFlow(
+            connector=_FakeConnector(),
+            config={"type": "timescaledb", "snapshot_dir": tmpdir},
+            schema_linking_pipeline=pipeline,
+        )
+        asyncio.run(
+            flow.run(
+                context=QueryRequestContext(
+                    database_id="demo",
+                    database_type="timescaledb",
+                    message="分析 price 的趋势",
+                    time_range={"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+                )
+            )
+        )
+
+        assert pipeline.ground_calls == 1
 
 
 def test_database_query_flow_can_probe_value_domains_before_rendering():

@@ -115,6 +115,7 @@ TSPilot-v0.2/
 - [engine.py](core/database/SPEC/engine_SPEC.md)
 - [repair.py](core/database/SPEC/repair_SPEC.md)
 - [schema.py](core/database/SPEC/schema_SPEC.md)
+- [schema linking](core/database/SPEC/schema_linking_SPEC.md)
 
 ### core/insight
 

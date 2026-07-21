@@ -26,6 +26,7 @@ try:
 except Exception:
     MetricContextBuilder = None
 from .schema_linker import SchemaLinker
+from .schema_linking import SchemaLinkingPipeline, SchemaLinkingPipelineResult
 from .query_compiler import QueryCompiler, CompiledQuery
 from .query_plan import (
     DatabaseQueryPlan,
@@ -578,6 +579,8 @@ __all__ = [
     "PaginatedResult",
     "MetricContextBuilder",
     "SchemaLinker",
+    "SchemaLinkingPipeline",
+    "SchemaLinkingPipelineResult",
     "QueryCompiler",
     "CompiledQuery",
     "DatabaseQueryPlan",

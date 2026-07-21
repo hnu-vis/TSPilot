@@ -5,7 +5,8 @@ import pytest
 from app.settings import get_settings
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
 from core.report.composer import missing_requirements
-from runtime.request_state import apply_observation
+from runtime.request_state import apply_observation, build_request_state
+from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
 from schemas.database import DatabaseEvidence
 from schemas.state import RequestStateModel
@@ -74,11 +75,32 @@ class _QueryLLM:
     def __init__(self, responses: list[dict]):
         self.responses = responses
         self.calls = 0
+        self.messages = []
 
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.messages.append(messages)
         payload = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return type("_Response", (), {"content": __import__("json").dumps(payload)})()
+
+
+class _BitcoinConnector(_FakeConnector):
+    async def get_schema(self):
+        return DatabaseSchema(
+            database="bitcoin",
+            tables=[
+                TableSchema(
+                    name="coindesk",
+                    columns=[
+                        ColumnSchema(name="_time", data_type="datetime"),
+                        ColumnSchema(name="_value", data_type="float"),
+                        ColumnSchema(name="code", data_type="string"),
+                        ColumnSchema(name="crypto", data_type="string"),
+                    ],
+                )
+            ],
+            metadata={"value_domains": {"coindesk": {"code": ["EUR", "GBP", "USD"], "crypto": ["bitcoin"]}}},
+        )
 
 
 def test_reference_dataset_filter_handles_naive_rows_and_utc_request_range():
@@ -233,6 +255,10 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
     assert result["metadata"]["sql_query_mode"] == "llm"
     assert result["metadata"]["generation_mode"] == "llm"
     assert result["diagnostics"]["llm_query_generation"]["selected_fields"] == ["value"]
+    prompt_payload = __import__("json").loads(llm.messages[0][1][1].split("LLM SQL Query Generation JSON:\n", 1)[1])
+    schema_linking = prompt_payload["request"]["schema_preview"]["schema_linking"]
+    assert schema_linking["schema_linking"]["sources"][0]["name"] == "prices"
+    assert result["diagnostics"]["schema_linking_generation"]["schema_linking"]["sources"][0]["name"] == "prices"
 
 
 @pytest.mark.asyncio
@@ -341,6 +367,53 @@ async def test_sql_query_rejects_write_sql():
                 query_language="sql",
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_explicit_flux_query_rejects_missing_user_value_domain_filters(monkeypatch):
+    from tools import sql_query as module
+
+    connector = _BitcoinConnector()
+
+    async def fake_load_databases():
+        return None
+
+    async def fake_get_database(database_id: str):
+        return {"type": "influxdb", "database": "bitcoin", "bucket": "bitcoin"}
+
+    async def fake_create_connector(**config):
+        return connector
+
+    monkeypatch.setattr(module.DatabaseFactory, "load_databases", fake_load_databases)
+    monkeypatch.setattr(module.DatabaseFactory, "get_database", fake_get_database)
+    monkeypatch.setattr(module.DatabaseFactory, "create_connector", fake_create_connector)
+    request_state = build_request_state(
+        ChatRequest(
+            message="查询当前数据源中比特币 USD 价格的最晚一条原始记录",
+            database_context={"database_id": "bitcoin", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+
+    with pytest.raises(ValueError, match="code='USD'|code=\\'USD\\'|code=.*USD"):
+        await SqlQueryTool(get_settings()).execute(
+            SqlQueryInput(
+                database_context=DatabaseContext(database_id="bitcoin", database_type="influxdb"),
+                query=(
+                    'from(bucket: "bitcoin")\n'
+                    "  |> range(start: 1970-01-01T00:00:00Z)\n"
+                    '  |> filter(fn: (r) => r._measurement == "coindesk")\n'
+                    '  |> filter(fn: (r) => r._field == "price")\n'
+                    '  |> sort(columns: ["_time"], desc: true)\n'
+                    "  |> limit(n: 1)"
+                ),
+                query_language="flux",
+                purpose="inspect latest raw rows",
+            ),
+            request_state=request_state,
+        )
+
+    assert connector.executed_queries == []
 
 
 def test_explicit_sql_query_evidence_satisfies_answer_requirements():

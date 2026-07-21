@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core.time_range import normalize_time_range, normalize_time_value, parse_time_to_utc
+from core.time_range import normalize_time_value, parse_time_to_utc
 from schemas.database import DatabaseEvidence
 
 from .connector import DatabaseSchema, QueryResult
@@ -35,8 +35,8 @@ from .contracts import (
 )
 from .engine import infer_evidence_family, normalize_query_result
 from .query_compiler import QueryCompiler
-from .query_plan import DatabaseQueryPlan, QueryFilter, QueryProjection, TimeRangePlan
-from .schema_linker import SchemaLinker
+from .query_plan import DatabaseQueryPlan, TimeRangePlan
+from .schema_linking import SchemaLinkingPipeline
 
 
 class ConnectorSchemaCatalog(SchemaCatalog):
@@ -186,7 +186,7 @@ class DefaultFieldMapper(FieldMapper):
     """Ground source and field candidates from schema metadata."""
 
     def __init__(self):
-        self._linker = SchemaLinker()
+        self._pipeline = SchemaLinkingPipeline()
 
     def map_fields(
         self,
@@ -195,65 +195,14 @@ class DefaultFieldMapper(FieldMapper):
         schema: DatabaseSchema,
         intent: QueryIntent,
     ) -> list[FieldMappingCandidate]:
-        linking = self._linker.link(
-            user_message=context.message,
-            schema=schema,
-            db_type=context.database_type,
-            dialect=context.database_type,
-        )
-        candidates: list[FieldMappingCandidate] = []
-        for source in linking.sources:
-            linked_columns = sorted(
-                source.columns,
-                key=lambda column: (0 if column.role == "value" else 1 if column.role == "dimension" else 2, -column.confidence),
-            )
-            for column in linked_columns:
-                candidates.append(
-                    FieldMappingCandidate(
-                        user_term=column.name,
-                        source_name=source.name,
-                        field_name=column.name,
-                        role=column.role,
-                        confidence=column.confidence,
-                        evidence=["linked_from_request"],
-                    )
-                )
-            if not source.columns and source.value_columns:
-                candidates.append(
-                    FieldMappingCandidate(
-                        user_term=context.message,
-                        source_name=source.name,
-                        field_name=source.value_columns[0],
-                        role="value",
-                        confidence=source.confidence,
-                        evidence=["fallback_first_value_column"],
-                    )
-                )
-
-        if not candidates and schema.tables:
-            first = schema.tables[0]
-            numeric = [column.name for column in first.columns if str(column.data_type).lower() in {"float", "double", "integer", "int", "numeric"}]
-            if not numeric:
-                numeric = [column.name for column in first.columns if column.name not in {"_time", "time", "timestamp"}][:1]
-            for column_name in numeric[:1]:
-                candidates.append(
-                    FieldMappingCandidate(
-                        user_term=context.message,
-                        source_name=first.name,
-                        field_name=column_name,
-                        role="value",
-                        confidence=0.35,
-                        evidence=["fallback_first_schema_source"],
-                    )
-                )
-        return candidates
+        return self._pipeline.map_fields(context=context, schema=schema, intent=intent)
 
 
 class DefaultLogicalQueryPlanner(LogicalQueryPlanner):
     """Build a conservative logical plan from intent and grounded fields."""
 
     def __init__(self):
-        self._linker = SchemaLinker()
+        self._pipeline = SchemaLinkingPipeline()
 
     def build_plan(
         self,
@@ -263,131 +212,12 @@ class DefaultLogicalQueryPlanner(LogicalQueryPlanner):
         intent: QueryIntent,
         field_mappings: list[FieldMappingCandidate],
     ) -> DatabaseQueryPlan:
-        linking = self._linker.link(
-            user_message=context.message,
+        return self._pipeline.build_plan(
+            context=context,
             schema=schema,
-            db_type=context.database_type,
-            dialect=context.database_type,
+            intent=intent,
+            field_mappings=field_mappings,
         )
-        output_shape = "long_series" if intent.query_shape == "raw_timeseries" else "scalar" if intent.query_shape == "scalar_aggregate" else "table"
-        plan = self._linker.build_plan(linking=linking, output_shape=output_shape)
-        if not plan.sources and schema.tables:
-            first = schema.tables[0]
-            fallback = self._linker.build_plan(
-                linking=self._linker.link(user_message=first.name, schema=schema, db_type=context.database_type, dialect=context.database_type),
-                output_shape=output_shape,
-            )
-            plan = fallback
-        self._apply_time_range(plan, context.time_range)
-        self._apply_projections(plan, intent, field_mappings)
-        self._apply_value_filters(plan, context, schema)
-        plan.notes.extend(intent.notes)
-        if context.constraints.get("max_points"):
-            plan.notes.append(f"max_points={int(context.constraints['max_points'])}")
-        return plan
-
-    def _apply_time_range(self, plan: DatabaseQueryPlan, time_range: dict[str, Any] | None) -> None:
-        if not time_range:
-            return
-        normalized = normalize_time_range(time_range) or {}
-        plan.time_range = TimeRangePlan(
-            start=normalized.get("start"),
-            end=normalized.get("end"),
-            timezone=normalized.get("timezone"),
-        )
-
-    def _apply_projections(
-        self,
-        plan: DatabaseQueryPlan,
-        intent: QueryIntent,
-        field_mappings: list[FieldMappingCandidate],
-    ) -> None:
-        if not plan.sources:
-            return
-        source = plan.sources[0]
-        value_candidates = [item for item in field_mappings if item.role == "value"]
-        chosen_field = (
-            value_candidates[0].field_name
-            if value_candidates
-            else field_mappings[0].field_name
-            if field_mappings
-            else (source.value_columns[0] if source.value_columns else "")
-        )
-        time_column = source.time_column or "timestamp"
-        alias = source.alias or source.name
-        aggregation = str(intent.filters.get("aggregation") or "")
-        if intent.query_shape == "scalar_aggregate" and chosen_field:
-            plan.projections = [
-                QueryProjection(
-                    source=alias,
-                    column=chosen_field,
-                    alias=f"{aggregation or 'value'}_{chosen_field}",
-                    aggregation=aggregation or "avg",
-                )
-            ]
-            return
-
-        projections: list[QueryProjection] = []
-        if time_column:
-            projections.append(QueryProjection(source=alias, column=time_column, alias="timestamp"))
-        if chosen_field:
-            projections.append(QueryProjection(source=alias, column=chosen_field, alias="value"))
-        elif source.value_columns:
-            projections.append(QueryProjection(source=alias, column=source.value_columns[0], alias="value"))
-        plan.projections = projections
-        plan.alignment.time_column = time_column
-        if source.time_column and not any(item.column == source.time_column for item in plan.filters):
-            return
-
-    def _apply_value_filters(
-        self,
-        plan: DatabaseQueryPlan,
-        context: QueryRequestContext,
-        schema: DatabaseSchema,
-    ) -> None:
-        if not plan.sources:
-            return
-        value_domains = schema.metadata.get("value_domains")
-        if not isinstance(value_domains, dict):
-            return
-        source = plan.sources[0]
-        domains = value_domains.get(source.name)
-        if not isinstance(domains, dict):
-            return
-        message_lower = context.message.lower()
-        existing = {(item.column, str(item.value).lower()) for item in plan.filters}
-        source_alias = source.alias or source.name
-        for column_name, values in domains.items():
-            if column_name in {"_measurement", "_field", "_start", "_stop", "result", "table"}:
-                continue
-            matched_value = self._match_domain_value(message_lower, values)
-            if not matched_value:
-                continue
-            key = (str(column_name), matched_value.lower())
-            if key in existing:
-                continue
-            plan.filters.append(
-                QueryFilter(
-                    source=source_alias,
-                    column=str(column_name),
-                    operator="=",
-                    value=matched_value,
-                )
-            )
-            existing.add(key)
-
-    def _match_domain_value(self, message_lower: str, values: Any) -> str | None:
-        if not isinstance(values, list):
-            return None
-        normalized_values = [
-            str(value).strip()
-            for value in values
-            if value not in (None, "")
-        ]
-        for candidate in sorted(normalized_values, key=len, reverse=True):
-            if candidate.lower() in message_lower:
-                return candidate
-        return None
 
 
 class CompositeDialectRenderer(DialectRenderer):
@@ -660,6 +490,7 @@ class DatabaseQueryFlow:
         repair_policy: QueryRepairPolicy | None = None,
         snapshot_store: QueryResultSnapshotStore | None = None,
         normalizer: EvidenceNormalizer | None = None,
+        schema_linking_pipeline: SchemaLinkingPipeline | None = None,
     ):
         self._connector = connector
         self._config = config
@@ -667,6 +498,8 @@ class DatabaseQueryFlow:
         self._intent_interpreter = intent_interpreter or DefaultIntentInterpreter()
         self._field_mapper = field_mapper or DefaultFieldMapper()
         self._planner = planner or DefaultLogicalQueryPlanner()
+        self._schema_linking_pipeline = schema_linking_pipeline or SchemaLinkingPipeline()
+        self._use_default_schema_linking = field_mapper is None and planner is None
         self._renderer = renderer or CompositeDialectRenderer(config)
         self._validator = validator or DefaultQueryValidator()
         self._repair_policy = repair_policy or DefaultQueryRepairPolicy(self._renderer)
@@ -677,8 +510,13 @@ class DatabaseQueryFlow:
     async def run(self, *, context: QueryRequestContext, execute_range_query_fn=None) -> DatabaseEvidence:
         schema = await self._schema_catalog.load_schema(context=context)
         intent = self._intent_interpreter.interpret(context=context)
-        field_mappings = self._field_mapper.map_fields(context=context, schema=schema, intent=intent)
-        plan = self._planner.build_plan(context=context, schema=schema, intent=intent, field_mappings=field_mappings)
+        if self._use_default_schema_linking:
+            linking_result = self._schema_linking_pipeline.ground(context=context, schema=schema, intent=intent)
+            field_mappings = linking_result.field_mappings
+            plan = linking_result.plan
+        else:
+            field_mappings = self._field_mapper.map_fields(context=context, schema=schema, intent=intent)
+            plan = self._planner.build_plan(context=context, schema=schema, intent=intent, field_mappings=field_mappings)
         schema, field_mappings, plan = await self._maybe_probe_value_domains(
             context=context,
             schema=schema,
@@ -809,8 +647,13 @@ class DatabaseQueryFlow:
                 normalized = str(value)
                 if normalized not in existing_values:
                     existing_values.append(normalized)
-        field_mappings = self._field_mapper.map_fields(context=context, schema=schema, intent=intent)
-        plan = self._planner.build_plan(context=context, schema=schema, intent=intent, field_mappings=field_mappings)
+        if self._use_default_schema_linking:
+            linking_result = self._schema_linking_pipeline.ground(context=context, schema=schema, intent=intent)
+            field_mappings = linking_result.field_mappings
+            plan = linking_result.plan
+        else:
+            field_mappings = self._field_mapper.map_fields(context=context, schema=schema, intent=intent)
+            plan = self._planner.build_plan(context=context, schema=schema, intent=intent, field_mappings=field_mappings)
         plan.notes.append("value_domains_probed=true")
         return schema, field_mappings, plan
 
