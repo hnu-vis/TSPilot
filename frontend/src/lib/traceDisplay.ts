@@ -16,6 +16,31 @@ export type SqlDetail = {
   truncated: boolean;
 };
 
+export type SchemaLinkingDetail = {
+  confidence: string | null;
+  sources: Array<{
+    name: string;
+    kind: string | null;
+    timeColumn: string | null;
+    valueColumns: string[];
+    dimensionColumns: string[];
+    linkedColumns: Array<{ name: string; role: string | null }>;
+  }>;
+  fieldMappings: Array<{
+    sourceName: string | null;
+    fieldName: string;
+    role: string | null;
+    confidence: number | null;
+  }>;
+  requiredFilters: Array<{
+    column: string;
+    operator: string;
+    value: string;
+  }>;
+  evidence: string[];
+  ambiguousTerms: Array<{ term: string; candidates: string[] }>;
+};
+
 export type CompletionDetail = {
   completed: boolean | null;
   reason: string | null;
@@ -37,6 +62,7 @@ export type DisplayStep = {
   metrics: DisplayMetric[];
   artifactRefs: string[];
   sqlDetail: SqlDetail | null;
+  schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
   debugPayload: Record<string, unknown> | null;
 };
@@ -69,6 +95,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     metrics,
     artifactRefs,
     sqlDetail: sqlDetailFor(tool, preview),
+    schemaLinkingDetail: schemaLinkingDetailFor(tool, preview),
     completionDetail,
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
   };
@@ -232,6 +259,59 @@ function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown>
     rowCount: numberFrom(preview.row_count),
     pointCount: numberFrom(preview.point_count),
     truncated: Boolean(preview.truncated || preview.payload_truncated),
+  };
+}
+
+function schemaLinkingDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): SchemaLinkingDetail | null {
+  if (tool !== 'sql_query' && tool !== 'query_database') return null;
+  const linking = asRecord(preview?.schema_linking);
+  if (!linking) return null;
+  const sources = recordsFrom(linking.sources).map((source) => ({
+    name: stringFrom(source.name) || '',
+    kind: stringFrom(source.kind),
+    timeColumn: stringFrom(source.time_column),
+    valueColumns: stringsFrom(source.value_columns),
+    dimensionColumns: stringsFrom(source.dimension_columns),
+    linkedColumns: recordsFrom(source.columns)
+      .map((column) => ({
+        name: stringFrom(column.name) || '',
+        role: stringFrom(column.role),
+      }))
+      .filter((column) => column.name),
+  })).filter((source) => source.name);
+  const fieldMappings = recordsFrom(linking.field_mappings).map((mapping) => ({
+    sourceName: stringFrom(mapping.source_name),
+    fieldName: stringFrom(mapping.field_name) || '',
+    role: stringFrom(mapping.role),
+    confidence: numberFrom(mapping.confidence),
+  })).filter((mapping) => mapping.fieldName);
+  const requiredFilters = recordsFrom(linking.required_filters).map((filter) => ({
+    column: stringFrom(filter.column) || '',
+    operator: stringFrom(filter.operator) || '=',
+    value: stringFrom(filter.value) || String(filter.value ?? ''),
+  })).filter((filter) => filter.column && filter.value);
+  const ambiguousRecord = asRecord(linking.ambiguous_terms);
+  const ambiguousTerms = ambiguousRecord
+    ? Object.entries(ambiguousRecord).map(([term, candidates]) => ({
+        term,
+        candidates: stringsFrom(candidates),
+      })).filter((item) => item.candidates.length > 0)
+    : [];
+  if (
+    sources.length === 0
+    && fieldMappings.length === 0
+    && requiredFilters.length === 0
+    && ambiguousTerms.length === 0
+  ) {
+    return null;
+  }
+  return {
+    confidence: stringFrom(linking.confidence),
+    sources,
+    fieldMappings,
+    requiredFilters,
+    evidence: stringsFrom(linking.evidence),
+    ambiguousTerms,
   };
 }
 

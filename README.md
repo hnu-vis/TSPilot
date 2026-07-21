@@ -54,7 +54,13 @@ The script starts both services and stops both when you press `Ctrl+C`. The fron
 Backend:
 
 ```bash
-/home/feilvvl/TSPilot/tspilot_env/bin/python -m uvicorn app.server:app --host 127.0.0.1 --port 5680
+scripts/backend-dev.sh
+```
+
+The backend runs in hot-reload mode. Equivalent command:
+
+```bash
+/home/feilvvl/TSPilot/tspilot_env/bin/python -m uvicorn app.server:app --host 127.0.0.1 --port 5680 --reload --reload-dir .
 ```
 
 Frontend:

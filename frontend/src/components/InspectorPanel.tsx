@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, ChevronDown, Code2, FileText, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, Code2, FileText, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
 
@@ -99,6 +99,8 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
 
+      {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
+
       {step.completionDetail && <CompletionPreview detail={step.completionDetail} />}
 
       {(step.sqlDetail?.query || step.artifactRefs.length > 0 || step.debugPayload) && (
@@ -185,6 +187,84 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
             </table>
           </div>
           {detail.truncated && <p className="sample-note">Preview only</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SchemaLinkingPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['schemaLinkingDetail']> }) {
+  return (
+    <section className="inspector-card schema-linking-preview">
+      <div className="inspector-card-title sql-detail-title">
+        <Network size={16} />
+        <h3>Schema linking</h3>
+        {detail.confidence && <span className="query-language-badge">{detail.confidence}</span>}
+      </div>
+
+      {detail.sources.length > 0 && (
+        <div className="schema-linking-group">
+          <span className="schema-linking-label">Sources</span>
+          {detail.sources.map((source) => (
+            <div key={source.name} className="schema-source-row">
+              <strong>{source.name}</strong>
+              {source.kind && <span>{source.kind}</span>}
+              {source.timeColumn && <code>{source.timeColumn}</code>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {detail.requiredFilters.length > 0 && (
+        <div className="schema-linking-group">
+          <span className="schema-linking-label">Required filters</span>
+          <div className="schema-chip-list">
+            {detail.requiredFilters.map((filter) => (
+              <code key={`${filter.column}-${filter.value}`}>
+                {filter.column} {filter.operator} {filter.value}
+              </code>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {detail.fieldMappings.length > 0 && (
+        <div className="schema-linking-group">
+          <span className="schema-linking-label">Field mappings</span>
+          <div className="schema-mapping-list">
+            {detail.fieldMappings.slice(0, 6).map((mapping) => (
+              <div key={`${mapping.sourceName || 'source'}-${mapping.fieldName}-${mapping.role || 'role'}`} className="schema-mapping-row">
+                <span>{mapping.sourceName || 'source'}</span>
+                <strong>{mapping.fieldName}</strong>
+                {mapping.role && <code>{mapping.role}</code>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {detail.sources.some((source) => source.valueColumns.length > 0 || source.dimensionColumns.length > 0) && (
+        <div className="schema-linking-group">
+          <span className="schema-linking-label">Linked fields</span>
+          <div className="schema-chip-list">
+            {detail.sources.flatMap((source) => [
+              ...source.valueColumns.map((column) => ({ key: `${source.name}-value-${column}`, label: column, role: 'value' })),
+              ...source.dimensionColumns.map((column) => ({ key: `${source.name}-dimension-${column}`, label: column, role: 'dimension' })),
+            ]).slice(0, 10).map((field) => (
+              <code key={field.key}>{field.label} · {field.role}</code>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {detail.ambiguousTerms.length > 0 && (
+        <div className="schema-linking-group">
+          <span className="schema-linking-label">Ambiguous</span>
+          <div className="schema-chip-list">
+            {detail.ambiguousTerms.map((item) => (
+              <code key={item.term}>{item.term}: {item.candidates.join(', ')}</code>
+            ))}
+          </div>
         </div>
       )}
     </section>
