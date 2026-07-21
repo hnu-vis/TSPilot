@@ -109,7 +109,7 @@ def infer_evidence_needs(todo: dict) -> list[str]:
         return ["schema"]
     if any(token in text for token in ["sample", "样例", "示例", "预览"]):
         return ["sample_rows"]
-    if any(token in text for token in ["总数", "总共", "多少条", "行数", "count", "row count"]):
+    if any(token in text for token in ["总数", "总共", "多少条", "行数", "记录数", "条数", "count", "row count"]):
         return ["count"]
     if any(token in text for token in ["最大", "最小", "平均", "均值", "sum", "avg", "average", "max", "min", "aggregate"]):
         return ["aggregate"]
