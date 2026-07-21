@@ -67,15 +67,15 @@ class FormatAnswerTool(BaseTool):
             validated_input.direct_answer,
         )
         direct_answer = self._usable_direct_answer(validated_input.direct_answer)
-        if analyses:
+        if direct_answer:
+            summary = direct_answer
+        elif analyses:
             analysis_summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
             summary = build_summary(
                 request_state,
                 facts,
                 analysis_summary or fallback_summary,
             )
-        elif not facts and direct_answer and self._has_database_answer_evidence(request_state):
-            summary = direct_answer
         else:
             summary = build_summary(
                 request_state,
@@ -300,15 +300,15 @@ class FormatAnswerTool(BaseTool):
         summary_goal: str,
         direct_answer: str | None = None,
     ) -> str:
+        usable_direct_answer = self._usable_direct_answer(direct_answer)
+        if usable_direct_answer:
+            return usable_direct_answer
         if request_state.latest_database_evidence is not None:
             return request_state.latest_database_evidence.summary
         if request_state.latest_rag:
             return request_state.latest_rag.get("summary", summary_goal)
         if request_state.latest_skill:
             return request_state.latest_skill.get("summary", summary_goal)
-        usable_direct_answer = self._usable_direct_answer(direct_answer)
-        if usable_direct_answer:
-            return usable_direct_answer
         return summary_goal
 
     def _has_explicit_sql_query_evidence(self, request_state: RequestStateModel) -> bool:
@@ -321,13 +321,7 @@ class FormatAnswerTool(BaseTool):
 
     def _has_database_answer_evidence(self, request_state: RequestStateModel) -> bool:
         evidence = request_state.latest_database_evidence
-        return bool(
-            self._has_explicit_sql_query_evidence(request_state)
-            or (
-                evidence is not None
-                and evidence.result_type in {"statistics", "table", "schema", "metric_list"}
-            )
-        )
+        return evidence is not None
 
     def _has_requested_facts(self, request_state: RequestStateModel, include_fact_ids: list[str]) -> bool:
         if not include_fact_ids:

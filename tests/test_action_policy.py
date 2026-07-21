@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from core.completion import CompletionEvaluation, normalize_todo_for_completion
-from core.runtime_evaluator import PlanRequirementVerdict
+from core.runtime_evaluator import PlanRequirementVerdict, RuntimeLLMEvaluator
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import validate_action
 from runtime.request_state import apply_observation, apply_observation_async
@@ -52,7 +52,11 @@ class _OneTurnAgent:
 class _PlanEvaluator:
     last_step_verdict = None
 
+    def __init__(self):
+        self.plan_requirement_calls = 0
+
     async def evaluate_plan_requirement(self, **kwargs):
+        self.plan_requirement_calls += 1
         return PlanRequirementVerdict(
             requires_plan=True,
             reason="multiple deliverables",
@@ -60,9 +64,49 @@ class _PlanEvaluator:
         )
 
 
+class _NoAnswerabilityEvaluator:
+    async def evaluate_plan_requirement(self, **kwargs):
+        return PlanRequirementVerdict(
+            requires_plan=False,
+            reason="single answer",
+            deliverables=[],
+        )
+
+
 class _UnusedExecutor:
     async def execute(self, *args, **kwargs):
         raise AssertionError("tool executor should not run when plan is required")
+
+
+def test_runtime_evaluator_marks_complete_query_preview_as_full_fidelity():
+    evaluator = RuntimeLLMEvaluator(llm=None)
+    summary = evaluator._summarize_payload(
+        {
+            "evidence_id": "evi_extrema",
+            "result_type": "timeseries",
+            "query": "from(...) |> sort(columns: [\"_value\"], desc: true) |> limit(n: 1)",
+            "data": {
+                "rows": [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}],
+                "points": [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}],
+            },
+            "diagnostics": {
+                "is_full_fidelity": True,
+                "summary_stats": {"rows_count": 1, "points_count": 1, "series_count": 1},
+                "prompt_sampling": {
+                    "sampled_for_prompt": False,
+                    "full_counts": {"rows_count": 1, "points_count": 1, "series_count": 1},
+                    "visible_counts": {"rows_count": 1, "points_count": 1, "series_count": 1},
+                    "full_artifact_ref": "evidence:evi_extrema",
+                },
+            },
+        }
+    )
+
+    assert "sample_rows" not in summary
+    assert summary["result_rows_preview"] == [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}]
+    assert summary["data_completeness"]["is_full_fidelity"] is True
+    assert summary["data_completeness"]["sampled_for_prompt"] is False
+    assert summary["data_completeness"]["full_row_count"] == 1
 
 
 def test_policy_does_not_force_todowrite_for_complex_initial_request():
@@ -242,10 +286,10 @@ async def test_llm_completion_verdict_false_keeps_todo_in_progress():
         "result_type": "table",
         "database": "demo",
         "query_language": "flux",
-        "query": "from(...)",
-        "summary": "Loaded 5 rows.",
-        "data": {"rows": [{"value": 1}]},
-        "columns": ["value"],
+        "query": "from(...) |> count()",
+        "summary": "Loaded count row.",
+        "data": {"rows": [{"count": 5}]},
+        "columns": ["count"],
         "metadata": {},
         "diagnostics": {},
     }
@@ -261,6 +305,49 @@ async def test_llm_completion_verdict_false_keeps_todo_in_progress():
     assert request_state.todo_list[0]["status"] == "in_progress"
     assert request_state.todo_list[1]["status"] == "pending"
     assert request_state.completion_state["latest_step"]["completed"] is False
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["missing exact result"]
+
+
+@pytest.mark.asyncio
+async def test_successful_query_observation_waits_for_llm_semantic_verdict():
+    request_state = RequestStateModel(
+        request_id="req-query-observation-first",
+        message="分析趋势。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {
+                "content": "查询趋势所需的时间序列",
+                "task_type": "query",
+                "status": "in_progress",
+                "priority": 1,
+                "evidence_needed": ["time_series"],
+            },
+            {"content": "分析趋势", "task_type": "insight", "status": "pending", "priority": 2},
+        ],
+    )
+    payload = {
+        "evidence_id": "evi_demo",
+        "result_type": "timeseries",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "from(...)",
+        "summary": "Loaded points.",
+        "data": {"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        "columns": ["timestamp", "value"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+
+    await apply_observation_async(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="points", payload=payload),
+        payload,
+        _EvidenceSpec(),
+        completion_evaluator=_CompletionEvaluator(completed=False),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
     assert request_state.completion_state["latest_step"]["missing_evidence"] == ["missing exact result"]
 
 
@@ -311,11 +398,12 @@ async def test_runtime_blocks_direct_query_when_llm_requires_plan():
         status="running",
         max_iterations=1,
     )
+    evaluator = _PlanEvaluator()
     loop = ReActLoop(
         data_agent=_OneTurnAgent(),
         tool_executor=_UnusedExecutor(),
         settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
-        runtime_evaluator=_PlanEvaluator(),
+        runtime_evaluator=evaluator,
     )
 
     events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
@@ -323,7 +411,44 @@ async def test_runtime_blocks_direct_query_when_llm_requires_plan():
 
     assert observation.payload["success"] is False
     assert "todo plan is required" in observation.payload["summary"].lower()
+    plan_requirement = request_state.completion_state["plan_requirement"]
+    assert plan_requirement["deliverables"] == ["count", "earliest rows"]
     assert request_state.tool_history == []
+    assert evaluator.plan_requirement_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_format_answer_does_not_use_llm_answerability_gate():
+    request_state = RequestStateModel(
+        request_id="req-no-answerability-gate",
+        message="分析趋势。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        latest_database_evidence={
+            "evidence_id": "evi_demo",
+            "result_type": "timeseries",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...)",
+            "summary": "ok",
+            "data": {"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+            "columns": ["timestamp", "value"],
+            "metadata": {},
+            "diagnostics": {},
+        },
+    )
+    loop = ReActLoop(
+        data_agent=_OneTurnAgent(),
+        tool_executor=_UnusedExecutor(),
+        settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
+        runtime_evaluator=_NoAnswerabilityEvaluator(),
+    )
+
+    reason = await loop._plan_requirement_block_reason(request_state, "format_answer", {})
+
+    assert reason is None
+    assert "answerability_verdict" not in request_state.completion_state
+    assert "semantic_repair_directive" not in request_state.completion_state
 
 
 def test_policy_blocks_format_answer_until_database_goal_has_evidence():

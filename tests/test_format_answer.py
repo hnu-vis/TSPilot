@@ -114,6 +114,58 @@ def test_format_answer_renders_real_query_as_fenced_code_section():
     assert result["sections"][2]["section_type"] == "table"
 
 
+def test_format_answer_preserves_direct_answer_for_timeseries_query_evidence():
+    request_state = build_request_state(
+        ChatRequest(
+            message="查询当前数据源中比特币 USD 价格的最晚一条原始记录",
+            database_context={"database_id": "bitcoin", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+    query = (
+        'from(bucket: "bitcoin")\n'
+        "  |> range(start: 0)\n"
+        '  |> filter(fn: (r) => r._measurement == "coindesk" and r.code == "USD")\n'
+        '  |> filter(fn: (r) => r._field == "price")\n'
+        '  |> sort(columns: ["_time"], desc: true)\n'
+        "  |> limit(n: 1)"
+    )
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_latest_bitcoin_price",
+        result_type="timeseries",
+        database="bitcoin",
+        query_language="flux",
+        query=query,
+        summary="Loaded 1 rows across 1 series.",
+        data={
+            "points": [{"timestamp": "2023-02-03T22:47:00+00:00", "value": 23428.6802}],
+            "rows": [{"timestamp": "2023-02-03T22:47:00+00:00", "value": 23428.6802}],
+            "time_field": "timestamp",
+            "value_field": "value",
+        },
+        columns=["timestamp", "value"],
+        metadata={"sql_query_mode": "llm"},
+        diagnostics={},
+    )
+
+    direct_answer = "最晚一条原始记录时间为 2023-02-03T22:47:00+00:00，价格为 23428.6802 USD。"
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(
+                summary_goal="回答最新价格",
+                direct_answer=direct_answer,
+                section_plan=["summary", "query"],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["summary"] == direct_answer
+    assert result["sections"][0]["content"] == direct_answer
+    assert result["sections"][1]["section_type"] == "query"
+    assert result["sections"][1]["content"].startswith("```flux\n")
+
+
 def test_format_answer_does_not_render_internal_reference_dataset_query_section():
     request_state = build_request_state(
         ChatRequest(
@@ -192,3 +244,51 @@ def test_format_answer_assembles_selected_analysis_results():
     assert "低位/中位/高位已划分" in result["summary"]
     assert result["sections"][0]["section_type"] == "analysis"
     assert [ref["source_type"] for ref in result["references"]] == ["analysis", "analysis"]
+
+
+def test_format_answer_preserves_direct_answer_when_analysis_exists():
+    request_state = build_request_state(
+        ChatRequest(message="分析趋势", database_context={"database_id": "demo", "database_type": "influxdb"}),
+        get_settings(),
+    )
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_trend",
+        result_type="timeseries",
+        database="demo",
+        query_language="flux",
+        query='from(bucket: "bitcoin") |> range(start: -30d)',
+        summary="Loaded 50 points.",
+        data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        columns=["timestamp", "value"],
+        metadata={},
+        diagnostics={},
+    )
+    analysis = AnalysisResult(
+        analysis_id="ana_trend",
+        analysis_goal="trend",
+        code_hash="sha256:trend",
+        input_evidence_id="evi_trend",
+        input_row_count=50,
+        status="succeeded",
+        summary="趋势分析已完成。",
+        result={"summary": "趋势分析已完成。", "metrics": {"change": -0.2}, "details": {}},
+        diagnostics={},
+    )
+    request_state.analysis_artifacts = {analysis.analysis_id: analysis}
+
+    direct_answer = "整体窄幅震荡，略有回落。"
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(
+                summary_goal="给出趋势结论",
+                direct_answer=direct_answer,
+                include_analysis_ids=["ana_trend"],
+                section_plan=["summary", "analysis", "query"],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["summary"] == direct_answer
+    assert result["sections"][0]["content"] == direct_answer
+    assert any(section["section_type"] == "analysis" for section in result["sections"])

@@ -228,23 +228,10 @@ class ReActLoop:
             self._runtime_evaluator is None
             or request_state.todo_list
             or action_name == "todowrite"
+            or action_name == "format_answer"
             or request_state.database_context is None
         ):
             return None
-        if action_name == "format_answer" and request_state.latest_database_evidence is not None:
-            try:
-                verdict = await self._runtime_evaluator.evaluate_answerability(request_state=request_state)
-            except Exception as exc:
-                request_state.completion_state["answerability_error"] = str(exc)
-                return None
-            payload = verdict.model_dump()
-            request_state.completion_state["answerability_verdict"] = payload
-            if not verdict.can_answer:
-                missing = ", ".join(verdict.missing_evidence[:8]) if verdict.missing_evidence else "missing evidence"
-                return (
-                    "Final answer is blocked by LLM answerability evaluation. "
-                    f"Missing: {missing}. Reason: {verdict.reason}"
-                )
         try:
             verdict = await self._runtime_evaluator.evaluate_plan_requirement(
                 request_state=request_state,
@@ -455,7 +442,6 @@ class ReActLoop:
 
     def _completion_payload_preview(self, request_state: RequestStateModel) -> dict:
         latest_step = request_state.completion_state.get("latest_step")
-        answerability = request_state.completion_state.get("answerability_verdict")
         plan_requirement = request_state.completion_state.get("plan_requirement")
         todo_total = len(request_state.todo_list)
         completed = len([todo for todo in request_state.todo_list if todo.get("status") == "completed"])
@@ -490,8 +476,6 @@ class ReActLoop:
                 "todo_index": latest_step.get("todo_index"),
                 "llm": latest_step.get("completion_verdict"),
             }
-        if isinstance(answerability, dict):
-            preview["answerability_verdict"] = answerability
         if isinstance(plan_requirement, dict):
             preview["plan_requirement"] = plan_requirement
         return preview
@@ -518,12 +502,44 @@ class ReActLoop:
             "point_count": point_count if point_count is not None else len(points),
             "sample_rows": rows[:5],
             "sample_points": points[:5],
+            "sampling": diagnostics.get("prompt_sampling"),
+            "schema_linking": self._schema_linking_payload_preview(diagnostics),
             "truncated": bool(
                 visible_payload.get("payload_truncated")
                 or diagnostics.get("truncated")
                 or diagnostics.get("artifact_ref")
                 or payload_truncated_marker(visible_payload)
             ),
+        }
+
+    def _schema_linking_payload_preview(self, diagnostics: dict) -> dict | None:
+        query_trace = diagnostics.get("query_trace") if isinstance(diagnostics.get("query_trace"), dict) else {}
+        logical_plan = query_trace.get("logical_plan") if isinstance(query_trace.get("logical_plan"), dict) else {}
+        linking = logical_plan.get("schema_linking") if isinstance(logical_plan.get("schema_linking"), dict) else None
+        if not linking:
+            return None
+        filters = logical_plan.get("filters") if isinstance(logical_plan.get("filters"), list) else []
+        required_filters = [
+            {
+                "source": item.get("source"),
+                "column": item.get("column"),
+                "operator": item.get("operator"),
+                "value": item.get("value"),
+            }
+            for item in filters
+            if isinstance(item, dict)
+            and item.get("column") not in {"_measurement", "_field", "_time", "time", "timestamp", "_start", "_stop", "result", "table"}
+        ]
+        field_mappings = query_trace.get("field_mappings") if isinstance(query_trace.get("field_mappings"), list) else []
+        return {
+            "confidence": linking.get("confidence"),
+            "sources": linking.get("sources", [])[:6] if isinstance(linking.get("sources"), list) else [],
+            "time_columns": linking.get("time_columns", [])[:8] if isinstance(linking.get("time_columns"), list) else [],
+            "value_columns": linking.get("value_columns", [])[:12] if isinstance(linking.get("value_columns"), list) else [],
+            "ambiguous_terms": linking.get("ambiguous_terms") if isinstance(linking.get("ambiguous_terms"), dict) else {},
+            "evidence": linking.get("evidence", [])[:8] if isinstance(linking.get("evidence"), list) else [],
+            "field_mappings": field_mappings[:12],
+            "required_filters": required_filters[:12],
         }
 
     def _truncate_preview_text(self, value, max_chars: int):
