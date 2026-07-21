@@ -127,11 +127,18 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
             },
         )
         payload = response.json()
-        log_path = tmp_path / payload["conversation_id"] / f"{payload['request_id']}.json"
+        run_dir = next(tmp_path.glob(f"*_{payload['conversation_id']}"))
+        request_dir = run_dir / "requests" / payload["request_id"]
+        log_path = request_dir / "conversation_trace.json"
         index_path = tmp_path / "index.jsonl"
 
         assert response.status_code == 200
         assert log_path.exists()
+        assert (request_dir / "request.json").exists()
+        assert (request_dir / "response.json").exists()
+        assert (request_dir / "state.json").exists()
+        assert (request_dir / "trace_internal.jsonl").exists()
+        assert (request_dir / "tool_calls.jsonl").exists()
         assert index_path.exists()
 
         log_payload = json.loads(log_path.read_text(encoding="utf-8"))
@@ -176,10 +183,13 @@ def test_chat_sse_path_persists_internal_and_public_trace_logs(tmp_path):
         request_id_line = next(line for line in body.splitlines() if line.startswith("data: {"))
         request_id = json.loads(request_id_line.removeprefix("data: "))["request_id"]
         conversation_id = json.loads(request_id_line.removeprefix("data: "))["conversation_id"]
-        log_path = tmp_path / conversation_id / f"{request_id}.json"
+        run_dir = next(tmp_path.glob(f"*_{conversation_id}"))
+        request_dir = run_dir / "requests" / request_id
+        log_path = request_dir / "conversation_trace.json"
 
         assert response.status_code == 200
         assert log_path.exists()
+        assert (request_dir / "trace_public.jsonl").exists()
         log_payload = json.loads(log_path.read_text(encoding="utf-8"))
         assert log_payload["mode"] == "sse"
         assert "thought" in [event["event_type"] for event in log_payload["trace"]["internal"]]
@@ -209,7 +219,47 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
                     "rows": [{"value": 12.3}, {"value": 13.4}],
                     "points": [{"timestamp": "t0", "value": 12.3}],
                 },
-                "diagnostics": {"summary_stats": {"rows_count": 2, "points_count": 1}},
+                "diagnostics": {
+                    "summary_stats": {"rows_count": 2, "points_count": 10},
+                    "prompt_sampling": {
+                        "policy": "head_tail_edges",
+                        "sampled_for_prompt": True,
+                        "full_counts": {"points_count": 10},
+                        "visible_counts": {"points_count": 1},
+                        "full_artifact_ref": "evidence:evi_sql",
+                    },
+                    "query_trace": {
+                        "logical_plan": {
+                            "filters": [
+                                {"source": "m1", "column": "code", "operator": "=", "value": "USD"},
+                                {"source": "m1", "column": "crypto", "operator": "=", "value": "bitcoin"},
+                            ],
+                            "schema_linking": {
+                                "confidence": "high",
+                                "sources": [
+                                    {
+                                        "name": "coindesk",
+                                        "kind": "measurement",
+                                        "time_column": "_time",
+                                        "value_columns": ["price"],
+                                        "dimension_columns": ["code", "crypto"],
+                                    }
+                                ],
+                                "time_columns": ["_time"],
+                                "value_columns": ["price"],
+                                "evidence": ["sources linked from schema names"],
+                            },
+                        },
+                        "field_mappings": [
+                            {
+                                "source_name": "coindesk",
+                                "field_name": "price",
+                                "role": "value",
+                                "confidence": 0.8,
+                            }
+                        ],
+                    },
+                },
             },
         }
     )
@@ -218,9 +268,18 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
     assert preview["query"] == "SELECT value FROM metrics"
     assert preview["columns"] == ["value"]
     assert preview["row_count"] == 2
-    assert preview["point_count"] == 1
+    assert preview["point_count"] == 10
     assert preview["sample_rows"] == [{"value": 12.3}, {"value": 13.4}]
     assert preview["sample_points"] == [{"timestamp": "t0", "value": 12.3}]
+    assert preview["sampling"]["sampled_for_prompt"] is True
+    assert preview["sampling"]["full_counts"]["points_count"] == 10
+    assert preview["schema_linking"]["confidence"] == "high"
+    assert preview["schema_linking"]["sources"][0]["name"] == "coindesk"
+    assert preview["schema_linking"]["field_mappings"][0]["field_name"] == "price"
+    assert preview["schema_linking"]["required_filters"] == [
+        {"source": "m1", "column": "code", "operator": "=", "value": "USD"},
+        {"source": "m1", "column": "crypto", "operator": "=", "value": "bitcoin"},
+    ]
 
 
 def test_chat_json_path_can_answer_without_database_context():

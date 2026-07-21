@@ -36,11 +36,14 @@ class ConversationTraceLogger:
 
         try:
             root = self._settings.resolved_conversation_log_dir
-            conversation_id = _safe_name(request_state.conversation_id or "unknown_conversation")
             request_id = _safe_name(request_state.request_id)
-            conversation_dir = root / conversation_id
-            conversation_dir.mkdir(parents=True, exist_ok=True)
-            path = conversation_dir / f"{request_id}.json"
+            if request_state.request_log_dir:
+                request_dir = Path(request_state.request_log_dir).resolve()
+            else:
+                conversation_id = _safe_name(request_state.conversation_id or "unknown_conversation")
+                request_dir = root / conversation_id / request_id
+            request_dir.mkdir(parents=True, exist_ok=True)
+            path = request_dir / "conversation_trace.json"
             envelope = self._build_envelope(
                 request_state=request_state,
                 response=response,
@@ -50,7 +53,7 @@ class ConversationTraceLogger:
                 interrupted=interrupted,
                 path=path,
             )
-            self._write_json_atomic(path, envelope)
+            self._write_request_files(request_dir, envelope)
             self._append_index(root / "index.jsonl", envelope, path)
             return path
         except Exception as exc:
@@ -112,12 +115,32 @@ class ConversationTraceLogger:
             },
             "state": state_payload,
             "log_path": str(path),
+            "request_log_dir": str(path.parent),
         }
 
     def _write_json_atomic(self, path: Path, payload: dict) -> None:
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
+
+    def _write_jsonl_atomic(self, path: Path, items: list[dict]) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for item in items:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        tmp_path.replace(path)
+
+    def _write_request_files(self, request_dir: Path, envelope: dict) -> None:
+        request_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(request_dir / "conversation_trace.json", envelope)
+        self._write_json_atomic(request_dir / "request.json", envelope["request"])
+        self._write_json_atomic(request_dir / "response.json", envelope["response"])
+        self._write_json_atomic(request_dir / "summary.json", envelope["summary"])
+        self._write_json_atomic(request_dir / "state.json", envelope["state"])
+        self._write_jsonl_atomic(request_dir / "trace_internal.jsonl", envelope["trace"]["internal"])
+        self._write_jsonl_atomic(request_dir / "trace_public.jsonl", envelope["trace"]["public"])
+        self._write_jsonl_atomic(request_dir / "tool_calls.jsonl", envelope["state"].get("tool_history", []))
+        self._write_jsonl_atomic(request_dir / "observations.jsonl", envelope["state"].get("observations", []))
 
     def _append_index(self, index_path: Path, envelope: dict, path: Path) -> None:
         index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +158,7 @@ class ConversationTraceLogger:
             "error": summary["error"],
             "message_preview": _preview(envelope["request"]["message"]),
             "log_path": str(path),
+            "request_log_dir": envelope.get("request_log_dir"),
         }
         with index_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")

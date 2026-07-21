@@ -44,6 +44,7 @@ class QueryDatabaseTool(BaseTool):
         self._settings = settings
 
     async def execute(self, validated_input: QueryDatabaseInput, **kwargs) -> dict:
+        request_state = kwargs.get("request_state")
         config_path, config = await self._load_database_config(validated_input.database_context.database_id)
         evidence_family = str(validated_input.constraints.get("expected_result_type") or "").strip()
         if evidence_family not in {"schema", "metric_list", "statistics", "table", "timeseries"}:
@@ -61,9 +62,9 @@ class QueryDatabaseTool(BaseTool):
             return self._reference_dataset_timeseries(validated_input, config_path, config, reference_dataset)
 
         if db_type == "prometheus":
-            return await self._prometheus_timeseries(validated_input, config)
+            return await self._prometheus_timeseries(validated_input, config, request_state=request_state)
 
-        return await self._connector_query_evidence(validated_input, config, evidence_family)
+        return await self._connector_query_evidence(validated_input, config, evidence_family, request_state=request_state)
 
     async def _load_database_config(self, database_id: str) -> tuple[Path, dict]:
         await DatabaseFactory.load_databases()
@@ -193,14 +194,14 @@ class QueryDatabaseTool(BaseTool):
         )
         return evidence.model_dump(mode="json")
 
-    async def _prometheus_timeseries(self, validated_input: QueryDatabaseInput, config: dict) -> dict:
+    async def _prometheus_timeseries(self, validated_input: QueryDatabaseInput, config: dict, *, request_state=None) -> dict:
         connector = await DatabaseFactory.create_connector(**config)
         async with connector:
             flow = DatabaseQueryFlow(
                 connector=connector,
                 config={
                     **config,
-                    "snapshot_dir": str((Path(self._settings.tspilot_root) / "cache_data" / "query_snapshots").resolve()),
+                    "snapshot_dir": str(self._query_snapshot_dir(request_state)),
                 },
             )
             evidence = await flow.run(
@@ -214,6 +215,8 @@ class QueryDatabaseTool(BaseTool):
         validated_input: QueryDatabaseInput,
         config: dict,
         evidence_family: str,
+        *,
+        request_state=None,
     ) -> dict:
         connector = await DatabaseFactory.create_connector(**config)
         async with connector:
@@ -221,7 +224,7 @@ class QueryDatabaseTool(BaseTool):
                 connector=connector,
                 config={
                     **config,
-                    "snapshot_dir": str((Path(self._settings.tspilot_root) / "cache_data" / "query_snapshots").resolve()),
+                    "snapshot_dir": str(self._query_snapshot_dir(request_state)),
                 },
             )
             evidence = await flow.run(
@@ -229,6 +232,12 @@ class QueryDatabaseTool(BaseTool):
                 execute_range_query_fn=execute_range_query,
             )
         return evidence.model_dump(mode="json")
+
+    def _query_snapshot_dir(self, request_state=None) -> Path:
+        request_log_dir = getattr(request_state, "request_log_dir", None)
+        if request_log_dir:
+            return (Path(str(request_log_dir)) / "artifacts" / "query_snapshots").resolve()
+        return (Path(self._settings.tspilot_root) / "cache_data" / "query_snapshots").resolve()
 
     def _build_query_context(self, validated_input: QueryDatabaseInput, config: dict):
         from core.database.contracts import QueryRequestContext

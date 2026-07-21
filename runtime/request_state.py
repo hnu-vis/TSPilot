@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import datetime, timezone
+import re
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,6 +42,13 @@ def normalize_chat_request(request: ChatRequest) -> ChatRequest:
 def build_request_state(request: ChatRequest, settings: Settings) -> RequestStateModel:
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     conversation_id = request.conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
+    conversation_run_dir = None
+    request_log_dir = None
+    if settings.conversation_log_enabled:
+        conversation_run_dir = _resolve_conversation_run_dir(settings, conversation_id)
+        request_log_dir = conversation_run_dir / "requests" / request_id
+        request_log_dir.mkdir(parents=True, exist_ok=True)
+        _write_conversation_meta(conversation_run_dir, conversation_id)
     requested_fact_types: list[str] = []
     answer_requirements = ["conclusion"]
     focus = request.message
@@ -47,6 +56,8 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
     return RequestStateModel(
         request_id=request_id,
         conversation_id=conversation_id,
+        conversation_run_dir=str(conversation_run_dir) if conversation_run_dir else None,
+        request_log_dir=str(request_log_dir) if request_log_dir else None,
         message=request.message,
         database_context=database_context,
         selected_database=request.selected_database,
@@ -99,6 +110,46 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         errors=[],
         prompt_context_summary=None,
     )
+
+
+def _resolve_conversation_run_dir(settings: Settings, conversation_id: str) -> Path:
+    root = settings.resolved_conversation_log_dir
+    root.mkdir(parents=True, exist_ok=True)
+    safe_conversation_id = _safe_path_name(conversation_id)
+    existing = sorted(root.glob(f"*_{safe_conversation_id}"))
+    for path in reversed(existing):
+        if path.is_dir():
+            return path.resolve()
+
+    local_now = datetime.now().astimezone()
+    timestamp = local_now.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = root / f"{timestamp}_{safe_conversation_id}"
+    suffix = 1
+    while run_dir.exists():
+        suffix += 1
+        run_dir = root / f"{timestamp}_{safe_conversation_id}_{suffix}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir.resolve()
+
+
+def _write_conversation_meta(conversation_run_dir: Path, conversation_id: str) -> None:
+    meta_path = conversation_run_dir / "conversation.json"
+    if meta_path.exists():
+        return
+    local_now = datetime.now().astimezone()
+    payload = {
+        "conversation_id": conversation_id,
+        "created_at_local": local_now.isoformat(),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "timezone": local_now.tzname(),
+        "run_dir": str(conversation_run_dir),
+    }
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_path_name(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
+    return normalized or "unknown"
 
 
 def build_conversation_state(request: ChatRequest, conversation_id: str) -> ConversationStateModel:
@@ -352,7 +403,7 @@ def enrich_observation_payload(
             analysis_id = str(full_payload.get("analysis_id"))
             analysis = request_state.analysis_artifacts.get(analysis_id)
             if analysis is not None:
-                payload = _build_prompt_safe_analysis(analysis)
+                payload = _build_prompt_safe_analysis(analysis, request_state)
         elif "insight_id" in full_payload and request_state.latest_insight is not None:
             payload = request_state.latest_insight.model_dump(mode="json")
         elif "forecast_id" in full_payload and request_state.latest_forecast is not None:
@@ -448,16 +499,22 @@ async def _advance_plan_after_success_async(
     if current_task_type and current_task_type != "generic" and current_task_type != task_type:
         return
 
-    if completion_evaluator is not None:
+    deterministic_evaluation = evaluate_step_completion(
+        request_state,
+        tool_name=tool_name,
+        full_payload=full_payload,
+    )
+    verdict = None
+    if completion_evaluator is not None and deterministic_evaluation.completed:
         evaluation = await completion_evaluator.evaluate_step_completion(
             request_state=request_state,
             tool_name=tool_name,
             full_payload=full_payload,
         )
+        verdict = getattr(completion_evaluator, "last_step_verdict", None)
     else:
-        evaluation = evaluate_step_completion(request_state, tool_name=tool_name, full_payload=full_payload)
+        evaluation = deterministic_evaluation
 
-    verdict = getattr(completion_evaluator, "last_step_verdict", None) if completion_evaluator is not None else None
     request_state.completion_state["latest_step"] = {
         **evaluation.model_dump(),
         "tool_name": tool_name,
@@ -504,8 +561,25 @@ def _apply_evidence_payload(request_state: RequestStateModel, full_payload: dict
     from schemas.database import DatabaseEvidence
 
     full_evidence = DatabaseEvidence.model_validate(full_payload)
+    diagnostics = dict(full_evidence.diagnostics)
+    diagnostics["artifact_kind"] = "database_evidence"
+    diagnostics["artifact_ref"] = f"evidence:{full_evidence.evidence_id}"
+    diagnostics["snapshot_ref"] = persist_json_artifact(
+        artifact_id=full_evidence.evidence_id,
+        artifact_kind="database_evidence",
+        payload=full_evidence.model_dump(mode="json"),
+        directory=_artifact_directory(request_state, "evidence"),
+    )
+    full_evidence = full_evidence.model_copy(update={"diagnostics": diagnostics})
     request_state.database_evidence_artifacts[full_evidence.evidence_id] = full_evidence
     request_state.latest_database_evidence = _build_prompt_safe_evidence(full_evidence)
+
+
+def _artifact_directory(request_state: RequestStateModel, artifact_group: str) -> str | Path:
+    if request_state.request_log_dir:
+        return Path(request_state.request_log_dir) / "artifacts" / artifact_group
+    fallback = "analysis_snapshots" if artifact_group == "analysis" else f"{artifact_group}_artifacts"
+    return Path(__file__).resolve().parents[1] / "cache_data" / fallback
 
 
 def _build_prompt_safe_evidence(evidence):
@@ -534,6 +608,24 @@ def _build_prompt_safe_evidence(evidence):
     diagnostics["artifact_kind"] = "database_evidence"
     diagnostics["artifact_ref"] = f"evidence:{evidence.evidence_id}"
     diagnostics["summary_stats"] = {key: value for key, value in summary_stats.items() if value is not None}
+    visible_counts = {
+        "points_count": len(data.get("points", [])) if isinstance(data.get("points"), list) else None,
+        "rows_count": len(data.get("rows", [])) if isinstance(data.get("rows"), list) else None,
+        "series_count": len(data.get("series", [])) if isinstance(data.get("series"), list) else None,
+    }
+    full_counts = {key: value for key, value in summary_stats.items() if value is not None}
+    diagnostics["prompt_sampling"] = {
+        "policy": "head_tail_edges",
+        "sampled_for_prompt": any(
+            isinstance(full_counts.get(key), int)
+            and isinstance(visible_counts.get(key), int)
+            and visible_counts[key] < full_counts[key]
+            for key in ("points_count", "rows_count", "series_count")
+        ),
+        "full_counts": full_counts,
+        "visible_counts": {key: value for key, value in visible_counts.items() if value is not None},
+        "full_artifact_ref": f"evidence:{evidence.evidence_id}",
+    }
     if "query_trace" in diagnostics and isinstance(diagnostics["query_trace"], dict):
         query_trace = dict(diagnostics["query_trace"])
         raw_result_summary = dict(query_trace.get("raw_result_summary") or {})
@@ -589,7 +681,7 @@ def _summarize_visualization_dict(payload: dict) -> dict:
     return item
 
 
-def _build_prompt_safe_insight(insight):
+def _build_prompt_safe_insight(insight, request_state: RequestStateModel):
     from schemas.insight import InsightResult
 
     payload = insight.model_dump(mode="json")
@@ -609,13 +701,13 @@ def _build_prompt_safe_insight(insight):
         artifact_id=insight.insight_id,
         artifact_kind="insight_result",
         payload=insight.model_dump(mode="json"),
-        subdir="analysis_snapshots",
+        directory=_artifact_directory(request_state, "analysis"),
     )
     payload["diagnostics"] = diagnostics
     return InsightResult.model_validate(payload)
 
 
-def _build_prompt_safe_analysis(analysis):
+def _build_prompt_safe_analysis(analysis, request_state: RequestStateModel):
     from schemas.analysis import AnalysisResult
 
     payload = analysis.model_dump(mode="json")
@@ -632,13 +724,13 @@ def _build_prompt_safe_analysis(analysis):
         artifact_id=analysis.analysis_id,
         artifact_kind="analysis_result",
         payload=analysis.model_dump(mode="json"),
-        subdir="analysis_snapshots",
+        directory=_artifact_directory(request_state, "analysis"),
     )
     payload["diagnostics"] = diagnostics
     return AnalysisResult.model_validate(payload).model_dump(mode="json")
 
 
-def _build_prompt_safe_forecast(forecast):
+def _build_prompt_safe_forecast(forecast, request_state: RequestStateModel):
     from schemas.timeseries import ForecastResult
 
     payload = forecast.model_dump(mode="json")
@@ -655,13 +747,13 @@ def _build_prompt_safe_forecast(forecast):
         artifact_id=forecast.forecast_id,
         artifact_kind="forecast_result",
         payload=forecast.model_dump(mode="json"),
-        subdir="analysis_snapshots",
+        directory=_artifact_directory(request_state, "analysis"),
     )
     payload["diagnostics"] = diagnostics
     return ForecastResult.model_validate(payload)
 
 
-def _build_prompt_safe_anomaly(anomaly):
+def _build_prompt_safe_anomaly(anomaly, request_state: RequestStateModel):
     from schemas.timeseries import AnomalyResult
 
     payload = anomaly.model_dump(mode="json")
@@ -679,7 +771,7 @@ def _build_prompt_safe_anomaly(anomaly):
         artifact_id=anomaly.anomaly_id,
         artifact_kind="anomaly_result",
         payload=anomaly.model_dump(mode="json"),
-        subdir="analysis_snapshots",
+        directory=_artifact_directory(request_state, "analysis"),
     )
     payload["diagnostics"] = diagnostics
     return AnomalyResult.model_validate(payload)
@@ -703,7 +795,7 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
         insight = InsightResult.model_validate(full_payload)
         request_state.insight_artifacts[insight.insight_id] = insight
-        request_state.latest_insight = _build_prompt_safe_insight(insight)
+        request_state.latest_insight = _build_prompt_safe_insight(insight, request_state)
         request_state.verified_facts = insight.verified_facts
         request_state.rejected_facts = insight.rejected_facts
         request_state.visualizations = list(request_state.latest_insight.visualizations)
@@ -719,7 +811,7 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
         forecast = ForecastResult.model_validate(full_payload)
         request_state.forecast_artifacts[forecast.forecast_id] = forecast
-        request_state.latest_forecast = _build_prompt_safe_forecast(forecast)
+        request_state.latest_forecast = _build_prompt_safe_forecast(forecast, request_state)
         request_state.visualizations.extend(request_state.latest_forecast.visualizations)
         request_state.answer_coverage["forecast"] = True
         return
@@ -729,7 +821,7 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
         anomaly = AnomalyResult.model_validate(full_payload)
         request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
-        request_state.latest_anomaly = _build_prompt_safe_anomaly(anomaly)
+        request_state.latest_anomaly = _build_prompt_safe_anomaly(anomaly, request_state)
         request_state.visualizations.extend(request_state.latest_anomaly.visualizations)
         request_state.answer_coverage["anomaly"] = True
         return

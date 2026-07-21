@@ -15,6 +15,44 @@ class _EvidenceSpec:
     result_target = "evidence"
 
 
+def test_sql_query_prompt_prefers_schema_linked_automatic_generation():
+    builder = DataAgentPromptBuilder()
+    system_prompt = builder.build_system_prompt()
+
+    assert "Default to message-only automatic planning" in system_prompt
+    assert "schema linking participates as auxiliary grounding" in system_prompt
+    assert "Do not write an explicit database query from user-facing names" in system_prompt
+    assert "Context is budgeted" in system_prompt
+    assert "diagnostics.prompt_sampling" in system_prompt
+
+
+def test_prompt_context_exposes_context_budget_rule():
+    settings = get_settings()
+    request = ChatRequest(
+        message="找出最高价和最低价。",
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+
+    assert "semantic_repair_directive" not in context["state"]["decision_frame"]
+    assert "Prompt context contains bounded previews only" in context["state"]["decision_frame"]["context_budget_rule"]
+
+
+def test_prompt_context_handles_diagnostics_without_data_preview():
+    payload = {
+        "summary": "analysis ok",
+        "diagnostics": {"runtime_ms": 12, "summary_stats": {"rows_count": 0}},
+    }
+
+    summarized = DataAgentPromptBuilder()._summarize_observation_payload(payload)
+
+    assert summarized["diagnostics"]["runtime_ms"] == 12
+    assert summarized["diagnostics"]["prompt_sampling"]["visible_counts"] == {}
+
+
 def test_prompt_builder_summarizes_heavy_context():
     settings = get_settings()
     request = ChatRequest(
@@ -66,14 +104,21 @@ def test_prompt_builder_summarizes_heavy_context():
     request_state.visualizations = request_state.latest_insight.visualizations
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    sql_action = next(action for action in context["available_actions"] if action["action"] == "sql_query")
 
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
+    assert "prefer message" in sql_action["input"]
+    assert "schema-linked generation" in sql_action["input"]
     assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True
     assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
     guidance = " ".join(context["state"]["decision_frame"]["recommended_next_action_types"])
     assert "continue with explicit read-only queries" in guidance
     assert "A prior sql_query does not force insight" in context["state"]["decision_frame"]["sql_loop_rule"]
     assert len(context["evidence"]["latest"]["data"]["points"]) <= 8
+    sampling = context["evidence"]["latest"]["diagnostics"]["prompt_sampling"]
+    assert sampling["sampled_for_prompt"] is True
+    assert sampling["full_counts"]["points_count"] == 100
+    assert sampling["visible_counts"]["points_count"] == 8
     assert context["evidence"]["prior_queries"] == []
     assert context["outputs"]["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
     assert "chart" not in context["outputs"]["visualizations"][0]

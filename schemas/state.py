@@ -19,6 +19,8 @@ from schemas.visualization import VisualizationPayload
 class RequestStateModel(BaseModel):
     request_id: str
     conversation_id: str | None = None
+    conversation_run_dir: str | None = None
+    request_log_dir: str | None = None
     message: str
     database_context: DatabaseContext | None = None
     selected_database: str | None = None

@@ -135,7 +135,12 @@ class RuntimeLLMEvaluator:
         raw = await self._invoke(
             "TSPilot Answerability JSON",
             (
-                "Decide whether available evidence is sufficient to answer the user's request fully. "
+                "Decide whether available observations and artifacts satisfy the user's requested answer. "
+                "Focus on task coverage: requested fields, filters, time range, statistics, grouping, comparisons, extrema, and required query text. "
+                "Use data_completeness to distinguish complete query results from prompt previews. "
+                "When data_completeness says the visible rows/points are complete for the executed query, do not call them sample-only evidence just because they appear in a preview field. "
+                "Do not block just because evidence has caveats, outliers, or prompt sampling if the answer can state those caveats. "
+                "Do block when the final answer would require deriving facts that no query or analysis artifact actually computed. "
                 "Return JSON with can_answer, reason, missing_items, answerable_from, next_action_hint, confidence."
             ),
             payload,
@@ -206,6 +211,19 @@ class RuntimeLLMEvaluator:
         rows = data.get("rows") if isinstance(data.get("rows"), list) else []
         points = data.get("points") if isinstance(data.get("points"), list) else []
         summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
+        prompt_sampling = diagnostics.get("prompt_sampling") if isinstance(diagnostics.get("prompt_sampling"), dict) else {}
+        row_count = summary_stats.get("rows_count") if summary_stats else payload.get("row_count")
+        point_count = summary_stats.get("points_count") if summary_stats else payload.get("point_count")
+        series_count = summary_stats.get("series_count") if summary_stats else payload.get("series_count")
+        sampled_for_prompt = bool(prompt_sampling.get("sampled_for_prompt"))
+        is_full_fidelity = diagnostics.get("is_full_fidelity")
+        if is_full_fidelity is None:
+            is_full_fidelity = not sampled_for_prompt and (
+                (not isinstance(row_count, int) or row_count == len(rows))
+                and (not isinstance(point_count, int) or point_count == len(points))
+            )
+        visible_row_count = len(rows)
+        visible_point_count = len(points)
         return {
             "evidence_id": payload.get("evidence_id"),
             "result_type": payload.get("result_type"),
@@ -213,13 +231,28 @@ class RuntimeLLMEvaluator:
             "query_language": payload.get("query_language"),
             "query": payload.get("query"),
             "columns": payload.get("columns") or [],
-            "row_count": summary_stats.get("rows_count") if summary_stats else payload.get("row_count"),
-            "point_count": summary_stats.get("points_count") if summary_stats else payload.get("point_count"),
-            "sample_rows": rows[: self.max_rows_preview],
-            "sample_points": points[: self.max_rows_preview],
+            "row_count": row_count,
+            "point_count": point_count,
+            "series_count": series_count,
+            "result_rows_preview": rows[: self.max_rows_preview],
+            "result_points_preview": points[: self.max_rows_preview],
+            "data_completeness": {
+                "is_full_fidelity": bool(is_full_fidelity),
+                "sampled_for_prompt": sampled_for_prompt,
+                "visible_row_count": visible_row_count,
+                "visible_point_count": visible_point_count,
+                "full_row_count": row_count,
+                "full_point_count": point_count,
+                "full_series_count": series_count,
+                "preview_contains_all_visible_rows": visible_row_count <= self.max_rows_preview,
+                "preview_contains_all_visible_points": visible_point_count <= self.max_rows_preview,
+                "full_artifact_ref": prompt_sampling.get("full_artifact_ref") or diagnostics.get("artifact_ref"),
+            },
             "metadata": payload.get("metadata") or {},
             "diagnostics": {
                 "summary_stats": summary_stats,
+                "prompt_sampling": prompt_sampling or None,
                 "llm_query_generation": diagnostics.get("llm_query_generation"),
+                "schema_linking_generation": diagnostics.get("schema_linking_generation"),
             },
         }

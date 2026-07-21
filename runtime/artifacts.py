@@ -13,11 +13,17 @@ def persist_json_artifact(
     artifact_id: str,
     artifact_kind: str,
     payload: dict,
-    subdir: str,
+    subdir: str | None = None,
+    directory: str | Path | None = None,
 ) -> dict:
     """Persist one artifact payload to cache_data and return its reference."""
 
-    root = Path(__file__).resolve().parents[1] / "cache_data" / subdir
+    if directory is not None:
+        root = Path(directory)
+    elif subdir is not None:
+        root = Path(__file__).resolve().parents[1] / "cache_data" / subdir
+    else:
+        raise ValueError("persist_json_artifact requires either subdir or directory.")
     root.mkdir(parents=True, exist_ok=True)
     filename = _artifact_filename(artifact_id)
     path = root / f"{filename}.json"

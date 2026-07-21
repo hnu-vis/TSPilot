@@ -119,6 +119,7 @@ def build_policy_observation(
             "recovery_hint": (
                 "Choose exactly one allowed next action and return one JSON object. "
                 "Do not call todowrite again when a plan already exists. "
+                "Use the latest observation, bounded evidence previews, and artifact refs to decide whether to query, analyze, or answer. "
                 "When an active todo exists, choose the action matching its task_type unless a database query is still needed to fill missing query evidence."
             ),
         },

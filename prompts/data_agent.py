@@ -26,6 +26,9 @@ class DataAgentPromptBuilder:
             "Decide from the current evidence gap, not from an imagined workflow.\n"
             "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
             "Use the user's message, current plan, and observations as the source of task intent.\n"
+            "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
+            "Use diagnostics.prompt_sampling, summary_stats, data_completeness, artifact_ref, and query text to decide whether the visible preview is complete. "
+            "When a task needs facts not present in the prompt preview, call sql_query or insight over the full artifact instead of guessing from the preview.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
@@ -35,7 +38,8 @@ class DataAgentPromptBuilder:
             "Only choose sql_query during a non-query step when the active step still lacks database/query evidence such as schema, sample rows, count, aggregate, or time_series.\n"
             "Tool contracts:\n"
             "- todowrite: create the initial full todo plan only when no plan exists.\n"
-            "- sql_query: query the selected datasource. Use message for automatic query planning, or query/query_language for explicit read-only SQL/Flux/PromQL. "
+            "- sql_query: query the selected datasource. Default to message-only automatic planning so the sql_query tool first runs schema linking and passes that grounding into SQL/Flux/PromQL generation. "
+            "Use explicit query/query_language only after prior grounded schema/evidence exists, when repairing a failed generated query, or when the user supplied an exact query. "
             "It is the primary database-analysis action for schema/sample inspection, raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
             "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
             "- insight: execute generated Python analysis code over existing full evidence artifacts. Use it only when SQL cannot express the needed computation well, or when structured fact extraction/visualization is needed after enough database queries. It returns structured analysis results, not raw rows.\n"
@@ -55,9 +59,9 @@ class DataAgentPromptBuilder:
             "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null, \"evidence_needed\": list[str]}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
-            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}.\n"
+            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for LLM SQL generation because schema linking participates as auxiliary grounding inside the tool.\n"
             "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
-            "Do not write an explicit database query from user-facing names when no schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so the datasource-specific fields are grounded.\n"
+            "Do not write an explicit database query from user-facing names when no grounded schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so datasource-specific measurements, fields, tags, and required filters are linked before SQL generation.\n"
             "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
             "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
             "Use insight after the SQL evidence is sufficiently grounded, or when the computation requires Python over full artifacts. Do not calculate final facts from prompt previews alone.\n"
@@ -163,7 +167,7 @@ class DataAgentPromptBuilder:
             {
                 "action": "sql_query",
                 "use_when": "Database evidence is missing, or a read-only follow-up query can compute the exact aggregation, grouping, ranking, filter validation, or diagnostic needed to answer correctly.",
-                "input": "message or query, database_context, time_range, constraints, query_language, purpose",
+                "input": "prefer message, database_context, time_range, constraints for automatic schema-linked generation; use query/query_language only after grounded schema/evidence, for repair, or for a user-supplied exact query",
             },
             {
                 "action": "insight",
@@ -286,6 +290,10 @@ class DataAgentPromptBuilder:
                 "or another database-checkable gap, call sql_query again with a focused read-only query. "
                 "Do not use this rule to bypass a non-query active plan step whose database evidence is already present."
             ),
+            "context_budget_rule": (
+                "Prompt context contains bounded previews only. Use prompt_sampling/data_completeness and artifact refs to distinguish complete results from previews; "
+                "run a tool when full-data computation is needed."
+            ),
         }
 
     def _active_plan_contract(self, request_state: RequestStateModel, current_todo: dict | None) -> dict:
@@ -362,8 +370,13 @@ class DataAgentPromptBuilder:
         visible_diagnostics = {
             key: value
             for key, value in diagnostics.items()
-            if key in {"artifact_kind", "artifact_ref", "summary_stats", "query_trace", "series_count"}
+            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count"}
         }
+        visible_diagnostics["prompt_sampling"] = self._prompt_sampling(
+            full_counts=summary_stats,
+            data=data,
+            fallback=visible_diagnostics.get("prompt_sampling") if isinstance(visible_diagnostics.get("prompt_sampling"), dict) else None,
+        )
         if "query_trace" in visible_diagnostics:
             visible_diagnostics["query_trace"] = self._bounded_value(
                 visible_diagnostics["query_trace"],
@@ -484,6 +497,7 @@ class DataAgentPromptBuilder:
         if not isinstance(payload, dict):
             return {}
         summarized = {}
+        preview = {}
         for key in (
             "recovery_hint",
             "error",
@@ -511,7 +525,6 @@ class DataAgentPromptBuilder:
                 summarized[key] = self._bounded_value(payload[key], max_string_chars=1200, max_list_items=12, max_dict_items=16)
         if isinstance(payload.get("data"), dict):
             data = dict(payload["data"])
-            preview = {}
             if isinstance(data.get("rows"), list):
                 preview["rows"] = data["rows"][:3]
             if isinstance(data.get("points"), list):
@@ -533,7 +546,14 @@ class DataAgentPromptBuilder:
                 key: self._bounded_value(value, max_string_chars=1000, max_list_items=8, max_dict_items=16)
                 for key, value in diagnostics.items()
                 if key in {"summary_stats", "query_trace", "sql_query", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
+                or key == "prompt_sampling"
             }
+            summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
+            summarized["diagnostics"]["prompt_sampling"] = self._prompt_sampling(
+                full_counts=summary_stats,
+                data=preview,
+                fallback=diagnostics.get("prompt_sampling") if isinstance(diagnostics.get("prompt_sampling"), dict) else None,
+            )
         if isinstance(payload.get("todos"), list):
             summarized["todos"] = payload["todos"][:8]
         if isinstance(payload.get("verified_facts"), list):
@@ -549,6 +569,28 @@ class DataAgentPromptBuilder:
         if isinstance(payload.get("valid_actions"), list):
             summarized["valid_actions"] = payload["valid_actions"]
         return summarized
+
+    def _prompt_sampling(self, *, full_counts: dict, data: dict, fallback: dict | None = None) -> dict:
+        visible_counts = {
+            "points_count": len(data.get("points", [])) if isinstance(data.get("points"), list) else None,
+            "rows_count": len(data.get("rows", [])) if isinstance(data.get("rows"), list) else None,
+            "series_count": len(data.get("series", [])) if isinstance(data.get("series"), list) else None,
+        }
+        counts = {key: value for key, value in (full_counts or {}).items() if value is not None}
+        if not counts and fallback:
+            counts = dict(fallback.get("full_counts") or {})
+        return {
+            "policy": "head_tail_edges",
+            "sampled_for_prompt": any(
+                isinstance(counts.get(key), int)
+                and isinstance(visible_counts.get(key), int)
+                and visible_counts[key] < counts[key]
+                for key in ("points_count", "rows_count", "series_count")
+            ),
+            "full_counts": counts,
+            "visible_counts": {key: value for key, value in visible_counts.items() if value is not None},
+            "full_artifact_ref": (fallback or {}).get("full_artifact_ref"),
+        }
 
     def _truncate_text(self, value, max_chars: int):
         if not isinstance(value, str):
