@@ -22,7 +22,7 @@ class FakeLLM:
         if context.get("database_context") is None:
             return _turn(
                 "No datasource is available, so I can only attempt final assembly and let the runtime fail closed.",
-                "format_answer",
+                "terminate",
                 {"summary_goal": context["message"], "include_fact_ids": [], "include_visualization_ids": [], "section_plan": []},
             )
 
@@ -52,7 +52,7 @@ class FakeLLM:
             }
             return _turn(
                 "I already have a non-timeseries evidence family and should answer directly.",
-                "format_answer",
+                "terminate",
                 action_input,
             )
 
@@ -77,7 +77,7 @@ class FakeLLM:
         }
         return _turn(
             "I have enough verified output to assemble the final answer.",
-            "format_answer",
+            "terminate",
             action_input,
         )
 
@@ -99,7 +99,7 @@ class CasualLLM:
         context = _compat_context(json.loads(context_json))
         return _turn(
             "This is a conversational request without a datasource, so I should answer directly.",
-            "format_answer",
+            "terminate",
             {
                 "summary_goal": "Answer the user's conversational request.",
                 "direct_answer": "你好！我是 TSPilot，可以帮你查询和分析时序数据。你可以选择数据库后直接问趋势、异常、预测或指标解释。",
@@ -129,7 +129,7 @@ class ComplexReActLLM:
         if context.get("database_context") is None:
             return _turn(
                 "No datasource is available, so I can only attempt final assembly and let the runtime fail closed.",
-                "format_answer",
+                "terminate",
                 {"summary_goal": context["message"], "include_fact_ids": [], "include_visualization_ids": [], "section_plan": []},
             )
 
@@ -209,7 +209,7 @@ class ComplexReActLLM:
         }
         return _turn(
             "I have enough verified evidence, anomaly findings, and forecast output to assemble the answer.",
-            "format_answer",
+            "terminate",
             action_input,
         )
 
@@ -286,7 +286,7 @@ class RepeatingTodoLLM:
 
         return _turn(
             "I now have enough outputs.",
-            "format_answer",
+            "terminate",
             {
                 "summary_goal": context["message"],
                 "include_analysis_ids": _analysis_ids(context),
@@ -347,7 +347,11 @@ class TodoScopeLLM:
                 },
             )
 
-        if latest_observation and latest_observation["tool_name"] == "format_answer" and latest_observation["success"] is False:
+        if (
+            latest_observation
+            and latest_observation["tool_name"] in {"format_answer", "terminate"}
+            and latest_observation["success"] is False
+        ):
             return _turn(
                 "The answer assembly reported missing anomaly output, so I should run anomaly detection.",
                 "anomaly",
@@ -377,7 +381,7 @@ class TodoScopeLLM:
         if _analysis_count(context) > 0 and context.get("latest_anomaly") is not None:
             return _turn(
                 "I have enough facts to answer.",
-                "format_answer",
+                "terminate",
                 {
                     "summary_goal": context["message"],
                     "include_analysis_ids": _analysis_ids(context),
@@ -485,7 +489,7 @@ def _runtime_evaluation_response(user_prompt: str) -> _FakeResponse | None:
         return _FakeResponse(
             json.dumps(
                 {
-                    "completed": bool(evidence_id or context.get("tool_name") in {"insight", "anomaly", "forecast", "format_answer"}),
+                    "completed": bool(evidence_id or context.get("tool_name") in {"insight", "anomaly", "forecast", "format_answer", "terminate"}),
                     "reason": "latest tool output satisfies the active todo",
                     "missing_items": [],
                     "satisfied_items": ["active_todo"],

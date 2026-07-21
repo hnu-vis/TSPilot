@@ -57,7 +57,7 @@ Each model turn must be parsed as one `ReActTurn` with:
 - `anomaly`
 - `rag`
 - `skill`
-- `format_answer`
+- `terminate`
 
 ## Runtime behavior
 
@@ -70,7 +70,7 @@ Each model turn must be parsed as one `ReActTurn` with:
 7. normalize the result into `ToolObservation`
 8. append trace events
 9. update request and conversation state
-10. if `action = format_answer`, persist the assembled final answer, emit a runtime `terminate` event, and end the loop
+10. if the executed tool has `produces_terminal_payload = true`, persist the assembled final answer, emit a runtime `terminate` event, and end the loop
 11. otherwise re-enter the loop until a stop condition is hit
 
 ## Action dispatch rules
@@ -89,9 +89,9 @@ Current practical routing is:
 1. retrieve evidence through `query_database`
 2. inspect the returned evidence family
 3. if the family is non-timeseries (`statistics`, `table`, `schema`,
-   `metric_list`), prefer `format_answer`
+   `metric_list`), prefer `terminate`
 4. if the family is `timeseries`, prefer `insight`, then optional `anomaly`
-   and `forecast`, then `format_answer`
+   and `forecast`, then `terminate`
 
 This means the main routing boundary for many requests currently depends on the
 evidence family selected by `query_database`, not on a dedicated fact execution
@@ -160,7 +160,7 @@ Recommended runtime fields:
 
 ## Stop conditions
 
-- `format_answer` completed and final answer is ready
+- terminal payload completed and final answer is ready
 - max iterations reached
 - context budget overflow after compaction
 - unrecoverable error

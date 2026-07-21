@@ -11,7 +11,7 @@ from schemas.agent_turn import ReActTurn
 from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
-from schemas.tool import ToolObservation
+from schemas.tool import ToolCall, ToolObservation
 
 
 class _EvidenceSpec:
@@ -418,7 +418,7 @@ async def test_runtime_blocks_direct_query_when_llm_requires_plan():
 
 
 @pytest.mark.asyncio
-async def test_format_answer_does_not_use_llm_answerability_gate():
+async def test_terminate_does_not_use_llm_answerability_gate():
     request_state = RequestStateModel(
         request_id="req-no-answerability-gate",
         message="分析趋势。",
@@ -444,14 +444,14 @@ async def test_format_answer_does_not_use_llm_answerability_gate():
         runtime_evaluator=_NoAnswerabilityEvaluator(),
     )
 
-    reason = await loop._plan_requirement_block_reason(request_state, "format_answer", {})
+    reason = await loop._plan_requirement_block_reason(request_state, "terminate", {})
 
     assert reason is None
     assert "answerability_verdict" not in request_state.completion_state
     assert "semantic_repair_directive" not in request_state.completion_state
 
 
-def test_policy_blocks_format_answer_until_database_goal_has_evidence():
+def test_policy_blocks_terminal_answer_until_database_goal_has_evidence():
     request_state = RequestStateModel(
         request_id="req-policy-format-block",
         message="总共有多少条数据？",
@@ -459,11 +459,58 @@ def test_policy_blocks_format_answer_until_database_goal_has_evidence():
         status="running",
     )
 
-    allowed, reason = validate_action(request_state, "format_answer")
+    allowed, reason = validate_action(request_state, "terminate")
 
     assert allowed is False
     assert "not complete" in (reason or "")
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["database_evidence"]
+
+
+def test_policy_blocks_terminate_when_latest_sql_runtime_coverage_requires_followup():
+    request_state = RequestStateModel(
+        request_id="req-policy-runtime-coverage",
+        message="返回最晚一条价格记录。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        latest_database_evidence={
+            "evidence_id": "evi_missing_price",
+            "result_type": "table",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...) |> last()",
+            "summary": "Loaded 1 row.",
+            "data": {"rows": [{"timestamp": "2023-01-01T00:00:00Z"}]},
+            "columns": ["timestamp"],
+            "metadata": {},
+            "diagnostics": {
+                "task_coverage": {
+                    "runtime_missing_or_uncertain": [
+                        "selected result fields are not present in returned columns: price"
+                    ],
+                    "runtime_requires_followup": True,
+                    "next_action_hint": "Query again and return the price value column.",
+                }
+            },
+        },
+        tool_history=[
+            ToolCall(
+                tool_name="sql_query",
+                tool_input={},
+                iteration=1,
+                reason="load latest price",
+            )
+        ],
+    )
+
+    allowed, reason = validate_action(request_state, "terminate")
+
+    assert allowed is False
+    assert "result-shape gaps" in (reason or "")
+    latest_goal = request_state.completion_state["latest_goal"]
+    assert latest_goal["missing_evidence"] == [
+        "selected result fields are not present in returned columns: price"
+    ]
+    assert latest_goal["next_action_hint"] == "Query again and return the price value column."
 
 
 def test_runtime_does_not_complete_count_todo_with_schema_only():

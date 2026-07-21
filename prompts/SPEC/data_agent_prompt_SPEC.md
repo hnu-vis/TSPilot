@@ -44,7 +44,7 @@ The model must treat anything outside that window as unavailable.
 - `anomaly`
 - `rag`
 - `skill`
-- `format_answer`
+- `terminate`
 
 ## Prompt responsibilities
 
@@ -150,15 +150,19 @@ Optional fields:
 
 - `parameters`
 
-### `format_answer`
+### `terminate`
 
 Required fields:
 
-- `summary_goal`
+- none
 
 Optional fields:
 
+- `result`
+- `summary_goal`
+- `direct_answer`
 - `include_fact_ids`
+- `include_analysis_ids`
 - `include_visualization_ids`
 - `section_plan`
 
@@ -272,8 +276,8 @@ The prompt should guide the model with this order:
 4. decide requested fact families before calling `insight`
 5. call `forecast` or `anomaly` only when the evidence is time-series shaped
 6. call `rag` or `skill` only when the request genuinely needs extension capability
-7. call `format_answer` when enough verified outputs exist and you need the final answer assembled; do not pass full runtime state back to the tool
-8. let the runtime stop the loop after `format_answer` has produced the final payload
+7. call `terminate` when enough verified outputs exist and the ReAct loop should end; do not pass full runtime state back to the tool
+8. let the runtime stop the loop after the terminal payload has been produced
 
 ## Prompt rules
 
@@ -287,7 +291,7 @@ The prompt should guide the model with this order:
 - prefer `linechart` for time-indexed or ratio/comparison facts when the evidence supports it
 - do not emit hidden state changes outside the structured block
 - do not emit `Observation`
-- treat `format_answer` as the final model-visible action
+- treat `terminate` as the final model-visible action
 - do not assume access to truncated context or hidden runtime state
 
 ## Must not do

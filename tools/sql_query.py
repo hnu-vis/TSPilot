@@ -121,6 +121,19 @@ class _ExplicitQueryExecutor(BaseTool):
             },
             **(extra_diagnostics or {}),
         }
+        evidence.diagnostics["task_coverage"] = self._task_coverage_diagnostics(
+            validated_input=validated_input,
+            evidence=evidence.model_dump(mode="json"),
+            query=executed_query,
+            query_language=validated_input.query_language or self._infer_query_language(config),
+            base=(extra_diagnostics or {}).get("task_coverage") if isinstance(extra_diagnostics, dict) else None,
+            selected_fields=(
+                ((extra_diagnostics or {}).get("llm_query_generation") or {}).get("selected_fields")
+                if isinstance(extra_diagnostics, dict)
+                and isinstance((extra_diagnostics or {}).get("llm_query_generation"), dict)
+                else None
+            ),
+        )
         return evidence.model_dump(mode="json")
 
     async def _execute_with_repair(
@@ -250,6 +263,143 @@ class _ExplicitQueryExecutor(BaseTool):
                 "Explicit query is missing filters required by the user request. "
                 f"{details} Preserve those filters or use sql_query automatic planning."
             )
+
+    def _task_coverage_diagnostics(
+        self,
+        *,
+        validated_input: _ExplicitQueryInput,
+        evidence: dict,
+        query: str,
+        query_language: str,
+        base: dict | None,
+        selected_fields: list[str] | None = None,
+    ) -> dict:
+        data = evidence.get("data") if isinstance(evidence.get("data"), dict) else {}
+        diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+        points = data.get("points") if isinstance(data.get("points"), list) else []
+        row_count = diagnostics.get("row_count_total")
+        if row_count is None:
+            row_count = len(rows)
+        result_summary = {
+            "result_type": evidence.get("result_type"),
+            "columns": (evidence.get("columns") or [])[:40],
+            "row_count": row_count,
+            "visible_row_count": len(rows),
+            "point_count": len(points),
+            "is_full_fidelity": diagnostics.get("is_full_fidelity"),
+            "truncated": diagnostics.get("truncated"),
+        }
+        satisfied = self._string_list((base or {}).get("satisfied"))
+        missing = self._string_list((base or {}).get("missing_or_uncertain"))
+        runtime_missing = self._runtime_missing_items(
+            selected_fields=selected_fields,
+            columns=evidence.get("columns") or [],
+            row_count=row_count,
+            query=query,
+            query_language=query_language,
+        )
+        for item in runtime_missing:
+            if item not in missing:
+                missing.append(item)
+        if row_count == 0 and "query returned no rows" not in missing:
+            missing.append("query returned no rows")
+            runtime_missing.append("query returned no rows")
+        if not satisfied and validated_input.purpose:
+            satisfied.append(f"executed query for: {validated_input.purpose}")
+        next_action_hint = self._optional_string((base or {}).get("next_action_hint"))
+        if missing and not next_action_hint:
+            next_action_hint = "Use the latest query, schema linking, and result summary to issue another focused sql_query for the missing facts."
+        return {
+            "source": (base or {}).get("source") or "sql_query_runtime",
+            "user_request": validated_input.purpose,
+            "executed_query": query,
+            "query_language": query_language,
+            "result_summary": result_summary,
+            "satisfied": satisfied,
+            "missing_or_uncertain": missing,
+            "runtime_missing_or_uncertain": runtime_missing,
+            "next_action_hint": next_action_hint,
+            "requires_followup": bool(missing),
+            "runtime_requires_followup": bool(runtime_missing),
+        }
+
+    def _runtime_missing_items(
+        self,
+        *,
+        selected_fields: list[str] | None,
+        columns: list,
+        row_count: int,
+        query: str | None = None,
+        query_language: str | None = None,
+    ) -> list[str]:
+        if row_count == 0:
+            return []
+        expected = {
+            str(field).strip().lower()
+            for field in (selected_fields or [])
+            if str(field).strip()
+        }
+        expected.update(self._projected_columns_from_query(query=query, query_language=query_language))
+        if not expected:
+            return []
+        actual = {
+            str(column).strip().lower()
+            for column in columns
+            if str(column).strip()
+        }
+        value_aliases = {"value", "_value", "metric_value"}
+        if actual & value_aliases:
+            return []
+        missing_fields = sorted(
+            field
+            for field in expected
+            if not self._field_present_in_columns(field, actual)
+        )
+        if not missing_fields:
+            return []
+        return [
+            "selected result fields are not present in returned columns: "
+            + ", ".join(missing_fields[:8])
+        ]
+
+    def _field_present_in_columns(self, field: str, columns: set[str]) -> bool:
+        time_aliases = {"time", "_time", "timestamp", "datetime", "date"}
+        if field in time_aliases and columns & time_aliases:
+            return True
+        if field in columns:
+            return True
+        normalized_field = field.replace("-", "_")
+        for column in columns:
+            normalized_column = column.replace("-", "_")
+            tokens = [token for token in normalized_column.split("_") if token]
+            if normalized_field in tokens:
+                return True
+            if normalized_column.endswith(f"_{normalized_field}"):
+                return True
+        return False
+
+    def _projected_columns_from_query(self, *, query: str | None, query_language: str | None) -> set[str]:
+        if not query or str(query_language or "").lower() != "flux":
+            return set()
+        projected: set[str] = set()
+        for match in re.finditer(r"keep\s*\(\s*columns\s*:\s*\[([^\]]*)\]", query, flags=re.IGNORECASE | re.DOTALL):
+            for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', match.group(1)):
+                column = (item[0] or item[1]).strip().lower()
+                if column:
+                    projected.add(column)
+        return projected
+
+    def _string_list(self, value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _optional_string(self, value) -> str | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class SqlQueryTool(BaseTool):
@@ -510,12 +660,38 @@ class SqlQueryTool(BaseTool):
                 "expected_result_type": generated.expected_result_type,
                 "selected_fields": generated.selected_fields,
                 "assumptions": generated.assumptions,
+                "task_coverage": generated.task_coverage,
                 "confidence": generated.confidence,
                 "repaired_from_query": generation.repaired_from_query,
                 "previous_error": str(previous_error) if previous_error is not None else None,
                 "reference_dataset_execution": reference_dataset,
-            }
+            },
+            "task_coverage": self._generation_task_coverage(generation),
         }
+
+    def _generation_task_coverage(self, generation: LLMQueryGenerationResult) -> dict:
+        generated = generation.generated_query
+        coverage = generated.task_coverage if isinstance(generated.task_coverage, dict) else {}
+        return {
+            "source": "llm_query_generation",
+            "query_purpose": generated.purpose,
+            "expected_result_type": generated.expected_result_type,
+            "satisfied": self._string_list(coverage.get("satisfied")),
+            "missing_or_uncertain": self._string_list(coverage.get("missing_or_uncertain")),
+            "next_action_hint": self._optional_string(coverage.get("next_action_hint")),
+            "confidence": generated.confidence,
+        }
+
+    def _string_list(self, value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _optional_string(self, value) -> str | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        return text or None
 
     def _infer_query_language(self, config: dict) -> str:
         db_type = str(config.get("type") or config.get("db_type") or "")

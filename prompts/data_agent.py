@@ -21,20 +21,21 @@ class DataAgentPromptBuilder:
             "{\"thought\": str, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
             "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
             "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
-            "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, format_answer.\n"
+            "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
             "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
             "Use the user's message, current plan, and observations as the source of task intent.\n"
             "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
             "Use diagnostics.prompt_sampling, summary_stats, data_completeness, artifact_ref, and query text to decide whether the visible preview is complete. "
+            "Use diagnostics.task_coverage from sql_query observations to decide whether the current query already covers the user request; if missing_or_uncertain is non-empty, prefer another focused sql_query before terminate. "
             "When a task needs facts not present in the prompt preview, call sql_query or insight over the full artifact instead of guessing from the preview.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
             "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
             "Todo is initial visible process state, not a model-maintained scheduler. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
-            "When a todo step is in_progress, its task_type is the active runtime contract. Choose the matching action for that step: query->sql_query, insight->insight, anomaly->anomaly, forecast->forecast, answer->format_answer. "
+            "When a todo step is in_progress, its task_type is the active runtime contract. Choose the matching action for that step: query->sql_query, insight->insight, anomaly->anomaly, forecast->forecast, answer->terminate. "
             "Only choose sql_query during a non-query step when the active step still lacks database/query evidence such as schema, sample rows, count, aggregate, or time_series.\n"
             "Tool contracts:\n"
             "- todowrite: create the initial full todo plan only when no plan exists.\n"
@@ -47,9 +48,9 @@ class DataAgentPromptBuilder:
             "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
             "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
-            "- format_answer: assemble the final answer from verified outputs already available in state. "
-            "When no datasource is selected and the user asks a greeting, capability question, clarification, or other non-data question, use format_answer directly and provide a concise direct_answer. "
-            "When the user asks a data-analysis question without a datasource, use format_answer to explain that a database/context is needed and suggest selecting one.\n"
+            "- terminate: end the ReAct loop when verified outputs already answer the task, and provide the final response payload. "
+            "When no datasource is selected and the user asks a greeting, capability question, clarification, or other non-data question, use terminate directly and provide a concise result/direct_answer. "
+            "When the user asks a data-analysis question without a datasource, use terminate to explain that a database/context is needed and suggest selecting one.\n"
             "Choose tools only from their current-state preconditions. Do not call a tool just because it appears in the user request.\n"
             "Action Input must be valid JSON.\n"
             "Use the exact action-input field names defined here.\n"
@@ -63,10 +64,11 @@ class DataAgentPromptBuilder:
             "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
             "Do not write an explicit database query from user-facing names when no grounded schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so datasource-specific measurements, fields, tags, and required filters are linked before SQL generation.\n"
             "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
+            "If diagnostics.task_coverage.requires_followup is true or missing_or_uncertain lists requested facts, continue with a focused sql_query for those facts instead of answering. "
             "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
             "Use insight after the SQL evidence is sufficiently grounded, or when the computation requires Python over full artifacts. Do not calculate final facts from prompt previews alone.\n"
             "For insight, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code_type\": \"python_rows_v1\", \"analysis_code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The generated code may use rows, points, columns, metadata, diagnostics, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}.\n"
-            "For format_answer, use: {\"summary_goal\": str, \"direct_answer\": str|null, "
+            "For terminate, use: {\"result\": str|null, \"summary_goal\": str|null, \"direct_answer\": str|null, "
             "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
             "Do not output markdown fences."
         )
@@ -195,7 +197,7 @@ class DataAgentPromptBuilder:
                 "input": "skill_name, parameters",
             },
             {
-                "action": "format_answer",
+                "action": "terminate",
                 "use_when": "Enough evidence-backed outputs are available, or the request is conversational / cannot proceed without more context.",
                 "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan",
             },
@@ -261,7 +263,7 @@ class DataAgentPromptBuilder:
         next_action_guidance = []
         active_contract = self._active_plan_contract(request_state, current_todo)
         if request_state.database_context is None:
-            next_action_guidance.append("format_answer: explain that a datasource/context is required for data analysis.")
+            next_action_guidance.append("terminate: explain that a datasource/context is required for data analysis.")
         elif latest_evidence is None:
             next_action_guidance.append("sql_query: obtain grounded schema/sample/raw evidence before analysis.")
         elif active_contract.get("expected_action"):
@@ -273,7 +275,7 @@ class DataAgentPromptBuilder:
                 [
                     "sql_query: continue with explicit read-only queries for additional aggregation, filtering, bucketing, or period validation.",
                     "insight: use Python over full evidence only when SQL is insufficient or structured facts/visualizations are now needed.",
-                    "format_answer: use only when enough database-backed evidence or derived outputs answer the user request.",
+                    "terminate: use only when enough database-backed evidence or derived outputs answer the user request.",
                 ]
             )
         if request_state.todo_list:
@@ -310,7 +312,7 @@ class DataAgentPromptBuilder:
             "insight": "insight",
             "anomaly": "anomaly",
             "forecast": "forecast",
-            "answer": "format_answer",
+            "answer": "terminate",
             "rag": "rag",
             "skill": "skill",
             "plan": "todowrite",
@@ -370,7 +372,7 @@ class DataAgentPromptBuilder:
         visible_diagnostics = {
             key: value
             for key, value in diagnostics.items()
-            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count"}
+            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count", "task_coverage"}
         }
         visible_diagnostics["prompt_sampling"] = self._prompt_sampling(
             full_counts=summary_stats,
@@ -426,6 +428,12 @@ class DataAgentPromptBuilder:
                     "row_count": row_count,
                     "point_count": point_count,
                     "series_count": series_count,
+                    "task_coverage": self._bounded_value(
+                        diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {},
+                        max_string_chars=800,
+                        max_list_items=8,
+                        max_dict_items=12,
+                    ),
                     "metadata": self._bounded_value(
                         item.get("metadata") or {},
                         max_string_chars=400,
@@ -545,7 +553,7 @@ class DataAgentPromptBuilder:
             summarized["diagnostics"] = {
                 key: self._bounded_value(value, max_string_chars=1000, max_list_items=8, max_dict_items=16)
                 for key, value in diagnostics.items()
-                if key in {"summary_stats", "query_trace", "sql_query", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
+                if key in {"summary_stats", "query_trace", "sql_query", "task_coverage", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
                 or key == "prompt_sampling"
             }
             summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}

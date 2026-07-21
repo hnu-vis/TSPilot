@@ -14,7 +14,10 @@ VALID_ACTIONS = {
     "rag",
     "skill",
     "format_answer",
+    "terminate",
 }
+
+TERMINAL_ACTIONS = {"format_answer", "terminate"}
 
 
 def validate_action(request_state: RequestStateModel, action_name: str) -> tuple[bool, str | None]:
@@ -23,12 +26,12 @@ def validate_action(request_state: RequestStateModel, action_name: str) -> tuple
     if action_name == "todowrite" and request_state.todo_list:
         return (
             False,
-            "A todo plan already exists. Runtime advances plan status after successful actions; choose the next analysis action or format_answer.",
+            "A todo plan already exists. Runtime advances plan status after successful actions; choose the next analysis action or terminate.",
         )
     allowed_by_plan, plan_reason = _validate_current_plan_step(request_state, action_name)
     if not allowed_by_plan:
         return False, plan_reason
-    if action_name == "format_answer":
+    if action_name in TERMINAL_ACTIONS:
         evaluation = evaluate_goal_completion(request_state)
         request_state.completion_state["latest_goal"] = evaluation.model_dump()
         if not evaluation.can_answer:
@@ -98,7 +101,7 @@ def _action_for_task_type(task_type: str) -> str | None:
         "insight": "insight",
         "anomaly": "anomaly",
         "forecast": "forecast",
-        "answer": "format_answer",
+        "answer": "terminate",
         "rag": "rag",
         "skill": "skill",
     }.get(task_type)
@@ -119,7 +122,7 @@ def build_policy_observation(
             "recovery_hint": (
                 "Choose exactly one allowed next action and return one JSON object. "
                 "Do not call todowrite again when a plan already exists. "
-                "Use the latest observation, bounded evidence previews, and artifact refs to decide whether to query, analyze, or answer. "
+                "Use the latest observation, bounded evidence previews, and artifact refs to decide whether to query, analyze, or terminate with the final answer. "
                 "When an active todo exists, choose the action matching its task_type unless a database query is still needed to fill missing query evidence."
             ),
         },

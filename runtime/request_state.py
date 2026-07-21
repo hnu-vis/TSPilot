@@ -321,7 +321,7 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
             request_id=request_state.request_id,
             status="completed",
             response_kind="final_answer",
-            used_tools=[call.tool_name for call in request_state.tool_history],
+            used_tools=_visible_used_tools(request_state),
             answer=request_state.final_answer_draft,
             trace=trace_events,
             error=None,
@@ -332,11 +332,20 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
         request_id=request_state.request_id,
         status="failed",
         response_kind="error",
-        used_tools=[call.tool_name for call in request_state.tool_history],
+        used_tools=_visible_used_tools(request_state),
         answer=None,
         trace=trace_events,
         error="Request did not reach a final answer.",
     )
+
+
+def _visible_used_tools(request_state: RequestStateModel) -> list[str]:
+    terminal_presentation_actions = {"format_answer", "terminate"}
+    return [
+        call.tool_name
+        for call in request_state.tool_history
+        if call.tool_name not in terminal_presentation_actions
+    ]
 
 
 def apply_observation(
@@ -551,6 +560,7 @@ def _task_type_for_tool(tool_name: str) -> str | None:
         "anomaly": "anomaly",
         "forecast": "forecast",
         "format_answer": "answer",
+        "terminate": "answer",
         "rag": "rag",
         "skill": "skill",
     }

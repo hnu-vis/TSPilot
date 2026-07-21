@@ -49,7 +49,7 @@ def test_chat_json_path_returns_final_answer():
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
-    assert payload["used_tools"] == ["sql_query", "insight", "format_answer"]
+    assert payload["used_tools"] == ["sql_query", "insight"]
     assert payload["answer"]["summary"]
 
 
@@ -147,7 +147,7 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
         assert log_payload["status"] == "completed"
         assert log_payload["request"]["message"] == "请分析 appliances_energy_wh 的趋势"
         assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 3
-        assert log_payload["summary"]["used_tools"] == ["sql_query", "insight", "format_answer"]
+        assert log_payload["summary"]["used_tools"] == ["sql_query", "insight"]
         assert log_payload["state"]["tool_history"]
 
         index_entry = json.loads(index_path.read_text(encoding="utf-8").strip().splitlines()[-1])
@@ -228,6 +228,12 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
                         "visible_counts": {"points_count": 1},
                         "full_artifact_ref": "evidence:evi_sql",
                     },
+                    "task_coverage": {
+                        "satisfied": ["已返回价格值"],
+                        "missing_or_uncertain": ["尚未返回时间戳"],
+                        "next_action_hint": "继续查询 timestamp 和 value",
+                        "requires_followup": True,
+                    },
                     "query_trace": {
                         "logical_plan": {
                             "filters": [
@@ -273,6 +279,8 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
     assert preview["sample_points"] == [{"timestamp": "t0", "value": 12.3}]
     assert preview["sampling"]["sampled_for_prompt"] is True
     assert preview["sampling"]["full_counts"]["points_count"] == 10
+    assert preview["task_coverage"]["requires_followup"] is True
+    assert preview["task_coverage"]["missing_or_uncertain"] == ["尚未返回时间戳"]
     assert preview["schema_linking"]["confidence"] == "high"
     assert preview["schema_linking"]["sources"][0]["name"] == "coindesk"
     assert preview["schema_linking"]["field_mappings"][0]["field_name"] == "price"
@@ -289,7 +297,7 @@ def test_chat_json_path_can_answer_without_database_context():
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
-    assert payload["used_tools"] == ["format_answer"]
+    assert payload["used_tools"] == []
     assert "TSPilot" in payload["answer"]["summary"]
     assert payload["answer"]["title"] is None
     assert payload["answer"]["sections"] == []
@@ -307,7 +315,7 @@ def test_chat_sse_path_can_answer_without_database_context():
 
     assert response.status_code == 200
     assert "event: final_answer" in body
-    assert '"tool": "format_answer"' in body
+    assert '"tool": "terminate"' not in body
     assert "TSPilot" in body
 
 
@@ -338,7 +346,6 @@ def test_chat_json_path_supports_complex_multi_step_react():
         "insight",
         "anomaly",
         "forecast",
-        "format_answer",
     ]
     assert payload["answer"]["summary"]
     section_types = [section["section_type"] for section in payload["answer"]["sections"]]
@@ -378,14 +385,14 @@ def test_chat_sse_path_supports_complex_multi_step_react():
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert body.count("event: tool_call") == 6
-    assert body.count("event: tool_result") == 6
+    assert body.count("event: tool_call") == 5
+    assert body.count("event: tool_result") == 5
     assert '"tool": "todowrite"' in body
     assert '"tool": "sql_query"' in body
     assert '"tool": "insight"' in body
     assert '"tool": "anomaly"' in body
     assert '"tool": "forecast"' in body
-    assert '"tool": "format_answer"' in body
+    assert '"tool": "terminate"' not in body
     assert '"phase": "intent"' in body
     assert '"phase": "analysis"' in body
     assert '"phase": "answer_assembly"' in body
@@ -416,7 +423,7 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     todo_updates = [
         event for event in observations
@@ -447,7 +454,7 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly", "format_answer"]
+    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     failures = [
         event for event in observations

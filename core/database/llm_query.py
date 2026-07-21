@@ -18,6 +18,7 @@ class LLMGeneratedQuery(BaseModel):
     expected_result_type: str | None = None
     selected_fields: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    task_coverage: dict[str, Any] = Field(default_factory=dict)
     confidence: float | None = None
 
     @model_validator(mode="after")
@@ -125,6 +126,11 @@ class LLMQueryGenerator:
             "If a value-domain candidate is the only plausible match for a requested entity, include that filter even when it was not in required_filters.\n"
             "Prefer raw time-series rows when the user asks for trends, seasonality, anomalies, or forecasting.\n"
             "Use aggregation only when the user asks for an aggregate, ranking, count, summary statistic, bucket, or comparison.\n"
+            "Before returning, self-check whether this single query covers the whole user request. "
+            "Use task_coverage.satisfied for request constraints/facts this query is designed to satisfy, "
+            "task_coverage.missing_or_uncertain for requested facts not directly computed by this query, and "
+            "task_coverage.next_action_hint for the next sql_query needed when coverage is incomplete. "
+            "Do not claim coverage for extrema, count, grouping, or ordering unless the query explicitly computes it.\n"
             "JSON schema: {"
             "\"query\": string, "
             "\"query_language\": string, "
@@ -132,6 +138,7 @@ class LLMQueryGenerator:
             "\"expected_result_type\": \"timeseries\"|\"table\"|\"statistics\"|\"schema\"|\"metric_list\", "
             "\"selected_fields\": string[], "
             "\"assumptions\": string[], "
+            "\"task_coverage\": {\"satisfied\": string[], \"missing_or_uncertain\": string[], \"next_action_hint\": string|null}, "
             "\"confidence\": number"
             "}."
         )

@@ -76,7 +76,7 @@ def test_parse_turn_accepts_dbgpt_style_step_fields():
 def test_next_turn_repairs_invalid_first_model_output_once():
     valid_turn = {
         "thought": "Use the current state to assemble the answer.",
-        "action": "format_answer",
+        "action": "terminate",
         "action_input": {
             "summary_goal": "Answer",
             "direct_answer": "Done.",
@@ -90,7 +90,7 @@ def test_next_turn_repairs_invalid_first_model_output_once():
 
     turn = asyncio.run(agent.next_turn(request_state=None, conversation_state=None))
 
-    assert turn.action == "format_answer"
+    assert turn.action == "terminate"
     assert turn.action_input["direct_answer"] == "Done."
 
 

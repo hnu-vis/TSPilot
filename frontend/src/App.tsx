@@ -151,6 +151,8 @@ export default function App() {
   };
 
   const handleStreamEvent = (conversationId: string, event: StreamEvent) => {
+    const isTerminalPresentationTool = (tool: unknown) => tool === 'terminate' || tool === 'format_answer';
+
     if (event.event === 'agent_step') {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
@@ -168,6 +170,7 @@ export default function App() {
     }
 
     if (event.event === 'tool_call') {
+      if (isTerminalPresentationTool(event.data.tool)) return;
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
       const step: TraceStep = {
@@ -186,6 +189,7 @@ export default function App() {
     }
 
     if (event.event === 'tool_result') {
+      if (isTerminalPresentationTool(event.data.tool)) return;
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
       const success = Boolean(event.data.success);

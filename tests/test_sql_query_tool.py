@@ -71,6 +71,18 @@ class _FailOnceConnector(_FakeConnector):
         )
 
 
+class _TimestampOnlyConnector(_FakeConnector):
+    async def execute(self, query: str, params=None, timeout=None):
+        self.last_query = query
+        self.executed_queries.append(query)
+        return QueryResult(
+            columns=["timestamp"],
+            rows=[{"timestamp": "2023-01-01T00:00:00Z"}],
+            row_count=1,
+            execution_time_ms=3,
+        )
+
+
 class _QueryLLM:
     def __init__(self, responses: list[dict]):
         self.responses = responses
@@ -118,6 +130,36 @@ def test_reference_dataset_filter_handles_naive_rows_and_utc_request_range():
     )
 
     assert [row["value"] for row in filtered] == ["2", "3"]
+
+
+def test_sql_query_runtime_field_check_treats_time_aliases_as_present():
+    executor = __import__("tools.sql_query", fromlist=["_ExplicitQueryExecutor"])._ExplicitQueryExecutor(get_settings())
+
+    missing = executor._runtime_missing_items(
+        selected_fields=["_time", "price"],
+        columns=["timestamp", "price"],
+        row_count=1,
+        query=None,
+        query_language=None,
+    )
+
+    assert missing == []
+
+
+def test_sql_query_runtime_field_check_uses_flux_keep_projection():
+    executor = __import__("tools.sql_query", fromlist=["_ExplicitQueryExecutor"])._ExplicitQueryExecutor(get_settings())
+
+    missing = executor._runtime_missing_items(
+        selected_fields=[],
+        columns=["timestamp", "code"],
+        row_count=1,
+        query='from(bucket: "demo") |> keep(columns: ["_time", "price", "code"])',
+        query_language="flux",
+    )
+
+    assert missing == [
+        "selected result fields are not present in returned columns: price"
+    ]
 
 
 @pytest.mark.asyncio
@@ -240,6 +282,11 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
             "expected_result_type": "timeseries",
             "selected_fields": ["value"],
             "assumptions": [],
+            "task_coverage": {
+                "satisfied": ["selected price timestamps and values"],
+                "missing_or_uncertain": ["trend conclusion still needs analysis"],
+                "next_action_hint": "run insight over the returned time series",
+            },
             "confidence": 0.91,
         }
     ])
@@ -252,13 +299,74 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
     )
 
     assert connector.executed_queries == ["SELECT timestamp, value FROM prices"]
+    assert llm.calls == 1
     assert result["metadata"]["sql_query_mode"] == "llm"
     assert result["metadata"]["generation_mode"] == "llm"
     assert result["diagnostics"]["llm_query_generation"]["selected_fields"] == ["value"]
+    coverage = result["diagnostics"]["task_coverage"]
+    assert coverage["satisfied"] == ["selected price timestamps and values"]
+    assert coverage["missing_or_uncertain"] == ["trend conclusion still needs analysis"]
+    assert coverage["next_action_hint"] == "run insight over the returned time series"
+    assert coverage["requires_followup"] is True
+    assert coverage["result_summary"]["row_count"] == 1
+    assert result["diagnostics"]["llm_query_generation"]["task_coverage"]["missing_or_uncertain"] == [
+        "trend conclusion still needs analysis"
+    ]
     prompt_payload = __import__("json").loads(llm.messages[0][1][1].split("LLM SQL Query Generation JSON:\n", 1)[1])
     schema_linking = prompt_payload["request"]["schema_preview"]["schema_linking"]
     assert schema_linking["schema_linking"]["sources"][0]["name"] == "prices"
     assert result["diagnostics"]["schema_linking_generation"]["schema_linking"]["sources"][0]["name"] == "prices"
+
+
+@pytest.mark.asyncio
+async def test_sql_query_marks_missing_selected_fields_from_runtime_result(monkeypatch):
+    from tools import sql_query as module
+
+    connector = _TimestampOnlyConnector()
+
+    async def fake_load_databases():
+        return None
+
+    async def fake_get_database(database_id: str):
+        return {"type": "influxdb", "database": "demo"}
+
+    async def fake_create_connector(**config):
+        return connector
+
+    monkeypatch.setattr(module.DatabaseFactory, "load_databases", fake_load_databases)
+    monkeypatch.setattr(module.DatabaseFactory, "get_database", fake_get_database)
+    monkeypatch.setattr(module.DatabaseFactory, "create_connector", fake_create_connector)
+
+    llm = _QueryLLM([
+        {
+            "query": "from(bucket: \"demo\") |> last() |> keep(columns: [\"_time\", \"price\"])",
+            "query_language": "flux",
+            "purpose": "load latest price",
+            "expected_result_type": "table",
+            "selected_fields": ["price"],
+            "assumptions": [],
+            "task_coverage": {
+                "satisfied": ["latest timestamp selected"],
+                "missing_or_uncertain": [],
+                "next_action_hint": None,
+            },
+            "confidence": 0.9,
+        }
+    ])
+
+    result = await SqlQueryTool(get_settings(), llm=llm).execute(
+        SqlQueryInput(
+            message="返回最新价格",
+            database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        )
+    )
+
+    coverage = result["diagnostics"]["task_coverage"]
+
+    assert coverage["runtime_requires_followup"] is True
+    assert coverage["runtime_missing_or_uncertain"] == [
+        "selected result fields are not present in returned columns: price"
+    ]
 
 
 @pytest.mark.asyncio

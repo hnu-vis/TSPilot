@@ -33,13 +33,16 @@ The registry must define exactly one `ToolSpec` for each prompt-visible action:
 - `anomaly`
 - `rag`
 - `skill`
-- `format_answer`
+- `terminate`
+
+The registry may also keep hidden compatibility entries such as `format_answer`
+when older traces or tests still need to resolve them.
 
 ## Resolution rules
 
 - one action name resolves to exactly one `ToolSpec`
 - `prompt_visible = false` entries must never appear in the model action space
-- runtime-owned finalization must not appear as a registry entry
+- terminal actions must declare `produces_terminal_payload = true`
 - the prompt builder should derive tool metadata from the same registry used by
   the executor
 
@@ -48,7 +51,7 @@ The registry must define exactly one `ToolSpec` for each prompt-visible action:
 - register available tools
 - expose tool metadata to the runtime and prompt builder
 - resolve one action name to one tool implementation
-- keep runtime-owned finalizers out of the prompt-visible action set
+- keep hidden compatibility finalizers out of the prompt-visible action set
 - declare which tools may read runtime state
 - declare which layer each tool writes into
 

@@ -197,7 +197,7 @@ class ReActLoop:
             )
             sync_from_request(request_state, conversation_state)
 
-            if turn.action == "format_answer":
+            if execution_result.tool_spec.produces_terminal_payload:
                 request_state.status = "completed"
                 yield append_trace(
                     request_state,
@@ -228,7 +228,7 @@ class ReActLoop:
             self._runtime_evaluator is None
             or request_state.todo_list
             or action_name == "todowrite"
-            or action_name == "format_answer"
+            or action_name in {"format_answer", "terminate"}
             or request_state.database_context is None
         ):
             return None
@@ -263,6 +263,8 @@ class ReActLoop:
 
         if event_type == "action":
             action_name = str(payload.get("action", ""))
+            if self._is_terminal_presentation_action(action_name):
+                return
             yield append_trace(
                 request_state,
                 "agent_step",
@@ -289,6 +291,8 @@ class ReActLoop:
             return
 
         if event_type == "observation":
+            if self._is_terminal_presentation_action(str(payload.get("tool_name", ""))):
+                return
             yield append_trace(
                 request_state,
                 "tool_result",
@@ -329,11 +333,15 @@ class ReActLoop:
         if event_type in {"terminate", "error"}:
             yield append_trace(request_state, event_type, payload)
 
+    def _is_terminal_presentation_action(self, action_name: str) -> bool:
+        return action_name in {"format_answer", "terminate"}
+
     def _phase_for_action(self, action_name: str) -> str:
         mapping = {
             "sql_query": "tool_selection",
             "insight": "analysis",
             "format_answer": "answer_assembly",
+            "terminate": "answer_assembly",
             "forecast": "analysis",
             "anomaly": "analysis",
             "rag": "analysis",
@@ -347,6 +355,7 @@ class ReActLoop:
             "sql_query": "正在查询数据源。",
             "insight": "正在将证据转换为已验证事实。",
             "format_answer": "正在组装最终回答。",
+            "terminate": "正在结束并组装最终回答。",
             "forecast": "正在执行趋势预测。",
             "anomaly": "正在检测异常。",
             "rag": "正在补充外部知识。",
@@ -380,8 +389,9 @@ class ReActLoop:
                 "code_type": action_input.get("code_type"),
                 "analysis_code_chars": len(str(action_input.get("analysis_code") or "")),
             }
-        if action_name == "format_answer":
+        if action_name in {"format_answer", "terminate"}:
             return {
+                "has_result": bool(action_input.get("result") or action_input.get("direct_answer")),
                 "include_analysis_count": len(action_input.get("include_analysis_ids", [])),
                 "include_fact_count": len(action_input.get("include_fact_ids", [])),
                 "include_visualization_count": len(action_input.get("include_visualization_ids", [])),
@@ -504,6 +514,7 @@ class ReActLoop:
             "sample_points": points[:5],
             "sampling": diagnostics.get("prompt_sampling"),
             "schema_linking": self._schema_linking_payload_preview(diagnostics),
+            "task_coverage": diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else None,
             "truncated": bool(
                 visible_payload.get("payload_truncated")
                 or diagnostics.get("truncated")

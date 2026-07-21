@@ -195,6 +195,10 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
             next_action_hint=_hint_for_needs(missing),
         )
 
+    followup = _latest_sql_runtime_followup(request_state)
+    if followup is not None:
+        return followup
+
     refs = _all_answer_refs(request_state)
     if refs:
         return GoalCompletionEvaluation(True, "Available artifacts are sufficient to assemble the final answer.", answerable_from=refs)
@@ -204,6 +208,40 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
         reason="No database-backed evidence or derived analysis is available yet.",
         missing_evidence=["database_evidence"],
         next_action_hint="Call sql_query to obtain grounded database evidence first.",
+    )
+
+
+def _latest_sql_runtime_followup(request_state: RequestStateModel) -> GoalCompletionEvaluation | None:
+    last_nonterminal_tool = next(
+        (
+            call.tool_name
+            for call in reversed(request_state.tool_history)
+            if call.tool_name not in {"format_answer", "terminate"}
+        ),
+        None,
+    )
+    if last_nonterminal_tool != "sql_query" or request_state.latest_database_evidence is None:
+        return None
+
+    diagnostics = request_state.latest_database_evidence.diagnostics or {}
+    coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
+    runtime_missing = [
+        str(item).strip()
+        for item in coverage.get("runtime_missing_or_uncertain", [])
+        if str(item).strip()
+    ]
+    if not coverage.get("runtime_requires_followup") and not runtime_missing:
+        return None
+
+    hint = coverage.get("next_action_hint")
+    if not isinstance(hint, str) or not hint.strip():
+        hint = "Call sql_query again with a focused query that returns the missing result fields."
+    return GoalCompletionEvaluation(
+        can_answer=False,
+        reason="The latest SQL observation reports result-shape gaps that must be repaired before the final answer.",
+        missing_evidence=runtime_missing or ["database_evidence"],
+        answerable_from=_all_answer_refs(request_state),
+        next_action_hint=hint,
     )
 
 

@@ -19,6 +19,9 @@ def test_sql_query_prompt_prefers_schema_linked_automatic_generation():
     builder = DataAgentPromptBuilder()
     system_prompt = builder.build_system_prompt()
 
+    assert "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate." in system_prompt
+    assert "For terminate" in system_prompt
+    assert "For format_answer" not in system_prompt
     assert "Default to message-only automatic planning" in system_prompt
     assert "schema linking participates as auxiliary grounding" in system_prompt
     assert "Do not write an explicit database query from user-facing names" in system_prompt
@@ -51,6 +54,48 @@ def test_prompt_context_handles_diagnostics_without_data_preview():
 
     assert summarized["diagnostics"]["runtime_ms"] == 12
     assert summarized["diagnostics"]["prompt_sampling"]["visible_counts"] == {}
+
+
+def test_prompt_context_exposes_sql_query_task_coverage():
+    settings = get_settings()
+    request = ChatRequest(
+        message="返回总数和最早 3 条记录。",
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    payload = {
+        "evidence_id": "evi_count",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "from(...) |> count()",
+        "summary": "Loaded 1 row.",
+        "data": {"rows": [{"count": 10}]},
+        "columns": ["count"],
+        "metadata": {},
+        "diagnostics": {
+            "task_coverage": {
+                "satisfied": ["已返回总数"],
+                "missing_or_uncertain": ["尚未返回最早 3 条记录"],
+                "next_action_hint": "继续按时间升序查询 3 条原始记录",
+                "requires_followup": True,
+            }
+        },
+    }
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="Loaded 1 row.", payload=payload),
+        payload,
+        _EvidenceSpec(),
+    )
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    coverage = context["evidence"]["latest"]["diagnostics"]["task_coverage"]
+
+    assert "diagnostics.task_coverage" in DataAgentPromptBuilder().build_system_prompt()
+    assert coverage["requires_followup"] is True
+    assert coverage["missing_or_uncertain"] == ["尚未返回最早 3 条记录"]
 
 
 def test_prompt_builder_summarizes_heavy_context():
@@ -107,6 +152,8 @@ def test_prompt_builder_summarizes_heavy_context():
     sql_action = next(action for action in context["available_actions"] if action["action"] == "sql_query")
 
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
+    assert any(action["action"] == "terminate" for action in context["available_actions"])
+    assert not any(action["action"] == "format_answer" for action in context["available_actions"])
     assert "prefer message" in sql_action["input"]
     assert "schema-linked generation" in sql_action["input"]
     assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True

@@ -19,6 +19,7 @@ from tools.insight import InsightInput, InsightTool
 from tools.rag import RagInput, RagTool
 from tools.skill import SkillInput, SkillTool
 from tools.sql_query import SqlQueryInput, SqlQueryTool
+from tools.terminate import TerminateInput, TerminateTool
 from tools.todowrite import TodoWriteInput, TodoWriteResult, TodoWriteTool
 
 
@@ -151,6 +152,18 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
             input_model=FormatAnswerInput,
             output_model=FinalAnswer,
             tool=FormatAnswerTool(),
+            prompt_visible=False,
+            runtime_access="request_state_read",
+            result_target="presentation",
+            produces_terminal_payload=True,
+            supports_streaming=False,
+        ),
+        ToolSpec(
+            tool_name="terminate",
+            description="Terminate the ReAct loop and assemble the final answer from verified outputs.",
+            input_model=TerminateInput,
+            output_model=FinalAnswer,
+            tool=TerminateTool(),
             prompt_visible=True,
             runtime_access="request_state_read",
             result_target="presentation",
