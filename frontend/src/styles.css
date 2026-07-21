@@ -1077,6 +1077,12 @@ input:focus-visible {
   font-weight: 650;
 }
 
+.status-line.compact {
+  margin-left: auto;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
 .status-line.complete {
   border-color: oklch(0.82 0.055 148);
   background: oklch(0.95 0.035 148);
@@ -1189,12 +1195,54 @@ input:focus-visible {
 }
 
 .sql-detail,
+.sql-query-preview,
 .data-preview {
   gap: 10px;
 }
 
+.query-run-summary {
+  gap: 10px;
+}
+
+.query-run-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.query-run-facts div {
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 7px 8px;
+  color: var(--muted-strong);
+}
+
+.query-run-facts svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.query-run-facts span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sql-detail-title {
   align-items: center;
+}
+
+.sql-detail-title h3 {
+  min-width: 0;
 }
 
 .query-language-badge {
@@ -1210,6 +1258,40 @@ input:focus-visible {
   text-transform: uppercase;
 }
 
+.query-actions {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.query-actions .query-language-badge {
+  margin-left: 0;
+}
+
+.icon-text-button {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 0 8px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 700;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.icon-text-button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--foreground);
+}
+
 .sql-code-block {
   max-height: 180px;
   overflow: auto;
@@ -1222,8 +1304,27 @@ input:focus-visible {
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.sql-code-block::-webkit-scrollbar,
+.sample-table-wrap::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.sql-code-block::-webkit-scrollbar-thumb,
+.sample-table-wrap::-webkit-scrollbar-thumb {
+  border: 3px solid oklch(0.962 0.004 250);
+  border-radius: 999px;
+  background: oklch(0.72 0.012 250);
+}
+
+.sql-code-block.visible-query {
+  max-height: min(34vh, 320px);
+  min-height: 92px;
+  max-width: 100%;
 }
 
 .column-chip-list {
@@ -1319,6 +1420,19 @@ input:focus-visible {
   margin: 0;
   color: var(--muted);
   font-size: 11px;
+}
+
+.empty-data-preview {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .schema-linking-preview {

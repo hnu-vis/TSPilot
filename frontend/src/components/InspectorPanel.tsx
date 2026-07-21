@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, ChevronDown, Code2, FileText, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
 
@@ -77,14 +77,7 @@ function ReferenceList({ answer }: { answer: FinalAnswer }) {
 function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   return (
     <>
-      <section className="inspector-card">
-        <div className="inspector-card-title">
-          <StatusIcon status={step.status} />
-          <h3>{step.title}</h3>
-        </div>
-        <p className="step-summary">{step.summary}</p>
-        <div className={`status-line ${step.status}`}>{statusLabel(step.status)}</div>
-      </section>
+      {step.sqlDetail ? <QueryRunSummary step={step} /> : <StepStatusCard step={step} />}
 
       {step.metrics.length > 0 && (
         <section className="metric-grid" aria-label="Step metrics">
@@ -97,16 +90,71 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         </section>
       )}
 
+      {step.sqlDetail?.query && <QueryPreview detail={step.sqlDetail} />}
+
       {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
 
       {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
 
       {step.completionDetail && <CompletionPreview detail={step.completionDetail} />}
 
-      {(step.sqlDetail?.query || step.artifactRefs.length > 0 || step.debugPayload) && (
+      {(step.artifactRefs.length > 0 || step.debugPayload) && (
         <AdvancedDetails step={step} />
       )}
     </>
+  );
+}
+
+function StepStatusCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  return (
+    <section className="inspector-card">
+      <div className="inspector-card-title">
+        <StatusIcon status={step.status} />
+        <h3>{step.title}</h3>
+      </div>
+      <p className="step-summary">{step.summary}</p>
+      <div className={`status-line ${step.status}`}>{statusLabel(step.status)}</div>
+    </section>
+  );
+}
+
+function QueryRunSummary({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  const detail = step.sqlDetail;
+  if (!detail) return null;
+  const resultSize = [
+    detail.rowCount !== null ? `${detail.rowCount.toLocaleString()} rows` : null,
+    detail.pointCount !== null ? `${detail.pointCount.toLocaleString()} points` : null,
+  ].filter(Boolean).join(' / ') || 'No visible rows';
+  const dataShape = detail.columns.length > 0
+    ? `${detail.columns.length} columns`
+    : detail.sampleRows.length || detail.samplePoints.length
+      ? 'Sample available'
+      : 'No preview';
+  return (
+    <section className="inspector-card query-run-summary">
+      <div className="inspector-card-title">
+        <StatusIcon status={step.status} />
+        <h3>Query result</h3>
+        <span className={`status-line compact ${step.status}`}>{statusLabel(step.status)}</span>
+      </div>
+      <p className="step-summary">{step.summary}</p>
+      <div className="query-run-facts" aria-label="Query result facts">
+        <div>
+          <Database size={14} />
+          <span>{resultSize}</span>
+        </div>
+        <div>
+          <Table2 size={14} />
+          <span>{dataShape}</span>
+        </div>
+        {detail.queryLanguage && (
+          <div>
+            <Code2 size={14} />
+            <span>{detail.queryLanguage.toUpperCase()}</span>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -139,6 +187,31 @@ function CompletionPreview({ detail }: { detail: NonNullable<ReturnType<typeof t
   );
 }
 
+function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+  return (
+    <section className="inspector-card sql-query-preview">
+      <div className="inspector-card-title sql-detail-title">
+        <Code2 size={16} />
+        <h3>Generated query</h3>
+        <div className="query-actions">
+          {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+          <button
+            type="button"
+            className="icon-text-button"
+            onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
+            aria-label="Copy generated query"
+            title="Copy query"
+          >
+            <Clipboard size={13} />
+            <span>Copy</span>
+          </button>
+        </div>
+      </div>
+      <pre className="sql-code-block visible-query">{detail.query}</pre>
+    </section>
+  );
+}
+
 function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
   const rows = detail.sampleRows.length > 0 ? detail.sampleRows : detail.samplePoints;
   const tableColumns = detail.columns.length > 0 ? detail.columns : inferColumns(rows);
@@ -146,7 +219,8 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
     <section className="inspector-card data-preview">
       <div className="inspector-card-title sql-detail-title">
         <Table2 size={16} />
-        <h3>Data preview</h3>
+        <h3>Returned data</h3>
+        <span className="query-language-badge">{formatCounts(detail)}</span>
       </div>
 
       {detail.columns.length > 0 && (
@@ -187,6 +261,13 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
             </table>
           </div>
           {detail.truncated && <p className="sample-note">Preview only</p>}
+        </div>
+      )}
+
+      {rows.length === 0 && (
+        <div className="empty-data-preview">
+          <Table2 size={16} />
+          <span>No sample rows are visible for this result.</span>
         </div>
       )}
     </section>
@@ -279,17 +360,6 @@ function AdvancedDetails({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         Advanced
       </summary>
       <div className="advanced-body">
-        {step.sqlDetail?.query && (
-          <section className="advanced-section">
-            <div className="advanced-section-title">
-              <Code2 size={14} />
-              <h4>Query</h4>
-              {step.sqlDetail.queryLanguage && <span className="query-language-badge">{step.sqlDetail.queryLanguage}</span>}
-            </div>
-            <pre className="sql-code-block">{step.sqlDetail.query}</pre>
-          </section>
-        )}
-
         {step.artifactRefs.length > 0 && (
           <section className="advanced-section">
             <div className="advanced-section-title">
