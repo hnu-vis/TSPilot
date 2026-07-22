@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from core.completion import CompletionEvaluation, normalize_todo_for_completion
-from core.runtime_evaluator import PlanRequirementVerdict, RuntimeLLMEvaluator
+from core.completion import normalize_todo_for_completion
+from core.runtime_evaluator import RuntimeLLMEvaluator
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import validate_action
 from runtime.request_state import apply_observation, apply_observation_async
@@ -12,32 +12,17 @@ from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
 from schemas.tool import ToolCall, ToolObservation
+from tools.todowrite import TodoWriteInput, TodoWriteTool
 
 
 class _EvidenceSpec:
     result_target = "evidence"
+    produces_terminal_payload = False
 
 
 class _AnalysisSpec:
     result_target = "analysis"
-
-
-class _CompletionEvaluator:
-    def __init__(self, completed: bool):
-        self.completed = completed
-        self.last_step_verdict = {
-            "completed": completed,
-            "reason": "test verdict",
-            "missing_items": [] if completed else ["missing exact result"],
-        }
-
-    async def evaluate_step_completion(self, **kwargs):
-        return CompletionEvaluation(
-            completed=self.completed,
-            reason="test verdict",
-            missing_evidence=[] if self.completed else ["missing exact result"],
-            evidence_refs=["evidence:evi_demo"] if self.completed else [],
-        )
+    produces_terminal_payload = False
 
 
 class _OneTurnAgent:
@@ -49,33 +34,9 @@ class _OneTurnAgent:
         )
 
 
-class _PlanEvaluator:
-    last_step_verdict = None
-
-    def __init__(self):
-        self.plan_requirement_calls = 0
-
-    async def evaluate_plan_requirement(self, **kwargs):
-        self.plan_requirement_calls += 1
-        return PlanRequirementVerdict(
-            requires_plan=True,
-            reason="multiple deliverables",
-            deliverables=["count", "earliest rows"],
-        )
-
-
-class _NoAnswerabilityEvaluator:
-    async def evaluate_plan_requirement(self, **kwargs):
-        return PlanRequirementVerdict(
-            requires_plan=False,
-            reason="single answer",
-            deliverables=[],
-        )
-
-
 class _UnusedExecutor:
     async def execute(self, *args, **kwargs):
-        raise AssertionError("tool executor should not run when plan is required")
+        raise AssertionError("tool executor should not run")
 
 
 def test_runtime_evaluator_marks_complete_query_preview_as_full_fidelity():
@@ -152,12 +113,10 @@ def test_policy_rejects_repeated_todowrite_but_allows_next_action():
     assert allowed is False
     assert "already exists" in (reason or "")
     assert validate_action(request_state, "insight") == (True, None)
-    forecast_allowed, forecast_reason = validate_action(request_state, "forecast")
-    assert forecast_allowed is False
-    assert "active plan step" in (forecast_reason or "")
+    assert validate_action(request_state, "forecast") == (True, None)
 
 
-def test_policy_blocks_unrelated_sql_when_active_analysis_step_has_evidence():
+def test_policy_does_not_block_model_chosen_action_by_active_todo():
     request_state = RequestStateModel(
         request_id="req-policy-anomaly-step",
         message="分析趋势和异常。",
@@ -186,10 +145,7 @@ def test_policy_blocks_unrelated_sql_when_active_analysis_step_has_evidence():
         },
     )
 
-    allowed, reason = validate_action(request_state, "sql_query")
-
-    assert allowed is False
-    assert "Current task_type is 'anomaly'" in (reason or "")
+    assert validate_action(request_state, "sql_query") == (True, None)
     assert validate_action(request_state, "anomaly") == (True, None)
 
 
@@ -226,7 +182,7 @@ def test_policy_rejects_unknown_action_only():
     assert "runtime contract" in (reason or "")
 
 
-def test_todo_evidence_needed_ignores_domain_field_names():
+def test_todo_evidence_needed_is_progress_metadata_only():
     todo = normalize_todo_for_completion(
         {
             "content": "查询 appliances_energy_wh 的原始时间序列",
@@ -235,7 +191,56 @@ def test_todo_evidence_needed_ignores_domain_field_names():
         }
     )
 
-    assert todo["evidence_needed"] == ["time_series"]
+    assert "evidence_needed" not in todo
+
+
+def test_query_todo_clears_internal_schema_need():
+    todo = normalize_todo_for_completion(
+        {
+            "content": "确认数据源与字段并获取基础样本",
+            "task_type": "query",
+            "evidence_needed": ["schema", "sample_rows"],
+        }
+    )
+
+    assert "evidence_needed" not in todo
+
+
+@pytest.mark.asyncio
+async def test_todowrite_drops_internal_plan_steps():
+    result = await TodoWriteTool().execute(
+        TodoWriteInput(
+            message="返回总数和最早5条。",
+            todos=[
+                {
+                    "content": "确认数据源与字段并生成可执行Flux查询计划",
+                    "task_type": "plan",
+                    "status": "in_progress",
+                    "priority": 1,
+                    "evidence_needed": ["schema"],
+                },
+                {
+                    "content": "查询总记录数",
+                    "task_type": "query",
+                    "status": "pending",
+                    "priority": 2,
+                    "evidence_needed": ["count"],
+                },
+                {
+                    "content": "整理最终答案",
+                    "task_type": "answer",
+                    "status": "pending",
+                    "priority": 3,
+                },
+            ],
+        )
+    )
+
+    todos = result["todos"]
+    assert [todo["content"] for todo in todos] == ["查询总记录数", "整理最终答案"]
+    assert todos[0]["status"] == "in_progress"
+    assert all(todo["task_type"] != "plan" for todo in todos)
+    assert all("evidence_needed" not in todo for todo in todos)
 
 
 def test_todo_plan_expands_iteration_budget_for_multistep_workflow():
@@ -270,7 +275,7 @@ def test_todo_plan_expands_iteration_budget_for_multistep_workflow():
 
 
 @pytest.mark.asyncio
-async def test_llm_completion_verdict_false_keeps_todo_in_progress():
+async def test_external_semantic_verdict_no_longer_blocks_todo_progress():
     request_state = RequestStateModel(
         request_id="req-llm-completion-false",
         message="返回总数和最早5条。",
@@ -299,17 +304,16 @@ async def test_llm_completion_verdict_false_keeps_todo_in_progress():
         ToolObservation(tool_name="sql_query", success=True, summary="rows", payload=payload),
         payload,
         _EvidenceSpec(),
-        completion_evaluator=_CompletionEvaluator(completed=False),
     )
 
-    assert request_state.todo_list[0]["status"] == "in_progress"
-    assert request_state.todo_list[1]["status"] == "pending"
-    assert request_state.completion_state["latest_step"]["completed"] is False
-    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["missing exact result"]
+    assert request_state.todo_list[0]["status"] == "completed"
+    assert request_state.todo_list[1]["status"] == "in_progress"
+    assert request_state.completion_state["latest_step"]["completed"] is True
+    assert "completion_verdict" not in request_state.completion_state["latest_step"]
 
 
 @pytest.mark.asyncio
-async def test_successful_query_observation_waits_for_llm_semantic_verdict():
+async def test_successful_query_observation_advances_without_semantic_verdict():
     request_state = RequestStateModel(
         request_id="req-query-observation-first",
         message="分析趋势。",
@@ -344,15 +348,14 @@ async def test_successful_query_observation_waits_for_llm_semantic_verdict():
         ToolObservation(tool_name="sql_query", success=True, summary="points", payload=payload),
         payload,
         _EvidenceSpec(),
-        completion_evaluator=_CompletionEvaluator(completed=False),
     )
 
-    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
-    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["missing exact result"]
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == []
 
 
 @pytest.mark.asyncio
-async def test_llm_completion_verdict_true_advances_todo():
+async def test_successful_observation_advances_todo_without_external_verdict():
     request_state = RequestStateModel(
         request_id="req-llm-completion-true",
         message="返回总数和最早5条。",
@@ -381,7 +384,6 @@ async def test_llm_completion_verdict_true_advances_todo():
         ToolObservation(tool_name="sql_query", success=True, summary="count", payload=payload),
         payload,
         _EvidenceSpec(),
-        completion_evaluator=_CompletionEvaluator(completed=True),
     )
 
     assert request_state.todo_list[0]["status"] == "completed"
@@ -390,31 +392,51 @@ async def test_llm_completion_verdict_true_advances_todo():
 
 
 @pytest.mark.asyncio
-async def test_runtime_blocks_direct_query_when_llm_requires_plan():
+async def test_runtime_does_not_run_separate_plan_requirement_gate():
     request_state = RequestStateModel(
-        request_id="req-plan-gate",
+        request_id="req-no-plan-gate",
         message="请完成以下任务: 1.返回总数; 2.返回最早5条。",
         database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
         status="running",
         max_iterations=1,
     )
-    evaluator = _PlanEvaluator()
+
+    class _Executor:
+        async def execute(self, action_name, action_input, *args, **kwargs):
+            assert action_name == "sql_query"
+            return type(
+                "_ExecutionResult",
+                (),
+                {
+                    "tool_spec": _EvidenceSpec(),
+                    "observation": ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+                    "full_payload": {
+                        "evidence_id": "evi_demo",
+                        "result_type": "table",
+                        "database": "demo",
+                        "query_language": "flux",
+                        "query": "from(...)",
+                        "summary": "ok",
+                        "data": {"rows": [{"count": 1}]},
+                        "columns": ["count"],
+                        "metadata": {},
+                        "diagnostics": {},
+                    },
+                },
+            )()
+
     loop = ReActLoop(
         data_agent=_OneTurnAgent(),
-        tool_executor=_UnusedExecutor(),
+        tool_executor=_Executor(),
         settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
-        runtime_evaluator=evaluator,
     )
 
     events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
     observation = next(event for event in events if event.event_type == "observation")
 
-    assert observation.payload["success"] is False
-    assert "todo plan is required" in observation.payload["summary"].lower()
-    plan_requirement = request_state.completion_state["plan_requirement"]
-    assert plan_requirement["deliverables"] == ["count", "earliest rows"]
-    assert request_state.tool_history == []
-    assert evaluator.plan_requirement_calls == 1
+    assert observation.payload["success"] is True
+    assert observation.payload["tool_name"] == "sql_query"
+    assert "plan_requirement" not in request_state.completion_state
 
 
 @pytest.mark.asyncio
@@ -441,11 +463,11 @@ async def test_terminate_does_not_use_llm_answerability_gate():
         data_agent=_OneTurnAgent(),
         tool_executor=_UnusedExecutor(),
         settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
-        runtime_evaluator=_NoAnswerabilityEvaluator(),
     )
 
-    reason = await loop._plan_requirement_block_reason(request_state, "terminate", {})
+    allowed, reason = validate_action(request_state, "terminate")
 
+    assert allowed is True
     assert reason is None
     assert "answerability_verdict" not in request_state.completion_state
     assert "semantic_repair_directive" not in request_state.completion_state
@@ -466,7 +488,7 @@ def test_policy_blocks_terminal_answer_until_database_goal_has_evidence():
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["database_evidence"]
 
 
-def test_policy_blocks_terminate_when_latest_sql_runtime_coverage_requires_followup():
+def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
     request_state = RequestStateModel(
         request_id="req-policy-runtime-coverage",
         message="返回最晚一条价格记录。",
@@ -504,16 +526,14 @@ def test_policy_blocks_terminate_when_latest_sql_runtime_coverage_requires_follo
 
     allowed, reason = validate_action(request_state, "terminate")
 
-    assert allowed is False
-    assert "result-shape gaps" in (reason or "")
+    assert allowed is True
+    assert reason is None
     latest_goal = request_state.completion_state["latest_goal"]
-    assert latest_goal["missing_evidence"] == [
-        "selected result fields are not present in returned columns: price"
-    ]
-    assert latest_goal["next_action_hint"] == "Query again and return the price value column."
+    assert latest_goal["can_answer"] is True
+    assert latest_goal["missing_evidence"] == []
 
 
-def test_runtime_does_not_complete_count_todo_with_schema_only():
+def test_runtime_advances_query_todo_after_any_successful_sql_observation():
     request_state = RequestStateModel(
         request_id="req-policy-count-schema",
         message="总共有多少条数据？",
@@ -551,8 +571,8 @@ def test_runtime_does_not_complete_count_todo_with_schema_only():
         _EvidenceSpec(),
     )
 
-    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
-    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["count"]
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == []
 
 
 def test_runtime_completes_count_todo_with_statistics_evidence():
@@ -639,6 +659,47 @@ def test_runtime_completes_count_todo_with_explicit_count_table():
     assert request_state.completion_state["latest_step"]["missing_evidence"] == []
 
 
+def test_runtime_completes_count_todo_with_flux_value_column():
+    request_state = RequestStateModel(
+        request_id="req-policy-count-flux-value",
+        message="总共有多少条数据？",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {
+                "content": "查询总行数",
+                "task_type": "query",
+                "status": "in_progress",
+                "priority": 1,
+                "evidence_needed": ["count"],
+            },
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    table_evidence = {
+        "evidence_id": "evi_count_flux",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": 'from(bucket: "b") |> count(column: "_value")',
+        "summary": "Loaded 1 row.",
+        "data": {"rows": [{"value": 2680, "field": "price"}]},
+        "columns": ["value", "field"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="count", payload={}),
+        table_evidence,
+        _EvidenceSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+
+
 def test_runtime_completes_timeseries_todo_with_timestamp_value_table():
     request_state = RequestStateModel(
         request_id="req-policy-timeseries-table",
@@ -683,6 +744,50 @@ def test_runtime_completes_timeseries_todo_with_timestamp_value_table():
     )
 
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+
+
+def test_runtime_advances_legacy_plan_step_with_query_evidence():
+    request_state = RequestStateModel(
+        request_id="req-policy-legacy-plan-step",
+        message="返回总数和最早5条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {
+                "content": "确认数据源与字段并生成可执行查询计划",
+                "task_type": "plan",
+                "status": "in_progress",
+                "priority": 1,
+                "evidence_needed": ["schema"],
+            },
+            {"content": "查询总记录数", "task_type": "query", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    evidence = {
+        "evidence_id": "evi_rows",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "from(...) |> limit(n: 5)",
+        "summary": "5 rows",
+        "data": {"rows": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        "columns": ["timestamp", "value"],
+        "metadata": {},
+        "diagnostics": {},
+    }
+
+    assert validate_action(request_state, "sql_query") == (True, None)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="rows", payload={}),
+        evidence,
+        _EvidenceSpec(),
+    )
+
+    assert request_state.todo_list[0]["status"] == "completed"
+    assert request_state.todo_list[0]["task_type"] == "query"
+    assert request_state.todo_list[1]["status"] == "in_progress"
 
 
 def test_runtime_advances_todo_after_successful_actions():

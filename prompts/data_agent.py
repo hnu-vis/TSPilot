@@ -24,6 +24,8 @@ class DataAgentPromptBuilder:
             "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
+            "For tasks with an explicit numbered or bulleted deliverable list, verify each user-visible deliverable against observations before terminate. "
+            "If a deliverable asks for its own query text, row count, raw records, extrema, bounds, or validation result and that item is not present in observations, call the appropriate tool instead of answering with a caveat.\n"
             "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
             "Use the user's message, current plan, and observations as the source of task intent.\n"
             "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
@@ -34,14 +36,13 @@ class DataAgentPromptBuilder:
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
             "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
-            "Todo is initial visible process state, not a model-maintained scheduler. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
-            "When a todo step is in_progress, its task_type is the active runtime contract. Choose the matching action for that step: query->sql_query, insight->insight, anomaly->anomaly, forecast->forecast, answer->terminate. "
-            "Only choose sql_query during a non-query step when the active step still lacks database/query evidence such as schema, sample rows, count, aggregate, or time_series.\n"
+            "Todo is initial visible process state, not a model-maintained scheduler or tool contract. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
+            "When a todo step is in_progress, treat its task_type as a progress label only. Choose the next action from the ReAct state, observations, and evidence gaps, not by mechanically matching the label.\n"
             "Tool contracts:\n"
-            "- todowrite: create the initial full todo plan only when no plan exists.\n"
-            "- sql_query: query the selected datasource. Default to message-only automatic planning so the sql_query tool first runs schema linking and passes that grounding into SQL/Flux/PromQL generation. "
-            "Use explicit query/query_language only after prior grounded schema/evidence exists, when repairing a failed generated query, or when the user supplied an exact query. "
-            "It is the primary database-analysis action for schema/sample inspection, raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
+            "- todowrite: create the initial full todo plan only when no plan exists. Plan user-visible deliverables, not internal tool stages. Do not create todo items for field confirmation, query generation, or query planning; those are internal to sql_query.\n"
+            "- sql_query: query the selected datasource and return database evidence, including the actual backend query text when available. "
+            "Use automatic message-based input for normal database requests. Use explicit query/query_language only when repairing a failed generated query, or when the user supplied an exact query. "
+            "It is the primary database-analysis action for raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
             "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
             "- insight: execute generated Python analysis code over existing full evidence artifacts. Use it only when SQL cannot express the needed computation well, or when structured fact extraction/visualization is needed after enough database queries. It returns structured analysis results, not raw rows.\n"
             "- anomaly: detect anomalies from existing time-series evidence only.\n"
@@ -49,6 +50,7 @@ class DataAgentPromptBuilder:
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
             "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
             "- terminate: end the ReAct loop when verified outputs already answer the task, and provide the final response payload. "
+            "Do not terminate with phrases like 'if needed, continue' for an explicitly requested deliverable; perform the needed next action first. "
             "When no datasource is selected and the user asks a greeting, capability question, clarification, or other non-data question, use terminate directly and provide a concise result/direct_answer. "
             "When the user asks a data-analysis question without a datasource, use terminate to explain that a database/context is needed and suggest selecting one.\n"
             "Choose tools only from their current-state preconditions. Do not call a tool just because it appears in the user request.\n"
@@ -57,12 +59,11 @@ class DataAgentPromptBuilder:
             "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
             "\"requested_fact_types\": list[str], \"focus\": str|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
-            "Each todo item should use {\"content\": str, \"task_type\": \"plan|query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null, \"evidence_needed\": list[str]}.\n"
+            "Each todo item should use {\"content\": str, \"task_type\": \"query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
-            "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction.\n"
-            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for LLM SQL generation because schema linking participates as auxiliary grounding inside the tool.\n"
+            "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction. For database plans, split by requested result: count, earliest/latest rows, grouped results, time bounds, comparisons, and final answer. Do not split by internal preparation stages.\n"
+            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for database queries.\n"
             "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
-            "Do not write an explicit database query from user-facing names when no grounded schema/raw evidence is available; first use sql_query automatic planning with message/database_context/time_range so datasource-specific measurements, fields, tags, and required filters are linked before SQL generation.\n"
             "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
             "If diagnostics.task_coverage.requires_followup is true or missing_or_uncertain lists requested facts, continue with a focused sql_query for those facts instead of answering. "
             "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
@@ -164,12 +165,12 @@ class DataAgentPromptBuilder:
             {
                 "action": "todowrite",
                 "use_when": "Create the initial plan only when todo_list is empty and the request needs visible multi-step analysis.",
-                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary; todos may include acceptance_criteria and evidence_needed",
+                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary; todos may include acceptance_criteria",
             },
             {
                 "action": "sql_query",
                 "use_when": "Database evidence is missing, or a read-only follow-up query can compute the exact aggregation, grouping, ranking, filter validation, or diagnostic needed to answer correctly.",
-                "input": "prefer message, database_context, time_range, constraints for automatic schema-linked generation; use query/query_language only after grounded schema/evidence, for repair, or for a user-supplied exact query",
+                "input": "prefer message, database_context, time_range, constraints for automatic database querying; use query/query_language only for repair or for a user-supplied exact query",
             },
             {
                 "action": "insight",
@@ -261,15 +262,11 @@ class DataAgentPromptBuilder:
             }
 
         next_action_guidance = []
-        active_contract = self._active_plan_contract(request_state, current_todo)
+        active_progress = self._active_progress_hint(current_todo)
         if request_state.database_context is None:
             next_action_guidance.append("terminate: explain that a datasource/context is required for data analysis.")
         elif latest_evidence is None:
-            next_action_guidance.append("sql_query: obtain grounded schema/sample/raw evidence before analysis.")
-        elif active_contract.get("expected_action"):
-            next_action_guidance.append(
-                f"{active_contract['expected_action']}: active plan step task_type={active_contract['task_type']}."
-            )
+            next_action_guidance.append("sql_query: obtain database evidence before analysis.")
         else:
             next_action_guidance.extend(
                 [
@@ -285,12 +282,11 @@ class DataAgentPromptBuilder:
             "current_todo": current_todo,
             "completion_state": request_state.completion_state,
             "latest_query_summary": latest_query_summary,
-            "active_plan_contract": active_contract,
+            "active_progress_hint": active_progress,
             "recommended_next_action_types": next_action_guidance,
             "sql_loop_rule": (
                 "A prior sql_query does not force insight. If the last SQL sample/counts reveal a missing filter, outlier, "
-                "or another database-checkable gap, call sql_query again with a focused read-only query. "
-                "Do not use this rule to bypass a non-query active plan step whose database evidence is already present."
+                "or another database-checkable gap, call sql_query again with a focused read-only query."
             ),
             "context_budget_rule": (
                 "Prompt context contains bounded previews only. Use prompt_sampling/data_completeness and artifact refs to distinguish complete results from previews; "
@@ -298,16 +294,14 @@ class DataAgentPromptBuilder:
             ),
         }
 
-    def _active_plan_contract(self, request_state: RequestStateModel, current_todo: dict | None) -> dict:
+    def _active_progress_hint(self, current_todo: dict | None) -> dict:
         if current_todo is None:
             return {
                 "task_type": None,
-                "expected_action": None,
-                "missing_evidence": [],
-                "can_query_for_missing_evidence": False,
+                "suggested_action": None,
             }
         task_type = str(current_todo.get("task_type") or "").strip().lower()
-        expected_action = {
+        suggested_action = {
             "query": "sql_query",
             "insight": "insight",
             "anomaly": "anomaly",
@@ -315,29 +309,10 @@ class DataAgentPromptBuilder:
             "answer": "terminate",
             "rag": "rag",
             "skill": "skill",
-            "plan": "todowrite",
         }.get(task_type)
-        completion_state = request_state.completion_state.get("latest_goal")
-        missing = []
-        if isinstance(completion_state, dict):
-            missing = [
-                str(item)
-                for item in completion_state.get("missing_evidence", [])
-                if item not in (None, "")
-            ]
-        if not missing:
-            missing = [
-                str(item)
-                for item in current_todo.get("evidence_needed", [])
-                if item not in (None, "")
-            ]
-        query_needs = {"schema", "sample_rows", "count", "aggregate", "filtered_table", "time_series", "database_evidence"}
-        analysis_step_needs_base_evidence = task_type in {"insight", "anomaly", "forecast"} and request_state.latest_database_evidence is None
         return {
             "task_type": task_type or None,
-            "expected_action": expected_action,
-            "missing_evidence": missing,
-            "can_query_for_missing_evidence": any(need in query_needs for need in missing) or analysis_step_needs_base_evidence,
+            "suggested_action": suggested_action,
         }
 
     def build_user_prompt(
@@ -346,7 +321,65 @@ class DataAgentPromptBuilder:
         conversation_state: ConversationStateModel,
     ) -> str:
         context = self.build_context(request_state, conversation_state)
-        return "Context JSON:\n" + json.dumps(context, ensure_ascii=False, indent=2)
+        return "\n".join(
+            [
+                "User Task:",
+                json.dumps(context["task"], ensure_ascii=False, indent=2),
+                "",
+                "Available Tools:",
+                json.dumps(context["available_actions"], ensure_ascii=False, indent=2),
+                "",
+                "Previous Thought/Action/Observation:",
+                self._react_transcript(request_state),
+                "",
+                "Runtime State JSON:",
+                json.dumps(context, ensure_ascii=False, indent=2),
+            ]
+        )
+
+    def _react_transcript(self, request_state: RequestStateModel) -> str:
+        if not request_state.tool_history and not request_state.observations:
+            return "(none)"
+        lines = []
+        calls_by_iteration = {call.iteration: call for call in request_state.tool_history}
+        observations_by_iteration: dict[int, list] = {}
+        for observation in request_state.observations:
+            iteration = self._observation_iteration(observation, calls_by_iteration)
+            observations_by_iteration.setdefault(iteration, []).append(observation)
+        for iteration in sorted(set(calls_by_iteration) | set(observations_by_iteration)):
+            call = calls_by_iteration.get(iteration)
+            if call is not None:
+                if call.reason:
+                    lines.append(f"Thought: {self._truncate_text(call.reason, 800)}")
+                lines.append(f"Action: {call.tool_name}")
+                lines.append(
+                    "Action Input: "
+                    + self._truncate_text(json.dumps(call.tool_input, ensure_ascii=False), 2000)
+                )
+            for observation in observations_by_iteration.get(iteration, []):
+                lines.append(
+                    "Observation: "
+                    + self._truncate_text(
+                        json.dumps(
+                            {
+                                "tool_name": observation.tool_name,
+                                "success": observation.success,
+                                "summary": observation.summary,
+                                "error": observation.error,
+                                "payload": self._summarize_observation_payload(observation.payload),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        3000,
+                    )
+                )
+        return "\n".join(lines) if lines else "(none)"
+
+    def _observation_iteration(self, observation, calls_by_iteration: dict[int, object]) -> int:
+        for iteration in sorted(calls_by_iteration, reverse=True):
+            if calls_by_iteration[iteration].tool_name == observation.tool_name:
+                return iteration
+        return max(calls_by_iteration.keys(), default=0)
 
     def _summarize_database_evidence(self, evidence) -> dict:
         payload = evidence.model_dump(mode="json")

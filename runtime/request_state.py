@@ -373,7 +373,6 @@ async def apply_observation_async(
     observation: ToolObservation,
     full_payload: dict,
     tool_spec: "ToolSpec",
-    completion_evaluator=None,
 ) -> None:
     request_state.observations.append(observation)
     if not observation.success:
@@ -383,16 +382,13 @@ async def apply_observation_async(
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, completion_evaluator)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, completion_evaluator)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, completion_evaluator)
-    elif tool_spec.result_target == "presentation":
-        _apply_presentation_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
 
 
 def enrich_observation_payload(
@@ -451,16 +447,16 @@ def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
-    task_type = _task_type_for_tool(tool_name)
-    if task_type is None:
-        return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
     if current_index is None:
         return
     current_todo = dict(request_state.todo_list[current_index])
     current_task_type = str(current_todo.get("task_type") or "").strip().lower()
-    if current_task_type and current_task_type != "generic" and current_task_type != task_type:
-        return
+    if current_task_type == "plan":
+        current_task_type = "query"
+        current_todo["task_type"] = "query"
+    current_todo = normalize_todo_for_completion(current_todo)
+    request_state.todo_list[current_index] = current_todo
     evaluation = evaluate_step_completion(request_state, tool_name=tool_name, full_payload=full_payload)
     request_state.completion_state["latest_step"] = {
         **evaluation.model_dump(),
@@ -492,44 +488,32 @@ async def _advance_plan_after_success_async(
     request_state: RequestStateModel,
     tool_name: str,
     full_payload: dict,
-    completion_evaluator=None,
 ) -> None:
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
-    task_type = _task_type_for_tool(tool_name)
-    if task_type is None:
         return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
     if current_index is None:
         return
     current_todo = dict(request_state.todo_list[current_index])
     current_task_type = str(current_todo.get("task_type") or "").strip().lower()
-    if current_task_type and current_task_type != "generic" and current_task_type != task_type:
-        return
+    if current_task_type == "plan":
+        current_task_type = "query"
+        current_todo["task_type"] = "query"
+    current_todo = normalize_todo_for_completion(current_todo)
+    request_state.todo_list[current_index] = current_todo
 
-    deterministic_evaluation = evaluate_step_completion(
+    evaluation = evaluate_step_completion(
         request_state,
         tool_name=tool_name,
         full_payload=full_payload,
     )
-    verdict = None
-    if completion_evaluator is not None and deterministic_evaluation.completed:
-        evaluation = await completion_evaluator.evaluate_step_completion(
-            request_state=request_state,
-            tool_name=tool_name,
-            full_payload=full_payload,
-        )
-        verdict = getattr(completion_evaluator, "last_step_verdict", None)
-    else:
-        evaluation = deterministic_evaluation
 
     request_state.completion_state["latest_step"] = {
         **evaluation.model_dump(),
         "tool_name": tool_name,
         "todo_index": current_index,
         "todo": current_todo,
-        "completion_verdict": verdict,
     }
     if not evaluation.completed:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
@@ -537,7 +521,6 @@ async def _advance_plan_after_success_async(
     current_todo["status"] = "completed"
     current_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else current_todo.get("result_ref")
     current_todo["completion_reason"] = evaluation.reason
-    current_todo["completion_verdict"] = verdict
     request_state.todo_list[current_index] = current_todo
     next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
     if next_index is not None:
@@ -550,21 +533,6 @@ async def _advance_plan_after_success_async(
         request_state.plan_current_step = len(request_state.todo_list)
         request_state.planning_complete = True
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-
-
-def _task_type_for_tool(tool_name: str) -> str | None:
-    mapping = {
-        "todowrite": "plan",
-        "sql_query": "query",
-        "insight": "insight",
-        "anomaly": "anomaly",
-        "forecast": "forecast",
-        "format_answer": "answer",
-        "terminate": "answer",
-        "rag": "rag",
-        "skill": "skill",
-    }
-    return mapping.get(tool_name)
 
 
 def _apply_evidence_payload(request_state: RequestStateModel, full_payload: dict) -> None:

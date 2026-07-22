@@ -15,16 +15,18 @@ class _EvidenceSpec:
     result_target = "evidence"
 
 
-def test_sql_query_prompt_prefers_schema_linked_automatic_generation():
+def test_sql_query_prompt_keeps_schema_linking_inside_tool():
     builder = DataAgentPromptBuilder()
     system_prompt = builder.build_system_prompt()
 
     assert "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate." in system_prompt
     assert "For terminate" in system_prompt
     assert "For format_answer" not in system_prompt
-    assert "Default to message-only automatic planning" in system_prompt
-    assert "schema linking participates as auxiliary grounding" in system_prompt
-    assert "Do not write an explicit database query from user-facing names" in system_prompt
+    assert "Use automatic message-based input for normal database requests" in system_prompt
+    assert "field confirmation, query generation, or query planning" in system_prompt
+    assert "schema linking" not in system_prompt.lower()
+    assert "schema linking participates as auxiliary grounding" not in system_prompt
+    assert "Do not write an explicit database query from user-facing names" not in system_prompt
     assert "Context is budgeted" in system_prompt
     assert "diagnostics.prompt_sampling" in system_prompt
 
@@ -155,7 +157,8 @@ def test_prompt_builder_summarizes_heavy_context():
     assert any(action["action"] == "terminate" for action in context["available_actions"])
     assert not any(action["action"] == "format_answer" for action in context["available_actions"])
     assert "prefer message" in sql_action["input"]
-    assert "schema-linked generation" in sql_action["input"]
+    assert "schema-linked generation" not in sql_action["input"]
+    assert "automatic database querying" in sql_action["input"]
     assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True
     assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
     guidance = " ".join(context["state"]["decision_frame"]["recommended_next_action_types"])

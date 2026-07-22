@@ -37,6 +37,9 @@ export type TraceStep = {
   status: TraceStatus;
   summary: string;
   tool?: string;
+  thought?: string;
+  actionInput?: Record<string, unknown>;
+  observation?: Record<string, unknown>;
   toolCall?: Record<string, unknown>;
   toolResult?: Record<string, unknown>;
   error?: string;

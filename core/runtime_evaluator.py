@@ -1,4 +1,4 @@
-"""LLM evaluators for runtime planning and completion contracts."""
+"""LLM evaluators for runtime completion diagnostics."""
 from __future__ import annotations
 
 import json
@@ -10,14 +10,6 @@ from pydantic import BaseModel, Field, ValidationError
 
 from core.completion import CompletionEvaluation, GoalCompletionEvaluation
 from schemas.state import RequestStateModel
-
-
-class PlanRequirementVerdict(BaseModel):
-    requires_plan: bool = False
-    reason: str = ""
-    deliverables: list[str] = Field(default_factory=list)
-    confidence: float | None = None
-    next_action_hint: str | None = None
 
 
 class StepCompletionVerdict(BaseModel):
@@ -41,45 +33,14 @@ class AnswerabilityVerdict(BaseModel):
 
 @dataclass
 class RuntimeLLMEvaluator:
-    """Use an LLM for semantic plan and evidence completion decisions."""
+    """Use an LLM for semantic evidence completion diagnostics."""
 
     llm: Any
     max_rows_preview: int = 6
     max_query_history: int = 6
-    last_plan_verdict: dict[str, Any] | None = None
     last_step_verdict: dict[str, Any] | None = None
     last_answerability_verdict: dict[str, Any] | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    async def evaluate_plan_requirement(
-        self,
-        *,
-        request_state: RequestStateModel,
-        proposed_action: str,
-        action_input: dict,
-    ) -> PlanRequirementVerdict:
-        if self.llm is None or not self._should_check_plan_requirement(request_state.message):
-            verdict = PlanRequirementVerdict(requires_plan=False, reason="Plan requirement LLM check was not needed.")
-            self.last_plan_verdict = verdict.model_dump(mode="json")
-            return verdict
-        payload = {
-            "message": request_state.message,
-            "database_context": request_state.database_context.model_dump(mode="json") if request_state.database_context else None,
-            "proposed_action": proposed_action,
-            "action_input": action_input,
-        }
-        raw = await self._invoke(
-            "TSPilot Plan Requirement JSON",
-            (
-                "Decide whether this user request needs an explicit todo plan before executing the proposed action. "
-                "Require a plan only when the user asks for multiple independently verifiable deliverables, ordered tasks, "
-                "or per-item query/result reporting. Return JSON with requires_plan, reason, deliverables, confidence, next_action_hint."
-            ),
-            payload,
-        )
-        verdict = self._parse(raw, PlanRequirementVerdict)
-        self.last_plan_verdict = verdict.model_dump(mode="json")
-        return verdict
 
     async def evaluate_step_completion(
         self,
@@ -153,19 +114,6 @@ class RuntimeLLMEvaluator:
             missing_evidence=verdict.missing_items,
             answerable_from=verdict.answerable_from,
             next_action_hint=verdict.next_action_hint,
-        )
-
-    def _should_check_plan_requirement(self, message: str) -> bool:
-        text = str(message or "")
-        numbered = len(re.findall(r"(?:^|[;；。:\n])\s*\d+[.)、．]", text)) >= 2
-        return bool(
-            numbered
-            or "完成以下任务" in text
-            or "每项结果" in text
-            or "每项对应" in text
-            or "分别返回" in text
-            or "展示执行过程" in text
-            or "按步骤" in text
         )
 
     async def _invoke(self, marker: str, instruction: str, payload: dict) -> str:

@@ -23,7 +23,6 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     deps.get_data_agent.cache_clear()
     deps.get_tool_registry.cache_clear()
     deps.get_tool_executor.cache_clear()
-    deps.get_runtime_evaluator.cache_clear()
     chat_route.get_react_loop = deps.get_react_loop
     return TestClient(app)
 
@@ -103,7 +102,9 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: tool_result" in body
     assert "event: final_answer" in body
     assert "event: terminate" in body
-    assert "event: thought" not in body
+    assert "event: thought" in body
+    assert '"action_input"' in body
+    assert '"observation"' in body
     assert "event: action" not in body
     assert "event: observation" not in body
 
@@ -194,8 +195,9 @@ def test_chat_sse_path_persists_internal_and_public_trace_logs(tmp_path):
         assert log_payload["mode"] == "sse"
         assert "thought" in [event["event_type"] for event in log_payload["trace"]["internal"]]
         public_event_types = [event["event_type"] for event in log_payload["trace"]["public"]]
-        assert "thought" not in public_event_types
+        assert "thought" in public_event_types
         assert "tool_call" in public_event_types
+        assert "tool_result" in public_event_types
         assert "final_answer" in public_event_types
     finally:
         settings.conversation_log_dir = old_log_dir
@@ -315,7 +317,7 @@ def test_chat_sse_path_can_answer_without_database_context():
 
     assert response.status_code == 200
     assert "event: final_answer" in body
-    assert '"tool": "terminate"' not in body
+    assert '"tool": "terminate"' in body
     assert "TSPilot" in body
 
 
@@ -385,20 +387,22 @@ def test_chat_sse_path_supports_complex_multi_step_react():
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert body.count("event: tool_call") == 5
-    assert body.count("event: tool_result") == 5
+    assert body.count("event: thought") == 6
+    assert body.count("event: tool_call") == 6
+    assert body.count("event: tool_result") == 6
     assert '"tool": "todowrite"' in body
     assert '"tool": "sql_query"' in body
     assert '"tool": "insight"' in body
     assert '"tool": "anomaly"' in body
     assert '"tool": "forecast"' in body
-    assert '"tool": "terminate"' not in body
+    assert '"tool": "terminate"' in body
+    assert '"action_input"' in body
+    assert '"observation"' in body
     assert '"phase": "intent"' in body
     assert '"phase": "analysis"' in body
     assert '"phase": "answer_assembly"' in body
     assert "event: final_answer" in body
     assert "event: terminate" in body
-    assert "event: thought" not in body
     assert "event: action" not in body
     assert "event: observation" not in body
 
@@ -454,11 +458,11 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly"]
+    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "insight", "anomaly"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     failures = [
         event for event in observations
         if event["payload"]["tool_name"] == "forecast" and event["payload"]["success"] is False
     ]
     assert failures
-    assert "active plan step" in failures[-1]["payload"]["summary"]
+    assert "forecast" in failures[-1]["payload"]["summary"].lower()

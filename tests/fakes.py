@@ -3,6 +3,14 @@ from __future__ import annotations
 import json
 
 
+def _context_from_prompt(user_prompt: str) -> dict:
+    if "Runtime State JSON:\n" in user_prompt:
+        context_json = user_prompt.split("Runtime State JSON:\n", 1)[1]
+    else:
+        context_json = user_prompt.split("Context JSON:\n", 1)[1]
+    return _compat_context(json.loads(context_json))
+
+
 class FakeLLM:
     def __init__(self):
         self.calls = 0
@@ -16,8 +24,7 @@ class FakeLLM:
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
-        context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = _compat_context(json.loads(context_json))
+        context = _context_from_prompt(user_prompt)
 
         if context.get("database_context") is None:
             return _turn(
@@ -95,8 +102,7 @@ class CasualLLM:
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
-        context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = _compat_context(json.loads(context_json))
+        context = _context_from_prompt(user_prompt)
         return _turn(
             "This is a conversational request without a datasource, so I should answer directly.",
             "terminate",
@@ -123,8 +129,7 @@ class ComplexReActLLM:
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
-        context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = _compat_context(json.loads(context_json))
+        context = _context_from_prompt(user_prompt)
 
         if context.get("database_context") is None:
             return _turn(
@@ -227,8 +232,7 @@ class RepeatingTodoLLM:
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
-        context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = _compat_context(json.loads(context_json))
+        context = _context_from_prompt(user_prompt)
 
         latest_observation_summaries = context.get("latest_observation_summaries", [])
         latest_observation = latest_observation_summaries[-1] if latest_observation_summaries else None
@@ -312,8 +316,7 @@ class TodoScopeLLM:
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
-        context_json = user_prompt.split("Context JSON:\n", 1)[1]
-        context = _compat_context(json.loads(context_json))
+        context = _context_from_prompt(user_prompt)
 
         if not context.get("todo_list"):
             return _turn(

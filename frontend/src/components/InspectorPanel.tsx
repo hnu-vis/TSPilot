@@ -77,6 +77,8 @@ function ReferenceList({ answer }: { answer: FinalAnswer }) {
 function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   return (
     <>
+      <ReactStepCard step={step} />
+
       {step.sqlDetail ? <QueryRunSummary step={step} /> : <StepStatusCard step={step} />}
 
       {step.metrics.length > 0 && (
@@ -102,6 +104,39 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         <AdvancedDetails step={step} />
       )}
     </>
+  );
+}
+
+function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  const detail = step.reactDetail;
+  return (
+    <section className="inspector-card react-step-card">
+      <div className="inspector-card-title">
+        <Code2 size={16} />
+        <h3>ReAct step</h3>
+      </div>
+      <div className="react-grid">
+        <ReactBlock label="Thought" value={detail.thought || 'Waiting for model reasoning.'} />
+        <ReactBlock label="Action" value={detail.action || step.tool || step.category} />
+        <ReactBlock label="Action Input" value={detail.actionInput} />
+        <ReactBlock label="Observation" value={detail.observation} />
+      </div>
+    </section>
+  );
+}
+
+function ReactBlock({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div className="react-block">
+      <span>{label}</span>
+      {typeof value === 'string' ? (
+        <pre>{value}</pre>
+      ) : value ? (
+        <pre>{JSON.stringify(value, null, 2)}</pre>
+      ) : (
+        <pre>Pending</pre>
+      )}
+    </div>
   );
 }
 

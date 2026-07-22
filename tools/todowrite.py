@@ -14,7 +14,6 @@ class TodoItem(BaseModel):
     priority: int = 2
     notes: str | None = None
     acceptance_criteria: str | None = None
-    evidence_needed: list[str] = Field(default_factory=list)
     result_ref: str | None = None
     completion_reason: str | None = None
 
@@ -57,11 +56,16 @@ class TodoWriteResult(BaseModel):
 
 class TodoWriteTool(BaseTool):
     async def execute(self, validated_input: TodoWriteInput, **kwargs) -> dict:
-        todos = [self._normalize_todo(index, todo) for index, todo in enumerate(validated_input.todos, start=1)]
+        todos = [
+            normalized
+            for index, todo in enumerate(validated_input.todos, start=1)
+            if (normalized := self._normalize_todo(index, todo)) is not None
+        ]
         if not todos:
             todos = [
                 TodoItem(
                     content=validated_input.focus or validated_input.message,
+                    task_type="query",
                     status="in_progress",
                     priority=1,
                     notes=validated_input.evidence_summary,
@@ -83,7 +87,7 @@ class TodoWriteTool(BaseTool):
             pending_count=pending_count,
         ).model_dump(mode="json")
 
-    def _normalize_todo(self, index: int, raw_todo: dict) -> TodoItem:
+    def _normalize_todo(self, index: int, raw_todo: dict) -> TodoItem | None:
         content = str(
             raw_todo.get("content")
             or raw_todo.get("task")
@@ -97,6 +101,8 @@ class TodoWriteTool(BaseTool):
             or raw_todo.get("kind")
             or self._infer_task_type(content)
         ).strip().lower()
+        if task_type == "plan" or self._is_internal_query_preparation(content):
+            return None
         status = str(raw_todo.get("status") or "pending").strip().lower()
         if status not in {"pending", "in_progress", "completed"}:
             status = "pending"
@@ -106,13 +112,6 @@ class TodoWriteTool(BaseTool):
         except (TypeError, ValueError):
             priority = 2
         notes = raw_todo.get("notes")
-        raw_evidence_needed = raw_todo.get("evidence_needed")
-        if isinstance(raw_evidence_needed, list):
-            evidence_needed = raw_evidence_needed
-        elif isinstance(raw_evidence_needed, str):
-            evidence_needed = [raw_evidence_needed]
-        else:
-            evidence_needed = []
         normalized = TodoItem(
             content=content,
             task_type=task_type,
@@ -120,7 +119,6 @@ class TodoWriteTool(BaseTool):
             priority=priority,
             notes=notes,
             acceptance_criteria=raw_todo.get("acceptance_criteria") or raw_todo.get("criteria"),
-            evidence_needed=evidence_needed,
             result_ref=raw_todo.get("result_ref"),
             completion_reason=raw_todo.get("completion_reason"),
         )
@@ -154,6 +152,8 @@ class TodoWriteTool(BaseTool):
 
     def _infer_task_type(self, content: str) -> str:
         normalized = content.lower()
+        if self._is_internal_query_preparation(content):
+            return "query"
         if any(token in normalized for token in ["查询", "查库", "取数", "query", "retrieve evidence"]):
             return "query"
         if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "insight", "trend"]):
@@ -167,3 +167,21 @@ class TodoWriteTool(BaseTool):
         if any(token in normalized for token in ["规划", "计划", "todo", "plan"]):
             return "plan"
         return "generic"
+
+    def _is_internal_query_preparation(self, content: str) -> bool:
+        normalized = content.lower()
+        internal_tokens = (
+            "schema linking",
+            "schema-linked",
+            "grounding",
+            "确认数据源",
+            "确认字段",
+            "字段确认",
+            "生成查询",
+            "生成flux",
+            "生成 flux",
+            "查询计划",
+            "可执行flux",
+            "可执行 flux",
+        )
+        return any(token in normalized for token in internal_tokens)

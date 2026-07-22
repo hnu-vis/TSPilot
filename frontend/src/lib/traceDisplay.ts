@@ -53,6 +53,13 @@ export type CompletionDetail = {
   } | null;
 };
 
+export type ReactDetail = {
+  thought: string | null;
+  action: string | null;
+  actionInput: Record<string, unknown> | null;
+  observation: Record<string, unknown> | null;
+};
+
 export type DisplayStep = {
   id: string;
   title: string;
@@ -64,6 +71,7 @@ export type DisplayStep = {
   sqlDetail: SqlDetail | null;
   schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
+  reactDetail: ReactDetail;
   debugPayload: Record<string, unknown> | null;
 };
 
@@ -85,6 +93,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const artifactRefs = artifactRefsFor(preview, result);
   const completionDetail = completionDetailFor(preview);
   const status = statusForStep(step, completionDetail);
+  const reactDetail = reactDetailFor(step, call, result);
 
   return {
     id: step.id,
@@ -97,7 +106,21 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     sqlDetail: sqlDetailFor(tool, preview),
     schemaLinkingDetail: schemaLinkingDetailFor(tool, preview),
     completionDetail,
+    reactDetail,
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
+  };
+}
+
+function reactDetailFor(
+  step: TraceStep,
+  call: Record<string, unknown> | null,
+  result: Record<string, unknown> | null,
+): ReactDetail {
+  return {
+    thought: step.thought || stringFrom(call?.thought) || (step.phase === 'reasoning' ? step.summary : null),
+    action: step.tool || stringFrom(call?.tool) || null,
+    actionInput: asRecord(step.actionInput) || asRecord(call?.action_input) || asRecord(call?.input_preview),
+    observation: asRecord(step.observation) || asRecord(result?.observation) || result,
   };
 }
 

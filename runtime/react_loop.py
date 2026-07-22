@@ -19,11 +19,10 @@ from schemas.tool import ToolObservation
 class ReActLoop:
     """Execute the strict outer loop."""
 
-    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings, runtime_evaluator=None):
+    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
-        self._runtime_evaluator = runtime_evaluator
         self._trace_logger = ConversationTraceLogger(settings)
 
     async def run(
@@ -119,6 +118,7 @@ class ReActLoop:
                 "action",
                 {
                     "iteration": request_state.iteration,
+                    "thought": turn.thought,
                     "action": turn.action,
                     "action_input": turn.action_input,
                     "action_intention": turn.action_intention,
@@ -126,12 +126,7 @@ class ReActLoop:
                 },
             )
 
-            plan_block_reason = await self._plan_requirement_block_reason(request_state, turn.action, turn.action_input)
-            allowed, reason = (
-                (False, plan_block_reason)
-                if plan_block_reason
-                else validate_action(request_state, turn.action)
-            )
+            allowed, reason = validate_action(request_state, turn.action)
             if not allowed:
                 observation = build_policy_observation(request_state, turn.action, reason or "Invalid action.")
                 request_state.observations.append(observation)
@@ -182,7 +177,6 @@ class ReActLoop:
                 execution_result.observation,
                 execution_result.full_payload,
                 execution_result.tool_spec,
-                completion_evaluator=self._runtime_evaluator,
             )
             execution_result.observation = enrich_observation_payload(
                 request_state,
@@ -218,38 +212,6 @@ class ReActLoop:
             {"message": "Maximum iterations reached before a terminal payload was produced."},
         )
 
-    async def _plan_requirement_block_reason(
-        self,
-        request_state: RequestStateModel,
-        action_name: str,
-        action_input: dict,
-    ) -> str | None:
-        if (
-            self._runtime_evaluator is None
-            or request_state.todo_list
-            or action_name == "todowrite"
-            or action_name in {"format_answer", "terminate"}
-            or request_state.database_context is None
-        ):
-            return None
-        try:
-            verdict = await self._runtime_evaluator.evaluate_plan_requirement(
-                request_state=request_state,
-                proposed_action=action_name,
-                action_input=action_input,
-            )
-        except Exception as exc:
-            request_state.completion_state["plan_requirement_error"] = str(exc)
-            return None
-        request_state.completion_state["plan_requirement"] = verdict.model_dump(mode="json")
-        if not verdict.requires_plan:
-            return None
-        deliverables = ", ".join(verdict.deliverables[:8]) if verdict.deliverables else "multiple deliverables"
-        return (
-            "A todo plan is required before this action because the user request has independently verifiable deliverables: "
-            f"{deliverables}. Reason: {verdict.reason or 'plan required by runtime evaluator'}"
-        )
-
     async def _map_trace_to_sse(
         self,
         request_state: RequestStateModel,
@@ -259,12 +221,24 @@ class ReActLoop:
         payload = event.payload
 
         if event_type == "thought":
+            yield append_trace(
+                request_state,
+                "thought",
+                {
+                    "agent": "data_agent",
+                    "status": "running",
+                    "phase": "reasoning",
+                    "message": payload.get("thought") or "正在判断下一步。",
+                    "iteration": payload.get("iteration"),
+                    "thought": payload.get("thought"),
+                    "intention": payload.get("action_intention"),
+                    "reason": payload.get("action_reason"),
+                },
+            )
             return
 
         if event_type == "action":
             action_name = str(payload.get("action", ""))
-            if self._is_terminal_presentation_action(action_name):
-                return
             yield append_trace(
                 request_state,
                 "agent_step",
@@ -283,16 +257,16 @@ class ReActLoop:
                     "tool": action_name,
                     "summary": self._message_for_action(action_name),
                     "iteration": payload.get("iteration"),
+                    "thought": payload.get("thought"),
                     "intention": payload.get("action_intention"),
                     "reason": payload.get("action_reason"),
+                    "action_input": payload.get("action_input", {}),
                     "input_preview": self._input_preview(action_name, payload.get("action_input", {})),
                 },
             )
             return
 
         if event_type == "observation":
-            if self._is_terminal_presentation_action(str(payload.get("tool_name", ""))):
-                return
             yield append_trace(
                 request_state,
                 "tool_result",
@@ -302,6 +276,7 @@ class ReActLoop:
                     "summary": payload.get("summary"),
                     "iteration": self._iteration_from_payload_ref(payload.get("payload_ref")) or request_state.iteration,
                     "payload_preview": self._payload_preview(payload, request_state),
+                    "observation": payload,
                     "payload_ref": payload.get("payload_ref"),
                 },
             )
@@ -332,9 +307,6 @@ class ReActLoop:
 
         if event_type in {"terminate", "error"}:
             yield append_trace(request_state, event_type, payload)
-
-    def _is_terminal_presentation_action(self, action_name: str) -> bool:
-        return action_name in {"format_answer", "terminate"}
 
     def _phase_for_action(self, action_name: str) -> str:
         mapping = {
@@ -452,7 +424,6 @@ class ReActLoop:
 
     def _completion_payload_preview(self, request_state: RequestStateModel) -> dict:
         latest_step = request_state.completion_state.get("latest_step")
-        plan_requirement = request_state.completion_state.get("plan_requirement")
         todo_total = len(request_state.todo_list)
         completed = len([todo for todo in request_state.todo_list if todo.get("status") == "completed"])
         in_progress = next((todo for todo in request_state.todo_list if todo.get("status") == "in_progress"), None)
@@ -478,16 +449,11 @@ class ReActLoop:
             "in_progress": in_progress.get("content") if isinstance(in_progress, dict) else None,
         }
         if isinstance(latest_step, dict):
-            preview["completion_verdict"] = {
+            preview["last_progress_update"] = {
                 "completed": latest_step.get("completed"),
                 "reason": latest_step.get("reason"),
-                "missing_items": latest_step.get("missing_evidence", []),
-                "next_action_hint": latest_step.get("next_action_hint"),
                 "todo_index": latest_step.get("todo_index"),
-                "llm": latest_step.get("completion_verdict"),
             }
-        if isinstance(plan_requirement, dict):
-            preview["plan_requirement"] = plan_requirement
         return preview
 
     def _sql_payload_preview(self, visible_payload: dict) -> dict:

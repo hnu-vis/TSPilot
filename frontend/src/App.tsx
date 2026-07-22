@@ -151,7 +151,22 @@ export default function App() {
   };
 
   const handleStreamEvent = (conversationId: string, event: StreamEvent) => {
-    const isTerminalPresentationTool = (tool: unknown) => tool === 'terminate' || tool === 'format_answer';
+    if (event.event === 'thought') {
+      const iteration = numberFrom(event.data.iteration, 0);
+      const id = `iteration-${iteration || Date.now()}`;
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: stringFrom(event.data.agent, 'data_agent'),
+        phase: stringFrom(event.data.phase, 'reasoning'),
+        status: statusFrom(event.data.status, 'running'),
+        summary: stringFrom(event.data.message, 'Thinking about the next action.'),
+        thought: stringFrom(event.data.thought, ''),
+        updatedAt: now(),
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
 
     if (event.event === 'agent_step') {
       const iteration = numberFrom(event.data.iteration, 0);
@@ -170,7 +185,6 @@ export default function App() {
     }
 
     if (event.event === 'tool_call') {
-      if (isTerminalPresentationTool(event.data.tool)) return;
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
       const step: TraceStep = {
@@ -181,7 +195,9 @@ export default function App() {
         status: 'running',
         summary: stringFrom(event.data.summary, 'Calling tool.'),
         tool: stringFrom(event.data.tool, 'tool'),
+        thought: stringFrom(event.data.thought, ''),
         toolCall: event.data,
+        actionInput: asRecord(event.data.action_input) || asRecord(event.data.input_preview) || undefined,
         updatedAt: now(),
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
@@ -189,7 +205,6 @@ export default function App() {
     }
 
     if (event.event === 'tool_result') {
-      if (isTerminalPresentationTool(event.data.tool)) return;
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
       const success = Boolean(event.data.success);
@@ -202,6 +217,7 @@ export default function App() {
         summary: stringFrom(event.data.summary, success ? 'Tool completed.' : 'Tool failed.'),
         tool: stringFrom(event.data.tool, 'tool'),
         toolResult: event.data,
+        observation: asRecord(event.data.observation) || event.data,
         updatedAt: now(),
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
@@ -320,4 +336,8 @@ function numberFrom(value: unknown, fallback: number) {
 function statusFrom(value: unknown, fallback: TraceStep['status']): TraceStep['status'] {
   if (value === 'complete' || value === 'error' || value === 'running') return value;
   return fallback;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
 }

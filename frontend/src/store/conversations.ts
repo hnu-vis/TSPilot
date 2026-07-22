@@ -155,7 +155,7 @@ export function upsertTraceStep(conversation: Conversation, step: TraceStep): Co
   const existingIndex = conversation.traceSteps.findIndex((item) => item.id === step.id);
   const traceSteps = [...conversation.traceSteps];
   if (existingIndex >= 0) {
-    traceSteps[existingIndex] = { ...traceSteps[existingIndex], ...step };
+    traceSteps[existingIndex] = mergeTraceStep(traceSteps[existingIndex], step);
   } else {
     traceSteps.push(step);
   }
@@ -164,6 +164,24 @@ export function upsertTraceStep(conversation: Conversation, step: TraceStep): Co
     traceSteps,
     updatedAt: now(),
   };
+}
+
+function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
+  return {
+    ...existing,
+    ...incoming,
+    tool: keepValue(incoming.tool, existing.tool),
+    thought: keepValue(incoming.thought, existing.thought),
+    actionInput: keepValue(incoming.actionInput, existing.actionInput),
+    observation: keepValue(incoming.observation, existing.observation),
+    toolCall: keepValue(incoming.toolCall, existing.toolCall),
+    toolResult: keepValue(incoming.toolResult, existing.toolResult),
+  };
+}
+
+function keepValue<T>(incoming: T | null | undefined, existing: T | undefined): T | undefined {
+  if (incoming === null || incoming === undefined || incoming === '') return existing;
+  return incoming;
 }
 
 export function buildBackendHistory(conversation: Conversation) {
