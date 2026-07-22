@@ -141,7 +141,7 @@ export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null
 
 export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite') return 'Plan the work';
-  if (tool === 'sql_query' || tool === 'query_database') return 'Query data';
+  if (tool === 'sql_query' || tool === 'query_database') return 'Data retrieval';
   if (tool === 'insight') return 'Analyze evidence';
   if (tool === 'anomaly') return 'Check anomalies';
   if (tool === 'forecast') return 'Forecast trend';
@@ -150,7 +150,7 @@ export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'format_answer') return 'Assemble answer';
   if (phase === 'answer_assembly') return 'Assemble answer';
   if (phase === 'analysis') return 'Analyze evidence';
-  if (phase === 'tool_selection') return 'Query data';
+  if (phase === 'tool_selection') return 'Data retrieval';
   if (phase === 'intent') return 'Plan the work';
   return 'Process step';
 }

@@ -42,7 +42,7 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
       <div className="empty-thread">
         <div className="empty-mark">TS</div>
         <h2>Ask about your time-series data</h2>
-        <p>Query databases, inspect trends, detect anomalies, forecast future values, and review the execution process.</p>
+        <p>Retrieve data, inspect trends, detect anomalies, forecast future values, and review the execution process.</p>
       </div>
     );
   }

@@ -134,7 +134,7 @@ function QueryRunSummary({ step }: { step: ReturnType<typeof toDisplayStep> }) {
     <section className="inspector-card query-run-summary">
       <div className="inspector-card-title">
         <StatusIcon status={step.status} />
-        <h3>Query result</h3>
+        <h3>Result</h3>
         <span className={`status-line compact ${step.status}`}>{statusLabel(step.status)}</span>
       </div>
       <p className="step-summary">{step.summary}</p>
@@ -192,18 +192,18 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
     <section className="inspector-card sql-query-preview">
       <div className="inspector-card-title sql-detail-title">
         <Code2 size={16} />
-        <h3>Generated query</h3>
+        <h3>Generated SQL</h3>
         <div className="query-actions">
           {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
           <button
             type="button"
             className="icon-text-button"
             onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
-            aria-label="Copy generated query"
-            title="Copy query"
+            aria-label="Copy generated SQL"
+            title="Copy SQL"
           >
             <Clipboard size={13} />
-            <span>Copy</span>
+            <span>Copy SQL</span>
           </button>
         </div>
       </div>
