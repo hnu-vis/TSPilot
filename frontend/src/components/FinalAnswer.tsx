@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronDown, Database, FileText } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Code2, Database, FileText } from 'lucide-react';
 import type { FinalAnswer as FinalAnswerType } from '../types';
 
 type MarkdownBlock =
@@ -90,12 +90,7 @@ function MarkdownContent({
     <div className={`answer-markdown answer-markdown-${variant}`}>
       {blocks.map((block, index) => {
         if (block.type === 'code') {
-          return (
-            <pre className="answer-code-block" key={`code-${index}`}>
-              {block.language && <span className="answer-code-language">{block.language}</span>}
-              <code>{block.content}</code>
-            </pre>
-          );
+          return <CollapsibleCodeBlock block={block} index={index} key={`code-${index}`} />;
         }
         if (block.type === 'bulletList') {
           return (
@@ -114,6 +109,27 @@ function MarkdownContent({
         return <p key={`paragraph-${index}`}>{block.content}</p>;
       })}
     </div>
+  );
+}
+
+function CollapsibleCodeBlock({ block, index }: { block: Extract<MarkdownBlock, { type: 'code' }>; index: number }) {
+  const language = block.language?.trim();
+  const lineCount = block.content ? block.content.split('\n').length : 0;
+  const title = language ? language.toUpperCase() : `Code ${index + 1}`;
+  return (
+    <details className="answer-code-details">
+      <summary>
+        <span>
+          <ChevronDown size={14} className="collapsible-chevron" />
+          <Code2 size={14} />
+          {title}
+        </span>
+        {lineCount > 0 && <strong>{lineCount} lines</strong>}
+      </summary>
+      <pre className="answer-code-block">
+        <code>{block.content}</code>
+      </pre>
+    </details>
   );
 }
 

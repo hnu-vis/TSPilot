@@ -1878,41 +1878,65 @@ details[open] > summary .collapsible-chevron {
   gap: 8px;
 }
 
-.answer-code-block {
-  position: relative;
+.answer-code-details {
   display: grid;
-  gap: 8px;
   min-width: 0;
-  max-width: 100%;
-  overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: oklch(0.955 0.004 250);
-  padding: 12px;
+}
+
+.answer-code-details summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.answer-code-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.answer-code-details summary > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
   color: var(--foreground);
-  font-family: var(--font-mono);
   font-size: 12px;
-  line-height: 1.6;
-  white-space: pre;
+  font-weight: 730;
 }
 
-.answer-code-block code {
-  min-width: max-content;
-  font: inherit;
-}
-
-.answer-code-language {
-  width: fit-content;
+.answer-code-details summary strong {
+  flex: 0 0 auto;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface);
   padding: 2px 7px;
   color: var(--muted-strong);
-  font-family: var(--font-sans);
   font-size: 10px;
-  font-weight: 760;
-  line-height: 1.3;
-  text-transform: uppercase;
+}
+
+.answer-code-block {
+  max-height: min(34vh, 320px);
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  margin: 0;
+  padding: 12px;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.answer-code-block code {
+  font: inherit;
 }
 
 .answer-reference-strip {
