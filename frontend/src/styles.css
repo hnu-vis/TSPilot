@@ -1267,6 +1267,63 @@ input:focus-visible {
   margin-left: auto;
 }
 
+.collapsible-card {
+  padding: 0;
+}
+
+.collapsible-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.collapsible-summary::-webkit-details-marker,
+.answer-reference-strip summary::-webkit-details-marker {
+  display: none;
+}
+
+.collapsible-summary > span,
+.answer-reference-strip summary > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.collapsible-summary strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collapsible-chevron {
+  flex: 0 0 auto;
+  transition: transform 150ms ease;
+}
+
+details[open] > summary .collapsible-chevron {
+  transform: rotate(180deg);
+}
+
+.collapsible-card .query-actions {
+  justify-content: flex-end;
+  margin: 0;
+  border-top: 1px solid var(--border);
+  padding: 8px 10px 0;
+}
+
+.collapsible-card .sql-code-block {
+  margin: 8px 10px 10px;
+}
+
 .query-actions .query-language-badge {
   margin-left: 0;
 }
@@ -1857,12 +1914,32 @@ input:focus-visible {
 }
 
 .answer-reference-strip {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.answer-reference-strip summary {
   display: flex;
   min-width: 0;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  color: var(--muted);
-  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.answer-reference-strip summary strong {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 2px 7px;
+  color: var(--muted-strong);
+  font-size: 10px;
 }
 
 .answer-reference-strip > div {

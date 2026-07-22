@@ -1,4 +1,4 @@
-import { CheckCircle2, Database, FileText } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Database, FileText } from 'lucide-react';
 import type { FinalAnswer as FinalAnswerType } from '../types';
 
 type MarkdownBlock =
@@ -47,19 +47,30 @@ export function FinalAnswer({ answer }: { answer: FinalAnswerType }) {
         </div>
       )}
 
-      {references.length > 0 && (
-        <footer className="answer-reference-strip" aria-label="Answer references">
-          <FileText size={14} />
-          <div>
-            {references.slice(0, 4).map((reference, index) => (
-              <span key={`${reference.source_type}-${reference.source_id || index}`}>
-                {formatLabel(reference.source_type)}
-              </span>
-            ))}
-          </div>
-        </footer>
-      )}
+      {references.length > 0 && <ReferenceStrip references={references} />}
     </div>
+  );
+}
+
+function ReferenceStrip({ references }: { references: FinalAnswerType['references'] }) {
+  return (
+    <details className="answer-reference-strip" aria-label="Answer references">
+      <summary>
+        <span>
+          <ChevronDown size={14} className="collapsible-chevron" />
+          <FileText size={14} />
+          Evidence
+        </span>
+        <strong>{references.length}</strong>
+      </summary>
+      <div>
+        {references.slice(0, 6).map((reference, index) => (
+          <span key={`${reference.source_type}-${reference.source_id || index}`}>
+            {formatLabel(reference.source_type)}
+          </span>
+        ))}
+      </div>
+    </details>
   );
 }
 

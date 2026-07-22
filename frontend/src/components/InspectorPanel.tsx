@@ -189,26 +189,29 @@ function CompletionPreview({ detail }: { detail: NonNullable<ReturnType<typeof t
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
   return (
-    <section className="inspector-card sql-query-preview">
-      <div className="inspector-card-title sql-detail-title">
-        <Code2 size={16} />
-        <h3>Generated SQL</h3>
-        <div className="query-actions">
-          {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
-          <button
-            type="button"
-            className="icon-text-button"
-            onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
-            aria-label="Copy generated SQL"
-            title="Copy SQL"
-          >
-            <Clipboard size={13} />
-            <span>Copy SQL</span>
-          </button>
-        </div>
+    <details className="inspector-card sql-query-preview collapsible-card" open>
+      <summary className="collapsible-summary">
+        <span>
+          <ChevronDown size={15} className="collapsible-chevron" />
+          <Code2 size={16} />
+          <strong>Generated SQL</strong>
+        </span>
+        {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+      </summary>
+      <div className="query-actions">
+        <button
+          type="button"
+          className="icon-text-button"
+          onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
+          aria-label="Copy generated SQL"
+          title="Copy SQL"
+        >
+          <Clipboard size={13} />
+          <span>Copy SQL</span>
+        </button>
       </div>
       <pre className="sql-code-block visible-query">{detail.query}</pre>
-    </section>
+    </details>
   );
 }
 
