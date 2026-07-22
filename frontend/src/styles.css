@@ -1382,6 +1382,8 @@ details[open] > summary .collapsible-chevron {
   max-height: min(34vh, 320px);
   min-height: 92px;
   max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .column-chip-list {
