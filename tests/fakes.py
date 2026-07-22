@@ -403,6 +403,109 @@ class TodoScopeLLM:
         )
 
 
+class BitcoinMultiQueryLLM:
+    def __init__(self):
+        self.calls = 0
+        self.agent_turn = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        if "LLM SQL Query Generation JSON:" in user_prompt:
+            raise AssertionError("BitcoinMultiQueryLLM uses explicit Flux queries.")
+
+        self.agent_turn += 1
+        database_context = {
+            "database_id": "influxdb2-bitcoin-sample",
+            "database_type": "influxdb",
+        }
+        base_flux = (
+            'from(bucket: "bitcoin")\n'
+            "  |> range(start: 0)\n"
+            '  |> filter(fn: (r) => r._measurement == "coindesk")\n'
+            '  |> filter(fn: (r) => r.code == "USD")\n'
+            '  |> filter(fn: (r) => r.crypto == "bitcoin")\n'
+            '  |> filter(fn: (r) => r._field == "price")'
+        )
+        queries = {
+            2: (
+                "返回USD价格数据的总记录数",
+                base_flux
+                + '\n  |> count()\n  |> keep(columns: ["_value"])\n  |> rename(columns: {_value: "count"})',
+            ),
+            3: (
+                "返回按时间升序排列的最早5条原始记录",
+                base_flux
+                + '\n  |> sort(columns: ["_time"], desc: false)\n  |> limit(n: 5)\n'
+                + '  |> keep(columns: ["_time", "_value", "code", "crypto", "description", "symbol"])\n'
+                + '  |> rename(columns: {_value: "price"})',
+            ),
+            4: (
+                "返回按时间降序排列的最晚5条原始记录",
+                base_flux
+                + '\n  |> sort(columns: ["_time"], desc: true)\n  |> limit(n: 5)\n'
+                + '  |> keep(columns: ["_time", "_value", "code", "crypto", "description", "symbol"])\n'
+                + '  |> rename(columns: {_value: "price"})',
+            ),
+            5: (
+                "返回整个数据集的最早时间和最晚时间，精确到秒",
+                "earliest = "
+                + base_flux
+                + '\n  |> first()\n  |> map(fn: (r) => ({ r with bound: "earliest" }))\n'
+                + "latest = "
+                + base_flux
+                + '\n  |> last()\n  |> map(fn: (r) => ({ r with bound: "latest" }))\n'
+                + 'union(tables: [earliest, latest])\n  |> keep(columns: ["bound", "_time", "_value"])\n'
+                + '  |> rename(columns: {_value: "price"})',
+            ),
+        }
+
+        if self.agent_turn == 1:
+            return _turn(
+                "I should plan the independent query deliverables first.",
+                "todowrite",
+                {
+                    "message": "查询比特币 USD 价格多分项结果",
+                    "current_intent": "database_query",
+                    "requested_fact_types": ["count", "earliest_rows", "latest_rows", "time_bounds"],
+                    "focus": "每项都必须有查询语句和实际返回行数",
+                    "todos": [
+                        {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+                        {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
+                        {"content": "查询最晚5条", "task_type": "query", "status": "pending", "priority": 3},
+                        {"content": "查询时间边界", "task_type": "query", "status": "pending", "priority": 4},
+                        {"content": "汇总最终答案", "task_type": "answer", "status": "pending", "priority": 5},
+                    ],
+                },
+            )
+        if self.agent_turn in queries:
+            purpose, query = queries[self.agent_turn]
+            return _turn(
+                purpose,
+                "sql_query",
+                {
+                    "database_context": database_context,
+                    "query_language": "flux",
+                    "purpose": purpose,
+                    "query": query,
+                },
+            )
+        return _turn(
+            "I have enough database evidence artifacts to assemble the answer.",
+            "terminate",
+            {
+                "summary_goal": "汇总比特币 USD 价格多分项查询结果",
+                "direct_answer": "已完成全部分项查询，以下结果均来自实际数据库查询 evidence。",
+                "include_fact_ids": [],
+                "include_visualization_ids": [],
+                "section_plan": ["summary", "query_results", "conclusion"],
+            },
+        )
+
+
 class _FakeResponse:
     def __init__(self, content: str):
         self.content = content

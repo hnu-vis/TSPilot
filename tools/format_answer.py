@@ -1,6 +1,8 @@
 """Final answer assembly tool."""
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field, model_validator
 
 from core.report.composer import (
@@ -116,7 +118,10 @@ class FormatAnswerTool(BaseTool):
                     "results": [analysis.result for analysis in analyses],
                 },
             )
-        if request_state.latest_database_evidence is not None and not facts:
+        database_evidence = self._database_evidence_inventory(request_state)
+        if len(database_evidence) > 1:
+            sections_by_type["query_results"] = self._database_query_results_section(database_evidence)
+        if len(database_evidence) <= 1 and request_state.latest_database_evidence is not None and not facts:
             evidence = request_state.latest_database_evidence
             for section in self._evidence_sections(evidence):
                 sections_by_type[section.section_type] = section
@@ -161,13 +166,13 @@ class FormatAnswerTool(BaseTool):
         )
         sections = ordered_sections(sections_by_type, validated_input.section_plan)
         references = []
-        if request_state.latest_database_evidence is not None:
+        for evidence in database_evidence:
             references.append(
                 AnswerReference(
                     source_type="query",
-                    source_id=request_state.latest_database_evidence.evidence_id,
-                    label="Database evidence",
-                    evidence={"summary": request_state.latest_database_evidence.summary},
+                    source_id=evidence.evidence_id,
+                    label=self._evidence_purpose(evidence) or "Database evidence",
+                    evidence=self._database_reference_payload(evidence),
                 )
             )
         references.extend(
@@ -406,6 +411,222 @@ class FormatAnswerTool(BaseTool):
                 )
             ]
         return sections
+
+    def _database_evidence_inventory(self, request_state: RequestStateModel) -> list:
+        """Return database evidence in insertion order without duplicating latest."""
+
+        items = list(request_state.database_evidence_artifacts.values())
+        latest = request_state.latest_database_evidence
+        if latest is not None and latest.evidence_id not in {item.evidence_id for item in items}:
+            items.append(latest)
+        return items
+
+    def _database_query_results_section(self, evidence_items: list) -> AnswerSection:
+        blocks = []
+        structured_items = []
+        for index, evidence in enumerate(evidence_items, start=1):
+            summary = self._database_evidence_summary(evidence)
+            structured_items.append(summary)
+            blocks.append(self._render_database_evidence_block(index, evidence, summary))
+        return AnswerSection(
+            section_type="query_results",
+            heading="Query Results",
+            content="\n\n".join(blocks),
+            structured_payload={"items": structured_items},
+        )
+
+    def _database_evidence_summary(self, evidence) -> dict[str, Any]:
+        data = evidence.data if isinstance(evidence.data, dict) else {}
+        diagnostics = evidence.diagnostics if isinstance(evidence.diagnostics, dict) else {}
+        prompt_sampling = diagnostics.get("prompt_sampling") if isinstance(diagnostics.get("prompt_sampling"), dict) else {}
+        summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
+        row_count = self._evidence_row_count(evidence, data, diagnostics, summary_stats, prompt_sampling)
+        rows_preview = self._preview_rows(data)
+        artifact_ref = (
+            diagnostics.get("artifact_ref")
+            or diagnostics.get("snapshot_ref")
+            or prompt_sampling.get("full_artifact_ref")
+        )
+        sampled = bool(prompt_sampling.get("sampled_for_prompt"))
+        return {
+            "evidence_id": evidence.evidence_id,
+            "purpose": self._evidence_purpose(evidence),
+            "summary": evidence.summary,
+            "query_language": evidence.query_language,
+            "query": evidence.query,
+            "row_count": row_count,
+            "columns": evidence.columns,
+            "rows_preview": rows_preview,
+            "sampled_for_prompt": sampled,
+            "artifact_ref": artifact_ref,
+        }
+
+    def _evidence_row_count(
+        self,
+        evidence,
+        data: dict,
+        diagnostics: dict,
+        summary_stats: dict,
+        prompt_sampling: dict,
+    ) -> int | None:
+        candidates = [
+            diagnostics.get("row_count_total"),
+            diagnostics.get("row_count_materialized"),
+            (diagnostics.get("sql_query") or {}).get("row_count") if isinstance(diagnostics.get("sql_query"), dict) else None,
+            summary_stats.get("rows_count"),
+            summary_stats.get("points_count"),
+            (prompt_sampling.get("full_counts") or {}).get("rows_count") if isinstance(prompt_sampling.get("full_counts"), dict) else None,
+            (prompt_sampling.get("full_counts") or {}).get("points_count") if isinstance(prompt_sampling.get("full_counts"), dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, int):
+                return candidate
+        rows = data.get("rows")
+        if isinstance(rows, list):
+            return len(rows)
+        points = data.get("points")
+        if isinstance(points, list):
+            return len(points)
+        return None
+
+    def _preview_rows(self, data: dict) -> list[dict]:
+        rows = data.get("rows")
+        if isinstance(rows, list):
+            return [row for row in rows[:5] if isinstance(row, dict)]
+        points = data.get("points")
+        if isinstance(points, list):
+            return [point for point in points[:5] if isinstance(point, dict)]
+        statistics = data.get("statistics")
+        if isinstance(statistics, dict):
+            return [statistics]
+        return []
+
+    def _evidence_purpose(self, evidence) -> str | None:
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        diagnostics = evidence.diagnostics if isinstance(evidence.diagnostics, dict) else {}
+        sql_query = diagnostics.get("sql_query") if isinstance(diagnostics.get("sql_query"), dict) else {}
+        for value in (
+            metadata.get("purpose"),
+            sql_query.get("purpose"),
+            metadata.get("expected_result_type"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+
+    def _render_database_evidence_block(self, index: int, evidence, summary: dict[str, Any]) -> str:
+        lines = [f"{index}. 查询目的：{summary.get('purpose') or evidence.summary}"]
+        row_count = summary.get("row_count")
+        if row_count is not None:
+            lines.append(f"实际返回行数：{row_count}")
+        columns = summary.get("columns") or []
+        if columns:
+            lines.append("返回列：" + ", ".join(str(column) for column in columns))
+        rows_preview = summary.get("rows_preview") or []
+        result_digest = self._result_digest(rows_preview)
+        if result_digest:
+            lines.append(f"结果值：{result_digest}")
+        concise_summary = self._concise_evidence_summary(evidence.summary)
+        if concise_summary:
+            lines.append(f"结果摘要：{concise_summary}")
+        if rows_preview:
+            if summary.get("sampled_for_prompt"):
+                lines.append("当前展示的是采样预览；完整结果见 artifact。")
+            else:
+                lines.append("当前展示的是实际返回预览。")
+            lines.append(self._markdown_table(rows_preview, columns))
+        elif summary.get("sampled_for_prompt"):
+            lines.append("当前仅有采样摘要可用于最终展示；完整结果见 artifact。")
+        artifact_ref = summary.get("artifact_ref")
+        if artifact_ref:
+            lines.append(f"结果引用：{artifact_ref}")
+        query = str(summary.get("query") or "").strip()
+        if query and not self._is_internal_query(evidence):
+            language = self._markdown_language(evidence.query_language)
+            fence = f"```{language}\n{query}\n```" if language else f"```\n{query}\n```"
+            lines.append("查询语句：")
+            lines.append(fence)
+        return "\n".join(lines)
+
+    def _markdown_table(self, rows: list[dict], preferred_columns: list | None = None) -> str:
+        if not rows:
+            return ""
+        columns = [
+            str(column)
+            for column in (preferred_columns or [])
+            if str(column) and any(str(column) in row for row in rows)
+        ]
+        for row in rows:
+            for column in row.keys():
+                if column not in columns:
+                    columns.append(column)
+        if not columns:
+            return ""
+        lines = [
+            "| " + " | ".join(str(column) for column in columns) + " |",
+            "| " + " | ".join("---" for _ in columns) + " |",
+        ]
+        for row in rows:
+            lines.append("| " + " | ".join(self._table_cell(row.get(column)) for column in columns) + " |")
+        return "\n".join(lines)
+
+    def _result_digest(self, rows: list[dict]) -> str | None:
+        if not rows:
+            return None
+        if len(rows) == 1:
+            row = rows[0]
+            if len(row) == 1:
+                key, value = next(iter(row.items()))
+                return f"{key} = {self._table_cell(value)}"
+            return ", ".join(
+                f"{key} = {self._table_cell(value)}"
+                for key, value in row.items()
+            )
+        if len(rows) <= 3:
+            return "; ".join(self._compact_row_digest(row) for row in rows)
+        return None
+
+    def _compact_row_digest(self, row: dict) -> str:
+        label_key = next(
+            (key for key in ("bound", "label", "metric", "type") if key in row),
+            None,
+        )
+        if label_key:
+            rest = ", ".join(
+                f"{key} = {self._table_cell(value)}"
+                for key, value in row.items()
+                if key != label_key
+            )
+            return f"{self._table_cell(row.get(label_key))}: {rest}"
+        return ", ".join(
+            f"{key} = {self._table_cell(value)}"
+            for key, value in row.items()
+        )
+
+    def _concise_evidence_summary(self, summary: str | None) -> str | None:
+        text = str(summary or "").strip()
+        if not text:
+            return None
+        marker = " for query '"
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip(".")
+        return text
+
+    def _table_cell(self, value) -> str:
+        text = str(value if value is not None else "")
+        return text.replace("|", "\\|").replace("\n", " ")
+
+    def _database_reference_payload(self, evidence) -> dict:
+        summary = self._database_evidence_summary(evidence)
+        return {
+            "summary": evidence.summary,
+            "query_language": evidence.query_language,
+            "query": evidence.query,
+            "row_count": summary.get("row_count"),
+            "sampled_for_prompt": summary.get("sampled_for_prompt"),
+            "artifact_ref": summary.get("artifact_ref"),
+        }
 
     def _query_sections(self, evidence) -> list[AnswerSection]:
         query = str(evidence.query or "").strip()

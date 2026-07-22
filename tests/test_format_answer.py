@@ -292,3 +292,90 @@ def test_format_answer_preserves_direct_answer_when_analysis_exists():
     assert result["summary"] == direct_answer
     assert result["sections"][0]["content"] == direct_answer
     assert any(section["section_type"] == "analysis" for section in result["sections"])
+
+
+def test_format_answer_summarizes_all_database_evidence_artifacts():
+    request_state = build_request_state(
+        ChatRequest(
+            message="请返回总数、最早记录和采样说明，并展示每项查询语句和实际返回行数。",
+            database_context={"database_id": "bitcoin", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+    count = DatabaseEvidence(
+        evidence_id="evi_count",
+        result_type="table",
+        database="bitcoin",
+        query_language="flux",
+        query='from(bucket: "bitcoin") |> range(start: 0) |> count()',
+        summary="Loaded 1 rows.",
+        data={"rows": [{"count": 2680}]},
+        columns=["count"],
+        metadata={"purpose": "返回总记录数"},
+        diagnostics={"row_count_total": 1, "artifact_ref": "evidence:evi_count"},
+    )
+    earliest = DatabaseEvidence(
+        evidence_id="evi_earliest",
+        result_type="table",
+        database="bitcoin",
+        query_language="flux",
+        query='from(bucket: "bitcoin") |> range(start: 0) |> sort(columns: ["_time"]) |> limit(n: 5)',
+        summary="Loaded 5 rows.",
+        data={
+            "rows": [
+                {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
+                {"timestamp": "2023-01-01T00:01:00Z", "value": 2.0},
+            ]
+        },
+        columns=["timestamp", "value"],
+        metadata={"purpose": "返回最早 5 条原始记录"},
+        diagnostics={"row_count_total": 5, "artifact_ref": "evidence:evi_earliest"},
+    )
+    sampled = DatabaseEvidence(
+        evidence_id="evi_sampled",
+        result_type="timeseries",
+        database="bitcoin",
+        query_language="flux",
+        query='from(bucket: "bitcoin") |> range(start: 0)',
+        summary="Loaded 2680 points.",
+        data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        columns=["timestamp", "value"],
+        metadata={"purpose": "返回原始价格序列"},
+        diagnostics={
+            "summary_stats": {"points_count": 2680},
+            "prompt_sampling": {
+                "sampled_for_prompt": True,
+                "full_counts": {"points_count": 2680},
+                "visible_counts": {"points_count": 24},
+                "full_artifact_ref": "evidence:evi_sampled",
+            },
+            "artifact_ref": "evidence:evi_sampled",
+        },
+    )
+    request_state.database_evidence_artifacts = {
+        count.evidence_id: count,
+        earliest.evidence_id: earliest,
+        sampled.evidence_id: sampled,
+    }
+    request_state.latest_database_evidence = sampled
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(
+                summary_goal="汇总查询结果",
+                direct_answer="已完成查询。",
+                section_plan=["summary", "query_results", "conclusion"],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    query_results = next(section for section in result["sections"] if section["section_type"] == "query_results")
+    assert "返回总记录数" in query_results["content"]
+    assert "返回最早 5 条原始记录" in query_results["content"]
+    assert "结果值：count = 2680" in query_results["content"]
+    assert "实际返回行数：5" in query_results["content"]
+    assert "当前展示的是采样预览" in query_results["content"]
+    assert "| timestamp | value |" in query_results["content"]
+    assert '```flux\nfrom(bucket: "bitcoin") |> range(start: 0) |> count()\n```' in query_results["content"]
+    assert [ref["source_id"] for ref in result["references"][:3]] == ["evi_count", "evi_earliest", "evi_sampled"]

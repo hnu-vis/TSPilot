@@ -171,12 +171,13 @@ def normalize_query_result(
             summary=f"Loaded {len(points)} points for query '{query}'.",
             data={
                 "points": points,
+                "rows": rows,
                 "time_field": "timestamp",
                 "value_field": "value",
                 "series_name": query,
                 "labels": {},
             },
-            columns=["timestamp", "value"],
+            columns=columns,
             metadata={"database_type": database_type},
             diagnostics=result_diagnostics,
         )
@@ -188,7 +189,6 @@ def normalize_query_result(
     ]
     if "timestamp" in columns and numeric_columns:
         primary = numeric_columns[0]
-        sampled_rows = []
         primary_points = []
         series = []
         for column in numeric_columns:
@@ -210,8 +210,6 @@ def normalize_query_result(
                     "labels": {},
                 }
             )
-        for row in rows:
-            sampled_rows.append({key: row.get(key) for key in ["timestamp", *numeric_columns] if key in row})
         return DatabaseEvidence(
             evidence_id=f"evi_{database_id}_{query.replace(' ', '_')}",
             result_type="timeseries",
@@ -221,14 +219,14 @@ def normalize_query_result(
             summary=f"Loaded {len(rows)} rows across {len(numeric_columns)} series for query '{query}'.",
             data={
                 "points": primary_points,
-                "rows": sampled_rows,
+                "rows": rows,
                 "series": series,
                 "time_field": "timestamp",
                 "value_field": primary,
                 "series_name": primary,
                 "labels": {},
             },
-            columns=["timestamp", *numeric_columns],
+            columns=columns,
             metadata={"database_type": database_type},
             diagnostics={
                 **result_diagnostics,

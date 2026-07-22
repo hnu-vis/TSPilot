@@ -129,6 +129,7 @@ def ordered_sections(sections_by_type: dict[str, AnswerSection], section_plan: l
     default_order = [
         "summary",
         "query",
+        "query_results",
         "plan",
         "analysis",
         "facts",

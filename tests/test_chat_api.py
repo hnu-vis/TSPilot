@@ -11,7 +11,14 @@ from app.settings import get_settings
 from runtime.react_loop import ReActLoop
 from runtime.request_state import build_conversation_state, build_request_state
 from schemas.api import ChatRequest
-from tests.fakes import CasualLLM, ComplexReActLLM, FakeLLM, RepeatingTodoLLM, TodoScopeLLM
+from tests.fakes import (
+    BitcoinMultiQueryLLM,
+    CasualLLM,
+    ComplexReActLLM,
+    FakeLLM,
+    RepeatingTodoLLM,
+    TodoScopeLLM,
+)
 
 
 def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
@@ -466,3 +473,90 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     ]
     assert failures
     assert "forecast" in failures[-1]["payload"]["summary"].lower()
+
+
+def test_chat_json_path_preserves_multi_query_results_in_final_answer():
+    client = _build_client(BitcoinMultiQueryLLM(), max_iterations=10)
+    response = client.post(
+        "/api/v1/chat",
+        json={
+            "message": _bitcoin_multi_query_message(),
+            "database_context": {
+                "database_id": "influxdb2-bitcoin-sample",
+                "database_type": "influxdb",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["used_tools"] == ["todowrite", "sql_query", "sql_query", "sql_query", "sql_query"]
+
+    query_results = next(
+        section
+        for section in payload["answer"]["sections"]
+        if section["section_type"] == "query_results"
+    )
+    content = query_results["content"]
+    assert content.count("查询目的：") == 4
+    assert content.count("实际返回行数：") == 4
+    assert content.count("```flux") == 4
+    assert "结果值：count = 2680" in content
+    assert "| timestamp | price | code | crypto | description | symbol |" in content
+    assert "| timestamp | price | bound |" in content
+    assert "| 2023-01-04T23:04:00+00:00 | 168249475888010.0 | earliest |" in content
+    assert "| 2023-02-03T22:47:00+00:00 | 23428.6802 | latest |" in content
+
+    observations = [
+        event
+        for event in payload["trace"]
+        if event["event_type"] == "observation"
+        and event["payload"]["tool_name"] == "sql_query"
+    ]
+    assert [
+        event["payload"]["payload"]["diagnostics"]["row_count_total"]
+        for event in observations
+    ] == [1, 5, 5, 2]
+    assert len(payload["answer"]["references"]) == 4
+
+
+def test_chat_sse_path_preserves_multi_query_results_in_final_answer():
+    client = _build_client(BitcoinMultiQueryLLM(), max_iterations=10)
+    with client.stream(
+        "POST",
+        "/api/v1/chat",
+        json={
+            "message": _bitcoin_multi_query_message(),
+            "database_context": {
+                "database_id": "influxdb2-bitcoin-sample",
+                "database_type": "influxdb",
+            },
+            "stream": True,
+        },
+    ) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert body.count("event: tool_call") == 6
+    assert body.count("event: tool_result") == 6
+    assert "event: final_answer" in body
+    assert "event: terminate" in body
+    assert "query_results" in body
+    assert "结果值：count = 2680" in body
+    assert "实际返回行数：5" in body
+    assert "2023-01-04T23:04:00+00:00" in body
+    assert "2023-02-03T22:47:00+00:00" in body
+    assert "```flux" in body
+
+
+def _bitcoin_multi_query_message() -> str:
+    return (
+        "请查询当前数据源中的比特币USD价格数据，并完成以下任务： "
+        "1.返回USD价格数据的总记录数； "
+        "2.返回按时间升序排列的最早5条原始记录； "
+        "3.返回按时间降序排列的最晚5条原始记录； "
+        "4.返回整个数据集的最早时间和最晚时间，精确到秒； "
+        "5.展示每项结果对应的完整Flux查询语句和实际返回行数。"
+    )
