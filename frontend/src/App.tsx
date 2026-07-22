@@ -232,9 +232,10 @@ export default function App() {
     }
 
     if (event.event === 'error') {
+      const message = stringFrom(event.data.message, 'The backend returned an error.');
       updateConversation(conversationId, (conversation) => appendAssistantError(
-        conversation,
-        stringFrom(event.data.message, 'The backend returned an error.'),
+        markLatestRunningStepErrored(conversation, message),
+        message,
       ));
     }
   };
@@ -336,6 +337,27 @@ function numberFrom(value: unknown, fallback: number) {
 function statusFrom(value: unknown, fallback: TraceStep['status']): TraceStep['status'] {
   if (value === 'complete' || value === 'error' || value === 'running') return value;
   return fallback;
+}
+
+function markLatestRunningStepErrored(conversation: Conversation, message: string): Conversation {
+  for (let index = conversation.traceSteps.length - 1; index >= 0; index -= 1) {
+    const step = conversation.traceSteps[index];
+    if (step.status !== 'running') continue;
+    const traceSteps = [...conversation.traceSteps];
+    traceSteps[index] = {
+      ...step,
+      status: 'error',
+      summary: message,
+      error: message,
+      updatedAt: now(),
+    };
+    return {
+      ...conversation,
+      traceSteps,
+      selectedTraceStepId: conversation.selectedTraceStepId || step.id,
+    };
+  }
+  return conversation;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

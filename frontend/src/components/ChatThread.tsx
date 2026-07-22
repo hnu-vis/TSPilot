@@ -140,6 +140,7 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
 }
 
 function latestTodoList(steps: TraceStep[]): TodoItem[] {
+  const hasTerminalError = steps.some((step) => step.status === 'error');
   for (let index = steps.length - 1; index >= 0; index -= 1) {
     const preview = asRecord(steps[index].toolResult?.payload_preview);
     const todos = preview && Array.isArray(preview.todos) ? preview.todos : null;
@@ -149,15 +150,26 @@ function latestTodoList(steps: TraceStep[]): TodoItem[] {
       .map((todo) => ({
         content: typeof todo.content === 'string' ? todo.content : 'Untitled todo',
         task_type: typeof todo.task_type === 'string' ? todo.task_type : undefined,
-        status: typeof todo.status === 'string' ? todo.status : 'pending',
+        status: statusForTodo(todo, hasTerminalError),
         priority: typeof todo.priority === 'number' ? todo.priority : undefined,
       }));
   }
   return [];
 }
 
+function statusForTodo(todo: Record<string, unknown>, hasTerminalError: boolean) {
+  const status = typeof todo.status === 'string' ? todo.status : 'pending';
+  return hasTerminalError && status === 'in_progress' ? 'attention' : status;
+}
+
 function formatTodoStatus(status: string, taskType?: string) {
-  const label = status === 'in_progress' ? 'In progress' : status === 'completed' ? 'Completed' : 'Pending';
+  const label = status === 'in_progress'
+    ? 'In progress'
+    : status === 'completed'
+      ? 'Completed'
+      : status === 'attention'
+        ? 'Needs attention'
+        : 'Pending';
   return taskType ? `${label} · ${taskType}` : label;
 }
 
