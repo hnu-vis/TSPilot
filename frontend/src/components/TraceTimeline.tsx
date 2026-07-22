@@ -14,7 +14,11 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
     <section className="trace-timeline" aria-label="Execution process">
       {steps.map((step) => {
         const displayStep = toDisplayStep(step);
-        const StatusIcon = displayStep.status === 'running' ? Loader2 : displayStep.status === 'error' ? AlertCircle : CheckCircle2;
+        const StatusIcon = displayStep.status === 'running'
+          ? Loader2
+          : displayStep.status === 'error' || displayStep.status === 'attention'
+            ? AlertCircle
+            : CheckCircle2;
         return (
           <button
             key={step.id}

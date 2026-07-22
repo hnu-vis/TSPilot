@@ -112,6 +112,7 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: thought" in body
     assert '"action_input"' in body
     assert '"observation"' in body
+    assert body.index('"placeholder": true') < body.index("event: tool_call")
     assert "event: action" not in body
     assert "event: observation" not in body
 

@@ -716,9 +716,19 @@ input:focus-visible {
   background: oklch(0.985 0.018 25);
 }
 
+.trace-step.attention {
+  border-color: oklch(0.82 0.09 82);
+  background: oklch(0.985 0.02 82);
+}
+
 .trace-step.error.selected {
   border-color: var(--error);
   background: oklch(0.965 0.03 25);
+}
+
+.trace-step.attention.selected {
+  border-color: oklch(0.68 0.12 82);
+  background: oklch(0.965 0.035 82);
 }
 
 .trace-icon {
@@ -734,6 +744,11 @@ input:focus-visible {
 .trace-step.error .trace-icon {
   background: oklch(0.94 0.04 25);
   color: var(--error);
+}
+
+.trace-step.attention .trace-icon {
+  background: oklch(0.945 0.045 82);
+  color: oklch(0.46 0.11 82);
 }
 
 .trace-copy {
@@ -1139,6 +1154,12 @@ input:focus-visible {
   color: var(--error);
 }
 
+.status-line.attention {
+  border-color: oklch(0.84 0.08 82);
+  background: oklch(0.96 0.035 82);
+  color: oklch(0.42 0.11 82);
+}
+
 .source-line {
   display: flex;
   min-width: 0;
@@ -1359,6 +1380,10 @@ details[open] > summary .collapsible-chevron {
 }
 
 .collapsible-card .sql-code-block {
+  margin: 8px 10px 10px;
+}
+
+.collapsible-card .query-markdown-render {
   margin: 8px 10px 10px;
 }
 

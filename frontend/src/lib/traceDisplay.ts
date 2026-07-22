@@ -64,7 +64,7 @@ export type DisplayStep = {
   id: string;
   title: string;
   category: string;
-  status: TraceStep['status'];
+  status: DisplayStatus;
   summary: string;
   metrics: DisplayMetric[];
   artifactRefs: string[];
@@ -75,8 +75,10 @@ export type DisplayStep = {
   debugPayload: Record<string, unknown> | null;
 };
 
+export type DisplayStatus = TraceStep['status'] | 'attention';
+
 export type RunOverview = {
-  status: TraceStep['status'] | 'idle';
+  status: DisplayStatus | 'idle';
   completedSteps: number;
   totalSteps: number;
   metrics: DisplayMetric[];
@@ -124,10 +126,10 @@ function reactDetailFor(
   };
 }
 
-function statusForStep(step: TraceStep, completionDetail: CompletionDetail | null): TraceStep['status'] {
+function statusForStep(step: TraceStep, completionDetail: CompletionDetail | null): DisplayStatus {
   if (step.status === 'running') return 'running';
   if (step.status === 'error') return 'error';
-  if (completionDetail?.completed === false) return 'error';
+  if (completionDetail?.completed === false) return 'attention';
   return step.status;
 }
 

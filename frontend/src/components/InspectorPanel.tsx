@@ -1,4 +1,5 @@
 import { AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
 
@@ -81,7 +82,7 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.sqlDetail ? <QueryRunSummary step={step} /> : <StepStatusCard step={step} />}
 
-      {step.metrics.length > 0 && (
+      {!step.sqlDetail && step.metrics.length > 0 && (
         <section className="metric-grid" aria-label="Step metrics">
           {step.metrics.map((metric) => (
             <div key={metric.label} className="metric-tile">
@@ -98,7 +99,9 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
 
-      {step.completionDetail && <CompletionPreview detail={step.completionDetail} />}
+      {step.completionDetail && shouldShowCompletion(step.completionDetail) && (
+        <CompletionPreview detail={step.completionDetail} />
+      )}
 
       {(step.artifactRefs.length > 0 || step.debugPayload) && (
         <AdvancedDetails step={step} />
@@ -117,7 +120,7 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
       </div>
       <div className="react-grid">
         <ReactBlock label="Thought" value={detail.thought || 'Waiting for model reasoning.'} />
-        <ReactBlock label="Action" value={detail.action || step.tool || step.category} />
+        <ReactBlock label="Action" value={detail.action || step.category} />
         <ReactBlock label="Action Input" value={detail.actionInput} />
         <ReactBlock label="Observation" value={detail.observation} />
       </div>
@@ -158,7 +161,7 @@ function QueryRunSummary({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   if (!detail) return null;
   const resultSize = [
     detail.rowCount !== null ? `${detail.rowCount.toLocaleString()} rows` : null,
-    detail.pointCount !== null ? `${detail.pointCount.toLocaleString()} points` : null,
+    shouldShowPointCount(detail) ? `${detail.pointCount?.toLocaleString()} points` : null,
   ].filter(Boolean).join(' / ') || 'No visible rows';
   const dataShape = detail.columns.length > 0
     ? `${detail.columns.length} columns`
@@ -223,13 +226,15 @@ function CompletionPreview({ detail }: { detail: NonNullable<ReturnType<typeof t
 }
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+  const queryLanguage = detail.queryLanguage || 'query';
+  const queryMarkdown = fencedQueryMarkdown(detail.query || '', detail.queryLanguage);
   return (
     <details className="inspector-card sql-query-preview collapsible-card" open>
       <summary className="collapsible-summary">
         <span>
           <ChevronDown size={15} className="collapsible-chevron" />
           <Code2 size={16} />
-          <strong>Generated SQL</strong>
+          <strong>Generated query</strong>
         </span>
         {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
       </summary>
@@ -238,14 +243,16 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
           type="button"
           className="icon-text-button"
           onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
-          aria-label="Copy generated SQL"
-          title="Copy SQL"
+          aria-label="Copy generated query"
+          title="Copy query"
         >
           <Clipboard size={13} />
-          <span>Copy SQL</span>
+          <span>Copy {queryLanguage}</span>
         </button>
       </div>
-      <pre className="sql-code-block visible-query">{detail.query}</pre>
+      <div className="query-markdown-render">
+        <MarkdownContent content={queryMarkdown} />
+      </div>
     </details>
   );
 }
@@ -426,15 +433,17 @@ function AdvancedDetails({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   );
 }
 
-function StatusIcon({ status }: { status: TraceStep['status'] }) {
+function StatusIcon({ status }: { status: ReturnType<typeof toDisplayStep>['status'] }) {
   if (status === 'error') return <AlertCircle size={16} />;
+  if (status === 'attention') return <AlertCircle size={16} />;
   return <CheckCircle2 size={16} />;
 }
 
 function statusLabel(status: string) {
   if (status === 'running') return 'Running';
   if (status === 'complete') return 'Complete';
-  if (status === 'error') return 'Needs attention';
+  if (status === 'attention') return 'Needs more evidence';
+  if (status === 'error') return 'Error';
   return 'Not started';
 }
 
@@ -457,9 +466,23 @@ function inferColumns(rows: Record<string, unknown>[]) {
 function formatCounts(detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']>) {
   const parts = [
     detail.rowCount !== null ? `${detail.rowCount.toLocaleString()} rows` : null,
-    detail.pointCount !== null ? `${detail.pointCount.toLocaleString()} points` : null,
+    shouldShowPointCount(detail) ? `${detail.pointCount?.toLocaleString()} points` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(' / ') : `${detail.sampleRows.length || detail.samplePoints.length} samples`;
+}
+
+function shouldShowPointCount(detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']>) {
+  if (detail.pointCount === null) return false;
+  if (detail.pointCount === 0 && (detail.rowCount || detail.sampleRows.length > 0)) return false;
+  return true;
+}
+
+function shouldShowCompletion(detail: ReturnType<typeof toDisplayStep>['completionDetail']) {
+  if (!detail) return false;
+  if (detail.completed === false) return true;
+  if (detail.missingItems.length > 0) return true;
+  if (detail.nextActionHint) return true;
+  return false;
 }
 
 function formatCell(value: unknown) {
@@ -467,4 +490,18 @@ function formatCell(value: unknown) {
   if (typeof value === 'number') return Number.isFinite(value) ? value.toLocaleString() : String(value);
   if (typeof value === 'string') return value;
   return JSON.stringify(value);
+}
+
+function fencedQueryMarkdown(query: string, queryLanguage: string | null) {
+  const language = markdownLanguage(queryLanguage);
+  return `\`\`\`${language}\n${query.trim()}\n\`\`\``;
+}
+
+function markdownLanguage(queryLanguage: string | null) {
+  const normalized = (queryLanguage || '').trim().toLowerCase();
+  if (!normalized) return '';
+  if (['postgres', 'postgresql', 'timescaledb', 'questdb', 'clickhouse'].includes(normalized)) return 'sql';
+  if (normalized === 'influxdb') return 'flux';
+  if (normalized === 'prometheus') return 'promql';
+  return normalized;
 }

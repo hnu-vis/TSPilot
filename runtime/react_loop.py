@@ -59,6 +59,20 @@ class ReActLoop:
             )
             public_trace.append(conversation_event)
             yield conversation_event
+            placeholder_event = append_trace(
+                request_state,
+                "agent_step",
+                {
+                    "agent": "data_agent",
+                    "status": "running",
+                    "phase": "reasoning",
+                    "message": "正在判断下一步。",
+                    "iteration": 1,
+                    "placeholder": True,
+                },
+            )
+            public_trace.append(placeholder_event)
+            yield placeholder_event
             async for event in self._iterate(request_state, conversation_state):
                 internal_trace.append(event)
                 async for mapped in self._map_trace_to_sse(request_state, event):

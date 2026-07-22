@@ -52,7 +52,7 @@ export function FinalAnswer({ answer }: { answer: FinalAnswerType }) {
   );
 }
 
-function ReferenceStrip({ references }: { references: FinalAnswerType['references'] }) {
+function ReferenceStrip({ references }: { references: NonNullable<FinalAnswerType['references']> }) {
   return (
     <details className="answer-reference-strip" aria-label="Answer references">
       <summary>
@@ -78,7 +78,7 @@ function ContentBlock({ content }: { content: string }) {
   return <MarkdownContent content={content} />;
 }
 
-function MarkdownContent({
+export function MarkdownContent({
   content,
   variant = 'section',
 }: {
