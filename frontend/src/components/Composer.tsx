@@ -62,7 +62,7 @@ export function Composer({
         onKeyDown={handleKeyDown}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        placeholder="Ask TSPilot to query, analyze, forecast, or explain your time-series data..."
+        placeholder="Ask TSPilot to retrieve, analyze, forecast, or explain your time-series data..."
         disabled={disabled}
         rows={1}
       />

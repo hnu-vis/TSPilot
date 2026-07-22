@@ -176,6 +176,8 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
 }
 
 function formatLabel(value: string) {
+  if (value === 'query') return 'Database evidence';
+  if (value === 'sql_query' || value === 'query_database') return 'Database evidence';
   return value
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
