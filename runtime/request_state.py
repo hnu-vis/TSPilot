@@ -353,19 +353,30 @@ def apply_observation(
     observation: ToolObservation,
     full_payload: dict,
     tool_spec: "ToolSpec",
-) -> None:
-    request_state.observations.append(observation)
+    *,
+    thought: str | None = None,
+    action_reason: str | None = None,
+) -> ToolObservation:
     if not observation.success:
-        return
+        safe_observation = _build_prompt_safe_failure_observation(observation)
+        request_state.observations.append(safe_observation)
+        return safe_observation
 
     if tool_spec.result_target == "todo":
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
+    elif tool_spec.result_target == "presentation":
+        _apply_presentation_payload(request_state, full_payload)
+        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
+
+    safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
+    request_state.observations.append(safe_observation)
+    return safe_observation
 
 
 async def apply_observation_async(
@@ -373,22 +384,30 @@ async def apply_observation_async(
     observation: ToolObservation,
     full_payload: dict,
     tool_spec: "ToolSpec",
-) -> None:
-    request_state.observations.append(observation)
+    *,
+    thought: str | None = None,
+    action_reason: str | None = None,
+) -> ToolObservation:
     if not observation.success:
-        return
+        safe_observation = _build_prompt_safe_failure_observation(observation)
+        request_state.observations.append(safe_observation)
+        return safe_observation
 
     if tool_spec.result_target == "todo":
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload)
+        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
+
+    safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
+    request_state.observations.append(safe_observation)
+    return safe_observation
 
 
 def enrich_observation_payload(
@@ -426,6 +445,68 @@ def enrich_observation_payload(
     )
 
 
+def _build_prompt_safe_failure_observation(observation: ToolObservation) -> ToolObservation:
+    return observation.model_copy(
+        update={
+            "summary": _truncate_text(observation.summary, 1600),
+            "error": _truncate_text(observation.error, 1600),
+            "payload": _bounded_value(observation.payload, max_string_chars=1600, max_list_items=8, max_dict_items=12),
+            "payload_truncated": observation.payload_truncated or _is_large_value(observation.payload),
+        }
+    )
+
+
+def _truncate_text(value: str | None, max_chars: int) -> str | None:
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+
+
+def _bounded_value(
+    value,
+    *,
+    max_string_chars: int = 800,
+    max_list_items: int = 8,
+    max_dict_items: int = 12,
+):
+    if isinstance(value, str):
+        return _truncate_text(value, max_string_chars)
+    if isinstance(value, list):
+        items = [
+            _bounded_value(
+                item,
+                max_string_chars=max_string_chars,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+            )
+            for item in value[:max_list_items]
+        ]
+        if len(value) > max_list_items:
+            items.append({"truncated_items": len(value) - max_list_items})
+        return items
+    if isinstance(value, dict):
+        bounded = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_dict_items:
+                bounded["truncated_keys"] = len(value) - max_dict_items
+                break
+            bounded[key] = _bounded_value(
+                item,
+                max_string_chars=max_string_chars,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+            )
+        return bounded
+    return value
+
+
+def _is_large_value(value) -> bool:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str)) > 2000
+    except Exception:
+        return len(str(value)) > 2000
+
+
 def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) -> None:
     request_state.todo_list = [
         normalize_todo_for_completion(todo)
@@ -443,7 +524,14 @@ def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) ->
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
-def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str, full_payload: dict) -> None:
+def _advance_plan_after_success(
+    request_state: RequestStateModel,
+    tool_name: str,
+    full_payload: dict,
+    *,
+    thought: str | None = None,
+    action_reason: str | None = None,
+) -> None:
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
@@ -457,7 +545,13 @@ def _advance_plan_after_success(request_state: RequestStateModel, tool_name: str
         current_todo["task_type"] = "query"
     current_todo = normalize_todo_for_completion(current_todo)
     request_state.todo_list[current_index] = current_todo
-    evaluation = evaluate_step_completion(request_state, tool_name=tool_name, full_payload=full_payload)
+    evaluation = evaluate_step_completion(
+        request_state,
+        tool_name=tool_name,
+        full_payload=full_payload,
+        thought=thought,
+        action_reason=action_reason,
+    )
     request_state.completion_state["latest_step"] = {
         **evaluation.model_dump(),
         "tool_name": tool_name,
@@ -488,6 +582,9 @@ async def _advance_plan_after_success_async(
     request_state: RequestStateModel,
     tool_name: str,
     full_payload: dict,
+    *,
+    thought: str | None = None,
+    action_reason: str | None = None,
 ) -> None:
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
@@ -507,6 +604,8 @@ async def _advance_plan_after_success_async(
         request_state,
         tool_name=tool_name,
         full_payload=full_payload,
+        thought=thought,
+        action_reason=action_reason,
     )
 
     request_state.completion_state["latest_step"] = {

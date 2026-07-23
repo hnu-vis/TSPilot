@@ -108,6 +108,12 @@ class ToolExecutor:
             if isinstance(data.get("rows"), list):
                 limit = int(request_state.context_budget.get("max_visible_rows", 60))
                 data["rows"] = data["rows"][:limit]
+            if isinstance(data.get("series"), list):
+                data["series"] = [
+                    self._summarize_series_for_observation(series)
+                    for series in data["series"][:6]
+                    if isinstance(series, dict)
+                ]
             visible["data"] = data
         if isinstance(visible.get("visualizations"), list):
             summarized_visualizations = []
@@ -142,3 +148,27 @@ class ToolExecutor:
                 if key in {"artifact_kind", "artifact_ref", "snapshot_ref", "threshold", "series_name", "query_trace", "runtime_ms", "sandbox"}
             }
         return visible, True
+
+    def _summarize_series_for_observation(self, series: dict) -> dict:
+        item = {
+            key: value
+            for key, value in series.items()
+            if key not in {"points", "rows"}
+        }
+        points = series.get("points")
+        if isinstance(points, list):
+            item["points_count"] = len(points)
+            item["points"] = _sample_edges(points, limit=12)
+        rows = series.get("rows")
+        if isinstance(rows, list):
+            item["rows_count"] = len(rows)
+            item["rows"] = _sample_edges(rows, limit=12)
+        return item
+
+
+def _sample_edges(items: list, limit: int) -> list:
+    if len(items) <= limit:
+        return items
+    head = max(1, limit // 2)
+    tail = max(1, limit - head)
+    return [*items[:head], *items[-tail:]]
