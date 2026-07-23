@@ -21,7 +21,7 @@ class DataAgentPromptBuilder:
             "{\"thought\": str, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
             "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
             "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
-            "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate.\n"
+            "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
             "For tasks with an explicit numbered or bulleted deliverable list, verify each user-visible deliverable against observations before terminate. "
@@ -31,7 +31,7 @@ class DataAgentPromptBuilder:
             "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
             "Use diagnostics.prompt_sampling, summary_stats, data_completeness, artifact_ref, and query text to decide whether the visible preview is complete. "
             "Use diagnostics.task_coverage from sql_query observations to decide whether the current query already covers the user request; if missing_or_uncertain is non-empty, prefer another focused sql_query before terminate. "
-            "When a task needs facts not present in the prompt preview, call sql_query or insight over the full artifact instead of guessing from the preview.\n"
+            "When a task needs facts not present in the prompt preview, call sql_query or code_interpreter over the full artifact instead of guessing from the preview.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
@@ -44,7 +44,7 @@ class DataAgentPromptBuilder:
             "Use automatic message-based input for normal database requests. Use explicit query/query_language only when repairing a failed generated query, or when the user supplied an exact query. "
             "It is the primary database-analysis action for raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
             "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
-            "- insight: execute generated Python analysis code over existing full evidence artifacts. Use it only when SQL cannot express the needed computation well, or when structured fact extraction/visualization is needed after enough database queries. It returns structured analysis results, not raw rows.\n"
+            "- code_interpreter: execute Python code in a subprocess over existing full evidence artifacts. Use it when the user explicitly asks for code interpreter, or when analysis needs fuller Python features such as imports, next/iterators, correlations, normalization, windowed calculations, custom loops, or multi-step dataframe-like computation that SQL cannot express cleanly.\n"
             "- anomaly: detect anomalies from existing time-series evidence only.\n"
             "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
@@ -59,7 +59,7 @@ class DataAgentPromptBuilder:
             "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
             "\"requested_fact_types\": list[str], \"focus\": str|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
-            "Each todo item should use {\"content\": str, \"task_type\": \"query|insight|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
+            "Each todo item should use {\"content\": str, \"task_type\": \"query|code_interpreter|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction. For database plans, split by requested result: count, earliest/latest rows, grouped results, time bounds, comparisons, and final answer. Do not split by internal preparation stages.\n"
             "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for database queries.\n"
@@ -67,8 +67,8 @@ class DataAgentPromptBuilder:
             "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
             "If diagnostics.task_coverage.requires_followup is true or missing_or_uncertain lists requested facts, continue with a focused sql_query for those facts instead of answering. "
             "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
-            "Use insight after the SQL evidence is sufficiently grounded, or when the computation requires Python over full artifacts. Do not calculate final facts from prompt previews alone.\n"
-            "For insight, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code_type\": \"python_rows_v1\", \"analysis_code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The generated code may use rows, points, columns, metadata, diagnostics, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}.\n"
+            "Use code_interpreter after the SQL evidence is sufficiently grounded for Python analysis or when the user explicitly asks for code interpreter. Do not calculate final facts from prompt previews alone.\n"
+            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough.\n"
             "For terminate, use: {\"result\": str|null, \"summary_goal\": str|null, \"direct_answer\": str|null, "
             "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
             "Do not output markdown fences."
@@ -173,9 +173,9 @@ class DataAgentPromptBuilder:
                 "input": "prefer message, database_context, time_range, constraints for automatic database querying; use query/query_language only for repair or for a user-supplied exact query",
             },
             {
-                "action": "insight",
-                "use_when": "Evidence is available and the user needs grounded facts such as trend, seasonality, extrema, distribution, or outliers.",
-                "input": "database_evidence, analysis_goal, code_type, analysis_code, expected_result_schema, constraints",
+                "action": "code_interpreter",
+                "use_when": "Evidence is available and the user explicitly asks for code interpreter, or the analysis needs fuller Python features such as imports, iterators, correlation, normalization, windows, or custom multi-step computation.",
+                "input": "database_evidence, analysis_goal, code, expected_result_schema, constraints",
             },
             {
                 "action": "anomaly",
@@ -271,7 +271,7 @@ class DataAgentPromptBuilder:
             next_action_guidance.extend(
                 [
                     "sql_query: continue with explicit read-only queries for additional aggregation, filtering, bucketing, or period validation.",
-                    "insight: use Python over full evidence only when SQL is insufficient or structured facts/visualizations are now needed.",
+                    "code_interpreter: use Python over full evidence only when SQL is insufficient or structured analysis output is now needed.",
                     "terminate: use only when enough database-backed evidence or derived outputs answer the user request.",
                 ]
             )
@@ -285,7 +285,7 @@ class DataAgentPromptBuilder:
             "active_progress_hint": active_progress,
             "recommended_next_action_types": next_action_guidance,
             "sql_loop_rule": (
-                "A prior sql_query does not force insight. If the last SQL sample/counts reveal a missing filter, outlier, "
+                "A prior sql_query does not force code_interpreter. If the last SQL sample/counts reveal a missing filter, outlier, "
                 "or another database-checkable gap, call sql_query again with a focused read-only query."
             ),
             "context_budget_rule": (
@@ -303,7 +303,8 @@ class DataAgentPromptBuilder:
         task_type = str(current_todo.get("task_type") or "").strip().lower()
         suggested_action = {
             "query": "sql_query",
-            "insight": "insight",
+            "insight": "code_interpreter",
+            "code_interpreter": "code_interpreter",
             "anomaly": "anomaly",
             "forecast": "forecast",
             "answer": "terminate",
@@ -393,10 +394,8 @@ class DataAgentPromptBuilder:
         if isinstance(data.get("series"), list):
             series_preview = []
             for item in data["series"][:3]:
-                item_copy = dict(item)
-                if isinstance(item_copy.get("points"), list):
-                    item_copy["points"] = item_copy["points"][:4]
-                series_preview.append(item_copy)
+                if isinstance(item, dict):
+                    series_preview.append(self._summarize_series_preview(item, point_limit=4))
             data["series"] = series_preview
         payload["data"] = data
         payload["query"] = self._truncate_text(payload.get("query"), 4000)
@@ -448,7 +447,11 @@ class DataAgentPromptBuilder:
             if isinstance(data.get("points"), list):
                 preview["points"] = data["points"][:4]
             if isinstance(data.get("series"), list):
-                preview["series"] = data["series"][:2]
+                preview["series"] = [
+                    self._summarize_series_preview(series, point_limit=4)
+                    for series in data["series"][:2]
+                    if isinstance(series, dict)
+                ]
             history.append(
                 {
                     "evidence_id": item.get("evidence_id"),
@@ -571,7 +574,11 @@ class DataAgentPromptBuilder:
             if isinstance(data.get("points"), list):
                 preview["points"] = data["points"][:4]
             if isinstance(data.get("series"), list):
-                preview["series"] = data["series"][:2]
+                preview["series"] = [
+                    self._summarize_series_preview(series, point_limit=4)
+                    for series in data["series"][:2]
+                    if isinstance(series, dict)
+                ]
             if preview:
                 summarized["data_preview"] = preview
         if isinstance(payload.get("result"), dict):
@@ -610,6 +617,22 @@ class DataAgentPromptBuilder:
         if isinstance(payload.get("valid_actions"), list):
             summarized["valid_actions"] = payload["valid_actions"]
         return summarized
+
+    def _summarize_series_preview(self, series: dict, *, point_limit: int) -> dict:
+        item = {
+            key: self._bounded_value(value, max_string_chars=400, max_list_items=6, max_dict_items=8)
+            for key, value in series.items()
+            if key not in {"points", "rows"}
+        }
+        points = series.get("points")
+        if isinstance(points, list):
+            item["points_count"] = series.get("points_count") or len(points)
+            item["points"] = self._sample_edges(points, limit=point_limit)
+        rows = series.get("rows")
+        if isinstance(rows, list):
+            item["rows_count"] = series.get("rows_count") or len(rows)
+            item["rows"] = self._sample_edges(rows, limit=point_limit)
+        return item
 
     def _prompt_sampling(self, *, full_counts: dict, data: dict, fallback: dict | None = None) -> dict:
         visible_counts = {
@@ -677,6 +700,13 @@ class DataAgentPromptBuilder:
                 )
             return bounded
         return value
+
+    def _sample_edges(self, items: list, *, limit: int) -> list:
+        if len(items) <= limit:
+            return items
+        head = max(1, limit // 2)
+        tail = max(1, limit - head)
+        return [*items[:head], *items[-tail:]]
 
     def _summarize_insight(self, insight) -> dict:
         payload = insight.model_dump(mode="json")

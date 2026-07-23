@@ -9,6 +9,7 @@ VALID_ACTIONS = {
     "todowrite",
     "sql_query",
     "insight",
+    "code_interpreter",
     "forecast",
     "anomaly",
     "rag",

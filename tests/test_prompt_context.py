@@ -19,7 +19,7 @@ def test_sql_query_prompt_keeps_schema_linking_inside_tool():
     builder = DataAgentPromptBuilder()
     system_prompt = builder.build_system_prompt()
 
-    assert "Allowed actions: todowrite, sql_query, insight, forecast, anomaly, rag, skill, terminate." in system_prompt
+    assert "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate." in system_prompt
     assert "For terminate" in system_prompt
     assert "For format_answer" not in system_prompt
     assert "Use automatic message-based input for normal database requests" in system_prompt
@@ -154,7 +154,9 @@ def test_prompt_builder_summarizes_heavy_context():
     sql_action = next(action for action in context["available_actions"] if action["action"] == "sql_query")
 
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
+    assert any(action["action"] == "code_interpreter" for action in context["available_actions"])
     assert any(action["action"] == "terminate" for action in context["available_actions"])
+    assert not any(action["action"] == "insight" for action in context["available_actions"])
     assert not any(action["action"] == "format_answer" for action in context["available_actions"])
     assert "prefer message" in sql_action["input"]
     assert "schema-linked generation" not in sql_action["input"]
@@ -163,7 +165,7 @@ def test_prompt_builder_summarizes_heavy_context():
     assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
     guidance = " ".join(context["state"]["decision_frame"]["recommended_next_action_types"])
     assert "continue with explicit read-only queries" in guidance
-    assert "A prior sql_query does not force insight" in context["state"]["decision_frame"]["sql_loop_rule"]
+    assert "A prior sql_query does not force code_interpreter" in context["state"]["decision_frame"]["sql_loop_rule"]
     assert len(context["evidence"]["latest"]["data"]["points"]) <= 8
     sampling = context["evidence"]["latest"]["diagnostics"]["prompt_sampling"]
     assert sampling["sampled_for_prompt"] is True

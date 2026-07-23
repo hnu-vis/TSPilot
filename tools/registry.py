@@ -13,6 +13,7 @@ from schemas.output import FinalAnswer
 from schemas.timeseries import AnomalyResult, ForecastResult
 from tools.anomaly import AnomalyInput, AnomalyTool
 from tools.base import BaseTool
+from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 from tools.forecast import ForecastInput, ForecastTool
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 from tools.insight import InsightInput, InsightTool
@@ -88,10 +89,22 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
         ),
         ToolSpec(
             tool_name="insight",
-            description="Execute generated Python analysis code over full evidence artifacts.",
+            description="Extract structured insights from existing evidence with lightweight generated Python analysis.",
             input_model=InsightInput,
             output_model=AnalysisResult,
             tool=InsightTool(),
+            prompt_visible=False,
+            runtime_access="request_state_read",
+            result_target="analysis",
+            produces_terminal_payload=False,
+            supports_streaming=False,
+        ),
+        ToolSpec(
+            tool_name="code_interpreter",
+            description="Execute Python code in a subprocess code interpreter over full evidence artifacts for complex analysis.",
+            input_model=CodeInterpreterInput,
+            output_model=AnalysisResult,
+            tool=CodeInterpreterTool(),
             prompt_visible=True,
             runtime_access="request_state_read",
             result_target="analysis",

@@ -156,8 +156,8 @@ class TodoWriteTool(BaseTool):
             return "query"
         if any(token in normalized for token in ["查询", "查库", "取数", "query", "retrieve evidence"]):
             return "query"
-        if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "insight", "trend"]):
-            return "insight"
+        if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "insight", "trend", "code interpreter"]):
+            return "code_interpreter"
         if any(token in normalized for token in ["异常", "anomaly", "outlier"]):
             return "anomaly"
         if any(token in normalized for token in ["预测", "forecast", "predict"]):

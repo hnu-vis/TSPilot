@@ -89,6 +89,87 @@ class FakeLLM:
         )
 
 
+class SandboxInsightLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        user_prompt = messages[-1][1]
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
+        context = _context_from_prompt(user_prompt)
+
+        if context.get("latest_database_evidence") is None:
+            return _turn(
+                "I need grounded database rows before running the code interpreter.",
+                "sql_query",
+                {
+                    "message": context["message"],
+                    "database_context": context["database_context"],
+                    "time_range": context.get("time_range"),
+                    "constraints": context.get("constraints", {}),
+                },
+            )
+
+        latest_evidence = context.get("latest_database_evidence") or {}
+        if _analysis_count(context) == 0:
+            return _turn(
+                "The SQL evidence is available, and this example needs the subprocess code interpreter.",
+                "code_interpreter",
+                {
+                    "database_evidence": latest_evidence,
+                    "analysis_goal": "compute pairwise deltas with the code interpreter",
+                    "code": (
+                        "import itertools\n"
+                        "values = []\n"
+                        "for row in rows:\n"
+                        "    for key, raw_value in row.items():\n"
+                        "        if key in {'timestamp', 'time', '_time'}:\n"
+                        "            continue\n"
+                        "        try:\n"
+                        "            values.append(float(raw_value))\n"
+                        "            break\n"
+                        "        except (TypeError, ValueError):\n"
+                        "            continue\n"
+                        "deltas = [right - left for left, right in itertools.pairwise(values)]\n"
+                        "result = {\n"
+                        "    'summary': f'Code interpreter computed {len(deltas)} pairwise deltas from {len(values)} values.',\n"
+                        "    'metrics': {\n"
+                        "        'value_count': len(values),\n"
+                        "        'delta_count': len(deltas),\n"
+                        "        'max_delta': max(deltas) if deltas else 0,\n"
+                        "        'min_delta': min(deltas) if deltas else 0,\n"
+                        "    },\n"
+                        "    'details': {'first_three_deltas': deltas[:3]},\n"
+                        "}\n"
+                    ),
+                    "expected_result_schema": {
+                        "summary": "str",
+                        "metrics": {"value_count": "int", "delta_count": "int"},
+                        "details": "dict",
+                    },
+                    "constraints": {"timeout_seconds": 5},
+                },
+            )
+
+        return _turn(
+            "The code interpreter result is available, so I can assemble the final answer.",
+            "terminate",
+            {
+                "summary_goal": context["message"],
+                "include_analysis_ids": _analysis_ids(context),
+                "include_fact_ids": [],
+                "include_visualization_ids": [],
+                "section_plan": ["summary", "analysis"],
+            },
+        )
+
+
 class CasualLLM:
     def __init__(self):
         self.calls = 0
@@ -506,6 +587,134 @@ class BitcoinMultiQueryLLM:
         )
 
 
+class VerifierRepairLLM:
+    def __init__(self):
+        self.calls = 0
+        self.agent_turn = 0
+        self.verifier_calls = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        user_prompt = messages[-1][1]
+        if "TSPilot Goal Verification JSON:" in user_prompt:
+            self.verifier_calls += 1
+            if self.verifier_calls == 1:
+                return _FakeResponse(
+                    json.dumps(
+                        {
+                            "can_answer": False,
+                            "reason": "The candidate only reports total count and misses the requested earliest rows.",
+                            "missing_items": ["earliest 5 raw records"],
+                            "unsupported_claims": [],
+                            "answerable_from": ["evidence:evi_influxdb2-bitcoin-sample_table"],
+                            "next_action_hint": "Run a focused sql_query for the earliest 5 Bitcoin USD records.",
+                            "confidence": 0.92,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            return _FakeResponse(
+                json.dumps(
+                    {
+                        "can_answer": True,
+                        "reason": "The candidate includes both requested query outputs.",
+                        "missing_items": [],
+                        "unsupported_claims": [],
+                        "answerable_from": ["evidence:latest"],
+                        "next_action_hint": None,
+                        "confidence": 0.9,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        runtime_response = _runtime_evaluation_response(user_prompt)
+        if runtime_response is not None:
+            return runtime_response
+        if "LLM SQL Query Generation JSON:" in user_prompt:
+            raise AssertionError("VerifierRepairLLM uses explicit Flux queries.")
+
+        self.agent_turn += 1
+        database_context = {
+            "database_id": "influxdb2-bitcoin-sample",
+            "database_type": "influxdb",
+        }
+        base_flux = (
+            'from(bucket: "bitcoin")\n'
+            "  |> range(start: 0)\n"
+            '  |> filter(fn: (r) => r._measurement == "coindesk")\n'
+            '  |> filter(fn: (r) => r.code == "USD")\n'
+            '  |> filter(fn: (r) => r.crypto == "bitcoin")\n'
+            '  |> filter(fn: (r) => r._field == "price")'
+        )
+
+        if self.agent_turn == 1:
+            return _turn(
+                "I should plan the two deliverables before querying.",
+                "todowrite",
+                {
+                    "message": "查询比特币 USD 的总数和最早5条",
+                    "current_intent": "database_query",
+                    "requested_fact_types": ["count", "earliest_rows"],
+                    "focus": "两个分项都必须有数据库证据",
+                    "todos": [
+                        {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+                        {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
+                        {"content": "汇总最终答案", "task_type": "answer", "status": "pending", "priority": 3},
+                    ],
+                },
+            )
+        if self.agent_turn == 2:
+            return _turn(
+                "I will query the total count first.",
+                "sql_query",
+                {
+                    "database_context": database_context,
+                    "query_language": "flux",
+                    "purpose": "返回USD价格数据的总记录数",
+                    "query": base_flux
+                    + '\n  |> count()\n  |> keep(columns: ["_value"])\n  |> rename(columns: {_value: "count"})',
+                },
+            )
+        if self.agent_turn == 3:
+            return _turn(
+                "I have the count and will prematurely try to answer.",
+                "terminate",
+                {
+                    "summary_goal": "汇总比特币 USD 总数和最早5条",
+                    "direct_answer": "已完成总记录数查询，但尚未列出最早5条。",
+                    "include_fact_ids": [],
+                    "include_visualization_ids": [],
+                    "section_plan": ["summary", "query_results", "conclusion"],
+                },
+            )
+        if self.agent_turn == 4:
+            return _turn(
+                "Verifier reported missing earliest rows, so I need a focused query.",
+                "sql_query",
+                {
+                    "database_context": database_context,
+                    "query_language": "flux",
+                    "purpose": "返回按时间升序排列的最早5条原始记录",
+                    "query": base_flux
+                    + '\n  |> sort(columns: ["_time"], desc: false)\n  |> limit(n: 5)\n'
+                    + '  |> keep(columns: ["_time", "_value", "code", "crypto", "description", "symbol"])\n'
+                    + '  |> rename(columns: {_value: "price"})',
+                },
+            )
+        return _turn(
+            "Now both requested query outputs are present.",
+            "terminate",
+            {
+                "summary_goal": "汇总比特币 USD 总数和最早5条",
+                "direct_answer": "已完成总记录数和最早5条两个分项查询，结果均来自数据库 evidence。",
+                "include_fact_ids": [],
+                "include_visualization_ids": [],
+                "section_plan": ["summary", "query_results", "conclusion"],
+            },
+        )
+
+
 class _FakeResponse:
     def __init__(self, content: str):
         self.content = content
@@ -613,6 +822,21 @@ def _runtime_evaluation_response(user_prompt: str) -> _FakeResponse | None:
                     "can_answer": True,
                     "reason": "available outputs are sufficient for this test scenario",
                     "missing_items": [],
+                    "answerable_from": ["evidence:latest"],
+                    "next_action_hint": None,
+                    "confidence": 0.9,
+                },
+                ensure_ascii=False,
+            )
+        )
+    if "TSPilot Goal Verification JSON:" in user_prompt:
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "can_answer": True,
+                    "reason": "candidate final answer satisfies this test scenario",
+                    "missing_items": [],
+                    "unsupported_claims": [],
                     "answerable_from": ["evidence:latest"],
                     "next_action_hint": None,
                     "confidence": 0.9,
