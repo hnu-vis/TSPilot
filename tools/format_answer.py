@@ -77,6 +77,7 @@ class FormatAnswerTool(BaseTool):
                 request_state,
                 facts,
                 analysis_summary or fallback_summary,
+                prefer_fallback=bool(analysis_summary),
             )
         else:
             summary = build_summary(

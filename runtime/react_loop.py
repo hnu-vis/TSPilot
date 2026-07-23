@@ -7,22 +7,30 @@ from app.settings import Settings
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
-from runtime.request_state import apply_observation_async, append_trace, build_final_response, enrich_observation_payload
+from runtime.request_state import apply_observation_async, append_trace, build_final_response
 from runtime.trace import TraceEventModel
 from schemas.api import ChatResponse
+from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
 from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
 from schemas.tool import ToolObservation
 
 
+def _truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+
+
 class ReActLoop:
     """Execute the strict outer loop."""
 
-    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings):
+    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings, goal_verifier=None):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
+        self._goal_verifier = goal_verifier
         self._trace_logger = ConversationTraceLogger(settings)
 
     async def run(
@@ -161,14 +169,15 @@ class ReActLoop:
                     action_reason=turn.action_reason or turn.thought,
                 )
             except Exception as exc:
-                message = f"Tool '{turn.action}' failed: {exc}"
-                request_state.errors.append({"stage": turn.action, "message": str(exc)})
+                error_detail = _truncate_text(str(exc), 2000)
+                message = f"Tool '{turn.action}' failed: {error_detail}"
+                request_state.errors.append({"stage": turn.action, "message": error_detail})
                 observation = ToolObservation(
                     tool_name=turn.action,
                     success=False,
                     summary=message,
                     payload={
-                        "error": str(exc),
+                        "error": error_detail,
                         "recovery_hint": (
                             "Use the current context and this failure observation to choose the next best action. "
                             "You may correct the tool input, call a prerequisite tool, update todos, or answer with caveats."
@@ -186,17 +195,28 @@ class ReActLoop:
                 )
                 sync_from_request(request_state, conversation_state)
                 continue
-            await apply_observation_async(
+            if execution_result.tool_spec.produces_terminal_payload:
+                verifier_observation = await self._verify_terminal_candidate(
+                    request_state,
+                    execution_result.full_payload,
+                )
+                if verifier_observation is not None:
+                    request_state.observations.append(verifier_observation)
+                    yield append_trace(
+                        request_state,
+                        "observation",
+                        verifier_observation.model_dump(mode="json"),
+                    )
+                    sync_from_request(request_state, conversation_state)
+                    continue
+
+            execution_result.observation = await apply_observation_async(
                 request_state,
                 execution_result.observation,
                 execution_result.full_payload,
                 execution_result.tool_spec,
-            )
-            execution_result.observation = enrich_observation_payload(
-                request_state,
-                execution_result.observation,
-                execution_result.full_payload,
-                execution_result.tool_spec,
+                thought=turn.thought,
+                action_reason=turn.action_reason,
             )
             yield append_trace(
                 request_state,
@@ -224,6 +244,78 @@ class ReActLoop:
             request_state,
             "error",
             {"message": "Maximum iterations reached before a terminal payload was produced."},
+        )
+
+    async def _verify_terminal_candidate(
+        self,
+        request_state: RequestStateModel,
+        full_payload: dict,
+    ) -> ToolObservation | None:
+        if self._goal_verifier is None or request_state.database_context is None:
+            return None
+        try:
+            candidate = FinalAnswer.model_validate(full_payload)
+        except Exception as exc:
+            return ToolObservation(
+                tool_name="goal_verifier",
+                success=False,
+                summary=f"Final answer candidate was invalid: {exc}",
+                payload={
+                    "can_answer": False,
+                    "missing_items": ["valid_final_answer"],
+                    "unsupported_claims": [],
+                    "next_action_hint": "Call terminate again with a valid final answer payload.",
+                    "reason": str(exc),
+                },
+                error=str(exc),
+                payload_truncated=False,
+                payload_ref=None,
+            )
+        try:
+            verdict = await self._goal_verifier.verify_final_answer(
+                request_state=request_state,
+                candidate_answer=candidate,
+            )
+        except Exception as exc:
+            request_state.completion_state["goal_verifier_error"] = str(exc)
+            return ToolObservation(
+                tool_name="goal_verifier",
+                success=False,
+                summary=f"Final answer verification failed: {exc}",
+                payload={
+                    "can_answer": False,
+                    "missing_items": ["goal_verification"],
+                    "unsupported_claims": [],
+                    "next_action_hint": "Continue with grounded evidence or retry final assembly after resolving the verifier error.",
+                    "reason": str(exc),
+                },
+                error=str(exc),
+                payload_truncated=False,
+                payload_ref=None,
+            )
+
+        verdict_payload = verdict.model_dump(mode="json")
+        request_state.completion_state["latest_goal_verification"] = verdict_payload
+        if verdict.can_answer:
+            request_state.completion_state["goal_verifier_failures"] = 0
+            return None
+
+        failures = int(request_state.completion_state.get("goal_verifier_failures") or 0) + 1
+        request_state.completion_state["goal_verifier_failures"] = failures
+        return ToolObservation(
+            tool_name="goal_verifier",
+            success=False,
+            summary="Final answer rejected by verifier: " + (verdict.reason or "missing required coverage"),
+            payload={
+                **verdict_payload,
+                "candidate_summary": candidate.summary,
+                "recovery_hint": verdict.next_action_hint
+                or "Use the missing_items and unsupported_claims to choose the next sql_query, insight, or corrected terminate action.",
+                "failure_count": failures,
+            },
+            error=verdict.reason or "Final answer did not satisfy the user task.",
+            payload_truncated=False,
+            payload_ref=None,
         )
 
     async def _map_trace_to_sse(

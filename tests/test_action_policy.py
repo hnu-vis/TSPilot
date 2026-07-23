@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from core.completion import normalize_todo_for_completion
-from core.runtime_evaluator import RuntimeLLMEvaluator
+from core.runtime_evaluator import GoalVerificationResult, RuntimeLLMEvaluator
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import validate_action
 from runtime.request_state import apply_observation, apply_observation_async
@@ -34,9 +34,59 @@ class _OneTurnAgent:
         )
 
 
+class _TerminateAgent:
+    async def next_turn(self, request_state, conversation_state):
+        return ReActTurn(
+            thought="I think I can answer now.",
+            action="terminate",
+            action_input={"summary_goal": request_state.message, "direct_answer": "partial answer"},
+        )
+
+
 class _UnusedExecutor:
     async def execute(self, *args, **kwargs):
         raise AssertionError("tool executor should not run")
+
+
+class _TerminalSpec:
+    result_target = "presentation"
+    produces_terminal_payload = True
+
+
+class _TerminalExecutor:
+    async def execute(self, action_name, action_input, *args, **kwargs):
+        assert action_name == "terminate"
+        return type(
+            "_ExecutionResult",
+            (),
+            {
+                "tool_spec": _TerminalSpec(),
+                "observation": ToolObservation(
+                    tool_name="terminate",
+                    success=True,
+                    summary="candidate",
+                    payload={"summary": "partial answer", "sections": [], "references": [], "visualizations": []},
+                ),
+                "full_payload": {
+                    "summary": "partial answer",
+                    "sections": [],
+                    "references": [],
+                    "visualizations": [],
+                },
+            },
+        )()
+
+
+class _RejectingVerifier:
+    async def verify_final_answer(self, *, request_state, candidate_answer):
+        return GoalVerificationResult(
+            can_answer=False,
+            reason="missing requested maximum value",
+            missing_items=["maximum value"],
+            unsupported_claims=[],
+            next_action_hint="Run sql_query for the maximum value.",
+            confidence=0.9,
+        )
 
 
 def test_runtime_evaluator_marks_complete_query_preview_as_full_fidelity():
@@ -113,6 +163,7 @@ def test_policy_rejects_repeated_todowrite_but_allows_next_action():
     assert allowed is False
     assert "already exists" in (reason or "")
     assert validate_action(request_state, "insight") == (True, None)
+    assert validate_action(request_state, "code_interpreter") == (True, None)
     assert validate_action(request_state, "forecast") == (True, None)
 
 
@@ -473,6 +524,46 @@ async def test_terminate_does_not_use_llm_answerability_gate():
     assert "semantic_repair_directive" not in request_state.completion_state
 
 
+@pytest.mark.asyncio
+async def test_goal_verifier_rejects_terminal_candidate_and_continues_loop():
+    request_state = RequestStateModel(
+        request_id="req-verifier-reject",
+        message="返回最大值。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        max_iterations=1,
+        latest_database_evidence={
+            "evidence_id": "evi_demo",
+            "result_type": "table",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...)",
+            "summary": "Loaded rows.",
+            "data": {"rows": [{"value": 1.0}]},
+            "columns": ["value"],
+            "metadata": {},
+            "diagnostics": {},
+        },
+    )
+    loop = ReActLoop(
+        data_agent=_TerminateAgent(),
+        tool_executor=_TerminalExecutor(),
+        settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
+        goal_verifier=_RejectingVerifier(),
+    )
+
+    events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
+
+    verifier_observation = next(
+        event for event in events
+        if event.event_type == "observation" and event.payload["tool_name"] == "goal_verifier"
+    )
+    assert verifier_observation.payload["success"] is False
+    assert verifier_observation.payload["payload"]["missing_items"] == ["maximum value"]
+    assert request_state.final_answer_draft is None
+    assert "final_answer" not in [event.event_type for event in events]
+
+
 def test_policy_blocks_terminal_answer_until_database_goal_has_evidence():
     request_state = RequestStateModel(
         request_id="req-policy-format-block",
@@ -533,7 +624,7 @@ def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
     assert latest_goal["missing_evidence"] == []
 
 
-def test_runtime_advances_query_todo_after_any_successful_sql_observation():
+def test_runtime_keeps_query_todo_active_for_schema_only_sql_observation():
     request_state = RequestStateModel(
         request_id="req-policy-count-schema",
         message="总共有多少条数据？",
@@ -571,8 +662,9 @@ def test_runtime_advances_query_todo_after_any_successful_sql_observation():
         _EvidenceSpec(),
     )
 
-    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
-    assert request_state.completion_state["latest_step"]["missing_evidence"] == []
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    assert request_state.completion_state["latest_step"]["completed"] is False
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == ["database_result"]
 
 
 def test_runtime_completes_count_todo_with_statistics_evidence():

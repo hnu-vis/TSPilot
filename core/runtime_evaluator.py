@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 
 from core.completion import CompletionEvaluation, GoalCompletionEvaluation
+from schemas.output import FinalAnswer
 from schemas.state import RequestStateModel
 
 
@@ -31,6 +32,16 @@ class AnswerabilityVerdict(BaseModel):
     confidence: float | None = None
 
 
+class GoalVerificationResult(BaseModel):
+    can_answer: bool = False
+    reason: str = ""
+    missing_items: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(default_factory=list)
+    answerable_from: list[str] = Field(default_factory=list)
+    next_action_hint: str | None = None
+    confidence: float | None = None
+
+
 @dataclass
 class RuntimeLLMEvaluator:
     """Use an LLM for semantic evidence completion diagnostics."""
@@ -40,6 +51,7 @@ class RuntimeLLMEvaluator:
     max_query_history: int = 6
     last_step_verdict: dict[str, Any] | None = None
     last_answerability_verdict: dict[str, Any] | None = None
+    last_goal_verification: dict[str, Any] | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     async def evaluate_step_completion(
@@ -116,6 +128,58 @@ class RuntimeLLMEvaluator:
             next_action_hint=verdict.next_action_hint,
         )
 
+    async def verify_final_answer(
+        self,
+        *,
+        request_state: RequestStateModel,
+        candidate_answer: FinalAnswer,
+    ) -> GoalVerificationResult:
+        """Semantically verify a terminal answer candidate against the user goal."""
+        if self.llm is None:
+            return GoalVerificationResult(
+                can_answer=False,
+                reason="LLM goal verifier was not available.",
+                missing_items=["goal_verifier"],
+                next_action_hint="Continue with more evidence or provide a datasource-specific answer only when verification is available.",
+            )
+        payload = {
+            "message": request_state.message,
+            "time_range": request_state.time_range,
+            "constraints": request_state.constraints,
+            "todo_list": request_state.todo_list,
+            "candidate_answer": self._summarize_final_answer(candidate_answer),
+            "latest_evidence": self._summarize_payload(
+                request_state.latest_database_evidence.model_dump(mode="json")
+                if request_state.latest_database_evidence
+                else {}
+            ),
+            "query_history": self._query_history(request_state),
+            "analysis_workspace": self._analysis_history(request_state),
+            "verified_facts": [
+                fact.model_dump(mode="json")
+                for fact in request_state.verified_facts[:12]
+            ],
+            "recent_observations": self._recent_observations(request_state),
+            "available_refs": self._available_refs(request_state),
+            "completion_state": request_state.completion_state,
+        }
+        raw = await self._invoke(
+            "TSPilot Goal Verification JSON",
+            (
+                "Judge whether the candidate final answer fully satisfies the user's task. "
+                "This is semantic verification, not action-success checking. Check every explicit user deliverable, "
+                "requested time range, entity/filter constraints, fields, aggregation/granularity, ordering/limits, "
+                "and whether every substantive answer claim is supported by observations, evidence, facts, or analysis refs. "
+                "Reject answers that infer facts from prompt previews when full-data computation was required. "
+                "Accept caveated answers only when the caveat itself is supported and no requested deliverable is missing. "
+                "Return JSON with can_answer, reason, missing_items, unsupported_claims, answerable_from, next_action_hint, confidence."
+            ),
+            payload,
+        )
+        verdict = self._parse(raw, GoalVerificationResult)
+        self.last_goal_verification = verdict.model_dump(mode="json")
+        return verdict
+
     async def _invoke(self, marker: str, instruction: str, payload: dict) -> str:
         messages = [
             (
@@ -152,6 +216,78 @@ class RuntimeLLMEvaluator:
         for evidence in request_state.database_evidence_artifacts.values():
             history.append(self._summarize_payload(evidence.model_dump(mode="json")))
         return history[-self.max_query_history :]
+
+    def _analysis_history(self, request_state: RequestStateModel) -> list[dict]:
+        analyses = []
+        for analysis in request_state.analysis_artifacts.values():
+            payload = analysis.model_dump(mode="json")
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            analyses.append(
+                {
+                    "analysis_id": payload.get("analysis_id"),
+                    "analysis_goal": payload.get("analysis_goal"),
+                    "summary": payload.get("summary"),
+                    "status": payload.get("status"),
+                    "input_evidence_id": payload.get("input_evidence_id"),
+                    "input_row_count": payload.get("input_row_count"),
+                    "result_preview": self._bounded_value(result, max_string_chars=1000, max_list_items=8, max_dict_items=12),
+                }
+            )
+        return analyses[-8:]
+
+    def _recent_observations(self, request_state: RequestStateModel) -> list[dict]:
+        observations = []
+        for observation in request_state.observations[-6:]:
+            observations.append(
+                {
+                    "tool_name": observation.tool_name,
+                    "success": observation.success,
+                    "summary": observation.summary,
+                    "error": observation.error,
+                    "payload": self._bounded_value(observation.payload, max_string_chars=800, max_list_items=6, max_dict_items=12),
+                }
+            )
+        return observations
+
+    def _available_refs(self, request_state: RequestStateModel) -> list[str]:
+        refs = []
+        refs.extend(f"evidence:{evidence_id}" for evidence_id in request_state.database_evidence_artifacts)
+        refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
+        refs.extend(f"insight:{insight_id}" for insight_id in request_state.insight_artifacts)
+        refs.extend(f"forecast:{forecast_id}" for forecast_id in request_state.forecast_artifacts)
+        refs.extend(f"anomaly:{anomaly_id}" for anomaly_id in request_state.anomaly_artifacts)
+        if request_state.latest_rag:
+            refs.append("rag:latest")
+        if request_state.latest_skill:
+            refs.append(f"skill:{request_state.latest_skill.get('skill_name', 'latest')}")
+        return refs
+
+    def _summarize_final_answer(self, answer: FinalAnswer) -> dict:
+        payload = answer.model_dump(mode="json")
+        return {
+            "title": payload.get("title"),
+            "summary": payload.get("summary"),
+            "sections": [
+                {
+                    "section_type": section.get("section_type"),
+                    "heading": section.get("heading"),
+                    "content": self._bounded_value(section.get("content"), max_string_chars=1000),
+                    "structured_payload": self._bounded_value(section.get("structured_payload") or {}, max_string_chars=600, max_list_items=8, max_dict_items=12),
+                }
+                for section in payload.get("sections", [])[:8]
+                if isinstance(section, dict)
+            ],
+            "references": [
+                {
+                    "source_type": ref.get("source_type"),
+                    "source_id": ref.get("source_id"),
+                    "label": ref.get("label"),
+                }
+                for ref in payload.get("references", [])[:16]
+                if isinstance(ref, dict)
+            ],
+            "visualization_count": len(payload.get("visualizations") or []),
+        }
 
     def _summarize_payload(self, payload: dict) -> dict:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -204,3 +340,43 @@ class RuntimeLLMEvaluator:
                 "schema_linking_generation": diagnostics.get("schema_linking_generation"),
             },
         }
+
+    def _bounded_value(
+        self,
+        value,
+        *,
+        max_string_chars: int = 800,
+        max_list_items: int = 8,
+        max_dict_items: int = 12,
+    ):
+        if isinstance(value, str):
+            if len(value) <= max_string_chars:
+                return value
+            return value[:max_string_chars] + f"... [truncated {len(value) - max_string_chars} chars]"
+        if isinstance(value, list):
+            items = [
+                self._bounded_value(
+                    item,
+                    max_string_chars=max_string_chars,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                )
+                for item in value[:max_list_items]
+            ]
+            if len(value) > max_list_items:
+                items.append({"truncated_items": len(value) - max_list_items})
+            return items
+        if isinstance(value, dict):
+            bounded = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= max_dict_items:
+                    bounded["truncated_keys"] = len(value) - max_dict_items
+                    break
+                bounded[key] = self._bounded_value(
+                    item,
+                    max_string_chars=max_string_chars,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                )
+            return bounded
+        return value

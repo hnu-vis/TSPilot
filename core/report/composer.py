@@ -27,7 +27,13 @@ def missing_requirements(request_state: RequestStateModel) -> list[str]:
     return missing
 
 
-def build_summary(request_state: RequestStateModel, facts: list, fallback: str) -> str:
+def build_summary(
+    request_state: RequestStateModel,
+    facts: list,
+    fallback: str,
+    *,
+    prefer_fallback: bool = False,
+) -> str:
     subject = subject_label(request_state)
     parts: list[str] = []
 
@@ -38,6 +44,8 @@ def build_summary(request_state: RequestStateModel, facts: list, fallback: str) 
         parts.append(trend_fact.statement)
     elif facts:
         parts.append(facts[0].statement)
+    elif prefer_fallback and fallback:
+        parts.append(fallback)
     elif request_state.latest_database_evidence is not None:
         parts.append(request_state.latest_database_evidence.summary)
 

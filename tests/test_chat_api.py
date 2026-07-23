@@ -17,7 +17,9 @@ from tests.fakes import (
     ComplexReActLLM,
     FakeLLM,
     RepeatingTodoLLM,
+    SandboxInsightLLM,
     TodoScopeLLM,
+    VerifierRepairLLM,
 )
 
 
@@ -30,6 +32,7 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     deps.get_data_agent.cache_clear()
     deps.get_tool_registry.cache_clear()
     deps.get_tool_executor.cache_clear()
+    deps.get_goal_verifier.cache_clear()
     chat_route.get_react_loop = deps.get_react_loop
     return TestClient(app)
 
@@ -57,6 +60,66 @@ def test_chat_json_path_returns_final_answer():
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == ["sql_query", "insight"]
     assert payload["answer"]["summary"]
+
+
+def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
+    settings = get_settings()
+    old_log_dir = settings.conversation_log_dir
+    old_enabled = settings.conversation_log_enabled
+    settings.conversation_log_dir = str(tmp_path)
+    settings.conversation_log_enabled = True
+    try:
+        client = _build_client(SandboxInsightLLM(), max_iterations=5)
+        response = client.post(
+            "/api/v1/chat",
+            json={
+                "message": "用 code interpreter 计算相邻点差值。",
+                "database_context": {
+                    "database_id": "influxdb2-energydata",
+                    "database_type": "influxdb",
+                },
+                "time_range": {
+                    "start": "2016-01-11T17:00:00",
+                    "end": "2016-01-12T23:00:00",
+                },
+                "constraints": {"max_points": 12},
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "completed"
+        assert payload["used_tools"] == ["sql_query", "code_interpreter"]
+
+        code_observation = next(
+            event
+            for event in payload["trace"]
+            if event["event_type"] == "observation"
+            and event["payload"]["tool_name"] == "code_interpreter"
+        )
+        code_payload = code_observation["payload"]["payload"]
+        assert code_payload["code_type"] == "code_interpreter_v1"
+        assert code_payload["diagnostics"]["sandbox"] == "subprocess_code_interpreter_v1"
+        assert code_payload["result"]["metrics"]["value_count"] > 1
+        assert code_payload["result"]["metrics"]["delta_count"] == code_payload["result"]["metrics"]["value_count"] - 1
+        assert "Code interpreter computed" in code_payload["summary"]
+
+        section_types = [section["section_type"] for section in payload["answer"]["sections"]]
+        assert "analysis" in section_types
+        assert "Code interpreter computed 180 pairwise deltas" in payload["answer"]["summary"]
+        conclusion = next(section for section in payload["answer"]["sections"] if section["section_type"] == "conclusion")
+        assert "Code interpreter computed 180 pairwise deltas" in conclusion["content"]
+        assert any(reference["source_type"] == "analysis" for reference in payload["answer"]["references"])
+
+        request_dir = next(tmp_path.glob(f"*_{payload['conversation_id']}/requests/{payload['request_id']}"))
+        code_outputs = list((request_dir / "artifacts" / "code_interpreter").glob("*/output.json"))
+        assert len(code_outputs) == 1
+        code_output = json.loads(code_outputs[0].read_text(encoding="utf-8"))
+        assert code_output["status"] == "succeeded"
+        assert code_output["result"]["metrics"]["delta_count"] == code_payload["result"]["metrics"]["delta_count"]
+    finally:
+        settings.conversation_log_dir = old_log_dir
+        settings.conversation_log_enabled = old_enabled
 
 
 def test_first_visible_action_does_not_wait_for_separate_intent_llm_call():
@@ -550,6 +613,75 @@ def test_chat_sse_path_preserves_multi_query_results_in_final_answer():
     assert "2023-01-04T23:04:00+00:00" in body
     assert "2023-02-03T22:47:00+00:00" in body
     assert "```flux" in body
+
+
+def test_chat_json_path_recovers_after_goal_verifier_rejects_premature_answer():
+    llm = VerifierRepairLLM()
+    client = _build_client(llm, max_iterations=8)
+    response = client.post(
+        "/api/v1/chat",
+        json={
+            "message": "请查询当前数据源中的比特币USD价格数据，返回总记录数和按时间升序排列的最早5条原始记录，并展示每项查询语句和实际返回行数。",
+            "database_context": {
+                "database_id": "influxdb2-bitcoin-sample",
+                "database_type": "influxdb",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["used_tools"] == ["todowrite", "sql_query", "sql_query"]
+    assert llm.verifier_calls == 2
+
+    observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
+    verifier_failures = [
+        event for event in observations
+        if event["payload"]["tool_name"] == "goal_verifier"
+        and event["payload"]["success"] is False
+    ]
+    assert len(verifier_failures) == 1
+    assert verifier_failures[0]["payload"]["payload"]["missing_items"] == ["earliest 5 raw records"]
+
+    query_results = next(
+        section
+        for section in payload["answer"]["sections"]
+        if section["section_type"] == "query_results"
+    )
+    assert query_results["content"].count("查询目的：") == 2
+    assert "结果值：count = 2680" in query_results["content"]
+    assert "| timestamp | price | code | crypto | description | symbol |" in query_results["content"]
+    assert len(payload["answer"]["references"]) == 2
+
+
+def test_chat_sse_path_recovers_after_goal_verifier_rejects_premature_answer():
+    llm = VerifierRepairLLM()
+    client = _build_client(llm, max_iterations=8)
+    with client.stream(
+        "POST",
+        "/api/v1/chat",
+        json={
+            "message": "请查询当前数据源中的比特币USD价格数据，返回总记录数和按时间升序排列的最早5条原始记录，并展示每项查询语句和实际返回行数。",
+            "database_context": {
+                "database_id": "influxdb2-bitcoin-sample",
+                "database_type": "influxdb",
+            },
+            "stream": True,
+        },
+    ) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert llm.verifier_calls == 2
+    assert body.count("event: tool_call") == 5
+    assert '"tool": "goal_verifier"' in body
+    assert "earliest 5 raw records" in body
+    assert "event: final_answer" in body
+    assert "query_results" in body
+    assert "结果值：count = 2680" in body
+    assert "实际返回行数：5" in body
 
 
 def _bitcoin_multi_query_message() -> str:

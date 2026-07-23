@@ -7,6 +7,7 @@ import pytest
 
 from app.settings import get_settings
 from core.analysis.python_runner import AnalysisCodeError, execute_python_rows_v1
+from sandbox.runner import execute_python_sandbox_v1
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
@@ -166,3 +167,63 @@ def test_python_rows_runner_rejects_unsafe_imports_and_requires_result_summary()
             metadata={},
             diagnostics={},
         )
+
+
+def test_python_sandbox_v1_executes_in_subprocess():
+    output = execute_python_sandbox_v1(
+        code=(
+            "values = [float(row['value']) for row in rows]\n"
+            "result = {'summary': f'{len(values)} sandbox rows', "
+            "'metrics': {'total': sum(values), 'count': len(values)}, 'details': {}}\n"
+        ),
+        rows=[{"value": 2.0}, {"value": 3.0}],
+        points=[],
+        columns=["value"],
+        metadata={},
+        diagnostics={},
+        timeout_seconds=5,
+    )
+
+    assert output.result["summary"] == "2 sandbox rows"
+    assert output.result["metrics"]["total"] == 5.0
+
+
+def test_python_sandbox_v1_times_out():
+    with pytest.raises(AnalysisCodeError, match="sandbox timeout"):
+        execute_python_sandbox_v1(
+            code="while True:\n    pass\nresult = {'summary': 'never', 'metrics': {}, 'details': {}}",
+            rows=[],
+            points=[],
+            columns=[],
+            metadata={},
+            diagnostics={},
+            timeout_seconds=1,
+        )
+
+
+def test_generated_insight_supports_python_sandbox_v1():
+    request_state = _request_state()
+
+    result = asyncio.run(
+        InsightTool().execute(
+            InsightInput(
+                database_evidence="evi_generated",
+                analysis_goal="sandbox threshold share",
+                code_type="python_sandbox_v1",
+                analysis_code=(
+                    "total = len(rows)\n"
+                    "count = sum(1 for row in rows if float(row['value']) > 20)\n"
+                    "result = {'summary': f'{count}/{total} rows are above 20', "
+                    "'metrics': {'count': count, 'total': total}, 'details': {}}\n"
+                ),
+                constraints={"timeout_seconds": 5},
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["code_type"] == "python_sandbox_v1"
+    assert result["diagnostics"]["sandbox"] == "subprocess_python_sandbox_v1"
+    assert result["input_row_count"] == 3
+    assert result["result"]["metrics"]["count"] == 2
