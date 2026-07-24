@@ -23,11 +23,17 @@
   --shadow-soft: 0 12px 32px oklch(0.18 0.01 250 / 0.07);
   --shadow-float: 0 18px 54px oklch(0.18 0.01 250 / 0.11);
   --chat-width: 980px;
-  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, monospace;
+  --inspector-width: 440px;
+  --inspector-mobile-width: 460px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: SFMono-Regular, "Cascadia Mono", "JetBrains Mono", "Fira Code", Consolas, ui-monospace, monospace;
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   letter-spacing: 0;
 }
 
@@ -49,12 +55,22 @@ body {
   height: 100%;
   overflow: hidden;
   background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
 }
 
 button,
 textarea,
-input {
+input,
+select {
   font: inherit;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
 }
 
 button {
@@ -77,13 +93,14 @@ input:focus-visible {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr) 0;
   height: 100vh;
+  min-height: 0;
   overflow: hidden;
   background: var(--background);
   transition: grid-template-columns 680ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .app-shell.inspector-open {
-  grid-template-columns: 260px minmax(0, 1fr) 360px;
+  grid-template-columns: 260px minmax(0, 1fr) var(--inspector-width);
 }
 
 .app-shell.inspector-open.inspector-collapsed {
@@ -118,7 +135,7 @@ input:focus-visible {
   background: var(--foreground);
   color: white;
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 700;
   letter-spacing: 0.05em;
 }
 
@@ -150,7 +167,7 @@ input:focus-visible {
   background: var(--foreground);
   color: white;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
   transition: transform 150ms ease, box-shadow 150ms ease, background 150ms ease;
 }
 
@@ -247,7 +264,7 @@ input:focus-visible {
   overflow: hidden;
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 620;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -637,7 +654,7 @@ input:focus-visible {
 .todo-copy strong {
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 620;
+  font-weight: 600;
   line-height: 1.45;
 }
 
@@ -664,7 +681,7 @@ input:focus-visible {
 .empty-thread h2 {
   margin: 18px 0 8px;
   font-size: clamp(24px, 4vw, 34px);
-  font-weight: 760;
+  font-weight: 700;
 }
 
 .empty-thread p {
@@ -773,7 +790,7 @@ input:focus-visible {
 .trace-copy strong {
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 680;
+  font-weight: 600;
 }
 
 .trace-copy small {
@@ -908,6 +925,15 @@ input:focus-visible {
   background: var(--primary-strong);
 }
 
+.send-button.stop-button {
+  border-color: var(--error);
+  background: var(--error);
+}
+
+.send-button.stop-button:hover:not(:disabled) {
+  background: oklch(0.5 0.17 25);
+}
+
 .resource-select {
   position: relative;
 }
@@ -957,7 +983,7 @@ input:focus-visible {
 .resource-menu span {
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .resource-menu small {
@@ -969,12 +995,25 @@ input:focus-visible {
 .inspector-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  min-height: 0;
+  max-height: 100vh;
   min-width: 0;
   overflow: hidden;
   border-left: 1px solid var(--border);
   background: var(--panel);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
   animation: inspector-in 620ms cubic-bezier(0.16, 1, 0.3, 1);
   will-change: opacity, transform;
+}
+
+.inspector-panel button,
+.inspector-panel input,
+.inspector-panel textarea,
+.inspector-panel select {
+  font: inherit;
 }
 
 .inspector-panel.collapsed {
@@ -1006,10 +1045,9 @@ input:focus-visible {
 .inspector-rail-button span {
   writing-mode: vertical-rl;
   color: inherit;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .inspector-panel header {
@@ -1039,29 +1077,46 @@ input:focus-visible {
 .inspector-panel header p {
   margin: 0 0 4px;
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 760;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .inspector-panel header h2 {
   overflow: hidden;
   margin: 0;
-  font-size: 15px;
-  font-weight: 720;
+  font-size: 16px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .inspector-body {
   display: flex;
+  height: 100%;
   min-height: 0;
   flex-direction: column;
   gap: 10px;
-  overflow: auto;
-  padding: 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px 12px 18px;
+  scrollbar-gutter: stable;
   animation: inspector-content-in 660ms cubic-bezier(0.16, 1, 0.3, 1) 140ms both;
+}
+
+.inspector-body > * {
+  flex: 0 0 auto;
+}
+
+.inspector-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.inspector-body::-webkit-scrollbar-thumb {
+  border: 3px solid var(--panel);
+  border-radius: 999px;
+  background: oklch(0.72 0.012 250);
 }
 
 .inspector-card {
@@ -1084,8 +1139,8 @@ input:focus-visible {
 .inspector-card-title h3 {
   margin: 0;
   color: var(--foreground);
-  font-size: 13px;
-  font-weight: 720;
+  font-size: 14px;
+  font-weight: 650;
 }
 
 .react-step-card {
@@ -1105,9 +1160,9 @@ input:focus-visible {
 
 .react-block span {
   color: var(--muted-strong);
-  font-size: 11px;
-  font-weight: 720;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .react-block pre {
@@ -1120,8 +1175,9 @@ input:focus-visible {
   background: var(--surface-soft);
   padding: 8px;
   color: var(--foreground);
-  font-size: 11px;
-  line-height: 1.5;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -1134,13 +1190,13 @@ input:focus-visible {
   padding: 4px 8px;
   color: var(--muted-strong);
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .status-line.compact {
   margin-left: auto;
   padding: 3px 7px;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .status-line.complete {
@@ -1191,8 +1247,8 @@ input:focus-visible {
   background: var(--surface-soft);
   padding: 2px 6px;
   color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-family: var(--font-sans);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1222,7 +1278,7 @@ input:focus-visible {
 .metric-tile span {
   overflow: hidden;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1231,8 +1287,8 @@ input:focus-visible {
   flex: 0 0 auto;
   overflow-wrap: anywhere;
   color: var(--foreground);
-  font-size: 12px;
-  font-weight: 720;
+  font-size: 14px;
+  font-weight: 600;
   text-align: right;
 }
 
@@ -1254,8 +1310,8 @@ input:focus-visible {
   background: var(--surface-soft);
   padding: 6px 8px;
   color: var(--muted-strong);
-  font-size: 11px;
-  font-weight: 620;
+  font-size: 12px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1297,8 +1353,8 @@ input:focus-visible {
 .query-run-facts span {
   min-width: 0;
   overflow: hidden;
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 13px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1318,9 +1374,9 @@ input:focus-visible {
   background: var(--surface-soft);
   padding: 2px 7px;
   color: var(--muted-strong);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 650;
   text-transform: uppercase;
 }
 
@@ -1347,13 +1403,11 @@ input:focus-visible {
   list-style: none;
 }
 
-.collapsible-summary::-webkit-details-marker,
-.answer-reference-strip summary::-webkit-details-marker {
+.collapsible-summary::-webkit-details-marker {
   display: none;
 }
 
-.collapsible-summary > span,
-.answer-reference-strip summary > span {
+.collapsible-summary > span {
   display: inline-flex;
   min-width: 0;
   align-items: center;
@@ -1365,7 +1419,7 @@ input:focus-visible {
   overflow: hidden;
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 720;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1408,8 +1462,8 @@ details[open] > summary .collapsible-chevron {
   background: var(--surface-soft);
   padding: 0 8px;
   color: var(--muted-strong);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
 }
 
@@ -1429,7 +1483,7 @@ details[open] > summary .collapsible-chevron {
   padding: 10px;
   color: var(--foreground);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
   white-space: pre;
   overflow-wrap: normal;
@@ -1470,8 +1524,8 @@ details[open] > summary .collapsible-chevron {
   background: var(--surface-soft);
   padding: 4px 6px;
   color: var(--muted-strong);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-family: var(--font-sans);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1487,7 +1541,7 @@ details[open] > summary .collapsible-chevron {
   justify-content: space-between;
   gap: 8px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .sample-table-caption span {
@@ -1495,7 +1549,7 @@ details[open] > summary .collapsible-chevron {
   align-items: center;
   gap: 5px;
   min-width: 0;
-  font-weight: 680;
+  font-weight: 600;
 }
 
 .sample-table-caption strong {
@@ -1516,7 +1570,7 @@ details[open] > summary .collapsible-chevron {
   min-width: 320px;
   border-collapse: collapse;
   background: var(--surface);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .sample-table th,
@@ -1531,13 +1585,14 @@ details[open] > summary .collapsible-chevron {
 .sample-table th {
   background: var(--surface-soft);
   color: var(--muted);
-  font-weight: 720;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .sample-table td {
   color: var(--foreground);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 
@@ -1548,7 +1603,7 @@ details[open] > summary .collapsible-chevron {
 .sample-note {
   margin: 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .empty-data-preview {
@@ -1576,10 +1631,9 @@ details[open] > summary .collapsible-chevron {
 
 .schema-linking-label {
   color: var(--muted);
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .schema-source-row,
@@ -1601,7 +1655,7 @@ details[open] > summary .collapsible-chevron {
   min-width: 0;
   overflow: hidden;
   color: var(--foreground);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1609,7 +1663,7 @@ details[open] > summary .collapsible-chevron {
 
 .schema-source-row span {
   color: var(--muted);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -1622,8 +1676,8 @@ details[open] > summary .collapsible-chevron {
   background: var(--surface);
   padding: 3px 5px;
   color: var(--muted-strong);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-family: var(--font-sans);
+  font-size: 12px;
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
@@ -1660,15 +1714,15 @@ details[open] > summary .collapsible-chevron {
 
 .reference-row span {
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 680;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .reference-row strong {
   overflow: hidden;
   color: var(--foreground);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
   line-height: 1.45;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1677,7 +1731,7 @@ details[open] > summary .collapsible-chevron {
 .step-summary {
   margin: 0;
   color: var(--muted-strong);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.6;
 }
 
@@ -1694,8 +1748,8 @@ details[open] > summary .collapsible-chevron {
   gap: 7px;
   padding: 10px 12px;
   color: var(--muted-strong);
-  font-size: 12px;
-  font-weight: 680;
+  font-size: 13px;
+  font-weight: 600;
   list-style: none;
 }
 
@@ -1744,8 +1798,8 @@ details[open] > summary .collapsible-chevron {
 .advanced-section-title h4 {
   margin: 0;
   color: var(--foreground);
-  font-size: 12px;
-  font-weight: 720;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .debug-details pre,
@@ -1755,7 +1809,7 @@ details[open] > summary .collapsible-chevron {
   margin: 0;
   color: var(--foreground);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
@@ -1773,7 +1827,7 @@ details[open] > summary .collapsible-chevron {
   border-radius: var(--radius-md);
   background: var(--surface);
   padding: 11px;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .detail-row span {
@@ -1783,12 +1837,12 @@ details[open] > summary .collapsible-chevron {
 .detail-row strong {
   overflow-wrap: anywhere;
   color: var(--foreground);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .json-section h3 {
   margin: 0 0 8px;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .json-section pre,
@@ -1800,7 +1854,7 @@ details[open] > summary .collapsible-chevron {
   padding: 12px;
   color: var(--foreground);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
@@ -1814,6 +1868,7 @@ details[open] > summary .collapsible-chevron {
   min-width: 0;
   gap: 18px;
   padding: 0;
+  font-family: var(--font-sans);
 }
 
 .final-answer h3,
@@ -1838,10 +1893,18 @@ details[open] > summary .collapsible-chevron {
   gap: 7px;
 }
 
+.answer-header-meta {
+  display: inline-flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .answer-header-title {
   color: var(--foreground);
   font-size: 13px;
-  font-weight: 760;
+  font-weight: 700;
 }
 
 .answer-header-title svg {
@@ -1856,7 +1919,7 @@ details[open] > summary .collapsible-chevron {
   padding: 4px 8px;
   color: var(--muted-strong);
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .answer-summary-block {
@@ -1869,7 +1932,7 @@ details[open] > summary .collapsible-chevron {
 .answer-summary {
   color: var(--foreground);
   font-size: 15px;
-  font-weight: 560;
+  font-weight: 400;
   line-height: 1.75;
   white-space: pre-wrap;
   margin-bottom: 0;
@@ -1892,7 +1955,7 @@ details[open] > summary .collapsible-chevron {
 .answer-markdown-summary li {
   color: var(--foreground);
   font-size: 15px;
-  font-weight: 560;
+  font-weight: 400;
   line-height: 1.75;
   white-space: pre-wrap;
 }
@@ -1923,17 +1986,227 @@ details[open] > summary .collapsible-chevron {
 .answer-section-type {
   width: fit-content;
   color: var(--muted);
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .answer-section h3 {
   margin: 0;
   color: var(--foreground);
   font-size: 15px;
-  font-weight: 760;
+  font-weight: 700;
+}
+
+.answer-structured-stack,
+.query-result-list,
+.query-result-item {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.query-result-list {
+  gap: 12px;
+}
+
+.query-result-item {
+  border-left: 2px solid var(--border-strong);
+  padding-left: 12px;
+}
+
+.query-result-heading {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+}
+
+.query-result-heading > span {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.query-result-heading strong {
+  min-width: 0;
+  margin: 0;
+}
+
+.query-result-heading strong {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.query-result-preview {
+  display: inline-flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.query-result-preview span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 3px 7px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.answer-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.answer-kv-grid dt,
+.answer-metric-grid dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.answer-kv-grid dd,
+.answer-metric-grid dd {
+  min-width: 0;
+  margin: 2px 0 0;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.answer-chip-row {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.answer-chip-row span {
+  max-width: 180px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 3px 7px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.answer-table-wrap {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.answer-data-table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.answer-data-table th,
+.answer-data-table td {
+  max-width: 220px;
+  border-bottom: 1px solid var(--border);
+  padding: 7px 9px;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.answer-data-table th {
+  background: var(--surface-soft);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.answer-data-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.answer-inline-details {
+  display: grid;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.answer-inline-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.answer-inline-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.answer-inline-details pre {
+  max-height: 180px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  margin: 0;
+  padding: 10px;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.answer-metric-groups {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.answer-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.answer-metric-grid > div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  padding: 8px 9px;
 }
 
 .answer-markdown ul,
@@ -1978,7 +2251,7 @@ details[open] > summary .collapsible-chevron {
   gap: 7px;
   color: var(--foreground);
   font-size: 12px;
-  font-weight: 730;
+  font-weight: 700;
 }
 
 .answer-code-details summary strong {
@@ -1998,7 +2271,7 @@ details[open] > summary .collapsible-chevron {
   margin: 0;
   padding: 12px;
   color: var(--foreground);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 12px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -2007,76 +2280,6 @@ details[open] > summary .collapsible-chevron {
 
 .answer-code-block code {
   font: inherit;
-}
-
-.answer-reference-strip {
-  display: grid;
-  min-width: 0;
-  gap: 8px;
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.answer-reference-strip summary {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.answer-reference-strip summary strong {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-soft);
-  padding: 2px 7px;
-  color: var(--muted-strong);
-  font-size: 10px;
-}
-
-.answer-reference-strip > div {
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.answer-reference-strip span {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-soft);
-  padding: 3px 7px;
-  color: var(--muted-strong);
-}
-
-.answer-references {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
-  border-top: 1px solid var(--border);
-  padding-top: 10px;
-}
-
-.answer-references span,
-.answer-references div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-
-.answer-references code {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-soft);
-  padding: 3px 7px;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
 }
 
 .spin {
@@ -2145,7 +2348,9 @@ details[open] > summary .collapsible-chevron {
     position: fixed;
     inset: 0 0 0 auto;
     z-index: 40;
-    width: min(92vw, 380px);
+    height: 100dvh;
+    max-height: 100dvh;
+    width: min(92vw, var(--inspector-mobile-width));
     border-left: 0;
     box-shadow: var(--shadow-float);
   }
@@ -2223,6 +2428,15 @@ details[open] > summary .collapsible-chevron {
 
   .message.assistant.has-answer .bubble {
     padding: 14px;
+  }
+
+  .query-result-heading {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .query-result-preview {
+    grid-column: 2;
+    justify-content: flex-start;
   }
 
   .composer {
