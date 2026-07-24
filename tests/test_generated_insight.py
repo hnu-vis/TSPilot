@@ -168,6 +168,16 @@ def test_python_rows_runner_rejects_unsafe_imports_and_requires_result_summary()
             diagnostics={},
         )
 
+    with pytest.raises(AnalysisCodeError, match="details"):
+        execute_python_rows_v1(
+            code="result = {'summary': 'computed', 'metrics': {}}",
+            rows=[],
+            points=[],
+            columns=[],
+            metadata={},
+            diagnostics={},
+        )
+
 
 def test_python_sandbox_v1_executes_in_subprocess():
     output = execute_python_sandbox_v1(
@@ -186,6 +196,19 @@ def test_python_sandbox_v1_executes_in_subprocess():
 
     assert output.result["summary"] == "2 sandbox rows"
     assert output.result["metrics"]["total"] == 5.0
+
+
+def test_python_sandbox_v1_requires_stable_result_shape():
+    with pytest.raises(AnalysisCodeError, match="details"):
+        execute_python_sandbox_v1(
+            code="result = {'summary': 'computed', 'metrics': {}}",
+            rows=[],
+            points=[],
+            columns=[],
+            metadata={},
+            diagnostics={},
+            timeout_seconds=5,
+        )
 
 
 def test_python_sandbox_v1_times_out():

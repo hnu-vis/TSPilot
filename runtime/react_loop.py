@@ -9,6 +9,7 @@ from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
 from runtime.request_state import apply_observation_async, append_trace, build_final_response
 from runtime.trace import TraceEventModel
+from runtime.token_usage import token_usage_summary
 from schemas.api import ChatResponse
 from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -300,8 +301,28 @@ class ReActLoop:
             request_state.completion_state["goal_verifier_failures"] = 0
             return None
 
-        failures = int(request_state.completion_state.get("goal_verifier_failures") or 0) + 1
+        previous_failures = int(request_state.completion_state.get("goal_verifier_failures") or 0)
+        max_rejections = max(0, int(getattr(self._settings, "goal_verifier_max_rejections", 1)))
+        if previous_failures >= max_rejections:
+            request_state.completion_state["goal_verifier_bypassed"] = {
+                **verdict_payload,
+                "candidate_summary": candidate.summary,
+                "failure_count": previous_failures,
+                "reason": verdict.reason or "Final answer did not satisfy the verifier.",
+            }
+            return None
+
+        failures = previous_failures + 1
         request_state.completion_state["goal_verifier_failures"] = failures
+        request_state.completion_state["semantic_repair_directive"] = {
+            "source": "goal_verifier",
+            "reason": verdict.reason or "Final answer did not satisfy the user task.",
+            "missing_items": verdict.missing_items,
+            "unsupported_claims": verdict.unsupported_claims,
+            "next_action_hint": verdict.next_action_hint,
+            "candidate_summary": candidate.summary,
+            "failure_count": failures,
+        }
         return ToolObservation(
             tool_name="goal_verifier",
             success=False,
@@ -407,6 +428,7 @@ class ReActLoop:
                     "conversation_id": request_state.conversation_id,
                     "request_id": request_state.request_id,
                     "answer": payload,
+                    "token_usage": token_usage_summary(request_state),
                 },
             )
             return

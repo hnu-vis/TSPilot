@@ -113,9 +113,10 @@ class FormatAnswerTool(BaseTool):
             sections_by_type["analysis"] = AnswerSection(
                 section_type="analysis",
                 heading="Analysis",
-                content="\n".join(f"- {analysis.summary}" for analysis in analyses),
+                content=self._render_analysis_section(analyses),
                 structured_payload={
                     "analysis_ids": [analysis.analysis_id for analysis in analyses],
+                    "metrics": [analysis.result.get("metrics", {}) for analysis in analyses],
                     "results": [analysis.result for analysis in analyses],
                 },
             )
@@ -348,6 +349,22 @@ class FormatAnswerTool(BaseTool):
                 if analysis_id in request_state.analysis_artifacts
             ]
         return list(request_state.analysis_artifacts.values())
+
+    def _render_analysis_section(self, analyses: list) -> str:
+        blocks = []
+        for analysis in analyses:
+            lines = [f"- {analysis.summary}"]
+            metrics = analysis.result.get("metrics", {}) if isinstance(analysis.result, dict) else {}
+            if metrics:
+                metric_text = ", ".join(
+                    f"{key}: {value}"
+                    for key, value in metrics.items()
+                    if value is not None
+                )
+                if metric_text:
+                    lines.append(f"  Metrics: {metric_text}")
+            blocks.append("\n".join(lines))
+        return "\n".join(blocks)
 
     def _usable_direct_answer(self, direct_answer: str | None) -> str | None:
         if not direct_answer or not direct_answer.strip():

@@ -5,6 +5,7 @@ import pytest
 from schemas.database import DatabaseEvidence
 from schemas.state import RequestStateModel
 from tools.anomaly import AnomalyInput, AnomalyTool
+from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 from tools.forecast import ForecastInput, ForecastTool
 from tools.insight import InsightInput, InsightTool
 
@@ -65,3 +66,44 @@ async def test_analysis_tools_resolve_lightweight_evidence_refs_from_state():
     assert anomaly["anomaly_id"] == "anomaly_evi_ref"
     assert forecast["forecast_id"] == "forecast_evi_ref"
     assert forecast["horizon"] == 2
+
+
+@pytest.mark.asyncio
+async def test_analysis_tools_reject_unknown_evidence_refs_instead_of_using_latest():
+    evidence = _evidence()
+    request_state = RequestStateModel(
+        request_id="req_refs",
+        message="分析趋势、异常和预测。",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+
+    with pytest.raises(ValueError, match="could not resolve database_evidence"):
+        await InsightTool().execute(
+            InsightInput(
+                database_evidence="evidence:missing",
+                analysis_goal="bad ref",
+                analysis_code="result = {'summary': 'ok', 'metrics': {}, 'details': {}}",
+            ),
+            request_state=request_state,
+        )
+    with pytest.raises(ValueError, match="could not resolve database_evidence"):
+        await CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence="evidence:missing",
+                analysis_goal="bad ref",
+                code="result = {'summary': 'ok', 'metrics': {}, 'details': {}}",
+            ),
+            request_state=request_state,
+        )
+    with pytest.raises(ValueError, match="could not resolve database_evidence"):
+        await AnomalyTool().execute(
+            AnomalyInput(database_evidence="evidence:missing"),
+            request_state=request_state,
+        )
+    with pytest.raises(ValueError, match="could not resolve database_evidence"):
+        await ForecastTool().execute(
+            ForecastInput(database_evidence="evidence:missing"),
+            request_state=request_state,
+        )

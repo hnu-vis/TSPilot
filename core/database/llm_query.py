@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from runtime.token_usage import record_llm_token_usage
+
 
 class LLMGeneratedQuery(BaseModel):
     """Structured query proposal returned by the query-generation LLM."""
@@ -56,6 +58,7 @@ class LLMQueryGenerator:
         history: list[dict],
         previous_query: str | None = None,
         error: Exception | str | None = None,
+        request_state=None,
     ) -> LLMQueryGenerationResult:
         if self._llm is None:
             raise RuntimeError("LLM query generation requires an llm instance.")
@@ -72,7 +75,11 @@ class LLMQueryGenerator:
             previous_query=previous_query,
             error=error,
         )
-        raw_response = await self._invoke_model([("system", system_prompt), ("user", user_prompt)])
+        raw_response = await self._invoke_model(
+            [("system", system_prompt), ("user", user_prompt)],
+            request_state=request_state,
+            source="sql_query.generation_repair" if previous_query or error else "sql_query.generation",
+        )
         generated_query = self._parse_response(raw_response)
         return LLMQueryGenerationResult(
             generated_query=generated_query,
@@ -81,7 +88,7 @@ class LLMQueryGenerator:
             diagnostics={"repair": bool(previous_query or error)},
         )
 
-    async def _invoke_model(self, messages) -> str:
+    async def _invoke_model(self, messages, *, request_state=None, source: str = "sql_query.generation") -> str:
         response = await self._llm.ainvoke(messages)
         content = getattr(response, "content", response)
         if isinstance(content, list):
@@ -89,7 +96,9 @@ class LLMQueryGenerator:
                 item.get("text", "") if isinstance(item, dict) else str(item)
                 for item in content
             )
-        return str(content)
+        content = str(content)
+        record_llm_token_usage(request_state, source=source, response=response, messages=messages, output_text=content)
+        return content
 
     def _parse_response(self, content: str) -> LLMGeneratedQuery:
         payload = self._decode_json(content)

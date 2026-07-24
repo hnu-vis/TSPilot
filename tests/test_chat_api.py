@@ -60,6 +60,9 @@ def test_chat_json_path_returns_final_answer():
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == ["sql_query", "insight"]
     assert payload["answer"]["summary"]
+    assert payload["token_usage"]["totals"]["total_tokens"] > 0
+    assert payload["token_usage"]["totals"]["call_count"] >= 1
+    assert payload["token_usage"]["totals"]["counting_method"] == "tiktoken_estimate"
 
 
 def test_chat_json_path_uses_code_interpreter_tool(tmp_path):

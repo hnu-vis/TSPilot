@@ -560,8 +560,58 @@ async def test_goal_verifier_rejects_terminal_candidate_and_continues_loop():
     )
     assert verifier_observation.payload["success"] is False
     assert verifier_observation.payload["payload"]["missing_items"] == ["maximum value"]
+    assert request_state.completion_state["semantic_repair_directive"]["missing_items"] == ["maximum value"]
+    assert request_state.completion_state["semantic_repair_directive"]["next_action_hint"] == "Run sql_query for the maximum value."
     assert request_state.final_answer_draft is None
     assert "final_answer" not in [event.event_type for event in events]
+
+
+@pytest.mark.asyncio
+async def test_goal_verifier_becomes_advisory_after_rejection_limit():
+    request_state = RequestStateModel(
+        request_id="req-verifier-bypass",
+        message="返回最大值。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        max_iterations=2,
+        latest_database_evidence={
+            "evidence_id": "evi_demo",
+            "result_type": "table",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...)",
+            "summary": "Loaded rows.",
+            "data": {"rows": [{"value": 1.0}]},
+            "columns": ["value"],
+            "metadata": {},
+            "diagnostics": {},
+        },
+    )
+    loop = ReActLoop(
+        data_agent=_TerminateAgent(),
+        tool_executor=_TerminalExecutor(),
+        settings=type(
+            "_Settings",
+            (),
+            {
+                "conversation_log_enabled": False,
+                "resolved_conversation_log_dir": ".",
+                "goal_verifier_max_rejections": 1,
+            },
+        )(),
+        goal_verifier=_RejectingVerifier(),
+    )
+
+    events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
+
+    verifier_failures = [
+        event for event in events
+        if event.event_type == "observation" and event.payload["tool_name"] == "goal_verifier"
+    ]
+    assert len(verifier_failures) == 1
+    assert request_state.completion_state["goal_verifier_bypassed"]["missing_items"] == ["maximum value"]
+    assert request_state.final_answer_draft is not None
+    assert "final_answer" in [event.event_type for event in events]
 
 
 def test_policy_blocks_terminal_answer_until_database_goal_has_evidence():

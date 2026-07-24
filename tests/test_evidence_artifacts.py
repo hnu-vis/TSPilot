@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from core.analysis.python_runner import AnalysisCodeError
 from app.settings import get_settings
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
@@ -217,3 +220,42 @@ def test_code_interpreter_accepts_analysis_code_alias():
 
     assert result["input_row_count"] == 40
     assert result["result"]["metrics"]["row_count"] == 40
+
+
+def test_code_interpreter_requires_stable_result_shape():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 分析趋势")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="metrics"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="missing metrics",
+                    code="result = {'summary': 'computed', 'details': {}}\n",
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_rejects_unknown_evidence_reference():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 分析趋势")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(ValueError, match="could not resolve database_evidence"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    database_evidence="evidence:missing",
+                    analysis_goal="bad ref",
+                    code="result = {'summary': 'computed', 'metrics': {}, 'details': {}}\n",
+                ),
+                request_state=request_state,
+            )
+        )

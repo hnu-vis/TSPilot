@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 
 from core.completion import CompletionEvaluation, GoalCompletionEvaluation
+from runtime.token_usage import record_llm_token_usage
 from schemas.output import FinalAnswer
 from schemas.state import RequestStateModel
 
@@ -79,6 +80,8 @@ class RuntimeLLMEvaluator:
                 "satisfied_items, evidence_refs, next_action_hint, confidence."
             ),
             payload,
+            request_state=request_state,
+            source="runtime_evaluator.step_completion",
         )
         verdict = self._parse(raw, StepCompletionVerdict)
         verdict_payload = verdict.model_dump(mode="json")
@@ -117,6 +120,8 @@ class RuntimeLLMEvaluator:
                 "Return JSON with can_answer, reason, missing_items, answerable_from, next_action_hint, confidence."
             ),
             payload,
+            request_state=request_state,
+            source="runtime_evaluator.answerability",
         )
         verdict = self._parse(raw, AnswerabilityVerdict)
         self.last_answerability_verdict = verdict.model_dump(mode="json")
@@ -175,12 +180,14 @@ class RuntimeLLMEvaluator:
                 "Return JSON with can_answer, reason, missing_items, unsupported_claims, answerable_from, next_action_hint, confidence."
             ),
             payload,
+            request_state=request_state,
+            source="runtime_evaluator.goal_verification",
         )
         verdict = self._parse(raw, GoalVerificationResult)
         self.last_goal_verification = verdict.model_dump(mode="json")
         return verdict
 
-    async def _invoke(self, marker: str, instruction: str, payload: dict) -> str:
+    async def _invoke(self, marker: str, instruction: str, payload: dict, *, request_state=None, source: str = "runtime_evaluator") -> str:
         messages = [
             (
                 "system",
@@ -195,7 +202,9 @@ class RuntimeLLMEvaluator:
         content = getattr(response, "content", response)
         if isinstance(content, list):
             content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
-        return str(content)
+        content = str(content)
+        record_llm_token_usage(request_state, source=source, response=response, messages=messages, output_text=content)
+        return content
 
     def _parse(self, raw: str, model):
         stripped = raw.strip()

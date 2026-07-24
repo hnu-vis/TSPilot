@@ -6,6 +6,7 @@ import re
 
 from agents.base import BaseAgent
 from prompts.data_agent import DataAgentPromptBuilder
+from runtime.token_usage import record_llm_token_usage
 from schemas.agent_turn import ReActTurn
 from schemas.state import ConversationStateModel, RequestStateModel
 
@@ -28,7 +29,9 @@ class DataAgent(BaseAgent):
             [
                 ("system", system_prompt),
                 ("user", user_prompt),
-            ]
+            ],
+            request_state=request_state,
+            source="data_agent.next_turn",
         )
         try:
             return self._parse_turn(content)
@@ -48,7 +51,9 @@ class DataAgent(BaseAgent):
                         "Continue solving the original user task using the current context. "
                         f"Parser error: {first_error}",
                     ),
-                ]
+                ],
+                request_state=request_state,
+                source="data_agent.contract_repair",
             )
             try:
                 return self._parse_turn(repaired_content)
@@ -58,7 +63,7 @@ class DataAgent(BaseAgent):
                     f"first_error={first_error}; second_error={second_error}"
                 ) from second_error
 
-    async def _invoke_model(self, messages) -> str:
+    async def _invoke_model(self, messages, *, request_state=None, source: str = "data_agent") -> str:
         response = await self._llm.ainvoke(messages)
         content = getattr(response, "content", response)
         if isinstance(content, list):
@@ -66,7 +71,9 @@ class DataAgent(BaseAgent):
                 item.get("text", "") if isinstance(item, dict) else str(item)
                 for item in content
             )
-        return str(content)
+        content = str(content)
+        record_llm_token_usage(request_state, source=source, response=response, messages=messages, output_text=content)
+        return content
 
     def _parse_turn(self, content: str) -> ReActTurn:
         stripped = content.strip()

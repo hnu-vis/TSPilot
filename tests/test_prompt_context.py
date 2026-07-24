@@ -46,6 +46,30 @@ def test_prompt_context_exposes_context_budget_rule():
     assert "Prompt context contains bounded previews only" in context["state"]["decision_frame"]["context_budget_rule"]
 
 
+def test_prompt_context_exposes_semantic_repair_directive():
+    settings = get_settings()
+    request = ChatRequest(
+        message="找出最高价。",
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    request_state.completion_state["semantic_repair_directive"] = {
+        "source": "goal_verifier",
+        "reason": "missing maximum value",
+        "missing_items": ["maximum value"],
+        "unsupported_claims": [],
+        "next_action_hint": "Run sql_query for the maximum value.",
+    }
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    builder = DataAgentPromptBuilder()
+    system_prompt = builder.build_system_prompt()
+    context = builder.build_context(request_state, conversation_state)
+
+    assert "semantic_repair_directive is present" in system_prompt
+    assert context["state"]["decision_frame"]["semantic_repair_directive"]["missing_items"] == ["maximum value"]
+
+
 def test_prompt_context_handles_diagnostics_without_data_preview():
     payload = {
         "summary": "analysis ok",

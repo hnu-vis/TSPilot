@@ -34,6 +34,8 @@ class DataAgentPromptBuilder:
             "When a task needs facts not present in the prompt preview, call sql_query or code_interpreter over the full artifact instead of guessing from the preview.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
+            "If state.decision_frame.semantic_repair_directive is present, treat it as the immediate repair objective. "
+            "Do not terminate again until you have addressed its missing_items or unsupported_claims with a new grounded action, unless the directive itself says no further evidence is possible.\n"
             "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
             "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
             "Todo is initial visible process state, not a model-maintained scheduler or tool contract. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
@@ -278,7 +280,7 @@ class DataAgentPromptBuilder:
         if request_state.todo_list:
             next_action_guidance.insert(0, "todowrite is locked after initial planning; runtime advances plan status.")
 
-        return {
+        decision_frame = {
             "current_todo": current_todo,
             "completion_state": request_state.completion_state,
             "latest_query_summary": latest_query_summary,
@@ -293,6 +295,10 @@ class DataAgentPromptBuilder:
                 "run a tool when full-data computation is needed."
             ),
         }
+        repair_directive = request_state.completion_state.get("semantic_repair_directive")
+        if repair_directive:
+            decision_frame["semantic_repair_directive"] = repair_directive
+        return decision_frame
 
     def _active_progress_hint(self, current_todo: dict | None) -> dict:
         if current_todo is None:

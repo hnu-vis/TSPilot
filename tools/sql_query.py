@@ -448,6 +448,7 @@ class SqlQueryTool(BaseTool):
             time_range=validated_input.time_range,
             constraints=validated_input.constraints,
             history=validated_input.history,
+            request_state=kwargs.get("request_state"),
         )
         try:
             return await self._execute_generated_query(
@@ -470,6 +471,7 @@ class SqlQueryTool(BaseTool):
                 history=validated_input.history,
                 previous_query=generation.generated_query.query,
                 error=exc,
+                request_state=kwargs.get("request_state"),
             )
             return await self._execute_generated_query(
                 validated_input,

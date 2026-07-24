@@ -17,6 +17,7 @@ from core.completion import (
 )
 from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
+from runtime.token_usage import token_usage_summary
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
@@ -324,6 +325,7 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
             used_tools=_visible_used_tools(request_state),
             answer=request_state.final_answer_draft,
             trace=trace_events,
+            token_usage=token_usage_summary(request_state),
             error=None,
         )
 
@@ -335,6 +337,7 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
         used_tools=_visible_used_tools(request_state),
         answer=None,
         trace=trace_events,
+        token_usage=token_usage_summary(request_state),
         error="Request did not reach a final answer.",
     )
 

@@ -142,17 +142,33 @@ def execute_python_rows_v1(
     except Exception as exc:
         raise AnalysisCodeError(f"analysis_code execution failed: {exc}") from exc
     runtime_ms = int((time.perf_counter() - started) * 1000)
-    result = locals_dict.get("result")
+    result = validate_analysis_result_payload(locals_dict.get("result"))
+    return ExecutionOutput(result=result, runtime_ms=runtime_ms)
+
+
+def validate_analysis_result_payload(result) -> dict:
+    """Validate the stable result contract consumed by later harness stages."""
+
     if not isinstance(result, dict):
         raise AnalysisCodeError("analysis_code must assign a dict to variable 'result'.")
     summary = result.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         raise AnalysisCodeError("analysis result must include non-empty string field 'summary'.")
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        raise AnalysisCodeError("analysis result must include object field 'metrics'.")
+    details = result.get("details")
+    if not isinstance(details, dict):
+        raise AnalysisCodeError("analysis result must include object field 'details'.")
+    normalized = dict(result)
+    normalized["summary"] = summary.strip()
+    normalized["metrics"] = dict(metrics)
+    normalized["details"] = dict(details)
     try:
-        json.dumps(result, ensure_ascii=False)
+        json.dumps(normalized, ensure_ascii=False)
     except TypeError as exc:
         raise AnalysisCodeError("analysis result must be JSON serializable.") from exc
-    return ExecutionOutput(result=result, runtime_ms=runtime_ms)
+    return normalized
 
 
 def _prepare_code(code: str) -> tuple[str, dict[str, Any]]:

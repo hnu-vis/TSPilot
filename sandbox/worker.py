@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from core.analysis.python_runner import validate_analysis_result_payload
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
@@ -64,14 +66,7 @@ def _execute(payload: dict) -> dict:
         "sqrt": math.sqrt,
     }
     exec(compile(code, "<sandbox_analysis_code>", "exec"), namespace, namespace)
-    result = namespace.get("result")
-    if not isinstance(result, dict):
-        raise ValueError("analysis_code must assign a dict to variable 'result'.")
-    summary = result.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        raise ValueError("analysis result must include non-empty string field 'summary'.")
-    json.dumps(result, ensure_ascii=False)
-    return result
+    return validate_analysis_result_payload(namespace.get("result"))
 
 
 if __name__ == "__main__":

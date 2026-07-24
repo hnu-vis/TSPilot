@@ -99,7 +99,10 @@ def _resolve_database_evidence(database_evidence, request_state):
             return _resolve_database_evidence(None, request_state)
         if evidence_ref.startswith("evidence:"):
             evidence_ref = evidence_ref.split(":", 1)[1]
-        return request_state.database_evidence_artifacts.get(evidence_ref) or _resolve_database_evidence(None, request_state)
+        resolved = request_state.database_evidence_artifacts.get(evidence_ref)
+        if resolved is None:
+            raise ValueError(f"Forecast could not resolve database_evidence reference: {database_evidence}")
+        return resolved
     if isinstance(database_evidence, dict):
         evidence_id = database_evidence.get("evidence_id")
         if evidence_id:

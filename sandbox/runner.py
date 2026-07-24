@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.analysis.python_runner import AnalysisCodeError, ExecutionOutput
+from core.analysis.python_runner import AnalysisCodeError, ExecutionOutput, validate_analysis_result_payload
 
 from .policy import MAX_RESULT_BYTES, MAX_STDIO_CHARS, clamp_timeout
 
@@ -87,8 +87,8 @@ def execute_python_sandbox_v1(
         if output_payload.get("status") != "succeeded":
             error = str(output_payload.get("error") or "unknown sandbox error")
             raise AnalysisCodeError(f"analysis_code sandbox failed: {error}")
-        result = output_payload.get("result")
-        _validate_result(result)
+        result = validate_analysis_result_payload(output_payload.get("result"))
+        _validate_result_size(result)
         runtime_ms = int((time.perf_counter() - started) * 1000)
         return ExecutionOutput(result=result, runtime_ms=runtime_ms)
     finally:
@@ -114,16 +114,8 @@ def _prepare_paths(work_dir: str | Path | None) -> tuple[SandboxPaths, tempfile.
     )
 
 
-def _validate_result(result) -> None:
-    if not isinstance(result, dict):
-        raise AnalysisCodeError("analysis_code must assign a dict to variable 'result'.")
-    summary = result.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        raise AnalysisCodeError("analysis result must include non-empty string field 'summary'.")
-    try:
-        encoded = json.dumps(result, ensure_ascii=False).encode("utf-8")
-    except TypeError as exc:
-        raise AnalysisCodeError("analysis result must be JSON serializable.") from exc
+def _validate_result_size(result: dict) -> None:
+    encoded = json.dumps(result, ensure_ascii=False).encode("utf-8")
     if len(encoded) > MAX_RESULT_BYTES:
         raise AnalysisCodeError("analysis result exceeded maximum output size.")
 

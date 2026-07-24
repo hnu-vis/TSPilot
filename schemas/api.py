@@ -36,4 +36,5 @@ class ChatResponse(BaseModel):
     used_tools: list[str] = Field(default_factory=list)
     answer: FinalAnswer | None = None
     trace: list[TraceEventModel] | None = None
+    token_usage: dict | None = None
     error: str | None = None

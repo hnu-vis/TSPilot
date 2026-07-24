@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AnalysisResult(BaseModel):
@@ -17,3 +17,23 @@ class AnalysisResult(BaseModel):
     summary: str
     result: dict = Field(default_factory=dict)
     diagnostics: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_succeeded_result_contract(self):
+        if self.status != "succeeded":
+            return self
+        result_summary = self.result.get("summary") if isinstance(self.result, dict) else None
+        if not isinstance(result_summary, str) or not result_summary.strip():
+            raise ValueError("succeeded analysis result must include result.summary.")
+        if not isinstance(self.result.get("metrics"), dict):
+            raise ValueError("succeeded analysis result must include result.metrics object.")
+        if not isinstance(self.result.get("details"), dict):
+            raise ValueError("succeeded analysis result must include result.details object.")
+        self.result = {
+            **self.result,
+            "summary": result_summary.strip(),
+            "metrics": dict(self.result["metrics"]),
+            "details": dict(self.result["details"]),
+        }
+        self.summary = result_summary.strip()
+        return self
