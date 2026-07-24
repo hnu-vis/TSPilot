@@ -243,7 +243,7 @@ def test_format_answer_assembles_selected_analysis_results():
     assert "比例为 60%" in result["summary"]
     assert "低位/中位/高位已划分" in result["summary"]
     assert result["sections"][0]["section_type"] == "analysis"
-    assert "Metrics: ratio: 0.6" in result["sections"][0]["content"]
+    assert "指标: ratio: 0.6" in result["sections"][0]["content"]
     assert result["sections"][0]["structured_payload"]["metrics"] == [{"ratio": 0.6}, {}]
     assert [ref["source_type"] for ref in result["references"]] == ["analysis", "analysis"]
 

@@ -17,6 +17,7 @@ from core.completion import (
 )
 from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
+from runtime.language import detect_response_language
 from runtime.token_usage import token_usage_summary
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
@@ -60,6 +61,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         conversation_run_dir=str(conversation_run_dir) if conversation_run_dir else None,
         request_log_dir=str(request_log_dir) if request_log_dir else None,
         message=request.message,
+        response_language=detect_response_language(request.message),
         database_context=database_context,
         selected_database=request.selected_database,
         selected_database_type=request.selected_database_type,

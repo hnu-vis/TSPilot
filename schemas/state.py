@@ -22,6 +22,7 @@ class RequestStateModel(BaseModel):
     conversation_run_dir: str | None = None
     request_log_dir: str | None = None
     message: str
+    response_language: Literal["zh", "en"] = "en"
     database_context: DatabaseContext | None = None
     selected_database: str | None = None
     selected_database_type: str | None = None

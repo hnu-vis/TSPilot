@@ -21,6 +21,10 @@ class DataAgentPromptBuilder:
             "{\"thought\": str, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
             "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
             "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
+            "Language policy: task.response_language is authoritative for all model-authored natural-language text. "
+            "If it is \"zh\", write thought, action_intention, action_reason, todo text, sql_query message/purpose/task_coverage text, "
+            "code_interpreter analysis_goal/result text, and terminate result/summary_goal/direct_answer in Simplified Chinese. "
+            "If it is \"en\", write those fields in English. Keep JSON keys, action names, query code, identifiers, metric names, and database values unchanged.\n"
             "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
             "Choose only the next best action for the current state.\n"
             "Decide from the current evidence gap, not from an imagined workflow.\n"
@@ -95,6 +99,7 @@ class DataAgentPromptBuilder:
         return {
             "task": {
                 "message": request_state.message,
+                "response_language": request_state.response_language,
                 "database_context": (
                     request_state.database_context.model_dump(mode="json")
                     if request_state.database_context

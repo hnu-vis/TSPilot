@@ -37,6 +37,45 @@ class FormatAnswerInput(BaseModel):
 
 
 class FormatAnswerTool(BaseTool):
+    _LABELS = {
+        "zh": {
+            "summary": "摘要",
+            "verified_facts": "已验证事实",
+            "analysis": "分析",
+            "plan": "计划",
+            "knowledge_context": "知识上下文",
+            "skill_output": "技能输出",
+            "conclusion": "结论",
+            "database_evidence": "数据库证据",
+            "knowledge_retrieval": "知识检索",
+            "statistics": "统计结果",
+            "available_metrics": "可用指标",
+            "schema_preview": "Schema 预览",
+            "table_result": "表格结果",
+            "query_results": "查询结果",
+            "query": "查询",
+            "metrics": "指标",
+        },
+        "en": {
+            "summary": "Summary",
+            "verified_facts": "Verified Facts",
+            "analysis": "Analysis",
+            "plan": "Plan",
+            "knowledge_context": "Knowledge Context",
+            "skill_output": "Skill Output",
+            "conclusion": "Conclusion",
+            "database_evidence": "Database evidence",
+            "knowledge_retrieval": "Knowledge retrieval",
+            "statistics": "Statistics",
+            "available_metrics": "Available Metrics",
+            "schema_preview": "Schema Preview",
+            "table_result": "Table Result",
+            "query_results": "Query Results",
+            "query": "Query",
+            "metrics": "Metrics",
+        },
+    }
+
     async def execute(
         self,
         validated_input: FormatAnswerInput,
@@ -98,22 +137,22 @@ class FormatAnswerTool(BaseTool):
         sections_by_type: dict[str, AnswerSection] = {}
         sections_by_type["summary"] = AnswerSection(
             section_type="summary",
-            heading="Summary",
+            heading=self._label(request_state, "summary"),
             content=summary,
             structured_payload=None,
         )
         if facts:
             sections_by_type["facts"] = AnswerSection(
                 section_type="facts",
-                heading="Verified Facts",
+                heading=self._label(request_state, "verified_facts"),
                 content="\n".join(f"- {fact.statement}" for fact in facts),
                 structured_payload={"fact_ids": [fact.fact_id for fact in facts]},
             )
         if analyses:
             sections_by_type["analysis"] = AnswerSection(
                 section_type="analysis",
-                heading="Analysis",
-                content=self._render_analysis_section(analyses),
+                heading=self._label(request_state, "analysis"),
+                content=self._render_analysis_section(analyses, request_state),
                 structured_payload={
                     "analysis_ids": [analysis.analysis_id for analysis in analyses],
                     "metrics": [analysis.result.get("metrics", {}) for analysis in analyses],
@@ -122,15 +161,15 @@ class FormatAnswerTool(BaseTool):
             )
         database_evidence = self._database_evidence_inventory(request_state)
         if len(database_evidence) > 1:
-            sections_by_type["query_results"] = self._database_query_results_section(database_evidence)
+            sections_by_type["query_results"] = self._database_query_results_section(database_evidence, request_state)
         if len(database_evidence) <= 1 and request_state.latest_database_evidence is not None and not facts:
             evidence = request_state.latest_database_evidence
-            for section in self._evidence_sections(evidence):
+            for section in self._evidence_sections(evidence, request_state):
                 sections_by_type[section.section_type] = section
         if request_state.todo_list and "plan" in request_state.answer_requirements:
             sections_by_type["plan"] = AnswerSection(
                 section_type="plan",
-                heading="Plan",
+                heading=self._label(request_state, "plan"),
                 content="\n".join(
                     f"- [{todo.get('status', 'pending')}] {todo.get('content', '')}"
                     for todo in request_state.todo_list
@@ -144,20 +183,20 @@ class FormatAnswerTool(BaseTool):
         if request_state.latest_rag:
             sections_by_type["rag"] = AnswerSection(
                 section_type="rag",
-                heading="Knowledge Context",
+                heading=self._label(request_state, "knowledge_context"),
                 content=request_state.latest_rag.get("summary", ""),
                 structured_payload={"result_count": len(request_state.latest_rag.get("results", []))},
             )
         if request_state.latest_skill:
             sections_by_type["skill"] = AnswerSection(
                 section_type="skill",
-                heading="Skill Output",
+                heading=self._label(request_state, "skill_output"),
                 content=request_state.latest_skill.get("summary", ""),
                 structured_payload={"skill_name": request_state.latest_skill.get("skill_name")},
             )
         sections_by_type["conclusion"] = AnswerSection(
             section_type="conclusion",
-            heading="Conclusion",
+            heading=self._label(request_state, "conclusion"),
             content=summary,
             structured_payload={
                 "has_facts": bool(facts),
@@ -173,7 +212,7 @@ class FormatAnswerTool(BaseTool):
                 AnswerReference(
                     source_type="query",
                     source_id=evidence.evidence_id,
-                    label=self._evidence_purpose(evidence) or "Database evidence",
+                    label=self._evidence_purpose(evidence) or self._label(request_state, "database_evidence"),
                     evidence=self._database_reference_payload(evidence),
                 )
             )
@@ -227,7 +266,7 @@ class FormatAnswerTool(BaseTool):
                     source_id=request_state.latest_rag.get("results", [{}])[0].get("source_id")
                     if request_state.latest_rag.get("results")
                     else None,
-                    label="Knowledge retrieval",
+                    label=self._label(request_state, "knowledge_retrieval"),
                     evidence={"summary": request_state.latest_rag.get("summary")},
                 )
             )
@@ -260,6 +299,7 @@ class FormatAnswerTool(BaseTool):
     def _build_summary(self, request_state: RequestStateModel, facts: list, summary_goal: str) -> str:
         subject = self._subject_label(request_state)
         parts: list[str] = []
+        language = self._language(request_state)
 
         trend_fact = next((fact for fact in facts if fact.fact_type == "trend"), None)
         extrema_fact = next((fact for fact in facts if fact.fact_type in {"extreme", "extrema"}), None)
@@ -281,22 +321,30 @@ class FormatAnswerTool(BaseTool):
                     f"{point.get('timestamp')}={point.get('value')}"
                     for point in anomaly_points[:3]
                 )
-                parts.append(
-                    f"异常检测发现 {len(anomaly_points)} 个异常点，典型异常包括 {preview}。"
-                )
+                if language == "zh":
+                    parts.append(f"异常检测发现 {len(anomaly_points)} 个异常点，典型异常包括 {preview}。")
+                else:
+                    parts.append(f"Anomaly detection found {len(anomaly_points)} anomalies, including {preview}.")
             else:
-                parts.append("异常检测未发现显著异常点。")
+                parts.append("异常检测未发现显著异常点。" if language == "zh" else "Anomaly detection found no significant anomalies.")
 
         if request_state.latest_forecast is not None:
             forecast_points = request_state.latest_forecast.forecast_points
             if forecast_points:
                 first_point = forecast_points[0]
                 last_point = forecast_points[-1]
-                direction = "上升" if last_point.value > first_point.value else "下降" if last_point.value < first_point.value else "基本持平"
-                parts.append(
-                    f"{subject} 的短期预测共 {len(forecast_points)} 个点，预测区间内整体{direction}，"
-                    f"从 {first_point.value:.2f} 变化到 {last_point.value:.2f}。"
-                )
+                if language == "zh":
+                    direction = "上升" if last_point.value > first_point.value else "下降" if last_point.value < first_point.value else "基本持平"
+                    parts.append(
+                        f"{subject} 的短期预测共 {len(forecast_points)} 个点，预测区间内整体{direction}，"
+                        f"从 {first_point.value:.2f} 变化到 {last_point.value:.2f}。"
+                    )
+                else:
+                    direction = "rises" if last_point.value > first_point.value else "falls" if last_point.value < first_point.value else "stays roughly flat"
+                    parts.append(
+                        f"The short-term forecast for {subject} contains {len(forecast_points)} points and overall {direction}, "
+                        f"moving from {first_point.value:.2f} to {last_point.value:.2f}."
+                    )
 
         compact = " ".join(part.strip() for part in parts if part and part.strip())
         return compact or self._fallback_summary(request_state, summary_goal)
@@ -317,6 +365,21 @@ class FormatAnswerTool(BaseTool):
         if request_state.latest_skill:
             return request_state.latest_skill.get("summary", summary_goal)
         return summary_goal
+
+    def _subject_label(self, request_state: RequestStateModel) -> str:
+        evidence = request_state.latest_database_evidence
+        if evidence is not None:
+            metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+            for value in (
+                metadata.get("series_name"),
+                metadata.get("metric"),
+                metadata.get("measurement"),
+                evidence.database,
+            ):
+                text = str(value or "").strip()
+                if text:
+                    return text
+        return "该序列" if self._language(request_state) == "zh" else "the series"
 
     def _has_explicit_sql_query_evidence(self, request_state: RequestStateModel) -> bool:
         evidence = request_state.latest_database_evidence
@@ -350,7 +413,7 @@ class FormatAnswerTool(BaseTool):
             ]
         return list(request_state.analysis_artifacts.values())
 
-    def _render_analysis_section(self, analyses: list) -> str:
+    def _render_analysis_section(self, analyses: list, request_state: RequestStateModel) -> str:
         blocks = []
         for analysis in analyses:
             lines = [f"- {analysis.summary}"]
@@ -362,7 +425,7 @@ class FormatAnswerTool(BaseTool):
                     if value is not None
                 )
                 if metric_text:
-                    lines.append(f"  Metrics: {metric_text}")
+                    lines.append(f"  {self._label(request_state, 'metrics')}: {metric_text}")
             blocks.append("\n".join(lines))
         return "\n".join(blocks)
 
@@ -383,15 +446,15 @@ class FormatAnswerTool(BaseTool):
             return None
         return normalized
 
-    def _evidence_sections(self, evidence) -> list[AnswerSection]:
-        sections = self._query_sections(evidence)
+    def _evidence_sections(self, evidence, request_state: RequestStateModel) -> list[AnswerSection]:
+        sections = self._query_sections(evidence, request_state)
         if evidence.result_type == "statistics":
             stats = evidence.data.get("statistics", {})
             lines = [f"- {key}: {value}" for key, value in stats.items()]
             return sections + [
                 AnswerSection(
                     section_type="statistics",
-                    heading="Statistics",
+                    heading=self._label(request_state, "statistics"),
                     content="\n".join(lines) if lines else evidence.summary,
                     structured_payload=stats or None,
                 )
@@ -402,7 +465,7 @@ class FormatAnswerTool(BaseTool):
             return sections + [
                 AnswerSection(
                     section_type="metric_list",
-                    heading="Available Metrics",
+                    heading=self._label(request_state, "available_metrics"),
                     content="\n".join(f"- {metric}" for metric in preview) if preview else evidence.summary,
                     structured_payload={"metric_count": len(metrics)},
                 )
@@ -413,7 +476,7 @@ class FormatAnswerTool(BaseTool):
             return sections + [
                 AnswerSection(
                     section_type="schema",
-                    heading="Schema Preview",
+                    heading=self._label(request_state, "schema_preview"),
                     content="\n".join(f"- {name}" for name in preview) if preview else evidence.summary,
                     structured_payload={"table_count": len(tables)},
                 )
@@ -423,7 +486,7 @@ class FormatAnswerTool(BaseTool):
             return sections + [
                 AnswerSection(
                     section_type="table",
-                    heading="Table Result",
+                    heading=self._label(request_state, "table_result"),
                     content=evidence.summary,
                     structured_payload={"row_count": len(rows), "columns": evidence.columns},
                 )
@@ -439,16 +502,16 @@ class FormatAnswerTool(BaseTool):
             items.append(latest)
         return items
 
-    def _database_query_results_section(self, evidence_items: list) -> AnswerSection:
+    def _database_query_results_section(self, evidence_items: list, request_state: RequestStateModel) -> AnswerSection:
         blocks = []
         structured_items = []
         for index, evidence in enumerate(evidence_items, start=1):
             summary = self._database_evidence_summary(evidence)
             structured_items.append(summary)
-            blocks.append(self._render_database_evidence_block(index, evidence, summary))
+            blocks.append(self._render_database_evidence_block(index, evidence, summary, request_state))
         return AnswerSection(
             section_type="query_results",
-            heading="Query Results",
+            heading=self._label(request_state, "query_results"),
             content="\n\n".join(blocks),
             structured_payload={"items": structured_items},
         )
@@ -533,37 +596,48 @@ class FormatAnswerTool(BaseTool):
                 return text
         return None
 
-    def _render_database_evidence_block(self, index: int, evidence, summary: dict[str, Any]) -> str:
-        lines = [f"{index}. 查询目的：{summary.get('purpose') or evidence.summary}"]
+    def _render_database_evidence_block(
+        self,
+        index: int,
+        evidence,
+        summary: dict[str, Any],
+        request_state: RequestStateModel,
+    ) -> str:
+        language = self._language(request_state)
+        if language == "zh":
+            lines = [f"{index}. 查询目的：{summary.get('purpose') or evidence.summary}"]
+        else:
+            lines = [f"{index}. Query purpose: {summary.get('purpose') or evidence.summary}"]
         row_count = summary.get("row_count")
         if row_count is not None:
-            lines.append(f"实际返回行数：{row_count}")
+            lines.append(f"实际返回行数：{row_count}" if language == "zh" else f"Rows returned: {row_count}")
         columns = summary.get("columns") or []
         if columns:
-            lines.append("返回列：" + ", ".join(str(column) for column in columns))
+            prefix = "返回列：" if language == "zh" else "Columns: "
+            lines.append(prefix + ", ".join(str(column) for column in columns))
         rows_preview = summary.get("rows_preview") or []
         result_digest = self._result_digest(rows_preview)
         if result_digest:
-            lines.append(f"结果值：{result_digest}")
+            lines.append(f"结果值：{result_digest}" if language == "zh" else f"Result values: {result_digest}")
         concise_summary = self._concise_evidence_summary(evidence.summary)
         if concise_summary:
-            lines.append(f"结果摘要：{concise_summary}")
+            lines.append(f"结果摘要：{concise_summary}" if language == "zh" else f"Result summary: {concise_summary}")
         if rows_preview:
             if summary.get("sampled_for_prompt"):
-                lines.append("当前展示的是采样预览；完整结果见 artifact。")
+                lines.append("当前展示的是采样预览；完整结果见 artifact。" if language == "zh" else "The current display is a sampled preview; see the artifact for the full result.")
             else:
-                lines.append("当前展示的是实际返回预览。")
+                lines.append("当前展示的是实际返回预览。" if language == "zh" else "The current display is the returned preview.")
             lines.append(self._markdown_table(rows_preview, columns))
         elif summary.get("sampled_for_prompt"):
-            lines.append("当前仅有采样摘要可用于最终展示；完整结果见 artifact。")
+            lines.append("当前仅有采样摘要可用于最终展示；完整结果见 artifact。" if language == "zh" else "Only a sampled summary is available for display; see the artifact for the full result.")
         artifact_ref = summary.get("artifact_ref")
         if artifact_ref:
-            lines.append(f"结果引用：{artifact_ref}")
+            lines.append(f"结果引用：{artifact_ref}" if language == "zh" else f"Result reference: {artifact_ref}")
         query = str(summary.get("query") or "").strip()
         if query and not self._is_internal_query(evidence):
             language = self._markdown_language(evidence.query_language)
             fence = f"```{language}\n{query}\n```" if language else f"```\n{query}\n```"
-            lines.append("查询语句：")
+            lines.append("查询语句：" if language == "zh" else "Query statement:")
             lines.append(fence)
         return "\n".join(lines)
 
@@ -646,7 +720,7 @@ class FormatAnswerTool(BaseTool):
             "artifact_ref": summary.get("artifact_ref"),
         }
 
-    def _query_sections(self, evidence) -> list[AnswerSection]:
+    def _query_sections(self, evidence, request_state: RequestStateModel | None = None) -> list[AnswerSection]:
         query = str(evidence.query or "").strip()
         if not query or self._is_internal_query(evidence):
             return []
@@ -655,7 +729,7 @@ class FormatAnswerTool(BaseTool):
         return [
             AnswerSection(
                 section_type="query",
-                heading="Query",
+                heading=self._label(request_state, "query"),
                 content=fence,
                 structured_payload={
                     "query_language": evidence.query_language,
@@ -683,3 +757,10 @@ class FormatAnswerTool(BaseTool):
             "prometheus": "promql",
         }
         return aliases.get(normalized, normalized)
+
+    def _language(self, request_state: RequestStateModel | None) -> str:
+        return "zh" if getattr(request_state, "response_language", "en") == "zh" else "en"
+
+    def _label(self, request_state: RequestStateModel | None, key: str) -> str:
+        language = self._language(request_state)
+        return self._LABELS[language].get(key, self._LABELS["en"].get(key, key.replace("_", " ").title()))

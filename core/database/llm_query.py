@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from runtime.language import detect_response_language
 from runtime.token_usage import record_llm_token_usage
 
 
@@ -64,10 +65,12 @@ class LLMQueryGenerator:
             raise RuntimeError("LLM query generation requires an llm instance.")
 
         system_prompt = self._system_prompt()
+        response_language = getattr(request_state, "response_language", None) or detect_response_language(message)
         user_prompt = self._user_prompt(
             database_id=database_id,
             database_type=database_type,
             message=message,
+            response_language=response_language,
             schema_preview=schema_preview,
             time_range=time_range,
             constraints=constraints,
@@ -136,6 +139,9 @@ class LLMQueryGenerator:
             "Prefer raw time-series rows when the user asks for trends, seasonality, anomalies, or forecasting.\n"
             "Use aggregation only when the user asks for an aggregate, ranking, count, summary statistic, bucket, or comparison.\n"
             "Before returning, self-check whether this single query covers the whole user request. "
+            "Use request.response_language for all natural-language JSON values you generate, including purpose, assumptions, "
+            "task_coverage.satisfied, task_coverage.missing_or_uncertain, and task_coverage.next_action_hint. "
+            "Use Simplified Chinese for \"zh\" and English for \"en\". Keep query code, identifiers, and data values unchanged.\n"
             "Use task_coverage.satisfied for request constraints/facts this query is designed to satisfy, "
             "task_coverage.missing_or_uncertain for requested facts not directly computed by this query, and "
             "task_coverage.next_action_hint for the next sql_query needed when coverage is incomplete. "
@@ -158,6 +164,7 @@ class LLMQueryGenerator:
         database_id: str,
         database_type: str,
         message: str,
+        response_language: str,
         schema_preview: dict,
         time_range: dict | None,
         constraints: dict,
@@ -169,6 +176,7 @@ class LLMQueryGenerator:
             "database_id": database_id,
             "database_type": database_type,
             "message": message,
+            "response_language": response_language,
             "schema_preview": schema_preview,
             "time_range": time_range,
             "constraints": constraints,
