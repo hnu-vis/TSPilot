@@ -39,10 +39,12 @@ export type ChatStreamRequest = {
 export async function streamChat(
   request: ChatStreamRequest,
   onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
 ) {
   const response = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal,
     body: JSON.stringify({
       message: request.message,
       conversation_id: request.conversationId,

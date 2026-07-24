@@ -60,7 +60,7 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
           )}
           <div className="bubble">
             {message.answer ? (
-              <FinalAnswer answer={message.answer} />
+              <FinalAnswer answer={message.answer} tokenUsage={message.tokenUsage} />
             ) : message.isStreaming ? (
               <div className="live-answer">
                 <div className="live-status">

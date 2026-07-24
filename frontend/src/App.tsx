@@ -1,5 +1,5 @@
 import { Menu } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatThread } from './components/ChatThread';
 import { Composer } from './components/Composer';
 import { HistorySidebar } from './components/HistorySidebar';
@@ -36,6 +36,7 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [resources, setResources] = useState<ResourceState>({ databases: [], knowledge: [], model: 'backend model' });
   const [, setResourceError] = useState<string | null>(null);
+  const activeAbortRef = useRef<AbortController | null>(null);
 
   const activeConversation = conversations.find((item) => item.id === activeId) || conversations[0];
   const selectedTraceStep = activeConversation?.selectedTraceStepId
@@ -121,6 +122,8 @@ export default function App() {
   const handleSend = async (message: string) => {
     if (!activeConversation || isStreaming) return;
     const conversationId = activeConversation.id;
+    const abortController = new AbortController();
+    activeAbortRef.current = abortController;
     const withUserMessage = appendUserMessage(activeConversation, message);
     const withAssistantPending = appendAssistantPending(withUserMessage);
     setConversations((current) => sortConversations(current.map((conversation) => (
@@ -139,15 +142,30 @@ export default function App() {
           history: buildBackendHistory(withUserMessage),
         },
         (event) => handleStreamEvent(conversationId, event),
+        abortController.signal,
       );
     } catch (error) {
+      if (isAbortError(error)) {
+        updateConversation(conversationId, (conversation) => appendAssistantError(
+          markLatestRunningStepErrored(conversation, 'Stopped by user.'),
+          '已停止。',
+        ));
+        return;
+      }
       updateConversation(conversationId, (conversation) => appendAssistantError(
         conversation,
         error instanceof Error ? error.message : 'The chat request failed.',
       ));
     } finally {
+      if (activeAbortRef.current === abortController) {
+        activeAbortRef.current = null;
+      }
       setIsStreaming(false);
     }
+  };
+
+  const handleStop = () => {
+    activeAbortRef.current?.abort();
   };
 
   const handleStreamEvent = (conversationId: string, event: StreamEvent) => {
@@ -227,7 +245,11 @@ export default function App() {
     if (event.event === 'final_answer') {
       const answer = extractFinalAnswer(event.data);
       if (!answer) return;
-      updateConversation(conversationId, (conversation) => appendAssistantAnswer(conversation, answer));
+      updateConversation(conversationId, (conversation) => appendAssistantAnswer(
+        conversation,
+        answer,
+        asRecord(event.data.token_usage),
+      ));
       return;
     }
 
@@ -287,6 +309,7 @@ export default function App() {
             <div className="empty-composer-slot">
               <Composer
                 disabled={isStreaming}
+                running={isStreaming}
                 databases={resources.databases}
                 knowledge={resources.knowledge}
                 selectedDatabaseId={activeConversation.selectedDatabaseId}
@@ -295,6 +318,7 @@ export default function App() {
                 onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
                 onSelectKnowledge={(id) => handleResourceChange('selectedKnowledgeId', id)}
                 onSubmit={handleSend}
+                onStop={handleStop}
               />
             </div>
           )}
@@ -303,6 +327,7 @@ export default function App() {
         {hasConversationContent && (
           <Composer
             disabled={isStreaming}
+            running={isStreaming}
             databases={resources.databases}
             knowledge={resources.knowledge}
             selectedDatabaseId={activeConversation.selectedDatabaseId}
@@ -311,6 +336,7 @@ export default function App() {
             onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
             onSelectKnowledge={(id) => handleResourceChange('selectedKnowledgeId', id)}
             onSubmit={handleSend}
+            onStop={handleStop}
           />
         )}
       </main>
@@ -362,4 +388,8 @@ function markLatestRunningStepErrored(conversation: Conversation, message: strin
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
 }

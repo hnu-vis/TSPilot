@@ -1,4 +1,4 @@
-import type { ChatMessage, Conversation, FinalAnswer, TraceStep } from '../types';
+import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep } from '../types';
 
 const STORAGE_KEY = 'tspilot:v02:conversations';
 
@@ -85,7 +85,7 @@ export function appendAssistantPending(conversation: Conversation): Conversation
   };
 }
 
-export function appendAssistantAnswer(conversation: Conversation, answer: FinalAnswer): Conversation {
+export function appendAssistantAnswer(conversation: Conversation, answer: FinalAnswer, tokenUsage?: TokenUsage | null): Conversation {
   const timestamp = now();
   const content = answer.summary || answer.title || 'Answer generated.';
   const streamingIndex = findStreamingAssistantIndex(conversation);
@@ -95,6 +95,7 @@ export function appendAssistantAnswer(conversation: Conversation, answer: FinalA
       ...messages[streamingIndex],
       content,
       answer,
+      tokenUsage,
       isStreaming: false,
       createdAt: messages[streamingIndex].createdAt,
     };
@@ -113,6 +114,7 @@ export function appendAssistantAnswer(conversation: Conversation, answer: FinalA
         role: 'assistant',
         content,
         answer,
+        tokenUsage,
         createdAt: timestamp,
       },
     ],

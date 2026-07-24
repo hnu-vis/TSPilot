@@ -6,7 +6,19 @@ export type ChatMessage = {
   content: string;
   createdAt: string;
   answer?: FinalAnswer;
+  tokenUsage?: TokenUsage | null;
   isStreaming?: boolean;
+};
+
+export type TokenUsage = {
+  totals?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    call_count?: number;
+    counting_method?: string;
+  };
+  calls?: Array<Record<string, unknown>>;
 };
 
 export type FinalAnswer = {

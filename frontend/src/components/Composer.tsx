@@ -1,10 +1,11 @@
-import { Loader2, Send } from 'lucide-react';
+import { Send, Square } from 'lucide-react';
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
 import type { DatabaseResource, KnowledgeResource } from '../types';
 import { ModelChip, ResourceSelect } from './ResourceSelect';
 
 type Props = {
   disabled: boolean;
+  running?: boolean;
   databases: DatabaseResource[];
   knowledge: KnowledgeResource[];
   selectedDatabaseId: string | null;
@@ -13,10 +14,12 @@ type Props = {
   onSelectDatabase: (id: string | null) => void;
   onSelectKnowledge: (id: string | null) => void;
   onSubmit: (message: string) => void;
+  onStop?: () => void;
 };
 
 export function Composer({
   disabled,
+  running = false,
   databases,
   knowledge,
   selectedDatabaseId,
@@ -25,6 +28,7 @@ export function Composer({
   onSelectDatabase,
   onSelectKnowledge,
   onSubmit,
+  onStop,
 }: Props) {
   const [value, setValue] = useState('');
   const [focused, setFocused] = useState(false);
@@ -78,8 +82,14 @@ export function Composer({
         </div>
         <div className="composer-actions">
           <ModelChip model={model} />
-          <button className="send-button" type="submit" disabled={disabled || !value.trim()} aria-label="Send message">
-            {disabled ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+          <button
+            className={`send-button ${running ? 'stop-button' : ''}`}
+            type={running ? 'button' : 'submit'}
+            disabled={!running && (disabled || !value.trim())}
+            aria-label={running ? 'Stop response' : 'Send message'}
+            onClick={running ? onStop : undefined}
+          >
+            {running ? <Square size={15} fill="currentColor" /> : <Send size={18} />}
           </button>
         </div>
       </div>
