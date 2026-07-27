@@ -124,6 +124,9 @@ Existing files already provide partial building blocks:
 - add deterministic `QueryValidator`
 - add repair policies for time-range loss, wrong aggregation, and empty-result
   retries
+- treat `max_points` for trend/forecast/anomaly time-series requests as a
+  full-range result budget: use window aggregation or representative
+  downsampling, not head/tail `LIMIT` truncation
 - normalize repair attempts into traceable execution events
 - persist large raw results via a stable snapshot reference instead of pushing
   them into model-visible observations

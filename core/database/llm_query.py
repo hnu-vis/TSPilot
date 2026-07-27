@@ -100,7 +100,14 @@ class LLMQueryGenerator:
                 for item in content
             )
         content = str(content)
-        record_llm_token_usage(request_state, source=source, response=response, messages=messages, output_text=content)
+        record_llm_token_usage(
+            request_state,
+            source=source,
+            response=response,
+            messages=messages,
+            output_text=content,
+            tool_name="sql_query",
+        )
         return content
 
     def _parse_response(self, content: str) -> LLMGeneratedQuery:
@@ -136,14 +143,19 @@ class LLMQueryGenerator:
             "Use schema_linking.candidate_filters and labels_or_tags as auxiliary value-domain evidence. "
             "Map user-mentioned entities, abbreviations, ticker symbols, and multilingual aliases to those domain values before writing filters.\n"
             "If a value-domain candidate is the only plausible match for a requested entity, include that filter even when it was not in required_filters.\n"
-            "Prefer raw time-series rows when the user asks for trends, seasonality, anomalies, or forecasting.\n"
-            "Use aggregation only when the user asks for an aggregate, ranking, count, summary statistic, bucket, or comparison.\n"
+            "For trends, seasonality, anomalies, or forecasting, preserve coverage of the requested time range. "
+            "If constraints.max_points limits output size, use time-window aggregation or representative downsampling across the full range; "
+            "do not use LIMIT/top/head as a substitute for sampling because it truncates the time range.\n"
+            "Use aggregation for explicit aggregate/ranking/count/summary/bucket/comparison requests, and for full-range downsampling needed to keep time-series evidence within constraints.\n"
+            "For derived or multi-field statistics, plan from the requested output contract rather than a fixed query template. "
+            "Each requested measure, dimension, grouping, comparison, time boundary, or derived quantity must either be represented by an explicit returned column/result shape, or listed in task_coverage.missing. "
+            "If one compact query would require fragile dialect-specific state logic, prefer a simpler reliable evidence query and mark the still-missing contract fields instead of claiming coverage.\n"
             "Before returning, self-check whether this single query covers the whole user request. "
             "Use request.response_language for all natural-language JSON values you generate, including purpose, assumptions, "
-            "task_coverage.satisfied, task_coverage.missing_or_uncertain, and task_coverage.next_action_hint. "
+            "task_coverage.satisfied, task_coverage.missing, and task_coverage.next_action_hint. "
             "Use Simplified Chinese for \"zh\" and English for \"en\". Keep query code, identifiers, and data values unchanged.\n"
             "Use task_coverage.satisfied for request constraints/facts this query is designed to satisfy, "
-            "task_coverage.missing_or_uncertain for requested facts not directly computed by this query, and "
+            "task_coverage.missing for requested facts not directly computed by this query, and "
             "task_coverage.next_action_hint for the next sql_query needed when coverage is incomplete. "
             "Do not claim coverage for extrema, count, grouping, or ordering unless the query explicitly computes it.\n"
             "JSON schema: {"
@@ -153,7 +165,7 @@ class LLMQueryGenerator:
             "\"expected_result_type\": \"timeseries\"|\"table\"|\"statistics\"|\"schema\"|\"metric_list\", "
             "\"selected_fields\": string[], "
             "\"assumptions\": string[], "
-            "\"task_coverage\": {\"satisfied\": string[], \"missing_or_uncertain\": string[], \"next_action_hint\": string|null}, "
+            "\"task_coverage\": {\"satisfied\": string[], \"missing\": string[], \"next_action_hint\": string|null}, "
             "\"confidence\": number"
             "}."
         )

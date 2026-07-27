@@ -133,6 +133,18 @@ class QueryDatabaseTool(BaseTool):
         value_fields = self._pick_value_fields(validated_input.message, reference_dataset, rows[0].keys())
         value_field = value_fields[0]
         filtered_rows = self._filter_rows(rows, time_field, validated_input.time_range)
+        if not filtered_rows:
+            return self._empty_reference_dataset_evidence(
+                validated_input=validated_input,
+                config_path=config_path,
+                config=config,
+                dataset_path=dataset_path,
+                value_field=value_field,
+                value_fields=value_fields,
+                time_field=time_field,
+                result_type="timeseries",
+                source=reference_dataset.get("source", "reference_dataset"),
+            ).model_dump(mode="json")
         requested_max_points = validated_input.constraints.get("max_points")
         points = self._to_points(filtered_rows, time_field, value_field)
         evidence = build_reference_dataset_timeseries_evidence(
@@ -175,6 +187,18 @@ class QueryDatabaseTool(BaseTool):
         reference_dataset = self._reference_dataset_with_query_hints(reference_dataset, validated_input.constraints)
         value_field = self._pick_value_field(validated_input.message, reference_dataset, rows[0].keys())
         filtered_rows = self._filter_rows(rows, time_field, validated_input.time_range)
+        if not filtered_rows:
+            return self._empty_reference_dataset_evidence(
+                validated_input=validated_input,
+                config_path=config_path,
+                config=config,
+                dataset_path=dataset_path,
+                value_field=value_field,
+                value_fields=[value_field],
+                time_field=time_field,
+                result_type="statistics",
+                source=reference_dataset.get("source", "reference_dataset"),
+            ).model_dump(mode="json")
         values = []
         for row in filtered_rows:
             try:
@@ -354,10 +378,12 @@ class QueryDatabaseTool(BaseTool):
             if end and timestamp > end:
                 continue
             filtered.append(row)
-        return filtered or rows
+        return filtered
 
     def _to_points(self, rows: list[dict], time_field: str, value_field: str) -> list[dict]:
         points = []
+        if not rows:
+            return points
         for row in rows:
             raw_value = str(row[value_field]).strip()
             try:
@@ -368,6 +394,59 @@ class QueryDatabaseTool(BaseTool):
         if not points:
             raise ValueError(f"No numeric points could be extracted from '{value_field}'.")
         return points
+
+    def _empty_reference_dataset_evidence(
+        self,
+        *,
+        validated_input: QueryDatabaseInput,
+        config_path: Path,
+        config: dict,
+        dataset_path: Path,
+        value_field: str,
+        value_fields: list[str],
+        time_field: str,
+        result_type: str,
+        source: str,
+    ) -> DatabaseEvidence:
+        query_language = "reference_dataset"
+        query = f"reference_dataset:{value_field}" + (":statistics" if result_type == "statistics" else "")
+        data = (
+            {"statistics": {"count": 0}, "value_field": value_field, "time_field": time_field}
+            if result_type == "statistics"
+            else {
+                "points": [],
+                "rows": [],
+                "series": [],
+                "time_field": time_field,
+                "value_field": value_field,
+                "series_name": value_field,
+                "labels": {"source": source},
+            }
+        )
+        return DatabaseEvidence(
+            evidence_id=f"evi_{validated_input.database_context.database_id}_{value_field}"
+            + ("_stats" if result_type == "statistics" else ""),
+            result_type=result_type,
+            database=validated_input.database_context.database_id,
+            query_language=query_language,
+            query=query,
+            summary=f"No rows matched the requested time range for {value_field}.",
+            data=data,
+            columns=([time_field, *value_fields] if result_type != "statistics" else ["metric", "value"]),
+            metadata={
+                "config_path": str(config_path),
+                "dataset_path": str(dataset_path),
+                "database_type": config.get("type"),
+            },
+            diagnostics={
+                "selected_field": value_field,
+                "selected_fields": value_fields,
+                "row_count_total": 0,
+                "row_count_materialized": 0,
+                "is_full_fidelity": True,
+                "no_data_reason": "time_range_filter_matched_no_rows",
+            },
+        )
 
     def _to_timeseries_rows(self, rows: list[dict], time_field: str, value_fields: list[str]) -> list[dict]:
         normalized_rows: list[dict] = []

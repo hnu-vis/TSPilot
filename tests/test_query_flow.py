@@ -517,6 +517,40 @@ def test_reference_dataset_max_points_does_not_sample_analysis_evidence():
         assert evidence["diagnostics"]["sampling_policy"]["requested_max_points"] == 3
 
 
+def test_reference_dataset_timeseries_returns_empty_evidence_for_unmatched_time_range():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        dataset_path = tmp_path / "series.csv"
+        dataset_path.write_text(
+            "timestamp,value\n"
+            "2016-01-11T17:00:00Z,2\n"
+            "2016-01-11T17:10:00Z,3\n",
+            encoding="utf-8",
+        )
+        tool = QueryDatabaseTool(get_settings())
+        evidence = tool._reference_dataset_timeseries(
+            QueryDatabaseInput(
+                message="查询 value",
+                database_context=DatabaseContext(database_id="demo", database_type="csv"),
+                time_range={"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+            ),
+            tmp_path / "database.yaml",
+            {"type": "csv"},
+            {
+                "dataset_path": str(dataset_path),
+                "timestamp_column": "timestamp",
+                "field_columns": ["value"],
+                "source": "test",
+            },
+        )
+
+        assert evidence["summary"] == "No rows matched the requested time range for value."
+        assert evidence["data"]["points"] == []
+        assert evidence["data"]["rows"] == []
+        assert evidence["diagnostics"]["row_count_total"] == 0
+        assert evidence["diagnostics"]["no_data_reason"] == "time_range_filter_matched_no_rows"
+
+
 def test_prompt_safe_evidence_still_samples_full_artifact_for_react_context():
     points = [
         {"timestamp": f"2023-01-01T00:{index:02d}:00Z", "value": float(index)}

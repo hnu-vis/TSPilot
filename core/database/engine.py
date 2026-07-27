@@ -1,11 +1,13 @@
 """Deterministic execution helpers for database-backed queries."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+import re
 
 from .connector import QueryResult
 from .repair import classify_query_error, should_retry_query
-from core.intent import AGGREGATION_FACT_TYPES, build_intent_profile_fallback
+from core.intent import build_intent_profile_fallback
 from schemas.database import DatabaseEvidence
 
 
@@ -36,9 +38,9 @@ async def execute_range_query(connector, query: str, *, start, end, step: str) -
 def infer_evidence_family(message: str) -> str:
     normalized = message.lower()
     intent_profile = build_intent_profile_fallback(message)
-    fact_types = set(intent_profile.get("requested_fact_types") or [])
-    has_statistics_request = bool(fact_types & AGGREGATION_FACT_TYPES)
-    has_timeseries_request = bool(fact_types & {"seasonality", "trend", "outlier", "forecast", "association", "difference"})
+    capabilities = set(intent_profile.get("requested_capabilities") or [])
+    has_statistics_request = "analysis" in capabilities
+    has_timeseries_request = bool(capabilities & {"forecast", "anomaly"})
 
     metric_keywords = ("metric list", "metrics", "available metrics", "有哪些指标", "有哪些 metric")
     if any(keyword in normalized for keyword in metric_keywords):
@@ -57,6 +59,9 @@ def infer_evidence_family(message: str) -> str:
     if any(keyword in normalized for keyword in schema_keywords):
         return "schema"
 
+    if _asks_for_raw_timeseries(normalized) and not _asks_for_scalar_aggregate(normalized):
+        return "timeseries"
+
     if has_statistics_request:
         return "statistics"
 
@@ -68,6 +73,57 @@ def infer_evidence_family(message: str) -> str:
         return "table"
 
     return "timeseries"
+
+
+def _asks_for_raw_timeseries(normalized: str) -> bool:
+    return any(
+        token in normalized
+        for token in (
+            "原始时间序列",
+            "时间序列",
+            "时序",
+            "周期",
+            "周期性",
+            "seasonality",
+            "daily",
+            "weekly",
+            "raw series",
+            "time series",
+            "forecast",
+            "predict",
+            "prediction",
+            "anomaly",
+            "outlier",
+            "预测",
+            "异常",
+            "离群",
+        )
+    )
+
+
+def _asks_for_scalar_aggregate(normalized: str) -> bool:
+    if any(
+        pattern in normalized
+        for pattern in (
+            "不要使用 max",
+            "不要用 max",
+            "avoid max",
+            "avoid aggregation",
+            "avoid aggregations",
+            "not use max",
+            "without max",
+        )
+    ):
+        return False
+    if any(token in normalized for token in ("最高", "最低", "最大", "最小", "平均", "均值", "总和", "总数", "多少条")):
+        return True
+    return bool(re.search(r"(?<![A-Za-z0-9_])(max|min|avg|mean|sum|count)(?![A-Za-z0-9_])", normalized))
+
+
+def evidence_id_for_query(database_id: str, query: str, result_type: str) -> str:
+    digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:12]
+    safe_result_type = "".join(char if char.isalnum() else "_" for char in result_type).strip("_") or "query"
+    return f"evi_{database_id}_{safe_result_type}_{digest}"
 
 
 def infer_prometheus_metric(message: str, schema) -> str | None:
@@ -125,7 +181,7 @@ def normalize_query_result(
                 labels = sorted(grouped)
                 primary = labels[0]
                 return DatabaseEvidence(
-                    evidence_id=f"evi_{database_id}_{query.replace(' ', '_')}",
+                    evidence_id=evidence_id_for_query(database_id, query, "timeseries"),
                     result_type="timeseries",
                     database=database_id,
                     query_language=query_language,
@@ -163,7 +219,7 @@ def normalize_query_result(
             if row.get("value") is not None
         ]
         return DatabaseEvidence(
-            evidence_id=f"evi_{database_id}_{query.replace(' ', '_')}",
+            evidence_id=evidence_id_for_query(database_id, query, "timeseries"),
             result_type="timeseries",
             database=database_id,
             query_language=query_language,
@@ -211,7 +267,7 @@ def normalize_query_result(
                 }
             )
         return DatabaseEvidence(
-            evidence_id=f"evi_{database_id}_{query.replace(' ', '_')}",
+            evidence_id=evidence_id_for_query(database_id, query, "timeseries"),
             result_type="timeseries",
             database=database_id,
             query_language=query_language,
@@ -236,7 +292,7 @@ def normalize_query_result(
         )
 
     return DatabaseEvidence(
-        evidence_id=f"evi_{database_id}_table",
+        evidence_id=evidence_id_for_query(database_id, query, "table"),
         result_type="table",
         database=database_id,
         query_language=query_language,

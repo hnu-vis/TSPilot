@@ -98,7 +98,7 @@ class DefaultIntentInterpreter(IntentInterpreter):
         intent_profile = context.intent_profile or {}
         profile_fact_types = [
             str(item)
-            for item in intent_profile.get("requested_fact_types", [])
+            for item in intent_profile.get("requested_capabilities", [])
             if item
         ]
         normalized = context.message.lower()

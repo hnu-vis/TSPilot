@@ -4,7 +4,7 @@ import pytest
 
 from app.settings import get_settings
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
-from core.report.composer import missing_requirements
+from core.database.engine import normalize_query_result
 from runtime.request_state import apply_observation, build_request_state
 from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
@@ -132,6 +132,22 @@ def test_reference_dataset_filter_handles_naive_rows_and_utc_request_range():
     assert [row["value"] for row in filtered] == ["2", "3"]
 
 
+def test_reference_dataset_filter_does_not_fallback_to_full_dataset_when_range_is_empty():
+    tool = QueryDatabaseTool(get_settings())
+    rows = [
+        {"timestamp": "2016-01-11 17:00:00", "value": "2"},
+        {"timestamp": "2016-01-11 17:10:00", "value": "3"},
+    ]
+
+    filtered = tool._filter_rows(
+        rows,
+        "timestamp",
+        {"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
+    )
+
+    assert filtered == []
+
+
 def test_sql_query_runtime_field_check_treats_time_aliases_as_present():
     executor = __import__("tools.sql_query", fromlist=["_ExplicitQueryExecutor"])._ExplicitQueryExecutor(get_settings())
 
@@ -160,6 +176,64 @@ def test_sql_query_runtime_field_check_uses_flux_keep_projection():
     assert missing == [
         "selected result fields are not present in returned columns: price"
     ]
+
+
+def test_sql_query_runtime_field_check_applies_flux_rename_aliases():
+    executor = __import__("tools.sql_query", fromlist=["_ExplicitQueryExecutor"])._ExplicitQueryExecutor(get_settings())
+
+    missing = executor._runtime_missing_items(
+        selected_fields=[],
+        columns=["timestamp", "price", "code"],
+        row_count=1,
+        query=(
+            'from(bucket: "demo") '
+            '|> keep(columns: ["_time", "_value", "code"]) '
+            '|> rename(columns: {_time: "timestamp", _value: "price"})'
+        ),
+        query_language="flux",
+    )
+
+    assert missing == []
+
+
+def test_sql_query_runtime_field_check_prefers_projected_output_over_selected_fields():
+    executor = __import__("tools.sql_query", fromlist=["_ExplicitQueryExecutor"])._ExplicitQueryExecutor(get_settings())
+
+    missing = executor._runtime_missing_items(
+        selected_fields=["_time", "price"],
+        columns=["earliest_time", "latest_time"],
+        row_count=1,
+        query='from(bucket: "demo") |> keep(columns: ["_time"]) |> min(column: "_time")',
+        query_language="flux",
+    )
+
+    assert missing == []
+
+
+def test_table_evidence_ids_are_unique_per_query():
+    first = normalize_query_result(
+        database_id="demo",
+        database_type="influxdb",
+        query_language="flux",
+        query='from(bucket: "demo") |> count()',
+        result=QueryResult(columns=["count"], rows=[{"count": 2}], row_count=1, execution_time_ms=1),
+    )
+    second = normalize_query_result(
+        database_id="demo",
+        database_type="influxdb",
+        query_language="flux",
+        query='from(bucket: "demo") |> min(column: "_time")',
+        result=QueryResult(
+            columns=["earliest_time"],
+            rows=[{"earliest_time": "2023-01-01T00:00:00Z"}],
+            row_count=1,
+            execution_time_ms=1,
+        ),
+    )
+
+    assert first.result_type == "table"
+    assert second.result_type == "table"
+    assert first.evidence_id != second.evidence_id
 
 
 @pytest.mark.asyncio
@@ -284,8 +358,8 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
             "assumptions": [],
             "task_coverage": {
                 "satisfied": ["selected price timestamps and values"],
-                "missing_or_uncertain": ["trend conclusion still needs analysis"],
-                "next_action_hint": "run insight over the returned time series",
+                "missing": ["trend conclusion still needs analysis"],
+                "next_action_hint": "run code_interpreter over the returned time series",
             },
             "confidence": 0.91,
         }
@@ -305,11 +379,11 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
     assert result["diagnostics"]["llm_query_generation"]["selected_fields"] == ["value"]
     coverage = result["diagnostics"]["task_coverage"]
     assert coverage["satisfied"] == ["selected price timestamps and values"]
-    assert coverage["missing_or_uncertain"] == ["trend conclusion still needs analysis"]
-    assert coverage["next_action_hint"] == "run insight over the returned time series"
+    assert coverage["missing"] == ["trend conclusion still needs analysis"]
+    assert coverage["next_action_hint"] == "run code_interpreter over the returned time series"
     assert coverage["requires_followup"] is True
     assert coverage["result_summary"]["row_count"] == 1
-    assert result["diagnostics"]["llm_query_generation"]["task_coverage"]["missing_or_uncertain"] == [
+    assert result["diagnostics"]["llm_query_generation"]["task_coverage"]["missing"] == [
         "trend conclusion still needs analysis"
     ]
     prompt_payload = __import__("json").loads(llm.messages[0][1][1].split("LLM SQL Query Generation JSON:\n", 1)[1])
@@ -347,7 +421,7 @@ async def test_sql_query_marks_missing_selected_fields_from_runtime_result(monke
             "assumptions": [],
             "task_coverage": {
                 "satisfied": ["latest timestamp selected"],
-                "missing_or_uncertain": [],
+                "missing": [],
                 "next_action_hint": None,
             },
             "confidence": 0.9,
@@ -364,7 +438,7 @@ async def test_sql_query_marks_missing_selected_fields_from_runtime_result(monke
     coverage = result["diagnostics"]["task_coverage"]
 
     assert coverage["runtime_requires_followup"] is True
-    assert coverage["runtime_missing_or_uncertain"] == [
+    assert coverage["runtime_missing"] == [
         "selected result fields are not present in returned columns: price"
     ]
 
@@ -524,12 +598,11 @@ async def test_explicit_flux_query_rejects_missing_user_value_domain_filters(mon
     assert connector.executed_queries == []
 
 
-def test_explicit_sql_query_evidence_satisfies_answer_requirements():
+def test_explicit_sql_query_evidence_is_available_for_gap_assessment():
     request_state = RequestStateModel(
         request_id="req_sql_query_requirement",
         message="按小时聚合并判断周期性。",
         status="running",
-        answer_requirements=["seasonality"],
     )
     payload = {
         "evidence_id": "evi_analysis",
@@ -562,4 +635,6 @@ def test_explicit_sql_query_evidence_satisfies_answer_requirements():
         ),
     )
 
-    assert missing_requirements(request_state) == []
+    assert request_state.latest_database_evidence is not None
+    assert request_state.latest_database_evidence.evidence_id == "evi_analysis"
+    assert "evi_analysis" in request_state.database_evidence_artifacts

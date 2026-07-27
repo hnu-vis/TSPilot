@@ -291,7 +291,7 @@ class _ExplicitQueryExecutor(BaseTool):
             "truncated": diagnostics.get("truncated"),
         }
         satisfied = self._string_list((base or {}).get("satisfied"))
-        missing = self._string_list((base or {}).get("missing_or_uncertain"))
+        missing = self._coverage_missing_items(base)
         runtime_missing = self._runtime_missing_items(
             selected_fields=selected_fields,
             columns=evidence.get("columns") or [],
@@ -299,6 +299,15 @@ class _ExplicitQueryExecutor(BaseTool):
             query=query,
             query_language=query_language,
         )
+        if self._raw_limit_timeseries_risk(
+            purpose=validated_input.purpose,
+            evidence=evidence,
+            query=query,
+            query_language=query_language,
+        ):
+            runtime_missing.append(
+                "time-series evidence uses raw LIMIT; use full-range aggregation or representative downsampling instead"
+            )
         for item in runtime_missing:
             if item not in missing:
                 missing.append(item)
@@ -317,8 +326,8 @@ class _ExplicitQueryExecutor(BaseTool):
             "query_language": query_language,
             "result_summary": result_summary,
             "satisfied": satisfied,
-            "missing_or_uncertain": missing,
-            "runtime_missing_or_uncertain": runtime_missing,
+            "missing": missing,
+            "runtime_missing": runtime_missing,
             "next_action_hint": next_action_hint,
             "requires_followup": bool(missing),
             "runtime_requires_followup": bool(runtime_missing),
@@ -335,12 +344,13 @@ class _ExplicitQueryExecutor(BaseTool):
     ) -> list[str]:
         if row_count == 0:
             return []
-        expected = {
+        selected_expected = {
             str(field).strip().lower()
             for field in (selected_fields or [])
             if str(field).strip()
         }
-        expected.update(self._projected_columns_from_query(query=query, query_language=query_language))
+        projected = self._projected_columns_from_query(query=query, query_language=query_language)
+        expected = projected or selected_expected
         if not expected:
             return []
         actual = {
@@ -363,15 +373,59 @@ class _ExplicitQueryExecutor(BaseTool):
             + ", ".join(missing_fields[:8])
         ]
 
+    def _coverage_missing_items(self, coverage: dict | None) -> list[str]:
+        if not isinstance(coverage, dict):
+            return []
+        missing = self._string_list(coverage.get("missing"))
+        if missing:
+            return missing
+        return self._string_list(coverage.get("missing_or_uncertain"))
+
+    def _raw_limit_timeseries_risk(
+        self,
+        *,
+        purpose: str | None,
+        evidence: dict,
+        query: str | None,
+        query_language: str | None,
+    ) -> bool:
+        if evidence.get("result_type") != "timeseries":
+            return False
+        normalized_query = str(query or "").lower()
+        if str(query_language or "").lower() == "flux":
+            has_raw_limit = "limit(" in normalized_query and "aggregatewindow" not in normalized_query
+        else:
+            has_raw_limit = bool(re.search(r"\blimit\s+\d+\b", normalized_query, flags=re.IGNORECASE))
+        if not has_raw_limit:
+            return False
+        normalized_purpose = str(purpose or "").lower()
+        return any(
+            token in normalized_purpose
+            for token in (
+                "forecast",
+                "predict",
+                "prediction",
+                "trend",
+                "anomaly",
+                "outlier",
+                "seasonality",
+                "预测",
+                "趋势",
+                "异常",
+                "离群",
+                "周期",
+            )
+        )
+
     def _field_present_in_columns(self, field: str, columns: set[str]) -> bool:
         time_aliases = {"time", "_time", "timestamp", "datetime", "date"}
         if field in time_aliases and columns & time_aliases:
             return True
         if field in columns:
             return True
-        normalized_field = field.replace("-", "_")
+        normalized_field = field.replace("-", "_").strip("_")
         for column in columns:
-            normalized_column = column.replace("-", "_")
+            normalized_column = column.replace("-", "_").strip("_")
             tokens = [token for token in normalized_column.split("_") if token]
             if normalized_field in tokens:
                 return True
@@ -388,7 +442,24 @@ class _ExplicitQueryExecutor(BaseTool):
                 column = (item[0] or item[1]).strip().lower()
                 if column:
                     projected.add(column)
-        return projected
+        return self._apply_flux_renames(projected, query)
+
+    def _apply_flux_renames(self, projected: set[str], query: str) -> set[str]:
+        if not projected:
+            return projected
+        aliases: dict[str, str] = {}
+        for match in re.finditer(r"rename\s*\(\s*columns\s*:\s*\{([^}]*)\}", query, flags=re.IGNORECASE | re.DOTALL):
+            for quoted_source, quoted_target, bare_source, bare_target in re.findall(
+                r'"([^"]+)"\s*:\s*"([^"]+)"|([A-Za-z_][\w]*)\s*:\s*"([^"]+)"',
+                match.group(1),
+            ):
+                source_name = (quoted_source or bare_source).strip().lower()
+                target_name = (quoted_target or bare_target).strip().lower()
+                if source_name and target_name:
+                    aliases[source_name] = target_name
+        if not aliases:
+            return projected
+        return {aliases.get(column, column) for column in projected}
 
     def _string_list(self, value) -> list[str]:
         if not isinstance(value, list):
@@ -679,10 +750,18 @@ class SqlQueryTool(BaseTool):
             "query_purpose": generated.purpose,
             "expected_result_type": generated.expected_result_type,
             "satisfied": self._string_list(coverage.get("satisfied")),
-            "missing_or_uncertain": self._string_list(coverage.get("missing_or_uncertain")),
+            "missing": self._coverage_missing_items(coverage),
             "next_action_hint": self._optional_string(coverage.get("next_action_hint")),
             "confidence": generated.confidence,
         }
+
+    def _coverage_missing_items(self, coverage: dict | None) -> list[str]:
+        if not isinstance(coverage, dict):
+            return []
+        missing = self._string_list(coverage.get("missing"))
+        if missing:
+            return missing
+        return self._string_list(coverage.get("missing_or_uncertain"))
 
     def _string_list(self, value) -> list[str]:
         if not isinstance(value, list):

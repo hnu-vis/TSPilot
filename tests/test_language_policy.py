@@ -28,7 +28,7 @@ class _QueryLLM:
                 "assumptions": [],
                 "task_coverage": {
                     "satisfied": ["已覆盖"],
-                    "missing_or_uncertain": [],
+                    "missing": [],
                     "next_action_hint": None,
                 },
                 "confidence": 0.9,
