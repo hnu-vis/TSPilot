@@ -1,4 +1,12 @@
-import type { DatabaseResource, FinalAnswer, KnowledgeResource, StreamEvent } from '../types';
+import type {
+  DatabaseConfigInput,
+  DatabaseConnectionTest,
+  DatabasePreviewResponse,
+  DatabaseResource,
+  FinalAnswer,
+  KnowledgeResource,
+  StreamEvent,
+} from '../types';
 
 const API_BASE = '/api/v1';
 
@@ -23,9 +31,46 @@ export async function fetchModel(): Promise<string> {
   return payload.model || 'backend model';
 }
 
-export async function fetchDatabasePreview(databaseId: string): Promise<Record<string, unknown>> {
+export async function fetchDatabasePreview(databaseId: string): Promise<DatabasePreviewResponse> {
   const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/preview`);
   if (!response.ok) throw new Error(`Failed to preview database: ${response.status}`);
+  return response.json();
+}
+
+export async function createDatabase(config: DatabaseConfigInput): Promise<DatabaseResource> {
+  const response = await fetch(`${API_BASE}/resources/databases`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) throw new Error(`Failed to create database: ${response.status}`);
+  const payload = await response.json();
+  return payload.database;
+}
+
+export async function updateDatabase(databaseId: string, config: Partial<DatabaseConfigInput>): Promise<DatabaseResource> {
+  const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) throw new Error(`Failed to update database: ${response.status}`);
+  const payload = await response.json();
+  return payload.database;
+}
+
+export async function deleteDatabase(databaseId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) throw new Error(`Failed to delete database: ${response.status}`);
+}
+
+export async function testDatabaseConnection(databaseId: string): Promise<DatabaseConnectionTest> {
+  const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/test`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(`Failed to test database: ${response.status}`);
   return response.json();
 }
 

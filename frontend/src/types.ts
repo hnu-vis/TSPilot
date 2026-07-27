@@ -76,6 +76,62 @@ export type DatabaseResource = {
   display_name?: string | null;
   config_source?: string | null;
   has_reference_dataset?: boolean;
+  username?: string | null;
+  ssl_enabled?: boolean;
+};
+
+export type DatabaseConfigInput = {
+  name: string;
+  type: string;
+  host?: string | null;
+  port?: number | null;
+  database?: string | null;
+  username?: string | null;
+  password?: string | null;
+  display_name?: string | null;
+  ssl_enabled?: boolean | null;
+};
+
+export type DatabaseConnectionTest = {
+  database: DatabaseResource;
+  status: string;
+  success: boolean;
+  latency_ms?: number | null;
+  version?: string | null;
+  error?: string | null;
+};
+
+export type DatabasePreviewColumn = {
+  name: string;
+  data_type?: string | null;
+  nullable?: boolean | null;
+};
+
+export type DatabasePreviewObject = {
+  name: string;
+  schema?: string | null;
+  type?: string | null;
+  row_count?: number | null;
+  columns?: DatabasePreviewColumn[];
+  field_values?: string[];
+  sample_rows?: Array<Record<string, unknown>>;
+};
+
+export type DatabasePreviewPayload = {
+  tables_or_measurements?: DatabasePreviewObject[];
+  metrics?: DatabasePreviewObject[];
+  fields?: Array<Record<string, unknown>>;
+  labels_or_tags?: Array<Record<string, unknown>>;
+  time_columns?: string[];
+  metadata?: Record<string, unknown>;
+};
+
+export type DatabasePreviewResponse = {
+  database: DatabaseResource;
+  preview_kind: 'schema' | 'metrics' | 'reference_dataset' | 'error' | string;
+  summary?: string;
+  preview?: DatabasePreviewPayload;
+  error?: string;
 };
 
 export type KnowledgeResource = {
