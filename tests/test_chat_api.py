@@ -19,7 +19,6 @@ from tests.fakes import (
     RepeatingTodoLLM,
     SandboxInsightLLM,
     TodoScopeLLM,
-    VerifierRepairLLM,
 )
 
 
@@ -32,7 +31,6 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     deps.get_data_agent.cache_clear()
     deps.get_tool_registry.cache_clear()
     deps.get_tool_executor.cache_clear()
-    deps.get_goal_verifier.cache_clear()
     chat_route.get_react_loop = deps.get_react_loop
     return TestClient(app)
 
@@ -58,7 +56,7 @@ def test_chat_json_path_returns_final_answer():
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
-    assert payload["used_tools"] == ["sql_query", "insight"]
+    assert payload["used_tools"] == ["sql_query", "code_interpreter"]
     assert payload["answer"]["summary"]
     assert payload["token_usage"]["totals"]["total_tokens"] > 0
     assert payload["token_usage"]["totals"]["call_count"] >= 1
@@ -105,7 +103,8 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         assert code_payload["diagnostics"]["sandbox"] == "subprocess_code_interpreter_v1"
         assert code_payload["result"]["metrics"]["value_count"] > 1
         assert code_payload["result"]["metrics"]["delta_count"] == code_payload["result"]["metrics"]["value_count"] - 1
-        assert "Code interpreter computed" in code_payload["summary"]
+        assert "Code interpreter computed" in code_observation["payload"]["summary"]
+        assert "Code interpreter computed" in code_payload["result"]["summary"]
 
         section_types = [section["section_type"] for section in payload["answer"]["sections"]]
         assert "analysis" in section_types
@@ -222,7 +221,7 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
         assert log_payload["status"] == "completed"
         assert log_payload["request"]["message"] == "请分析 appliances_energy_wh 的趋势"
         assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 3
-        assert log_payload["summary"]["used_tools"] == ["sql_query", "insight"]
+        assert log_payload["summary"]["used_tools"] == ["sql_query", "code_interpreter"]
         assert log_payload["state"]["tool_history"]
 
         index_entry = json.loads(index_path.read_text(encoding="utf-8").strip().splitlines()[-1])
@@ -356,7 +355,8 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
     assert preview["sampling"]["sampled_for_prompt"] is True
     assert preview["sampling"]["full_counts"]["points_count"] == 10
     assert preview["task_coverage"]["requires_followup"] is True
-    assert preview["task_coverage"]["missing_or_uncertain"] == ["尚未返回时间戳"]
+    assert preview["task_coverage"]["missing"] == ["尚未返回时间戳"]
+    assert "missing_or_uncertain" not in preview["task_coverage"]
     assert preview["schema_linking"]["confidence"] == "high"
     assert preview["schema_linking"]["sources"][0]["name"] == "coindesk"
     assert preview["schema_linking"]["field_mappings"][0]["field_name"] == "price"
@@ -364,6 +364,97 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
         {"source": "m1", "column": "code", "operator": "=", "value": "USD"},
         {"source": "m1", "column": "crypto", "operator": "=", "value": "bitcoin"},
     ]
+
+
+def test_code_interpreter_trace_preview_exposes_code_and_result():
+    loop = ReActLoop.__new__(ReActLoop)
+    input_preview = loop._input_preview(
+        "code_interpreter",
+        {
+            "database_evidence": "latest",
+            "analysis_goal": "compute stats",
+            "code": "result = {'summary': 'ok', 'metrics': {'mean': 1.2}, 'details': {'n': 3}}",
+        },
+    )
+    payload_preview = loop._payload_preview(
+        {
+            "tool_name": "code_interpreter",
+            "success": True,
+            "summary": "ok",
+            "payload": {
+                "analysis_id": "ana_stats",
+                "analysis_goal": "compute stats",
+                "code_type": "code_interpreter_v1",
+                "code_hash": "sha256:abc",
+                "input_evidence_id": "evi_sql",
+                "input_row_count": 3,
+                "status": "succeeded",
+                "summary": "ok",
+                "result": {
+                    "summary": "ok",
+                    "metrics": {"mean": 1.2},
+                    "details": {"n": 3},
+                },
+                "diagnostics": {
+                    "runtime_ms": 12.4,
+                    "input_columns": ["timestamp", "value"],
+                },
+            },
+        }
+    )
+
+    assert input_preview["code_preview"].startswith("result =")
+    assert input_preview["analysis_code_chars"] > 0
+    assert payload_preview["analysis_metrics"] == {"mean": 1.2}
+    assert payload_preview["analysis_details"] == {"n": 3}
+    assert payload_preview["runtime_ms"] == 12.4
+    assert payload_preview["input_columns"] == ["timestamp", "value"]
+
+
+def test_forecast_and_anomaly_trace_previews_expose_tool_specific_outputs():
+    loop = ReActLoop.__new__(ReActLoop)
+    forecast_preview = loop._payload_preview(
+        {
+            "tool_name": "forecast",
+            "success": True,
+            "summary": "ok",
+            "payload": {
+                "forecast_id": "forecast_evi",
+                "model_name": "linear_regression",
+                "horizon": 2,
+                "status": "succeeded",
+                "forecast_plan": {"mode": "direct", "requested_steps": 2},
+                "forecast_points": [
+                    {"timestamp": "t1", "value": 1.0},
+                    {"timestamp": "t2", "value": 2.0},
+                ],
+            },
+        }
+    )
+    anomaly_preview = loop._payload_preview(
+        {
+            "tool_name": "anomaly",
+            "success": True,
+            "summary": "ok",
+            "payload": {
+                "anomaly_id": "anomaly_evi",
+                "detector_name": "zscore",
+                "anomaly_points": [{"timestamp": "t1", "value": 99.0, "score": 3.1}],
+                "scores": [{"timestamp": "t1", "score": 3.1}],
+                "anomaly_spans": [],
+            },
+        }
+    )
+
+    assert forecast_preview["forecast_status"] == "succeeded"
+    assert forecast_preview["forecast_plan"] == {"mode": "direct", "requested_steps": 2}
+    assert forecast_preview["forecast_points"] == [
+        {"timestamp": "t1", "value": 1.0},
+        {"timestamp": "t2", "value": 2.0},
+    ]
+    assert anomaly_preview["detector_name"] == "zscore"
+    assert anomaly_preview["anomaly_points"] == [{"timestamp": "t1", "value": 99.0, "score": 3.1}]
+    assert anomaly_preview["anomaly_scores"] == [{"timestamp": "t1", "score": 3.1}]
 
 
 def test_chat_json_path_can_answer_without_database_context():
@@ -419,7 +510,7 @@ def test_chat_json_path_supports_complex_multi_step_react():
     assert payload["used_tools"] == [
         "todowrite",
         "sql_query",
-        "insight",
+        "code_interpreter",
         "anomaly",
         "forecast",
     ]
@@ -466,7 +557,7 @@ def test_chat_sse_path_supports_complex_multi_step_react():
     assert body.count("event: tool_result") == 6
     assert '"tool": "todowrite"' in body
     assert '"tool": "sql_query"' in body
-    assert '"tool": "insight"' in body
+    assert '"tool": "code_interpreter"' in body
     assert '"tool": "anomaly"' in body
     assert '"tool": "forecast"' in body
     assert '"tool": "terminate"' in body
@@ -501,7 +592,7 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "insight", "anomaly"]
+    assert payload["used_tools"] == ["todowrite", "sql_query", "code_interpreter", "anomaly"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     todo_updates = [
         event for event in observations
@@ -532,7 +623,7 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "insight", "anomaly"]
+    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "code_interpreter", "anomaly"]
     observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
     failures = [
         event for event in observations
@@ -616,75 +707,6 @@ def test_chat_sse_path_preserves_multi_query_results_in_final_answer():
     assert "2023-01-04T23:04:00+00:00" in body
     assert "2023-02-03T22:47:00+00:00" in body
     assert "```flux" in body
-
-
-def test_chat_json_path_recovers_after_goal_verifier_rejects_premature_answer():
-    llm = VerifierRepairLLM()
-    client = _build_client(llm, max_iterations=8)
-    response = client.post(
-        "/api/v1/chat",
-        json={
-            "message": "请查询当前数据源中的比特币USD价格数据，返回总记录数和按时间升序排列的最早5条原始记录，并展示每项查询语句和实际返回行数。",
-            "database_context": {
-                "database_id": "influxdb2-bitcoin-sample",
-                "database_type": "influxdb",
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "sql_query"]
-    assert llm.verifier_calls == 2
-
-    observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
-    verifier_failures = [
-        event for event in observations
-        if event["payload"]["tool_name"] == "goal_verifier"
-        and event["payload"]["success"] is False
-    ]
-    assert len(verifier_failures) == 1
-    assert verifier_failures[0]["payload"]["payload"]["missing_items"] == ["earliest 5 raw records"]
-
-    query_results = next(
-        section
-        for section in payload["answer"]["sections"]
-        if section["section_type"] == "query_results"
-    )
-    assert query_results["content"].count("查询目的：") == 2
-    assert "结果值：count = 2680" in query_results["content"]
-    assert "| timestamp | price | code | crypto | description | symbol |" in query_results["content"]
-    assert len(payload["answer"]["references"]) == 2
-
-
-def test_chat_sse_path_recovers_after_goal_verifier_rejects_premature_answer():
-    llm = VerifierRepairLLM()
-    client = _build_client(llm, max_iterations=8)
-    with client.stream(
-        "POST",
-        "/api/v1/chat",
-        json={
-            "message": "请查询当前数据源中的比特币USD价格数据，返回总记录数和按时间升序排列的最早5条原始记录，并展示每项查询语句和实际返回行数。",
-            "database_context": {
-                "database_id": "influxdb2-bitcoin-sample",
-                "database_type": "influxdb",
-            },
-            "stream": True,
-        },
-    ) as response:
-        body = "".join(chunk for chunk in response.iter_text())
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert llm.verifier_calls == 2
-    assert body.count("event: tool_call") == 5
-    assert '"tool": "goal_verifier"' in body
-    assert "earliest 5 raw records" in body
-    assert "event: final_answer" in body
-    assert "query_results" in body
-    assert "结果值：count = 2680" in body
-    assert "实际返回行数：5" in body
 
 
 def _bitcoin_multi_query_message() -> str:

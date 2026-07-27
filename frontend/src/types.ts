@@ -18,6 +18,13 @@ export type TokenUsage = {
     call_count?: number;
     counting_method?: string;
   };
+  by_tool?: Record<string, {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    call_count?: number;
+    counting_method?: string;
+  }>;
   calls?: Array<Record<string, unknown>>;
 };
 

@@ -11,7 +11,6 @@ from runtime.request_state import apply_observation, build_conversation_state, b
 from schemas.api import ChatRequest
 from schemas.tool import ToolObservation
 from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
-from tools.insight import InsightInput, InsightTool
 
 
 class _ToolSpec:
@@ -141,29 +140,6 @@ def test_large_evidence_observation_and_prompt_are_prompt_safe():
     assert "evidence:evi_demo_large" in prompt
 
 
-def test_insight_uses_full_evidence_artifact_from_request_state():
-    settings = get_settings()
-    request = ChatRequest(message="分析趋势")
-    request_state = build_request_state(request, settings)
-    request_state.latest_database_evidence = None
-    request_state.database_evidence_artifacts = {}
-    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
-    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
-
-    result = asyncio.run(
-        InsightTool().execute(
-            InsightInput(
-                analysis_goal="count full artifact rows",
-                analysis_code="result = {'summary': f'{len(rows)} rows analyzed', 'metrics': {'row_count': len(rows)}, 'details': {}}",
-            ),
-            request_state=request_state,
-        )
-    )
-
-    assert result["input_row_count"] == 40
-    assert result["result"]["metrics"]["row_count"] == 40
-
-
 def test_code_interpreter_uses_full_evidence_artifact_from_request_state():
     settings = get_settings()
     request = ChatRequest(message="用 code interpreter 分析趋势")
@@ -235,6 +211,74 @@ def test_code_interpreter_requires_stable_result_shape():
                 CodeInterpreterInput(
                     analysis_goal="missing metrics",
                     code="result = {'summary': 'computed', 'details': {}}\n",
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_enforces_expected_result_schema():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 分析趋势")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="structured trend summary",
+                code=(
+                    "values = [float(row['value']) for row in rows]\n"
+                    "result = {\n"
+                    "    'summary': 'structured trend result',\n"
+                    "    'metrics': {'row_count': len(rows), 'min_value': min(values), 'max_value': max(values)},\n"
+                    "    'details': {\n"
+                    "        'extrema': {'min_timestamp': rows[0]['timestamp'], 'max_timestamp': rows[-1]['timestamp']},\n"
+                    "        'findings': [{'label': 'range', 'value': max(values) - min(values), 'evidence_ref': 'rows'}],\n"
+                    "    },\n"
+                    "}\n"
+                ),
+                expected_result_schema={
+                    "summary": "str",
+                    "metrics": {"row_count": "int", "min_value": "number", "max_value": "number"},
+                    "details": {
+                        "extrema": {"min_timestamp": "str", "max_timestamp": "str"},
+                        "findings": [{"label": "str", "value": "number", "evidence_ref": "str"}],
+                    },
+                },
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["details"]["findings"][0]["value"] == 39.0
+
+
+def test_code_interpreter_rejects_result_missing_expected_detail_field():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 分析趋势")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="details\\.findings"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="missing structured findings",
+                    code=(
+                        "result = {\n"
+                        "    'summary': 'structured trend result',\n"
+                        "    'metrics': {'row_count': len(rows)},\n"
+                        "    'details': {'extrema': {}},\n"
+                        "}\n"
+                    ),
+                    expected_result_schema={
+                        "summary": "str",
+                        "metrics": {"row_count": "int"},
+                        "details": {"findings": [{"label": "str", "value": "number"}]},
+                    },
                 ),
                 request_state=request_state,
             )

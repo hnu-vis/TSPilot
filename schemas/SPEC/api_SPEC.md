@@ -85,7 +85,7 @@ Example:
   "request_id": "req_456",
   "status": "completed",
   "response_kind": "final_answer",
-  "used_tools": ["query_database", "insight", "format_answer"],
+  "used_tools": ["sql_query", "code_interpreter"],
   "answer": {
     "title": "CPU趋势分析",
     "summary": "最近7天CPU整体上升。",

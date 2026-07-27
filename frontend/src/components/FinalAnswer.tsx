@@ -18,7 +18,7 @@ type QueryResultItem = {
 type MarkdownBlock =
   | { type: 'paragraph'; content: string }
   | { type: 'bulletList'; items: string[] }
-  | { type: 'numberedList'; items: string[] }
+  | { type: 'numberedList'; items: string[]; start: number }
   | { type: 'code'; language: string | null; content: string };
 
 export function FinalAnswer({ answer, tokenUsage }: { answer: FinalAnswerType; tokenUsage?: TokenUsage | null }) {
@@ -207,7 +207,7 @@ export function MarkdownContent({
         }
         if (block.type === 'numberedList') {
           return (
-            <ol key={`numbers-${index}`}>
+            <ol key={`numbers-${index}`} start={block.start}>
               {block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{item}</li>)}
             </ol>
           );
@@ -281,13 +281,15 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
       continue;
     }
 
-    if (/^\d+[.)、]\s+/.test(trimmedLine)) {
+    const numberedMatch = trimmedLine.match(/^(\d+)[.)、]\s+/);
+    if (numberedMatch) {
       const items: string[] = [];
+      const start = Number.parseInt(numberedMatch[1], 10);
       while (index < lines.length && /^\d+[.)、]\s+/.test(lines[index].trim())) {
         items.push(lines[index].trim().replace(/^\d+[.)、]\s+/, ''));
         index += 1;
       }
-      blocks.push({ type: 'numberedList', items });
+      blocks.push({ type: 'numberedList', items, start: Number.isFinite(start) ? start : 1 });
       continue;
     }
 

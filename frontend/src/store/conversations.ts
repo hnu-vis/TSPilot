@@ -1,6 +1,10 @@
 import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep } from '../types';
 
 const STORAGE_KEY = 'tspilot:v02:conversations';
+const MAX_STORED_CONVERSATIONS = 12;
+const MAX_STORED_MESSAGES_PER_CONVERSATION = 30;
+const MAX_STORED_TRACE_STEPS = 40;
+const MAX_STORED_TEXT_CHARS = 12000;
 
 const now = () => new Date().toISOString();
 const makeId = (prefix: string) => {
@@ -43,7 +47,32 @@ export function loadConversations(): Conversation[] {
 }
 
 export function saveConversations(conversations: Conversation[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+  const compact = conversations.map(compactConversationForStorage).slice(0, MAX_STORED_CONVERSATIONS);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(compact));
+    return;
+  } catch (error) {
+    if (!isStorageQuotaError(error)) {
+      console.warn('Unable to save conversations.', error);
+      return;
+    }
+  }
+
+  for (const limit of [6, 3, 1]) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(compact.slice(0, limit)));
+      console.warn(`Conversation history was trimmed to the latest ${limit} item(s) because browser storage is full.`);
+      return;
+    } catch {
+      // Try a smaller snapshot.
+    }
+  }
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+    console.warn('Conversation history was cleared because browser storage is full.');
+  } catch {
+    // Nothing else to do; saving must never crash the app.
+  }
 }
 
 export function sortConversations(conversations: Conversation[]) {
@@ -184,6 +213,93 @@ function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
 function keepValue<T>(incoming: T | null | undefined, existing: T | undefined): T | undefined {
   if (incoming === null || incoming === undefined || incoming === '') return existing;
   return incoming;
+}
+
+function compactConversationForStorage(conversation: Conversation): Conversation {
+  return {
+    ...conversation,
+    messages: conversation.messages
+      .slice(-MAX_STORED_MESSAGES_PER_CONVERSATION)
+      .map(compactMessageForStorage),
+    traceSteps: conversation.traceSteps
+      .slice(-MAX_STORED_TRACE_STEPS)
+      .map(compactTraceStepForStorage),
+  };
+}
+
+function compactMessageForStorage(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    content: truncateString(message.content),
+    answer: message.answer ? compactUnknown(message.answer) as FinalAnswer : undefined,
+    tokenUsage: message.tokenUsage ? compactUnknown(message.tokenUsage) as TokenUsage : undefined,
+  };
+}
+
+function compactTraceStepForStorage(step: TraceStep): TraceStep {
+  const toolCall = compactToolCall(step.toolCall);
+  const toolResult = compactToolResult(step.toolResult);
+  return {
+    ...step,
+    summary: truncateString(step.summary),
+    thought: truncateOptionalString(step.thought),
+    actionInput: compactUnknown(step.actionInput) as TraceStep['actionInput'],
+    observation: compactUnknown(step.observation) as TraceStep['observation'],
+    toolCall,
+    toolResult,
+  };
+}
+
+function compactToolCall(toolCall: TraceStep['toolCall']): TraceStep['toolCall'] {
+  if (!toolCall) return toolCall;
+  return compactUnknown({
+    ...toolCall,
+    action_input: undefined,
+    input_preview: compactUnknown((toolCall as Record<string, unknown>).input_preview),
+  }) as TraceStep['toolCall'];
+}
+
+function compactToolResult(toolResult: TraceStep['toolResult']): TraceStep['toolResult'] {
+  if (!toolResult) return toolResult;
+  return compactUnknown({
+    ...toolResult,
+    observation: undefined,
+    payload: undefined,
+    payload_preview: compactUnknown((toolResult as Record<string, unknown>).payload_preview),
+  }) as TraceStep['toolResult'];
+}
+
+function compactUnknown(value: unknown): unknown {
+  if (typeof value === 'string') return truncateString(value);
+  if (Array.isArray(value)) return value.slice(0, 24).map(compactUnknown);
+  if (!value || typeof value !== 'object') return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (child === undefined) continue;
+    result[key] = compactUnknown(child);
+  }
+  return result;
+}
+
+function truncateOptionalString(value: string | undefined): string | undefined {
+  return typeof value === 'string' ? truncateString(value) : value;
+}
+
+function truncateString(value: string): string {
+  if (value.length <= MAX_STORED_TEXT_CHARS) return value;
+  return `${value.slice(0, MAX_STORED_TEXT_CHARS)}... [truncated ${value.length - MAX_STORED_TEXT_CHARS} chars]`;
+}
+
+function isStorageQuotaError(error: unknown): boolean {
+  return (
+    error instanceof DOMException
+    && (
+      error.name === 'QuotaExceededError'
+      || error.name === 'NS_ERROR_DOM_QUOTA_REACHED'
+      || error.code === 22
+      || error.code === 1014
+    )
+  );
 }
 
 export function buildBackendHistory(conversation: Conversation) {

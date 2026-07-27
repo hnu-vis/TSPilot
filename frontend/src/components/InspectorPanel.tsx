@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { Activity, AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, LineChart, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
@@ -76,15 +76,14 @@ function ReferenceList({ answer }: { answer: FinalAnswer }) {
 }
 
 function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  const visibleMetrics = step.metrics.filter((metric) => metric.value !== '0' && metric.value !== '0/0');
   return (
     <>
-      <ReactStepCard step={step} />
-
       {step.sqlDetail ? <QueryRunSummary step={step} /> : <StepStatusCard step={step} />}
 
-      {!step.sqlDetail && step.metrics.length > 0 && (
+      {!step.sqlDetail && step.status !== 'error' && visibleMetrics.length > 0 && (
         <section className="metric-grid" aria-label="Step metrics">
-          {step.metrics.map((metric) => (
+          {visibleMetrics.map((metric) => (
             <div key={metric.label} className="metric-tile">
               <span>{metric.label}</span>
               <strong>{metric.value}</strong>
@@ -97,11 +96,19 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
 
+      {step.codeInterpreterDetail && <CodeInterpreterPreview detail={step.codeInterpreterDetail} />}
+
+      {step.forecastDetail && <ForecastPreview detail={step.forecastDetail} />}
+
+      {step.anomalyDetail && <AnomalyPreview detail={step.anomalyDetail} />}
+
       {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
 
       {step.completionDetail && shouldShowCompletion(step.completionDetail) && (
         <CompletionPreview detail={step.completionDetail} />
       )}
+
+      {!step.hasPrimaryDetail && <ReactStepCard step={step} />}
 
       {(step.artifactRefs.length > 0 || step.debugPayload) && (
         <AdvancedDetails step={step} />
@@ -113,18 +120,21 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   const detail = step.reactDetail;
   return (
-    <section className="inspector-card react-step-card">
-      <div className="inspector-card-title">
-        <Code2 size={16} />
-        <h3>ReAct step</h3>
-      </div>
+    <details className="inspector-card react-step-card collapsible-card">
+      <summary className="collapsible-summary">
+        <span>
+          <ChevronDown size={15} className="collapsible-chevron" />
+          <Code2 size={16} />
+          <strong>ReAct details</strong>
+        </span>
+      </summary>
       <div className="react-grid">
         <ReactBlock label="Thought" value={detail.thought || 'Waiting for model reasoning.'} />
         <ReactBlock label="Action" value={detail.action || step.category} />
         <ReactBlock label="Action Input" value={detail.actionInput} />
         <ReactBlock label="Observation" value={detail.observation} />
       </div>
-    </section>
+    </details>
   );
 }
 
@@ -148,7 +158,7 @@ function StepStatusCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
     <section className="inspector-card">
       <div className="inspector-card-title">
         <StatusIcon status={step.status} />
-        <h3>{step.title}</h3>
+        <h3>Status</h3>
       </div>
       <p className="step-summary">{step.summary}</p>
       <div className={`status-line ${step.status}`}>{statusLabel(step.status)}</div>
@@ -316,6 +326,274 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
         </div>
       )}
     </section>
+  );
+}
+
+function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']> }) {
+  return (
+    <section className="inspector-card tool-detail-card">
+      <div className="inspector-card-title sql-detail-title">
+        <Code2 size={16} />
+        <h3>Code interpreter</h3>
+        {detail.codeType && <span className="query-language-badge">{detail.codeType}</span>}
+      </div>
+
+      {detail.analysisGoal && <p className="step-summary">{detail.analysisGoal}</p>}
+
+      <div className="query-run-facts" aria-label="Code interpreter facts">
+        {detail.inputRowCount !== null && (
+          <div>
+            <Table2 size={14} />
+            <span>{detail.inputRowCount.toLocaleString()} rows</span>
+          </div>
+        )}
+        {detail.runtimeMs !== null && (
+          <div>
+            <Activity size={14} />
+            <span>{Math.round(detail.runtimeMs).toLocaleString()} ms</span>
+          </div>
+        )}
+        {detail.codeHash && (
+          <div>
+            <Code2 size={14} />
+            <span>{detail.codeHash}</span>
+          </div>
+        )}
+      </div>
+
+      {detail.code && (
+        <ToolCodeBlock
+          title="Python code"
+          language="python"
+          code={detail.code}
+          copyLabel="Copy code"
+        />
+      )}
+
+      <StructuredResult
+        title="Result"
+        summary={detail.summary}
+        metrics={detail.metrics}
+        details={detail.details}
+        fallback={detail.result}
+      />
+    </section>
+  );
+}
+
+function ForecastPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['forecastDetail']> }) {
+  const rows = detail.points;
+  return (
+    <section className="inspector-card tool-detail-card">
+      <div className="inspector-card-title sql-detail-title">
+        <LineChart size={16} />
+        <h3>Forecast result</h3>
+        {detail.status && <span className="query-language-badge">{detail.status}</span>}
+      </div>
+
+      <div className="query-run-facts" aria-label="Forecast facts">
+        {detail.horizon !== null && (
+          <div>
+            <LineChart size={14} />
+            <span>{detail.horizon.toLocaleString()} horizon</span>
+          </div>
+        )}
+        {detail.pointCount !== null && (
+          <div>
+            <Table2 size={14} />
+            <span>{detail.pointCount.toLocaleString()} points</span>
+          </div>
+        )}
+        {detail.modelName && (
+          <div>
+            <Code2 size={14} />
+            <span>{detail.modelName}</span>
+          </div>
+        )}
+      </div>
+
+      {detail.plan && <KeyValuePreview title="Forecast plan" data={detail.plan} />}
+
+      {rows.length > 0 ? (
+        <SimpleRecordsTable title="Forecast points" records={rows} />
+      ) : (
+        <p className="sample-note">No direct forecast points were returned for this step.</p>
+      )}
+    </section>
+  );
+}
+
+function AnomalyPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['anomalyDetail']> }) {
+  return (
+    <section className="inspector-card tool-detail-card">
+      <div className="inspector-card-title sql-detail-title">
+        <AlertCircle size={16} />
+        <h3>Anomaly result</h3>
+        {detail.detectorName && <span className="query-language-badge">{detail.detectorName}</span>}
+      </div>
+
+      <div className="query-run-facts" aria-label="Anomaly facts">
+        {detail.pointCount !== null && (
+          <div>
+            <AlertCircle size={14} />
+            <span>{detail.pointCount.toLocaleString()} anomalies</span>
+          </div>
+        )}
+        {detail.spanCount !== null && (
+          <div>
+            <Activity size={14} />
+            <span>{detail.spanCount.toLocaleString()} spans</span>
+          </div>
+        )}
+      </div>
+
+      {detail.points.length > 0 ? (
+        <SimpleRecordsTable title="Anomaly points" records={detail.points} />
+      ) : (
+        <p className="sample-note">No anomaly points are visible for this step.</p>
+      )}
+      {detail.scores.length > 0 && <SimpleRecordsTable title="Scores" records={detail.scores} />}
+    </section>
+  );
+}
+
+function StructuredResult({
+  title,
+  summary,
+  metrics,
+  details,
+  fallback,
+}: {
+  title: string;
+  summary: string | null;
+  metrics: Record<string, unknown>;
+  details: Record<string, unknown>;
+  fallback: Record<string, unknown> | null;
+}) {
+  const hasMetrics = Object.keys(metrics).length > 0;
+  const hasDetails = Object.keys(details).length > 0;
+  return (
+    <div className="tool-result-section">
+      <div className="sample-table-caption">
+        <span>
+          <CheckCircle2 size={14} />
+          {title}
+        </span>
+      </div>
+      {summary && <MarkdownContent content={summary} />}
+      {hasMetrics && <InspectorMetricGroup metrics={metrics} />}
+      {hasDetails && <KeyValuePreview title="Details" data={details} />}
+      {!summary && !hasMetrics && !hasDetails && fallback && <pre className="debug-json">{JSON.stringify(fallback, null, 2)}</pre>}
+    </div>
+  );
+}
+
+function InspectorMetricGroup({ metrics }: { metrics: Record<string, unknown> }) {
+  return (
+    <dl className="answer-metric-grid">
+      {Object.entries(metrics).map(([key, value]) => (
+        <div key={key}>
+          <dt>{formatLabel(key)}</dt>
+          <dd>{formatCell(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function KeyValuePreview({ title, data }: { title: string; data: Record<string, unknown> }) {
+  return (
+    <div className="tool-result-section">
+      <div className="sample-table-caption">
+        <span>
+          <FileText size={14} />
+          {title}
+        </span>
+      </div>
+      <dl className="answer-metric-grid">
+        {Object.entries(data).slice(0, 24).map(([key, value]) => (
+          <div key={key}>
+            <dt>{formatLabel(key)}</dt>
+            <dd>{formatCell(value)}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function SimpleRecordsTable({ title, records }: { title: string; records: Record<string, unknown>[] }) {
+  const columns = inferColumns(records).slice(0, 8);
+  return (
+    <div className="sample-table-section">
+      <div className="sample-table-caption">
+        <span>
+          <Table2 size={14} />
+          {title}
+        </span>
+        <strong>{records.length.toLocaleString()} visible</strong>
+      </div>
+      {columns.length > 0 && (
+        <div className="sample-table-wrap">
+          <table className="sample-table">
+            <thead>
+              <tr>
+                {columns.map((column) => <th key={column}>{column}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((row, index) => (
+                <tr key={index}>
+                  {columns.map((column) => <td key={column}>{formatCell(row[column])}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolCodeBlock({
+  title,
+  language,
+  code,
+  copyLabel,
+}: {
+  title: string;
+  language: string;
+  code: string;
+  copyLabel: string;
+}) {
+  const codeMarkdown = `\`\`\`${language}\n${code}\n\`\`\``;
+  return (
+    <details className="answer-code-details tool-code-details" open>
+      <summary>
+        <span>
+          <ChevronDown size={14} className="collapsible-chevron" />
+          <Code2 size={14} />
+          {title}
+        </span>
+        <button
+          type="button"
+          className="icon-text-button inline-copy-button"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void navigator.clipboard?.writeText(code);
+          }}
+          aria-label={copyLabel}
+          title={copyLabel}
+        >
+          <Clipboard size={13} />
+          <span>Copy</span>
+        </button>
+      </summary>
+      <div className="query-markdown-render">
+        <MarkdownContent content={codeMarkdown} />
+      </div>
+    </details>
   );
 }
 

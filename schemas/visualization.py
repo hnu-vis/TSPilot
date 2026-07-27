@@ -19,6 +19,7 @@ class VisualizationPayload(BaseModel):
     annotations: list[dict] = Field(default_factory=list)
     binding_fact_ids: list[str] = Field(default_factory=list)
     binding_evidence_ids: list[str] = Field(default_factory=list)
+    requested_capabilities: list[str] = Field(default_factory=list)
     requested_fact_types: list[str] = Field(default_factory=list)
     subject: dict = Field(default_factory=dict)
     presentation: dict = Field(default_factory=dict)
@@ -31,4 +32,3 @@ class VisualizationPayload(BaseModel):
     legend: list[dict] = Field(default_factory=list)
     display_priority: int = 0
     render_hints: dict = Field(default_factory=dict)
-

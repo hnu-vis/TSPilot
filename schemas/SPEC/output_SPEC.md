@@ -48,7 +48,7 @@ Fields:
 
 ## Responsibilities
 
-- define the answer assembly target for `format_answer`
+- define the answer assembly target used by `terminate`
 - keep the final response grounded and structured
 
 ## Must not do

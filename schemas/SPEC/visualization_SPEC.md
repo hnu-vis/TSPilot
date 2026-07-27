@@ -20,7 +20,8 @@ Fields:
 - `annotations: list[dict]`
 - `binding_fact_ids: list[str]`
 - `binding_evidence_ids: list[str]`
-- `requested_fact_types: list[str]`
+- `requested_capabilities: list[str]`
+- `requested_fact_types: list[str]` deprecated compatibility metadata
 - `subject: dict`
 - `presentation: dict`
 - `row_count: int | null`

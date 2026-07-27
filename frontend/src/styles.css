@@ -1152,6 +1152,10 @@ input:focus-visible {
   gap: 8px;
 }
 
+.react-step-card .react-grid {
+  padding: 0 10px 10px;
+}
+
 .react-block {
   display: grid;
   min-width: 0;
@@ -1166,7 +1170,7 @@ input:focus-visible {
 }
 
 .react-block pre {
-  max-height: 220px;
+  max-height: min(28vh, 180px);
   min-width: 0;
   overflow: auto;
   margin: 0;
@@ -1318,8 +1322,23 @@ input:focus-visible {
 
 .sql-detail,
 .sql-query-preview,
-.data-preview {
+.data-preview,
+.tool-detail-card {
   gap: 10px;
+}
+
+.tool-result-section {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.tool-code-details {
+  min-width: 0;
+}
+
+.inline-copy-button {
+  flex: 0 0 auto;
 }
 
 .query-run-summary {

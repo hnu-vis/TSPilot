@@ -53,6 +53,38 @@ export type CompletionDetail = {
   } | null;
 };
 
+export type CodeInterpreterDetail = {
+  analysisGoal: string | null;
+  code: string | null;
+  codeHash: string | null;
+  codeType: string | null;
+  inputEvidenceId: string | null;
+  inputRowCount: number | null;
+  runtimeMs: number | null;
+  summary: string | null;
+  metrics: Record<string, unknown>;
+  details: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  inputColumns: string[];
+};
+
+export type ForecastDetail = {
+  status: string | null;
+  modelName: string | null;
+  horizon: number | null;
+  plan: Record<string, unknown> | null;
+  points: Record<string, unknown>[];
+  pointCount: number | null;
+};
+
+export type AnomalyDetail = {
+  detectorName: string | null;
+  points: Record<string, unknown>[];
+  scores: Record<string, unknown>[];
+  pointCount: number | null;
+  spanCount: number | null;
+};
+
 export type ReactDetail = {
   thought: string | null;
   action: string | null;
@@ -69,9 +101,13 @@ export type DisplayStep = {
   metrics: DisplayMetric[];
   artifactRefs: string[];
   sqlDetail: SqlDetail | null;
+  codeInterpreterDetail: CodeInterpreterDetail | null;
+  forecastDetail: ForecastDetail | null;
+  anomalyDetail: AnomalyDetail | null;
   schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
   reactDetail: ReactDetail;
+  hasPrimaryDetail: boolean;
   debugPayload: Record<string, unknown> | null;
 };
 
@@ -96,6 +132,19 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const completionDetail = completionDetailFor(preview);
   const status = statusForStep(step, completionDetail);
   const reactDetail = reactDetailFor(step, call, result);
+  const sqlDetail = sqlDetailFor(tool, preview);
+  const codeInterpreterDetail = codeInterpreterDetailFor(tool, preview, call, step);
+  const forecastDetail = forecastDetailFor(tool, preview);
+  const anomalyDetail = anomalyDetailFor(tool, preview);
+  const schemaLinkingDetail = schemaLinkingDetailFor(tool, preview);
+  const hasPrimaryDetail = Boolean(
+    sqlDetail ||
+    codeInterpreterDetail ||
+    forecastDetail ||
+    anomalyDetail ||
+    schemaLinkingDetail ||
+    completionDetail,
+  );
 
   return {
     id: step.id,
@@ -105,10 +154,14 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     summary: summaryForStep(step, preview),
     metrics,
     artifactRefs,
-    sqlDetail: sqlDetailFor(tool, preview),
-    schemaLinkingDetail: schemaLinkingDetailFor(tool, preview),
+    sqlDetail,
+    codeInterpreterDetail,
+    forecastDetail,
+    anomalyDetail,
+    schemaLinkingDetail,
     completionDetail,
     reactDetail,
+    hasPrimaryDetail,
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
   };
 }
@@ -167,12 +220,10 @@ export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null
 export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite') return 'Plan the work';
   if (tool === 'sql_query' || tool === 'query_database') return 'Data retrieval';
-  if (tool === 'insight') return 'Analyze evidence';
   if (tool === 'anomaly') return 'Check anomalies';
   if (tool === 'forecast') return 'Forecast trend';
   if (tool === 'rag') return 'Retrieve knowledge';
   if (tool === 'skill') return 'Run workflow';
-  if (tool === 'format_answer') return 'Assemble answer';
   if (phase === 'answer_assembly') return 'Assemble answer';
   if (phase === 'analysis') return 'Analyze evidence';
   if (phase === 'tool_selection') return 'Data retrieval';
@@ -183,7 +234,7 @@ export function titleForTool(tool?: string, phase?: string) {
 function categoryForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite' || phase === 'intent') return 'Plan';
   if (tool === 'sql_query' || tool === 'query_database' || phase === 'tool_selection') return 'Data';
-  if (tool === 'format_answer' || phase === 'answer_assembly') return 'Answer';
+  if (phase === 'answer_assembly') return 'Answer';
   if (tool === 'rag' || tool === 'skill') return 'Context';
   return 'Analysis';
 }
@@ -204,9 +255,6 @@ function summaryForStep(step: TraceStep, preview: Record<string, unknown> | null
       seriesCount !== null ? `${seriesCount} series` : null,
     ].filter(Boolean);
     return parts.length ? `Retrieved ${parts.join(', ')}.` : step.summary;
-  }
-  if (tool === 'insight' && preview) {
-    return stringFrom(preview.summary) || stringFrom(preview.result_preview && asRecord(preview.result_preview)?.summary) || step.summary;
   }
   if (tool === 'anomaly' && preview) {
     const anomalyCount = numberFrom(preview.anomaly_count) ?? numberFrom(preview.anomaly_point_count);
@@ -245,12 +293,6 @@ function metricsForTool(
   }
   addMetric(metrics, 'Visuals', numberFrom(preview?.visualization_count));
 
-  const inputPreview = asRecord(call?.input_preview);
-  if (tool === 'format_answer' && inputPreview) {
-    addMetric(metrics, 'Analyses used', numberFrom(inputPreview.include_analysis_count));
-    addMetric(metrics, 'Facts used', numberFrom(inputPreview.include_fact_count));
-  }
-
   return metrics;
 }
 
@@ -260,7 +302,6 @@ function artifactRefsFor(preview: Record<string, unknown> | null, result: Record
     stringFrom(result?.payload_ref),
     stringFrom(preview?.evidence_id),
     stringFrom(preview?.analysis_id),
-    stringFrom(preview?.insight_id),
     stringFrom(preview?.forecast_id),
     stringFrom(preview?.anomaly_id),
   ];
@@ -284,6 +325,65 @@ function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown>
     rowCount: numberFrom(preview.row_count),
     pointCount: numberFrom(preview.point_count),
     truncated: Boolean(preview.truncated || preview.payload_truncated),
+  };
+}
+
+function codeInterpreterDetailFor(
+  tool: string | undefined,
+  preview: Record<string, unknown> | null,
+  call: Record<string, unknown> | null,
+  step: TraceStep,
+): CodeInterpreterDetail | null {
+  if (tool !== 'code_interpreter') return null;
+  const inputPreview = asRecord(call?.input_preview);
+  const actionInput = asRecord(step.actionInput) || asRecord(call?.action_input);
+  const code = stringFrom(inputPreview?.code_preview) || stringFrom(actionInput?.code);
+  const result = asRecord(preview?.analysis_result) || asRecord(preview?.result_preview);
+  const metrics = asRecord(preview?.analysis_metrics) || asRecord(result?.metrics) || {};
+  const details = asRecord(preview?.analysis_details) || asRecord(result?.details) || {};
+  if (!code && !result && !preview) return null;
+  return {
+    analysisGoal: stringFrom(preview?.analysis_goal) || stringFrom(inputPreview?.analysis_goal) || stringFrom(actionInput?.analysis_goal),
+    code,
+    codeHash: stringFrom(preview?.code_hash),
+    codeType: stringFrom(preview?.code_type) || stringFrom(inputPreview?.code_type) || stringFrom(actionInput?.code_type),
+    inputEvidenceId: stringFrom(preview?.input_evidence_id) || stringFrom(inputPreview?.evidence_id) || stringFrom(actionInput?.database_evidence),
+    inputRowCount: numberFrom(preview?.input_row_count),
+    runtimeMs: numberFrom(preview?.runtime_ms),
+    summary: stringFrom(preview?.analysis_summary) || stringFrom(result?.summary) || stringFrom(preview?.summary),
+    metrics,
+    details,
+    result,
+    inputColumns: stringsFrom(preview?.input_columns),
+  };
+}
+
+function forecastDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): ForecastDetail | null {
+  if (tool !== 'forecast' || !preview) return null;
+  const points = recordsFrom(preview.forecast_points);
+  const plan = asRecord(preview.forecast_plan);
+  if (!plan && points.length === 0 && !preview.forecast_id) return null;
+  return {
+    status: stringFrom(preview.forecast_status) || stringFrom(preview.status),
+    modelName: stringFrom(preview.model_name),
+    horizon: numberFrom(preview.horizon),
+    plan,
+    points,
+    pointCount: numberFrom(preview.forecast_point_count),
+  };
+}
+
+function anomalyDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): AnomalyDetail | null {
+  if (tool !== 'anomaly' || !preview) return null;
+  const points = recordsFrom(preview.anomaly_points);
+  const scores = recordsFrom(preview.anomaly_scores);
+  if (points.length === 0 && scores.length === 0 && !preview.anomaly_id) return null;
+  return {
+    detectorName: stringFrom(preview.detector_name),
+    points,
+    scores,
+    pointCount: numberFrom(preview.anomaly_point_count),
+    spanCount: numberFrom(preview.anomaly_span_count),
   };
 }
 
