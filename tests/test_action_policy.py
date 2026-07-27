@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from core.completion import normalize_todo_for_completion
-from core.runtime_evaluator import GoalVerificationResult, RuntimeLLMEvaluator
+from core.completion import apply_previous_observation_assessment, normalize_todo_for_completion
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import validate_action
-from runtime.request_state import apply_observation, apply_observation_async
-from schemas.agent_turn import ReActTurn
+from runtime.request_state import apply_observation, apply_observation_async, enrich_observation_payload
+from schemas.agent_turn import PreviousObservationAssessment, ReActTurn
+from schemas.database import DatabaseEvidence
 from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
@@ -23,6 +23,267 @@ class _EvidenceSpec:
 class _AnalysisSpec:
     result_target = "analysis"
     produces_terminal_payload = False
+
+
+class _NoTargetSpec:
+    result_target = "none"
+    produces_terminal_payload = False
+
+
+def _assess_previous_complete(request_state: RequestStateModel, reason: str = "Previous observation satisfies active todo."):
+    return apply_previous_observation_assessment(
+        request_state,
+        PreviousObservationAssessment(
+            completed_active_todo=True,
+            reason=reason,
+        ),
+    )
+
+
+def test_observation_payload_removes_duplicate_envelope_summary():
+    request_state = RequestStateModel(
+        request_id="req-observation-dedupe",
+        message="查询",
+        status="running",
+    )
+    observation = ToolObservation(
+        tool_name="sql_query",
+        success=True,
+        summary="Loaded 1 row.",
+        payload={"summary": "Loaded 1 row.", "evidence_id": "evi_demo"},
+    )
+
+    safe_observation = enrich_observation_payload(
+        request_state,
+        observation,
+        {"summary": "Loaded 1 row.", "evidence_id": "evi_demo"},
+        _NoTargetSpec(),
+    )
+
+    assert safe_observation.summary == "Loaded 1 row."
+    assert "summary" not in safe_observation.payload
+    assert safe_observation.payload["evidence_id"] == "evi_demo"
+
+
+def test_observation_payload_keeps_distinct_business_summary():
+    request_state = RequestStateModel(
+        request_id="req-observation-keep-summary",
+        message="分析",
+        status="running",
+    )
+    observation = ToolObservation(
+        tool_name="code_interpreter",
+        success=True,
+        summary="Tool completed.",
+        payload={"summary": "业务分析结论。", "analysis_id": "ana_demo"},
+    )
+
+    safe_observation = enrich_observation_payload(
+        request_state,
+        observation,
+        {"summary": "业务分析结论。", "analysis_id": "ana_demo"},
+        _NoTargetSpec(),
+    )
+
+    assert safe_observation.summary == "Tool completed."
+    assert safe_observation.payload["summary"] == "业务分析结论。"
+
+
+def test_terminate_requires_forecast_tool_output_when_forecast_is_requested():
+    request_state = RequestStateModel(
+        request_id="req-forecast-required",
+        message="查询并预测 Bitcoin USD",
+        status="running",
+        database_context=DatabaseContext(database_id="influxdb2-bitcoin-sample", database_type="influxdb"),
+        requested_capabilities=["query", "analysis", "forecast"],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_btc",
+            result_type="timeseries",
+            database="influxdb2-bitcoin-sample",
+            summary="Loaded Bitcoin rows.",
+            data={
+                "points": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
+                    {"timestamp": "2023-01-01T01:00:00Z", "value": 2.0},
+                ]
+            },
+        ),
+        latest_analysis_id="ana_stats",
+    )
+
+    allowed, reason = validate_action(request_state, "terminate")
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
+
+
+def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():
+    request_state = RequestStateModel(
+        request_id="req-gap-missing",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_partial",
+            result_type="table",
+            database="demo",
+            summary="Loaded extrema only.",
+            data={"rows": [{"min_value": 1.0, "max_value": 2.0}]},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["highest", "lowest"],
+                "missing": ["start_value", "end_value", "change_pct"],
+                "can_answer": False,
+                "next_action_reason": "Query boundary values for the same time range.",
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "还缺少首末值。"})
+
+    assert allowed is False
+    assert reason is not None
+    assert "not fully covered" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
+        "start_value",
+        "end_value",
+        "change_pct",
+    ]
+
+
+def test_terminate_allowed_when_latest_gap_assessment_can_answer():
+    request_state = RequestStateModel(
+        request_id="req-gap-covered",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_stats",
+            result_type="table",
+            database="demo",
+            summary="Loaded requested statistics.",
+            data={
+                "rows": [
+                    {
+                        "start_value": 1.0,
+                        "end_value": 1.2,
+                        "change_pct": 20.0,
+                        "min_value": 0.9,
+                        "max_value": 1.3,
+                    }
+                ]
+            },
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["start_value", "end_value", "change_pct", "min_value", "max_value"],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "已得到全部统计。"})
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+
+
+def test_terminate_allows_nonblocking_missing_when_gap_can_answer_true():
+    request_state = RequestStateModel(
+        request_id="req-gap-answerable-with-caveat",
+        message="检测异常并总结趋势。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded anomaly-ready series.",
+            data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["异常检测已完成", "趋势总结可回答"],
+                "missing": ["可选异常点逐条解释"],
+                "can_answer": True,
+                "next_action_reason": "可以回答并说明限制。",
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "未发现异常点。"})
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+
+
+def test_terminate_allowed_with_explicit_unavailable_gap_outputs():
+    request_state = RequestStateModel(
+        request_id="req-gap-unavailable",
+        message="计算涨跌幅。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_empty",
+            result_type="table",
+            database="demo",
+            summary="No boundary rows returned.",
+            data={"rows": []},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": [],
+                "missing": ["start_value", "end_value", "change_pct"],
+                "can_answer": False,
+                "next_action_reason": "The selected range has no rows after query repair.",
+            }
+        },
+    )
+
+    allowed, reason = validate_action(
+        request_state,
+        "terminate",
+        {
+            "direct_answer": "当前区间没有可用边界值，无法计算涨跌幅。",
+            "unavailable_outputs": ["start_value", "end_value", "change_pct"],
+            "unavailable_reason": "Repeated grounded queries returned no rows for the selected range.",
+        },
+    )
+
+    assert allowed is True
+    assert reason is None
+
+
+def test_repeated_failed_action_requires_changed_strategy_reason():
+    request_state = RequestStateModel(
+        request_id="req-repeat-failure",
+        message="查询价格。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        observations=[
+            ToolObservation(tool_name="sql_query", success=False, summary="syntax error", payload={}, error="syntax error"),
+            ToolObservation(tool_name="sql_query", success=False, summary="syntax error", payload={}, error="syntax error"),
+        ],
+    )
+
+    allowed, reason = validate_action(request_state, "sql_query", {"message": "查询价格"})
+
+    assert allowed is False
+    assert reason is not None
+    assert "failed repeatedly" in reason
+
+    request_state.completion_state["latest_gap_assessment"] = {
+        "missing": ["price"],
+        "next_action_reason": "Simplify the query and fetch raw rows before aggregation.",
+    }
+
+    assert validate_action(request_state, "sql_query", {"message": "查询价格"}) == (True, None)
 
 
 class _OneTurnAgent:
@@ -77,47 +338,92 @@ class _TerminalExecutor:
         )()
 
 
-class _RejectingVerifier:
-    async def verify_final_answer(self, *, request_state, candidate_answer):
-        return GoalVerificationResult(
-            can_answer=False,
-            reason="missing requested maximum value",
-            missing_items=["maximum value"],
-            unsupported_claims=[],
-            next_action_hint="Run sql_query for the maximum value.",
-            confidence=0.9,
+@pytest.mark.asyncio
+async def test_gap_assessment_without_active_todo_does_not_block_action_execution():
+    request_state = RequestStateModel(
+        request_id="req-gap-no-active-todo",
+        message="检测异常点。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        max_iterations=1,
+    )
+    request_state.observations.append(
+        ToolObservation(
+            tool_name="sql_query",
+            success=True,
+            summary="Loaded time series.",
+            payload={
+                "evidence_id": "evi_demo",
+                "result_type": "timeseries",
+                "data": {"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+            },
         )
-
-
-def test_runtime_evaluator_marks_complete_query_preview_as_full_fidelity():
-    evaluator = RuntimeLLMEvaluator(llm=None)
-    summary = evaluator._summarize_payload(
-        {
-            "evidence_id": "evi_extrema",
-            "result_type": "timeseries",
-            "query": "from(...) |> sort(columns: [\"_value\"], desc: true) |> limit(n: 1)",
-            "data": {
-                "rows": [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}],
-                "points": [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}],
-            },
-            "diagnostics": {
-                "is_full_fidelity": True,
-                "summary_stats": {"rows_count": 1, "points_count": 1, "series_count": 1},
-                "prompt_sampling": {
-                    "sampled_for_prompt": False,
-                    "full_counts": {"rows_count": 1, "points_count": 1, "series_count": 1},
-                    "visible_counts": {"rows_count": 1, "points_count": 1, "series_count": 1},
-                    "full_artifact_ref": "evidence:evi_extrema",
-                },
-            },
-        }
+    )
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_demo",
+        result_type="timeseries",
+        database="demo",
+        summary="Loaded time series.",
+        data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
     )
 
-    assert "sample_rows" not in summary
-    assert summary["result_rows_preview"] == [{"timestamp": "2023-01-04T23:04:00Z", "value": 168249475888010.0}]
-    assert summary["data_completeness"]["is_full_fidelity"] is True
-    assert summary["data_completeness"]["sampled_for_prompt"] is False
-    assert summary["data_completeness"]["full_row_count"] == 1
+    class _GapThenActionAgent:
+        async def next_turn(self, request_state, conversation_state):
+            return ReActTurn(
+                thought="上一条查询覆盖输入序列，还需要执行异常检测。",
+                previous_observation_assessment=PreviousObservationAssessment(
+                    completed_active_todo=True,
+                    reason="No active todo; this is a gap assessment only.",
+                    evidence_refs=["evidence:evi_demo"],
+                    covered=["time_series"],
+                    missing=["anomaly_result"],
+                    can_answer=False,
+                    next_action_reason="Run anomaly on the evidence.",
+                ),
+                action="anomaly",
+                action_input={"database_evidence": "evidence:evi_demo"},
+            )
+
+    class _AnomalySpec:
+        result_target = "analysis"
+        produces_terminal_payload = False
+
+    class _Executor:
+        async def execute(self, action_name, action_input, *args, **kwargs):
+            assert action_name == "anomaly"
+            return type(
+                "_ExecutionResult",
+                (),
+                {
+                    "tool_spec": _AnomalySpec(),
+                    "observation": ToolObservation(tool_name="anomaly", success=True, summary="ok", payload={}),
+                    "full_payload": {
+                        "anomaly_id": "anomaly_demo",
+                        "detector_name": "unit",
+                        "anomaly_points": [],
+                        "anomaly_spans": [],
+                        "scores": [],
+                        "diagnostics": {},
+                        "visualizations": [],
+                    },
+                },
+            )()
+
+    loop = ReActLoop(
+        data_agent=_GapThenActionAgent(),
+        tool_executor=_Executor(),
+        settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
+    )
+
+    events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
+
+    assert any(event.event_type == "observation" and event.payload["tool_name"] == "anomaly" for event in events)
+    assert not any(
+        event.event_type == "observation"
+        and event.payload["tool_name"] == "todo_assessment"
+        and event.payload["success"] is False
+        for event in events
+    )
 
 
 def test_policy_does_not_force_todowrite_for_complex_initial_request():
@@ -147,6 +453,31 @@ def test_policy_does_not_force_todowrite_for_complex_initial_request():
     assert reason is None
 
 
+def test_policy_requires_todowrite_for_explicit_multi_deliverable_list():
+    request_state = RequestStateModel(
+        request_id="req-policy-explicit-list",
+        message=(
+            "请查询当前数据源中的比特币USD价格数据，并完成以下任务： "
+            "1.返回USD价格数据的总记录数； "
+            "2.返回按时间升序排列的最早5条原始记录； "
+            "3.返回按时间降序排列的最晚5条原始记录； "
+            "4.返回整个数据集的最早时间和最晚时间，精确到秒； "
+            "5.展示每项结果对应的完整Flux查询语句和实际返回行数。"
+        ),
+        database_context=DatabaseContext(
+            database_id="influxdb2-bitcoin-sample",
+            database_type="influxdb",
+        ),
+        status="running",
+    )
+
+    allowed, reason = validate_action(request_state, "sql_query")
+
+    assert allowed is False
+    assert "initial todo plan" in (reason or "")
+    assert validate_action(request_state, "todowrite") == (True, None)
+
+
 def test_policy_rejects_repeated_todowrite_but_allows_next_action():
     request_state = RequestStateModel(
         request_id="req-policy-todo",
@@ -154,7 +485,7 @@ def test_policy_rejects_repeated_todowrite_but_allows_next_action():
         database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
         status="running",
         todo_list=[
-            {"content": "提炼趋势事实", "task_type": "insight", "status": "in_progress", "priority": 1}
+            {"content": "提炼趋势事实", "task_type": "code_interpreter", "status": "in_progress", "priority": 1}
         ],
     )
 
@@ -162,7 +493,7 @@ def test_policy_rejects_repeated_todowrite_but_allows_next_action():
 
     assert allowed is False
     assert "already exists" in (reason or "")
-    assert validate_action(request_state, "insight") == (True, None)
+    assert validate_action(request_state, "code_interpreter") == (True, None)
     assert validate_action(request_state, "code_interpreter") == (True, None)
     assert validate_action(request_state, "forecast") == (True, None)
 
@@ -306,7 +637,7 @@ def test_todo_plan_expands_iteration_budget_for_multistep_workflow():
         "summary": "plan",
         "todos": [
             {"content": "查询数据", "task_type": "query", "status": "in_progress", "priority": 1},
-            {"content": "分析趋势", "task_type": "insight", "status": "pending", "priority": 2},
+            {"content": "分析趋势", "task_type": "code_interpreter", "status": "pending", "priority": 2},
             {"content": "检查异常", "task_type": "anomaly", "status": "pending", "priority": 3},
             {"content": "预测", "task_type": "forecast", "status": "pending", "priority": 4},
             {"content": "回答", "task_type": "answer", "status": "pending", "priority": 5},
@@ -357,6 +688,8 @@ async def test_external_semantic_verdict_no_longer_blocks_todo_progress():
         _EvidenceSpec(),
     )
 
+    assert request_state.todo_list[0]["status"] == "in_progress"
+    _assess_previous_complete(request_state)
     assert request_state.todo_list[0]["status"] == "completed"
     assert request_state.todo_list[1]["status"] == "in_progress"
     assert request_state.completion_state["latest_step"]["completed"] is True
@@ -378,7 +711,7 @@ async def test_successful_query_observation_advances_without_semantic_verdict():
                 "priority": 1,
                 "evidence_needed": ["time_series"],
             },
-            {"content": "分析趋势", "task_type": "insight", "status": "pending", "priority": 2},
+            {"content": "分析趋势", "task_type": "code_interpreter", "status": "pending", "priority": 2},
         ],
     )
     payload = {
@@ -401,6 +734,8 @@ async def test_successful_query_observation_advances_without_semantic_verdict():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
     assert request_state.completion_state["latest_step"]["missing_evidence"] == []
 
@@ -437,6 +772,8 @@ async def test_successful_observation_advances_todo_without_external_verdict():
         _EvidenceSpec(),
     )
 
+    assert request_state.todo_list[0]["status"] == "in_progress"
+    _assess_previous_complete(request_state)
     assert request_state.todo_list[0]["status"] == "completed"
     assert request_state.todo_list[1]["status"] == "in_progress"
     assert request_state.completion_state["latest_step"]["completed"] is True
@@ -525,9 +862,9 @@ async def test_terminate_does_not_use_llm_answerability_gate():
 
 
 @pytest.mark.asyncio
-async def test_goal_verifier_rejects_terminal_candidate_and_continues_loop():
+async def test_terminal_candidate_does_not_run_goal_verifier():
     request_state = RequestStateModel(
-        request_id="req-verifier-reject",
+        request_id="req-no-verifier",
         message="返回最大值。",
         database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
         status="running",
@@ -549,68 +886,16 @@ async def test_goal_verifier_rejects_terminal_candidate_and_continues_loop():
         data_agent=_TerminateAgent(),
         tool_executor=_TerminalExecutor(),
         settings=type("_Settings", (), {"conversation_log_enabled": False, "resolved_conversation_log_dir": "."})(),
-        goal_verifier=_RejectingVerifier(),
     )
 
     events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
 
-    verifier_observation = next(
-        event for event in events
-        if event.event_type == "observation" and event.payload["tool_name"] == "goal_verifier"
-    )
-    assert verifier_observation.payload["success"] is False
-    assert verifier_observation.payload["payload"]["missing_items"] == ["maximum value"]
-    assert request_state.completion_state["semantic_repair_directive"]["missing_items"] == ["maximum value"]
-    assert request_state.completion_state["semantic_repair_directive"]["next_action_hint"] == "Run sql_query for the maximum value."
-    assert request_state.final_answer_draft is None
-    assert "final_answer" not in [event.event_type for event in events]
-
-
-@pytest.mark.asyncio
-async def test_goal_verifier_becomes_advisory_after_rejection_limit():
-    request_state = RequestStateModel(
-        request_id="req-verifier-bypass",
-        message="返回最大值。",
-        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
-        status="running",
-        max_iterations=2,
-        latest_database_evidence={
-            "evidence_id": "evi_demo",
-            "result_type": "table",
-            "database": "demo",
-            "query_language": "flux",
-            "query": "from(...)",
-            "summary": "Loaded rows.",
-            "data": {"rows": [{"value": 1.0}]},
-            "columns": ["value"],
-            "metadata": {},
-            "diagnostics": {},
-        },
-    )
-    loop = ReActLoop(
-        data_agent=_TerminateAgent(),
-        tool_executor=_TerminalExecutor(),
-        settings=type(
-            "_Settings",
-            (),
-            {
-                "conversation_log_enabled": False,
-                "resolved_conversation_log_dir": ".",
-                "goal_verifier_max_rejections": 1,
-            },
-        )(),
-        goal_verifier=_RejectingVerifier(),
-    )
-
-    events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
-
-    verifier_failures = [
-        event for event in events
-        if event.event_type == "observation" and event.payload["tool_name"] == "goal_verifier"
-    ]
-    assert len(verifier_failures) == 1
-    assert request_state.completion_state["goal_verifier_bypassed"]["missing_items"] == ["maximum value"]
     assert request_state.final_answer_draft is not None
+    assert not any(
+        event.event_type == "observation" and event.payload["tool_name"] == "goal_verifier"
+        for event in events
+    )
+    assert "semantic_repair_directive" not in request_state.completion_state
     assert "final_answer" in [event.event_type for event in events]
 
 
@@ -647,7 +932,7 @@ def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
             "metadata": {},
             "diagnostics": {
                 "task_coverage": {
-                    "runtime_missing_or_uncertain": [
+                    "runtime_missing": [
                         "selected result fields are not present in returned columns: price"
                     ],
                     "runtime_requires_followup": True,
@@ -713,6 +998,8 @@ def test_runtime_keeps_query_todo_active_for_schema_only_sql_observation():
     )
 
     assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
     assert request_state.completion_state["latest_step"]["completed"] is False
     assert request_state.completion_state["latest_step"]["missing_evidence"] == ["database_result"]
 
@@ -755,6 +1042,8 @@ def test_runtime_completes_count_todo_with_statistics_evidence():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
     assert request_state.todo_list[0]["result_ref"] == "evidence:evi_count"
 
@@ -797,8 +1086,163 @@ def test_runtime_completes_count_todo_with_explicit_count_table():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
     assert request_state.completion_state["latest_step"]["missing_evidence"] == []
+
+
+def test_runtime_advances_todo_when_generation_coverage_only_mentions_future_work():
+    request_state = RequestStateModel(
+        request_id="req-policy-generation-followup",
+        message="返回总数、最早5条、最晚5条和时间范围。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    count_evidence = {
+        "evidence_id": "evi_count_generation_followup",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": 'from(bucket: "bitcoin") |> count()',
+        "summary": "Loaded 1 row.",
+        "data": {"rows": [{"count": 2680}]},
+        "columns": ["count"],
+        "metadata": {},
+        "diagnostics": {
+            "task_coverage": {
+                "requires_followup": True,
+                "runtime_requires_followup": False,
+                "missing": ["未返回按时间升序排列的最早5条原始记录。"],
+                "runtime_missing": [],
+            }
+        },
+    }
+
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="count", payload={}),
+        count_evidence,
+        _EvidenceSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+    assert request_state.completion_state["latest_step"]["completed"] is True
+
+
+def test_runtime_keeps_todo_active_for_runtime_coverage_gap():
+    request_state = RequestStateModel(
+        request_id="req-policy-runtime-followup",
+        message="返回总数。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    incomplete_evidence = {
+        "evidence_id": "evi_runtime_gap",
+        "result_type": "table",
+        "database": "demo",
+        "query_language": "flux",
+        "query": 'from(bucket: "bitcoin")',
+        "summary": "Loaded 1 row.",
+        "data": {"rows": [{"timestamp": "2023-01-01T00:00:00Z"}]},
+        "columns": ["timestamp"],
+        "metadata": {},
+        "diagnostics": {
+            "task_coverage": {
+                "requires_followup": True,
+                "runtime_requires_followup": True,
+                "missing": ["未返回总记录数。"],
+                "runtime_missing": ["selected result fields are not present in returned columns: count"],
+            }
+        },
+    }
+
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="rows", payload={}),
+        incomplete_evidence,
+        _EvidenceSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
+    assert request_state.completion_state["latest_step"]["completed"] is True
+
+
+def test_runtime_completes_answer_todo_after_terminal_payload():
+    request_state = RequestStateModel(
+        request_id="req-policy-answer-terminal",
+        message="返回总数。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "completed", "priority": 1},
+            {"content": "回答问题", "task_type": "answer", "status": "in_progress", "priority": 2},
+        ],
+        plan_current_step=2,
+    )
+    final_answer = {
+        "summary": "共有 42 条数据。",
+        "sections": [],
+        "references": [],
+        "visualizations": [],
+    }
+
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="terminate", success=True, summary="answered", payload={}),
+        final_answer,
+        _TerminalSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "completed"]
+    assert request_state.planning_complete is True
+    assert request_state.completion_state["latest_step"]["completed"] is True
+    assert request_state.completion_state["latest_step"]["tool_name"] == "terminate"
+
+
+def test_runtime_does_not_complete_non_answer_todo_after_terminal_payload():
+    request_state = RequestStateModel(
+        request_id="req-policy-query-terminal",
+        message="返回总数。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    final_answer = {
+        "summary": "缺少查询证据，无法确认总数。",
+        "sections": [],
+        "references": [],
+        "visualizations": [],
+    }
+
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="terminate", success=True, summary="answered", payload={}),
+        final_answer,
+        _TerminalSpec(),
+    )
+
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    assert request_state.planning_complete is False
+    assert request_state.completion_state["latest_step"]["completed"] is False
 
 
 def test_runtime_completes_count_todo_with_flux_value_column():
@@ -839,6 +1283,8 @@ def test_runtime_completes_count_todo_with_flux_value_column():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
 
 
@@ -856,7 +1302,7 @@ def test_runtime_completes_timeseries_todo_with_timestamp_value_table():
                 "priority": 1,
                 "evidence_needed": ["time_series"],
             },
-            {"content": "分析趋势", "task_type": "insight", "status": "pending", "priority": 2},
+            {"content": "分析趋势", "task_type": "code_interpreter", "status": "pending", "priority": 2},
         ],
         plan_current_step=1,
     )
@@ -885,6 +1331,8 @@ def test_runtime_completes_timeseries_todo_with_timestamp_value_table():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
 
 
@@ -927,6 +1375,8 @@ def test_runtime_advances_legacy_plan_step_with_query_evidence():
         _EvidenceSpec(),
     )
 
+    assert request_state.todo_list[0]["status"] == "in_progress"
+    _assess_previous_complete(request_state)
     assert request_state.todo_list[0]["status"] == "completed"
     assert request_state.todo_list[0]["task_type"] == "query"
     assert request_state.todo_list[1]["status"] == "in_progress"
@@ -940,7 +1390,7 @@ def test_runtime_advances_todo_after_successful_actions():
         status="running",
         todo_list=[
             {"content": "查询时序数据", "task_type": "query", "status": "in_progress", "priority": 1},
-            {"content": "提炼趋势事实", "task_type": "insight", "status": "pending", "priority": 2},
+            {"content": "提炼趋势事实", "task_type": "code_interpreter", "status": "pending", "priority": 2},
             {"content": "检查异常", "task_type": "anomaly", "status": "pending", "priority": 3},
         ],
         plan_current_step=1,
@@ -964,9 +1414,11 @@ def test_runtime_advances_todo_after_successful_actions():
         _EvidenceSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress", "pending"]
 
-    insight = {
+    code_interpreter = {
         "analysis_id": "ana_demo",
         "analysis_goal": "趋势",
         "code_type": "python_rows_v1",
@@ -980,9 +1432,11 @@ def test_runtime_advances_todo_after_successful_actions():
     }
     apply_observation(
         request_state,
-        ToolObservation(tool_name="insight", success=True, summary="ok", payload={}),
-        insight,
+        ToolObservation(tool_name="code_interpreter", success=True, summary="ok", payload={}),
+        code_interpreter,
         _AnalysisSpec(),
     )
 
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress", "pending"]
+    _assess_previous_complete(request_state)
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "completed", "in_progress"]

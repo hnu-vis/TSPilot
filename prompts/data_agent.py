@@ -18,11 +18,16 @@ class DataAgentPromptBuilder:
             "Respond with exactly one JSON object and nothing else.\n"
             "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
             "Output schema: "
-            "{\"thought\": str, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
+            "{\"thought\": str, \"previous_observation_assessment\": object|null, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
+            "previous_observation_assessment must be null when there is no previous observation or the previous observation only created the todo plan. "
+            "Otherwise, use {\"completed_active_todo\": bool, \"reason\": str|null, \"evidence_refs\": list[str], "
+            "\"covered\": list[str], \"missing\": list[str], "
+            "\"next_action_reason\": str|null, \"can_answer\": bool|null}. "
+            "Set completed_active_todo=true only when your Thought concludes the latest Observation satisfies the currently active todo from before this turn; observation itself is factual, not a completion verdict.\n"
             "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
             "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
             "Language policy: task.response_language is authoritative for all model-authored natural-language text. "
-            "If it is \"zh\", write thought, action_intention, action_reason, todo text, sql_query message/purpose/task_coverage text, "
+            "If it is \"zh\", write thought, action_intention, action_reason, todo text, sql_query message/purpose text, "
             "code_interpreter analysis_goal/result text, and terminate result/summary_goal/direct_answer in Simplified Chinese. "
             "If it is \"en\", write those fields in English. Keep JSON keys, action names, query code, identifiers, metric names, and database values unchanged.\n"
             "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
@@ -31,28 +36,38 @@ class DataAgentPromptBuilder:
             "For tasks with an explicit numbered or bulleted deliverable list, verify each user-visible deliverable against observations before terminate. "
             "If a deliverable asks for its own query text, row count, raw records, extrema, bounds, or validation result and that item is not present in observations, call the appropriate tool instead of answering with a caveat.\n"
             "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
-            "Use the user's message, current plan, and observations as the source of task intent.\n"
+            "Use the user's message, current plan, evidence, outputs, and observations as the source of task intent.\n"
             "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
             "Use diagnostics.prompt_sampling, summary_stats, data_completeness, artifact_ref, and query text to decide whether the visible preview is complete. "
-            "Use diagnostics.task_coverage from sql_query observations to decide whether the current query already covers the user request; if missing_or_uncertain is non-empty, prefer another focused sql_query before terminate. "
             "When a task needs facts not present in the prompt preview, call sql_query or code_interpreter over the full artifact instead of guessing from the preview.\n"
+            "Natural ReAct order is Thought_n, Action_n, Observation_n, then Thought_n+1 interprets Observation_n. "
+            "Do not assume runtime already advanced the todo after Observation_n; explicitly assess the previous observation in Thought_n+1 before choosing Action_n+1.\n"
             "Do not emit any non-tool action or follow-up-question action.\n"
             "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
-            "If state.decision_frame.semantic_repair_directive is present, treat it as the immediate repair objective. "
-            "Do not terminate again until you have addressed its missing_items or unsupported_claims with a new grounded action, unless the directive itself says no further evidence is possible.\n"
-            "Use todowrite when no useful plan exists yet and the request is multi-step, asks for the execution process, or needs non-trivial analysis such as seasonality.\n"
-            "Do not call todowrite when a todo plan already exists. Runtime owns plan progress and advances todo statuses after successful actions.\n"
-            "Todo is initial visible process state, not a model-maintained scheduler or tool contract. After each action, judge whether the current task has enough evidence to answer; if not, choose the next non-todowrite action.\n"
+            "Task management follows the DB-GPT-style planning rule, adapted to TSPilot runtime progress ownership. "
+            "For complex tasks that require 3 or more independently verifiable user-visible steps, use todowrite to create a structured task plan BEFORE starting work. "
+            "This includes numbered or bulleted deliverables where separate results must be returned or verified, such as counts, earliest/latest raw rows, time bounds, query text, row counts, extrema, comparisons, validation checks, or final synthesis. "
+            "Do not use todowrite for simple single-step tasks, even if the user uses numbering.\n"
+            "Do not call todowrite when a todo plan already exists. Runtime advances plan status only after your next-turn assessment of the previous observation passes hard safety checks.\n"
+            "Todo is visible process state, not a deterministic tool contract. After each observation, use your next Thought to judge whether the current task has enough evidence; if not, choose the next non-todowrite action.\n"
             "When a todo step is in_progress, treat its task_type as a progress label only. Choose the next action from the ReAct state, observations, and evidence gaps, not by mechanically matching the label.\n"
+            "Task-first evidence rule:\n"
+            "- Before choosing the next tool, translate the user's request into a task output contract: required measures, dimensions, time scope, grouping, comparisons, derived quantities, model outputs, and evidence quality notes.\n"
+            "- After each observation, fill previous_observation_assessment as a gap assessment between that output contract and current evidence: covered, missing, can_answer, and next_action_reason. This is required even when there is no active todo to complete.\n"
+            "- Treat tools as ways to produce or verify that contract. Do not choose a tool chain by template; choose the smallest next action that fills missing contract fields from grounded evidence.\n"
+            "- A sql_query result that explicitly covers the requested contract fields is enough for database-computable work. Do not call code_interpreter just because the task is analytical.\n"
+            "- If evidence is grounded but some contract fields are missing, prefer the tool that can directly and reliably produce those missing fields. If a generated database expression repeatedly fails because it is too complex, simplify or split the evidence query instead of repeating fragile syntax, and state the changed strategy in next_action_reason/action_reason before retrying.\n"
+            "- Set missing only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in missing; mention those in the final answer when useful.\n"
+            "- Do not set can_answer=true while missing contains core requested outputs. If the core request is answerable, set can_answer=true and keep missing empty. Only terminate with truly missing core outputs when action_input includes unavailable_outputs and unavailable_reason that explicitly name what cannot be computed and why.\n"
             "Tool contracts:\n"
-            "- todowrite: create the initial full todo plan only when no plan exists. Plan user-visible deliverables, not internal tool stages. Do not create todo items for field confirmation, query generation, or query planning; those are internal to sql_query.\n"
+            "- todowrite: create the initial full todo plan only when no plan exists and the task needs 3 or more independently verifiable user-visible steps. Plan user-visible deliverables, not internal tool stages. Do not create todo items for field confirmation, query generation, or query planning; those are internal to sql_query.\n"
             "- sql_query: query the selected datasource and return database evidence, including the actual backend query text when available. "
             "Use automatic message-based input for normal database requests. Use explicit query/query_language only when repairing a failed generated query, or when the user supplied an exact query. "
             "It is the primary database-analysis action for raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
             "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
-            "- code_interpreter: execute Python code in a subprocess over existing full evidence artifacts. Use it when the user explicitly asks for code interpreter, or when analysis needs fuller Python features such as imports, next/iterators, correlations, normalization, windowed calculations, custom loops, or multi-step dataframe-like computation that SQL cannot express cleanly.\n"
-            "- anomaly: detect anomalies from existing time-series evidence only.\n"
-            "- forecast: generate a short-term forecast from existing time-series evidence only.\n"
+            "- code_interpreter: execute Python code in a subprocess over existing full evidence artifacts. Use it when the user explicitly asks for code interpreter, or when analysis needs fuller Python features such as imports, next/iterators, correlations, normalization, windowed calculations, custom loops, or multi-step dataframe-like computation that SQL cannot express cleanly. It may support a forecast/anomaly workflow with statistics, but it must not replace the registered forecast or anomaly tool when the user asks for prediction or anomaly detection.\n"
+            "- anomaly: detect anomalies from existing time-series evidence only. Use detector_name only when the user names a supported detector; otherwise omit it and use the default registered detector.\n"
+            "- forecast: generate a forecast plan/result from existing time-series evidence only. It accepts explicit step counts or duration-like horizons such as '1 day'. Use model_name only when the user names a supported forecast model; otherwise omit it and use the default registered model. A forecast observation with status 'succeeded' or 'requires_rolling' is forecast evidence that can be answered from.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
             "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
             "- terminate: end the ReAct loop when verified outputs already answer the task, and provide the final response payload. "
@@ -63,7 +78,7 @@ class DataAgentPromptBuilder:
             "Action Input must be valid JSON.\n"
             "Use the exact action-input field names defined here.\n"
             "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
-            "\"requested_fact_types\": list[str], \"focus\": str|null, \"todos\": list[object], "
+            "\"focus\": str|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
             "Each todo item should use {\"content\": str, \"task_type\": \"query|code_interpreter|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
@@ -71,12 +86,15 @@ class DataAgentPromptBuilder:
             "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for database queries.\n"
             "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
             "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient aggregation, issue another explicit sql_query that corrects or validates the data. "
-            "If diagnostics.task_coverage.requires_followup is true or missing_or_uncertain lists requested facts, continue with a focused sql_query for those facts instead of answering. "
             "For data questions requiring exact aggregation, grouping, ranking, median/quantile, period checks, validation of anomalies, threshold proportions, or comparison across categories, prefer an explicit sql_query when the database can compute it directly. "
-            "Use code_interpreter after the SQL evidence is sufficiently grounded for Python analysis or when the user explicitly asks for code interpreter. Do not calculate final facts from prompt previews alone.\n"
-            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough.\n"
+            "Use code_interpreter after the SQL evidence is sufficiently grounded for Python analysis or when the user explicitly asks for code interpreter. Do not calculate final facts from prompt previews alone. If the user asks for forecast or anomaly detection, code_interpreter output alone is not enough to answer; call the corresponding registered tool before terminate.\n"
+            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough. "
+            "When the user needs precise or detailed analysis, set expected_result_schema to the exact nested fields the answer will need, such as {\"metrics\":{\"row_count\":\"int\",\"min_value\":\"number\",\"max_value\":\"number\"},\"details\":{\"findings\":[{\"label\":\"str\",\"value\":\"number\",\"evidence_ref\":\"str\"}]}}; the runtime rejects code_interpreter output that misses those fields or returns the wrong JSON types.\n"
+            "For anomaly, use: {\"database_evidence\": str|object|null, \"detector_name\": str|null, \"series_name\": str|null, \"constraints\": object}. Omit detector_name unless the user requested a specific supported detector.\n"
+            "For forecast, use: {\"database_evidence\": str|object|null, \"horizon\": int|str|object|null, \"model_name\": str|null, \"series_name\": str|null, \"constraints\": object}. Pass fuzzy user durations as strings when the user did not specify exact steps; the forecast tool resolves sampling interval and may return status='requires_rolling' with forecast_plan instead of points for long horizons. Omit model_name unless the user requested a specific supported model.\n"
             "For terminate, use: {\"result\": str|null, \"summary_goal\": str|null, \"direct_answer\": str|null, "
-            "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str]}.\n"
+            "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str], "
+            "\"unavailable_outputs\": list[str], \"unavailable_reason\": str|null}.\n"
             "Do not output markdown fences."
         )
 
@@ -113,11 +131,9 @@ class DataAgentPromptBuilder:
             },
             "state": {
                 "execution": self._execution_state(request_state),
-                "decision_frame": self._decision_frame(request_state),
                 "todo_list": request_state.todo_list,
                 "plan_current_step": request_state.plan_current_step,
                 "planning_complete": request_state.planning_complete,
-                "requested_fact_types": request_state.requested_fact_types,
                 "focus": request_state.focus,
                 "recent_todo_summary": conversation_state.recent_todo_summary,
                 "prompt_context_summary": request_state.prompt_context_summary,
@@ -127,11 +143,6 @@ class DataAgentPromptBuilder:
                 "prior_queries": prior_queries[-5:],
             },
             "outputs": {
-                "latest_insight": (
-                    self._summarize_insight_status(request_state.latest_insight)
-                    if request_state.latest_insight
-                    else None
-                ),
                 "analysis_workspace": self._analysis_workspace(request_state),
                 "latest_forecast": (
                     self._summarize_forecast_status(request_state.latest_forecast)
@@ -171,8 +182,8 @@ class DataAgentPromptBuilder:
         return [
             {
                 "action": "todowrite",
-                "use_when": "Create the initial plan only when todo_list is empty and the request needs visible multi-step analysis.",
-                "input": "message, current_intent, requested_fact_types, focus, todos, evidence_summary; todos may include acceptance_criteria",
+                "use_when": "Create the initial plan before starting work when todo_list is empty and the request needs 3 or more independently verifiable user-visible steps.",
+                "input": "message, current_intent, focus, todos, evidence_summary; todos may include acceptance_criteria",
             },
             {
                 "action": "sql_query",
@@ -187,12 +198,12 @@ class DataAgentPromptBuilder:
             {
                 "action": "anomaly",
                 "use_when": "Time-series evidence is available and the user specifically needs anomaly/spike/outlier detection.",
-                "input": "database_evidence, constraints",
+                "input": "database_evidence, detector_name, series_name, constraints",
             },
             {
                 "action": "forecast",
                 "use_when": "Time-series evidence is available and the user specifically asks for prediction or forecast.",
-                "input": "database_evidence, horizon, constraints",
+                "input": "database_evidence, horizon, model_name, series_name, constraints",
             },
             {
                 "action": "rag",
@@ -207,7 +218,7 @@ class DataAgentPromptBuilder:
             {
                 "action": "terminate",
                 "use_when": "Enough evidence-backed outputs are available, or the request is conversational / cannot proceed without more context.",
-                "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan",
+                "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan, unavailable_outputs, unavailable_reason",
             },
         ]
 
@@ -234,7 +245,6 @@ class DataAgentPromptBuilder:
             ),
             "artifacts": {
                 "has_database_evidence": request_state.latest_database_evidence is not None,
-                "has_insight": request_state.latest_insight is not None,
                 "has_analysis": bool(request_state.analysis_artifacts),
                 "has_forecast": request_state.latest_forecast is not None,
                 "has_anomaly": request_state.latest_anomaly is not None,
@@ -244,87 +254,6 @@ class DataAgentPromptBuilder:
                 "analysis_count": len(request_state.analysis_artifacts),
             },
             "plan_progress_owner": "runtime" if request_state.todo_list else "none",
-        }
-
-    def _decision_frame(self, request_state: RequestStateModel) -> dict:
-        current_todo = next(
-            (todo for todo in request_state.todo_list if todo.get("status") == "in_progress"),
-            None,
-        )
-        latest_evidence = request_state.latest_database_evidence
-        latest_query_summary = None
-        if latest_evidence is not None:
-            diagnostics = latest_evidence.diagnostics or {}
-            summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
-            latest_query_summary = {
-                "evidence_id": latest_evidence.evidence_id,
-                "result_type": latest_evidence.result_type,
-                "query_language": latest_evidence.query_language,
-                "columns": latest_evidence.columns[:20],
-                "rows_count": summary_stats.get("rows_count"),
-                "points_count": summary_stats.get("points_count"),
-                "series_count": summary_stats.get("series_count"),
-                "sample_rows_visible": isinstance((latest_evidence.data or {}).get("rows"), list),
-                "sample_points_visible": isinstance((latest_evidence.data or {}).get("points"), list),
-            }
-
-        next_action_guidance = []
-        active_progress = self._active_progress_hint(current_todo)
-        if request_state.database_context is None:
-            next_action_guidance.append("terminate: explain that a datasource/context is required for data analysis.")
-        elif latest_evidence is None:
-            next_action_guidance.append("sql_query: obtain database evidence before analysis.")
-        else:
-            next_action_guidance.extend(
-                [
-                    "sql_query: continue with explicit read-only queries for additional aggregation, filtering, bucketing, or period validation.",
-                    "code_interpreter: use Python over full evidence only when SQL is insufficient or structured analysis output is now needed.",
-                    "terminate: use only when enough database-backed evidence or derived outputs answer the user request.",
-                ]
-            )
-        if request_state.todo_list:
-            next_action_guidance.insert(0, "todowrite is locked after initial planning; runtime advances plan status.")
-
-        decision_frame = {
-            "current_todo": current_todo,
-            "completion_state": request_state.completion_state,
-            "latest_query_summary": latest_query_summary,
-            "active_progress_hint": active_progress,
-            "recommended_next_action_types": next_action_guidance,
-            "sql_loop_rule": (
-                "A prior sql_query does not force code_interpreter. If the last SQL sample/counts reveal a missing filter, outlier, "
-                "or another database-checkable gap, call sql_query again with a focused read-only query."
-            ),
-            "context_budget_rule": (
-                "Prompt context contains bounded previews only. Use prompt_sampling/data_completeness and artifact refs to distinguish complete results from previews; "
-                "run a tool when full-data computation is needed."
-            ),
-        }
-        repair_directive = request_state.completion_state.get("semantic_repair_directive")
-        if repair_directive:
-            decision_frame["semantic_repair_directive"] = repair_directive
-        return decision_frame
-
-    def _active_progress_hint(self, current_todo: dict | None) -> dict:
-        if current_todo is None:
-            return {
-                "task_type": None,
-                "suggested_action": None,
-            }
-        task_type = str(current_todo.get("task_type") or "").strip().lower()
-        suggested_action = {
-            "query": "sql_query",
-            "insight": "code_interpreter",
-            "code_interpreter": "code_interpreter",
-            "anomaly": "anomaly",
-            "forecast": "forecast",
-            "answer": "terminate",
-            "rag": "rag",
-            "skill": "skill",
-        }.get(task_type)
-        return {
-            "task_type": task_type or None,
-            "suggested_action": suggested_action,
         }
 
     def build_user_prompt(
@@ -415,7 +344,7 @@ class DataAgentPromptBuilder:
         visible_diagnostics = {
             key: value
             for key, value in diagnostics.items()
-            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count", "task_coverage"}
+            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count"}
         }
         visible_diagnostics["prompt_sampling"] = self._prompt_sampling(
             full_counts=summary_stats,
@@ -475,12 +404,6 @@ class DataAgentPromptBuilder:
                     "row_count": row_count,
                     "point_count": point_count,
                     "series_count": series_count,
-                    "task_coverage": self._bounded_value(
-                        diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {},
-                        max_string_chars=800,
-                        max_list_items=8,
-                        max_dict_items=12,
-                    ),
                     "metadata": self._bounded_value(
                         item.get("metadata") or {},
                         max_string_chars=400,
@@ -520,22 +443,17 @@ class DataAgentPromptBuilder:
             "analyses": analyses[-8:],
         }
 
-    def _summarize_insight_status(self, insight) -> dict:
-        payload = insight.model_dump(mode="json")
-        return {
-            "insight_id": payload.get("insight_id"),
-            "summary": self._truncate_text(payload.get("summary"), 800),
-            "verified_fact_count": len(payload.get("verified_facts", []) or []),
-            "completed_fact_count": len(payload.get("completed_facts", []) or []),
-            "visualization_count": len(payload.get("visualizations", []) or []),
-        }
-
     def _summarize_forecast_status(self, forecast) -> dict:
         payload = forecast.model_dump(mode="json")
+        forecast_points = payload.get("forecast_points", []) or []
         return {
             "forecast_id": payload.get("forecast_id"),
+            "status": payload.get("status"),
+            "horizon": payload.get("horizon"),
+            "forecast_plan": payload.get("forecast_plan"),
             "summary": self._truncate_text(payload.get("summary"), 800),
-            "forecast_point_count": len(payload.get("forecast_points", []) or []),
+            "forecast_point_count": len(forecast_points),
+            "forecast_points_preview": forecast_points[:6],
             "visualization_count": len(payload.get("visualizations", []) or []),
         }
 
@@ -563,7 +481,6 @@ class DataAgentPromptBuilder:
             "code_hash",
             "input_evidence_id",
             "input_row_count",
-            "insight_id",
             "forecast_id",
             "anomaly_id",
             "summary",
@@ -602,9 +519,14 @@ class DataAgentPromptBuilder:
         if isinstance(payload.get("diagnostics"), dict):
             diagnostics = dict(payload["diagnostics"])
             summarized["diagnostics"] = {
-                key: self._bounded_value(value, max_string_chars=1000, max_list_items=8, max_dict_items=16)
+                key: self._bounded_value(
+                    value,
+                    max_string_chars=1000,
+                    max_list_items=8,
+                    max_dict_items=16,
+                )
                 for key, value in diagnostics.items()
-                if key in {"summary_stats", "query_trace", "sql_query", "task_coverage", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
+                if key in {"summary_stats", "query_trace", "sql_query", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
                 or key == "prompt_sampling"
             }
             summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
@@ -719,47 +641,6 @@ class DataAgentPromptBuilder:
         tail = max(1, limit - head)
         return [*items[:head], *items[-tail:]]
 
-    def _summarize_insight(self, insight) -> dict:
-        payload = insight.model_dump(mode="json")
-        payload["fact_candidates"] = payload.get("fact_candidates", [])[:8]
-        payload["completed_facts"] = [
-            {
-                "fact_id": fact.get("fact_id"),
-                "fact_type": fact.get("fact_type"),
-                "statement": fact.get("statement"),
-                "focus": fact.get("focus"),
-            }
-            for fact in payload.get("completed_facts", [])[:6]
-        ]
-        payload["verified_facts"] = [
-            {
-                "fact_id": fact.get("fact_id"),
-                "fact_type": fact.get("fact_type"),
-                "statement": fact.get("statement"),
-                "confidence": fact.get("confidence"),
-            }
-            for fact in payload.get("verified_facts", [])[:6]
-        ]
-        payload["rejected_facts"] = [
-            {
-                "fact_id": fact.get("fact_id"),
-                "fact_type": fact.get("fact_type"),
-                "reason": fact.get("reason"),
-            }
-            for fact in payload.get("rejected_facts", [])[:6]
-        ]
-        payload["visualizations"] = [
-            self._summarize_visualization_from_dict(item)
-            for item in payload.get("visualizations", [])[:4]
-        ]
-        diagnostics = dict(payload.get("diagnostics") or {})
-        payload["diagnostics"] = {
-            key: value
-            for key, value in diagnostics.items()
-            if key in {"artifact_kind", "artifact_ref", "snapshot_ref"}
-        }
-        return payload
-
     def _summarize_forecast(self, forecast) -> dict:
         payload = forecast.model_dump(mode="json")
         payload["forecast_points"] = payload.get("forecast_points", [])[:6]
@@ -804,7 +685,6 @@ class DataAgentPromptBuilder:
             "summary": payload.get("summary"),
             "binding_fact_ids": payload.get("binding_fact_ids", [])[:6],
             "binding_evidence_ids": payload.get("binding_evidence_ids", [])[:6],
-            "requested_fact_types": payload.get("requested_fact_types", [])[:6],
             "time_column": payload.get("time_column"),
             "primary_measure": payload.get("primary_measure"),
             "display_priority": payload.get("display_priority"),

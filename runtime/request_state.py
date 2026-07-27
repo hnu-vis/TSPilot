@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING
 from app.settings import Settings
 from core.completion import (
     evaluate_goal_completion,
-    evaluate_step_completion,
     normalize_todo_for_completion,
 )
+from core.intent import build_intent_profile_fallback
 from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
 from runtime.language import detect_response_language
@@ -51,8 +51,8 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         request_log_dir = conversation_run_dir / "requests" / request_id
         request_log_dir.mkdir(parents=True, exist_ok=True)
         _write_conversation_meta(conversation_run_dir, conversation_id)
-    requested_fact_types: list[str] = []
-    answer_requirements = ["conclusion"]
+    intent_profile = build_intent_profile_fallback(request.message)
+    requested_capabilities = list(intent_profile.get("requested_capabilities") or [])
     focus = request.message
     database_context = _with_schema_hint(request.database_context, settings)
     return RequestStateModel(
@@ -70,10 +70,8 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         history=request.history,
         status="running",
         current_intent="chat_analysis",
-        intent_profile={},
-        requested_fact_types=requested_fact_types,
-        answer_requirements=answer_requirements,
-        answer_coverage={requirement: False for requirement in answer_requirements},
+        intent_profile=intent_profile,
+        requested_capabilities=requested_capabilities,
         focus=focus,
         todo_list=[],
         plan_current_step=0,
@@ -94,8 +92,6 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         completion_state={},
         latest_database_evidence=None,
         database_evidence_artifacts={},
-        latest_insight=None,
-        insight_artifacts={},
         latest_analysis_id=None,
         analysis_artifacts={},
         latest_forecast=None,
@@ -162,14 +158,13 @@ def build_conversation_state(request: ChatRequest, conversation_id: str) -> Conv
         recent_messages=request.history,
         session_summary=None,
         intent_profile={},
+        requested_capabilities=[],
         todo_list=[],
         plan_current_step=0,
         planning_complete=False,
         recent_todo_summary=None,
         latest_database_evidence=None,
         database_evidence_artifacts={},
-        latest_insight=None,
-        insight_artifacts={},
         latest_analysis_id=None,
         analysis_artifacts={},
         latest_forecast=None,
@@ -345,11 +340,10 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
 
 
 def _visible_used_tools(request_state: RequestStateModel) -> list[str]:
-    terminal_presentation_actions = {"format_answer", "terminate"}
     return [
         call.tool_name
         for call in request_state.tool_history
-        if call.tool_name not in terminal_presentation_actions
+        if call.tool_name != "terminate"
     ]
 
 
@@ -371,13 +365,11 @@ def apply_observation(
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-        _advance_plan_after_success(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
+        _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
 
     safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
     request_state.observations.append(safe_observation)
@@ -402,13 +394,11 @@ async def apply_observation_async(
         _apply_todo_payload(request_state, full_payload)
     elif tool_spec.result_target == "evidence":
         _apply_evidence_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "analysis":
         _apply_analysis_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
-        await _advance_plan_after_success_async(request_state, observation.tool_name, full_payload, thought=thought, action_reason=action_reason)
+        _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
 
     safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
     request_state.observations.append(safe_observation)
@@ -433,14 +423,14 @@ def enrich_observation_payload(
             analysis = request_state.analysis_artifacts.get(analysis_id)
             if analysis is not None:
                 payload = _build_prompt_safe_analysis(analysis, request_state)
-        elif "insight_id" in full_payload and request_state.latest_insight is not None:
-            payload = request_state.latest_insight.model_dump(mode="json")
         elif "forecast_id" in full_payload and request_state.latest_forecast is not None:
             payload = request_state.latest_forecast.model_dump(mode="json")
         elif "anomaly_id" in full_payload and request_state.latest_anomaly is not None:
             payload = request_state.latest_anomaly.model_dump(mode="json")
     elif tool_spec.result_target == "presentation" and request_state.final_answer_draft is not None:
         payload = request_state.final_answer_draft.model_dump(mode="json")
+
+    payload = _deduplicate_observation_payload(observation, payload)
 
     return observation.model_copy(
         update={
@@ -451,14 +441,32 @@ def enrich_observation_payload(
 
 
 def _build_prompt_safe_failure_observation(observation: ToolObservation) -> ToolObservation:
+    payload = _bounded_value(observation.payload, max_string_chars=1600, max_list_items=8, max_dict_items=12)
+    payload = _deduplicate_observation_payload(observation, payload)
     return observation.model_copy(
         update={
             "summary": _truncate_text(observation.summary, 1600),
             "error": _truncate_text(observation.error, 1600),
-            "payload": _bounded_value(observation.payload, max_string_chars=1600, max_list_items=8, max_dict_items=12),
+            "payload": payload,
             "payload_truncated": observation.payload_truncated or _is_large_value(observation.payload),
         }
     )
+
+
+def _deduplicate_observation_payload(observation: ToolObservation, payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    envelope_values = {
+        "summary": observation.summary,
+        "error": observation.error,
+        "success": observation.success,
+        "tool_name": observation.tool_name,
+    }
+    for key, envelope_value in envelope_values.items():
+        if key in cleaned and cleaned.get(key) == envelope_value:
+            cleaned.pop(key, None)
+    return cleaned
 
 
 def _truncate_text(value: str | None, max_chars: int) -> str | None:
@@ -521,7 +529,6 @@ def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) ->
     request_state.plan_current_step = int(full_payload.get("current_step") or 0)
     request_state.planning_complete = bool(full_payload.get("planning_complete", False))
     if request_state.todo_list:
-        request_state.answer_coverage["plan"] = True
         request_state.max_iterations = max(
             request_state.max_iterations,
             min(20, len(request_state.todo_list) * 3 + 2),
@@ -529,13 +536,10 @@ def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) ->
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
-def _advance_plan_after_success(
+def _complete_answer_todo_after_terminal(
     request_state: RequestStateModel,
     tool_name: str,
     full_payload: dict,
-    *,
-    thought: str | None = None,
-    action_reason: str | None = None,
 ) -> None:
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
@@ -544,31 +548,36 @@ def _advance_plan_after_success(
     if current_index is None:
         return
     current_todo = dict(request_state.todo_list[current_index])
-    current_task_type = str(current_todo.get("task_type") or "").strip().lower()
-    if current_task_type == "plan":
-        current_task_type = "query"
-        current_todo["task_type"] = "query"
+    if str(current_todo.get("task_type") or "").strip().lower() != "answer":
+        request_state.completion_state["latest_step"] = {
+            "completed": False,
+            "reason": "Terminal payload cannot complete a non-answer todo.",
+            "missing_evidence": ["answer_todo"],
+            "evidence_refs": [],
+            "next_action_hint": "Complete the active evidence or analysis todo before terminating.",
+            "tool_name": tool_name,
+            "todo_index": current_index,
+            "todo": current_todo,
+        }
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
     current_todo = normalize_todo_for_completion(current_todo)
-    request_state.todo_list[current_index] = current_todo
-    evaluation = evaluate_step_completion(
-        request_state,
-        tool_name=tool_name,
-        full_payload=full_payload,
-        thought=thought,
-        action_reason=action_reason,
-    )
-    request_state.completion_state["latest_step"] = {
-        **evaluation.model_dump(),
-        "tool_name": tool_name,
-        "todo_index": current_index,
-        "todo": current_todo,
-    }
-    if not evaluation.completed:
+    if not _has_final_answer_payload(full_payload):
+        request_state.completion_state["latest_step"] = {
+            "completed": False,
+            "reason": "Terminal payload did not contain a final answer.",
+            "missing_evidence": ["final_answer"],
+            "evidence_refs": [],
+            "next_action_hint": "Assemble the final answer again after evidence is ready.",
+            "tool_name": tool_name,
+            "todo_index": current_index,
+            "todo": current_todo,
+        }
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current_todo["status"] = "completed"
-    current_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else current_todo.get("result_ref")
-    current_todo["completion_reason"] = evaluation.reason
+    current_todo["result_ref"] = "final_answer:latest"
+    current_todo["completion_reason"] = f"Tool '{tool_name}' produced the final answer."
     request_state.todo_list[current_index] = current_todo
     next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
     if next_index is not None:
@@ -580,62 +589,16 @@ def _advance_plan_after_success(
     else:
         request_state.plan_current_step = len(request_state.todo_list)
         request_state.planning_complete = True
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-
-
-async def _advance_plan_after_success_async(
-    request_state: RequestStateModel,
-    tool_name: str,
-    full_payload: dict,
-    *,
-    thought: str | None = None,
-    action_reason: str | None = None,
-) -> None:
-    if not request_state.todo_list:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
-    current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
-    if current_index is None:
-        return
-    current_todo = dict(request_state.todo_list[current_index])
-    current_task_type = str(current_todo.get("task_type") or "").strip().lower()
-    if current_task_type == "plan":
-        current_task_type = "query"
-        current_todo["task_type"] = "query"
-    current_todo = normalize_todo_for_completion(current_todo)
-    request_state.todo_list[current_index] = current_todo
-
-    evaluation = evaluate_step_completion(
-        request_state,
-        tool_name=tool_name,
-        full_payload=full_payload,
-        thought=thought,
-        action_reason=action_reason,
-    )
-
     request_state.completion_state["latest_step"] = {
-        **evaluation.model_dump(),
+        "completed": True,
+        "reason": current_todo["completion_reason"],
+        "missing_evidence": [],
+        "evidence_refs": ["final_answer:latest"],
+        "next_action_hint": None,
         "tool_name": tool_name,
         "todo_index": current_index,
         "todo": current_todo,
     }
-    if not evaluation.completed:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
-    current_todo["status"] = "completed"
-    current_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else current_todo.get("result_ref")
-    current_todo["completion_reason"] = evaluation.reason
-    request_state.todo_list[current_index] = current_todo
-    next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
-    if next_index is not None:
-        next_todo = dict(request_state.todo_list[next_index])
-        next_todo["status"] = "in_progress"
-        request_state.todo_list[next_index] = next_todo
-        request_state.plan_current_step = next_index + 1
-        request_state.planning_complete = False
-    else:
-        request_state.plan_current_step = len(request_state.todo_list)
-        request_state.planning_complete = True
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
@@ -763,32 +726,6 @@ def _summarize_visualization_dict(payload: dict) -> dict:
     return item
 
 
-def _build_prompt_safe_insight(insight, request_state: RequestStateModel):
-    from schemas.insight import InsightResult
-
-    payload = insight.model_dump(mode="json")
-    payload["fact_candidates"] = payload.get("fact_candidates", [])[:8]
-    payload["completed_facts"] = payload.get("completed_facts", [])[:6]
-    payload["verified_facts"] = payload.get("verified_facts", [])[:6]
-    payload["rejected_facts"] = payload.get("rejected_facts", [])[:6]
-    payload["summary_blocks"] = payload.get("summary_blocks", [])[:6]
-    payload["visualizations"] = [
-        _summarize_visualization_dict(item)
-        for item in payload.get("visualizations", [])[:4]
-    ]
-    diagnostics = dict(payload.get("diagnostics") or {})
-    diagnostics["artifact_kind"] = "insight_result"
-    diagnostics["artifact_ref"] = f"insight:{insight.insight_id}"
-    diagnostics["snapshot_ref"] = persist_json_artifact(
-        artifact_id=insight.insight_id,
-        artifact_kind="insight_result",
-        payload=insight.model_dump(mode="json"),
-        directory=_artifact_directory(request_state, "analysis"),
-    )
-    payload["diagnostics"] = diagnostics
-    return InsightResult.model_validate(payload)
-
-
 def _build_prompt_safe_analysis(analysis, request_state: RequestStateModel):
     from schemas.analysis import AnalysisResult
 
@@ -866,26 +803,6 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         analysis = AnalysisResult.model_validate(full_payload)
         request_state.analysis_artifacts[analysis.analysis_id] = analysis
         request_state.latest_analysis_id = analysis.analysis_id
-        request_state.answer_coverage["analysis"] = True
-        for requirement in list(request_state.answer_coverage):
-            if requirement not in {"plan", "forecast", "anomaly"}:
-                request_state.answer_coverage[requirement] = True
-        return
-
-    if "insight_id" in full_payload:
-        from schemas.insight import InsightResult
-
-        insight = InsightResult.model_validate(full_payload)
-        request_state.insight_artifacts[insight.insight_id] = insight
-        request_state.latest_insight = _build_prompt_safe_insight(insight, request_state)
-        request_state.verified_facts = insight.verified_facts
-        request_state.rejected_facts = insight.rejected_facts
-        request_state.visualizations = list(request_state.latest_insight.visualizations)
-        for fact in insight.verified_facts:
-            fact_type = str(fact.fact_type)
-            request_state.answer_coverage[fact_type] = True
-            if fact_type == "outlier":
-                request_state.answer_coverage["anomaly"] = True
         return
 
     if "forecast_id" in full_payload:
@@ -895,7 +812,6 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         request_state.forecast_artifacts[forecast.forecast_id] = forecast
         request_state.latest_forecast = _build_prompt_safe_forecast(forecast, request_state)
         request_state.visualizations.extend(request_state.latest_forecast.visualizations)
-        request_state.answer_coverage["forecast"] = True
         return
 
     if "anomaly_id" in full_payload:
@@ -905,7 +821,6 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
         request_state.latest_anomaly = _build_prompt_safe_anomaly(anomaly, request_state)
         request_state.visualizations.extend(request_state.latest_anomaly.visualizations)
-        request_state.answer_coverage["anomaly"] = True
         return
 
     if "skill_name" in full_payload:
@@ -918,4 +833,11 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
 def _apply_presentation_payload(request_state: RequestStateModel, full_payload: dict) -> None:
     request_state.final_answer_draft = FinalAnswer.model_validate(full_payload)
-    request_state.answer_coverage["conclusion"] = True
+
+
+def _has_final_answer_payload(payload: dict) -> bool:
+    summary = payload.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return True
+    sections = payload.get("sections")
+    return isinstance(sections, list) and bool(sections)

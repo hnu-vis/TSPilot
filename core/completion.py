@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from schemas.agent_turn import PreviousObservationAssessment
 from schemas.state import RequestStateModel
+from schemas.tool import ToolObservation
 
 
 @dataclass
@@ -54,67 +56,38 @@ def normalize_todo_for_completion(todo: dict) -> dict:
     return normalized
 
 
-def evaluate_step_completion(
-    request_state: RequestStateModel,
-    *,
-    tool_name: str,
-    full_payload: dict,
-    thought: str | None = None,
-    action_reason: str | None = None,
-) -> CompletionEvaluation:
-    """Advance visible todo progress only when the latest action appears to finish it."""
-    current = current_todo(request_state)
-    if current is None:
-        return CompletionEvaluation(False, "No active todo step.", next_action_hint=None)
-
-    refs = evidence_refs_for_payload(full_payload)
-    current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo is current), None)
-    if current_index is not None:
-        history = request_state.completion_state.setdefault("_todo_action_history", {})
-        history.setdefault(str(current_index), []).append(tool_name)
-
-    if tool_name in {"todowrite", "format_answer", "terminate"}:
-        return CompletionEvaluation(
-            False,
-            f"Tool '{tool_name}' does not auto-complete ordinary todo steps.",
-            evidence_refs=refs,
-            next_action_hint="Continue with the next evidence or analysis action.",
-        )
-
-    current_task_type = str(current.get("task_type") or "").strip().lower()
-    if current_task_type == "generic":
-        current_task_type = ""
-    if _action_matches_task_type(tool_name, current_task_type):
-        return _evaluate_matching_action(
-            request_state=request_state,
-            current=current,
-            tool_name=tool_name,
-            full_payload=full_payload,
-            refs=refs,
-            thought=thought,
-            action_reason=action_reason,
-        )
-
-    if _signals_transition_to_next_todo(request_state, thought=thought, action_reason=action_reason):
-        return CompletionEvaluation(
-            True,
-            "Agent reasoning indicates the active todo is complete and it is moving to the next todo.",
-            evidence_refs=refs,
-        )
-
-    return CompletionEvaluation(
-        False,
-        f"Latest action '{tool_name}' does not satisfy active todo type '{current_task_type or 'unspecified'}'.",
-        evidence_refs=refs,
-        next_action_hint=_hint_for_task_type(current_task_type),
-    )
-
-
 def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletionEvaluation:
     if request_state.database_context is None:
         return GoalCompletionEvaluation(True, "No database context is required for this response.")
 
     refs = _all_answer_refs(request_state)
+    missing_required = _missing_required_tool_outputs(request_state)
+    if missing_required:
+        return GoalCompletionEvaluation(
+            can_answer=False,
+            reason="Required specialized tool output is missing for the requested analysis.",
+            missing_evidence=missing_required,
+            answerable_from=refs,
+            next_action_hint=_next_action_for_missing_required(missing_required),
+        )
+    gap = latest_gap_assessment(request_state)
+    if gap is not None:
+        gap_missing = _gap_blocking_items(gap)
+        can_answer = gap.get("can_answer")
+        if can_answer is False or (gap_missing and can_answer is not True):
+            return GoalCompletionEvaluation(
+                can_answer=False,
+                reason="Latest ReAct gap assessment says the user request is not fully covered.",
+                missing_evidence=gap_missing or ["gap_assessment_not_answerable"],
+                answerable_from=refs,
+                next_action_hint=gap.get("next_action_reason") or "Choose the next action that fills the assessed evidence gap.",
+            )
+        if can_answer is True and refs:
+            return GoalCompletionEvaluation(
+                True,
+                "Latest ReAct gap assessment says available evidence covers the user request.",
+                answerable_from=refs,
+            )
     if refs:
         return GoalCompletionEvaluation(True, "Available observations or artifacts exist for the final answer.", answerable_from=refs)
 
@@ -126,8 +99,226 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
     )
 
 
+def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str]:
+    requirements = {
+        str(item).strip().lower()
+        for item in (request_state.requested_capabilities or [])
+        if str(item).strip()
+    }
+    missing: list[str] = []
+    if "forecast" in requirements and request_state.latest_forecast is None:
+        missing.append("forecast")
+    if "anomaly" in requirements and request_state.latest_anomaly is None:
+        missing.append("anomaly")
+    return missing
+
+
+def _next_action_for_missing_required(missing: list[str]) -> str:
+    if "forecast" in missing:
+        return "Call forecast with the latest time-series evidence before answering."
+    if "anomaly" in missing:
+        return "Call anomaly with the latest time-series evidence before answering."
+    return "Call the missing specialized analysis tool before answering."
+
+
 def current_todo(request_state: RequestStateModel) -> dict | None:
     return next((todo for todo in request_state.todo_list if todo.get("status") == "in_progress"), None)
+
+
+def apply_previous_observation_assessment(
+    request_state: RequestStateModel,
+    assessment: PreviousObservationAssessment | None,
+) -> CompletionEvaluation:
+    if assessment is not None:
+        request_state.completion_state["latest_gap_assessment"] = gap_assessment_payload(assessment)
+
+    current = current_todo(request_state)
+    if current is None:
+        return CompletionEvaluation(False, "No active todo step.", next_action_hint=None)
+    if assessment is None:
+        return CompletionEvaluation(False, "No previous observation assessment was provided.", next_action_hint=None)
+
+    current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo is current), None)
+    if current_index is None:
+        return CompletionEvaluation(False, "Active todo could not be located.", next_action_hint=None)
+
+    previous_observation = request_state.observations[-1] if request_state.observations else None
+    if not assessment.completed_active_todo:
+        evaluation = CompletionEvaluation(
+            False,
+            assessment.reason or "LLM assessment did not mark the active todo complete.",
+            evidence_refs=assessment.evidence_refs,
+            next_action_hint="Continue from the latest observation.",
+        )
+        request_state.completion_state["latest_step"] = _assessment_state(
+            evaluation,
+            tool_name=previous_observation.tool_name if previous_observation else None,
+            todo_index=current_index,
+            todo=current,
+            accepted=False,
+        )
+        return evaluation
+
+    evaluation = _hard_gate_previous_assessment(
+        current=current,
+        assessment=assessment,
+        previous_observation=previous_observation,
+    )
+    accepted = evaluation.completed
+    request_state.completion_state["latest_step"] = _assessment_state(
+        evaluation,
+        tool_name=previous_observation.tool_name if previous_observation else None,
+        todo_index=current_index,
+        todo=current,
+        accepted=accepted,
+    )
+    if not accepted:
+        return evaluation
+
+    completed_todo = normalize_todo_for_completion(dict(current))
+    completed_todo["status"] = "completed"
+    completed_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else completed_todo.get("result_ref")
+    completed_todo["completion_reason"] = evaluation.reason
+    request_state.todo_list[current_index] = completed_todo
+    next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
+    if next_index is not None:
+        next_todo = dict(request_state.todo_list[next_index])
+        next_todo["status"] = "in_progress"
+        request_state.todo_list[next_index] = next_todo
+        request_state.plan_current_step = next_index + 1
+        request_state.planning_complete = False
+    else:
+        request_state.plan_current_step = len(request_state.todo_list)
+        request_state.planning_complete = True
+    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+    return evaluation
+
+
+def gap_assessment_payload(assessment: PreviousObservationAssessment) -> dict:
+    return {
+        "completed_active_todo": assessment.completed_active_todo,
+        "reason": assessment.reason,
+        "evidence_refs": list(assessment.evidence_refs),
+        "covered": list(assessment.covered),
+        "missing": list(assessment.missing),
+        "next_action_reason": assessment.next_action_reason,
+        "can_answer": assessment.can_answer,
+    }
+
+
+def latest_gap_assessment(request_state: RequestStateModel) -> dict | None:
+    gap = request_state.completion_state.get("latest_gap_assessment")
+    return gap if isinstance(gap, dict) else None
+
+
+def _gap_blocking_items(gap: dict) -> list[str]:
+    items: list[str] = []
+    values = gap.get("missing")
+    if isinstance(values, list):
+        items.extend(str(item).strip() for item in values if str(item).strip())
+    return items
+
+
+def _hard_gate_previous_assessment(
+    *,
+    current: dict,
+    assessment: PreviousObservationAssessment,
+    previous_observation: ToolObservation | None,
+) -> CompletionEvaluation:
+    if previous_observation is None:
+        return CompletionEvaluation(False, "No previous observation exists for the assessment.", next_action_hint="Run a tool first.")
+    if not previous_observation.success:
+        return CompletionEvaluation(
+            False,
+            "Previous observation failed, so it cannot complete the active todo.",
+            missing_evidence=["successful_observation"],
+            next_action_hint="Repair the failed action or choose another grounded action.",
+        )
+
+    tool_name = previous_observation.tool_name
+    payload = previous_observation.payload if isinstance(previous_observation.payload, dict) else {}
+    current_task_type = str(current.get("task_type") or "").strip().lower()
+    if current_task_type in {"generic", "plan"}:
+        current_task_type = "" if current_task_type == "generic" else "query"
+
+    if tool_name in {"todowrite"}:
+        return CompletionEvaluation(False, "Todo planning observations do not complete business todo steps.")
+    if tool_name == "terminate" and current_task_type != "answer":
+        return CompletionEvaluation(False, "Terminal observations cannot complete non-answer todo steps.")
+    if current_task_type == "answer" and tool_name != "terminate":
+        return CompletionEvaluation(False, "Only a terminal final-answer observation can complete an answer todo.")
+    if current_task_type and not _action_matches_task_type(tool_name, current_task_type):
+        return CompletionEvaluation(
+            False,
+            f"Previous observation '{tool_name}' does not match active todo type '{current_task_type}'.",
+            next_action_hint=_hint_for_task_type(current_task_type),
+        )
+
+    refs = assessment.evidence_refs or evidence_refs_for_payload(payload)
+    if tool_name == "sql_query":
+        if _query_returned_no_rows(payload) and not _assessment_accepts_empty_result(assessment):
+            return CompletionEvaluation(
+                False,
+                "SQL query returned no rows; LLM assessment did not explain why the empty result itself satisfies the todo.",
+                missing_evidence=["non_empty_query_result"],
+                evidence_refs=refs,
+                next_action_hint="Repair the query or explicitly explain why the empty result is the requested outcome.",
+            )
+        if _is_schema_only_query(payload) and not _todo_mentions_schema(current):
+            return CompletionEvaluation(
+                False,
+                "Schema-only evidence cannot complete a non-schema query todo.",
+                missing_evidence=["database_result"],
+                evidence_refs=refs,
+                next_action_hint="Query the requested rows, aggregate, or validation result.",
+            )
+        if not refs and not _has_non_empty_payload(payload):
+            return CompletionEvaluation(
+                False,
+                "SQL observation did not provide evidence or a usable payload.",
+                missing_evidence=["database_evidence"],
+                next_action_hint="Run a grounded sql_query.",
+            )
+    elif tool_name in {"code_interpreter", "anomaly", "forecast", "rag", "skill"}:
+        if not refs and not _has_non_empty_payload(payload):
+            return CompletionEvaluation(
+                False,
+                f"Observation '{tool_name}' did not provide a usable artifact.",
+                missing_evidence=[f"{tool_name}_artifact"],
+                next_action_hint=_hint_for_task_type(current_task_type or tool_name),
+            )
+    elif tool_name == "terminate":
+        if not _has_final_answer_payload(payload):
+            return CompletionEvaluation(
+                False,
+                "Terminal observation did not provide a usable final answer.",
+                missing_evidence=["final_answer"],
+                evidence_refs=refs,
+                next_action_hint="Assemble the final answer again after evidence is ready.",
+            )
+
+    return CompletionEvaluation(
+        True,
+        assessment.reason or "LLM assessment marked the active todo complete based on the previous observation.",
+        evidence_refs=refs,
+    )
+
+
+def _assessment_state(
+    evaluation: CompletionEvaluation,
+    *,
+    tool_name: str | None,
+    todo_index: int,
+    todo: dict,
+    accepted: bool,
+) -> dict:
+    return {
+        **evaluation.model_dump(),
+        "tool_name": tool_name,
+        "todo_index": todo_index,
+        "todo": todo,
+        "assessment_accepted": accepted,
+    }
 
 
 def _action_matches_task_type(tool_name: str, task_type: str) -> bool:
@@ -136,82 +327,8 @@ def _action_matches_task_type(tool_name: str, task_type: str) -> bool:
     if task_type == "query":
         return tool_name == "sql_query"
     if task_type == "answer":
-        return tool_name in {"format_answer", "terminate"}
+        return tool_name == "terminate"
     return tool_name == task_type
-
-
-def _evaluate_matching_action(
-    *,
-    request_state: RequestStateModel,
-    current: dict,
-    tool_name: str,
-    full_payload: dict,
-    refs: list[str],
-    thought: str | None,
-    action_reason: str | None,
-) -> CompletionEvaluation:
-    if tool_name == "sql_query":
-        coverage = _task_coverage(full_payload)
-        if coverage.get("requires_followup") or coverage.get("runtime_requires_followup"):
-            missing = _string_items(coverage.get("missing_or_uncertain")) + _string_items(
-                coverage.get("runtime_missing_or_uncertain")
-            )
-            return CompletionEvaluation(
-                False,
-                "SQL observation reports missing or uncertain task coverage.",
-                missing_evidence=missing,
-                evidence_refs=refs,
-                next_action_hint=coverage.get("next_action_hint") or "Issue a focused sql_query for the missing item.",
-            )
-        if _query_returned_no_rows(full_payload):
-            return CompletionEvaluation(
-                False,
-                "SQL query returned no rows; keep the current todo active until the empty result is explained or repaired.",
-                missing_evidence=["non_empty_query_result"],
-                evidence_refs=refs,
-                next_action_hint="Validate filters, time range, and field selection with another sql_query or answer later with explicit caveats.",
-            )
-        if _is_schema_only_query(full_payload) and not _todo_mentions_schema(current):
-            return CompletionEvaluation(
-                False,
-                "Schema-only evidence does not complete a user-visible query todo.",
-                missing_evidence=["database_result"],
-                evidence_refs=refs,
-                next_action_hint="Query the requested rows, points, aggregate, or validation result.",
-            )
-        return CompletionEvaluation(
-            True,
-            "SQL observation appears to cover the active query todo.",
-            evidence_refs=refs,
-        )
-
-    if tool_name in {"insight", "code_interpreter", "anomaly", "forecast", "rag", "skill"}:
-        if not refs and not _has_non_empty_payload(full_payload):
-            return CompletionEvaluation(
-                False,
-                f"Tool '{tool_name}' returned no usable artifact for the active todo.",
-                missing_evidence=[f"{tool_name}_artifact"],
-                next_action_hint=_hint_for_task_type(tool_name),
-            )
-        return CompletionEvaluation(
-            True,
-            f"Tool '{tool_name}' produced output for the active todo.",
-            evidence_refs=refs,
-        )
-
-    if _signals_transition_to_next_todo(request_state, thought=thought, action_reason=action_reason):
-        return CompletionEvaluation(
-            True,
-            "Agent reasoning indicates the active todo is complete.",
-            evidence_refs=refs,
-        )
-
-    return CompletionEvaluation(
-        False,
-        "The latest tool output is not enough to complete the active todo.",
-        evidence_refs=refs,
-        next_action_hint=_hint_for_task_type(str(current.get("task_type") or "")),
-    )
 
 
 def _task_coverage(payload: dict) -> dict:
@@ -223,7 +340,8 @@ def _task_coverage(payload: dict) -> dict:
 def _query_returned_no_rows(payload: dict) -> bool:
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
     coverage = _task_coverage(payload)
-    if "query returned no rows" in _string_items(coverage.get("missing_or_uncertain")):
+    missing_items = _string_items(coverage.get("missing")) or _string_items(coverage.get("missing_or_uncertain"))
+    if "query returned no rows" in missing_items:
         return True
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     rows = data.get("rows") if isinstance(data.get("rows"), list) else None
@@ -255,43 +373,38 @@ def _has_non_empty_payload(payload: dict) -> bool:
     return any(value not in (None, "", [], {}) for value in payload.values())
 
 
-def _signals_transition_to_next_todo(
-    request_state: RequestStateModel,
-    *,
-    thought: str | None,
-    action_reason: str | None,
-) -> bool:
-    text = f"{thought or ''} {action_reason or ''}".strip().lower()
-    if not text:
-        return False
-    current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
-    if current_index is None or current_index + 1 >= len(request_state.todo_list):
-        return False
-    next_todo = str(request_state.todo_list[current_index + 1].get("content") or "").lower()
-    transition_markers = (
-        "next step",
-        "now i need",
-        "now i should",
-        "continue to",
-        "下一步",
-        "接下来",
-        "然后",
-        "继续",
-        "转向",
-    )
-    if not any(marker in text for marker in transition_markers):
-        return False
-    next_tokens = [token for token in next_todo.replace("，", " ").replace("。", " ").split() if token]
-    if not next_tokens:
+def _has_final_answer_payload(payload: dict) -> bool:
+    summary = payload.get("summary")
+    if isinstance(summary, str) and summary.strip():
         return True
-    return any(token in text for token in next_tokens[:6])
+    sections = payload.get("sections")
+    if isinstance(sections, list) and sections:
+        return True
+    return False
+
+
+def _assessment_accepts_empty_result(assessment: PreviousObservationAssessment) -> bool:
+    text = str(assessment.reason or "").lower()
+    return any(
+        token in text
+        for token in (
+            "empty result",
+            "no rows",
+            "no matching",
+            "no anomalies",
+            "无结果",
+            "空结果",
+            "没有匹配",
+            "未发现",
+            "无异常",
+        )
+    )
 
 
 def _hint_for_task_type(task_type: str) -> str | None:
     return {
         "query": "Call sql_query with the missing filters, fields, aggregation, or time range.",
         "code_interpreter": "Run code_interpreter over the full evidence artifact.",
-        "insight": "Run code_interpreter over the full evidence artifact.",
         "anomaly": "Run anomaly after time-series evidence is available.",
         "forecast": "Run forecast after time-series evidence is available.",
         "rag": "Call rag only if external knowledge is required.",
@@ -311,7 +424,6 @@ def evidence_refs_for_payload(payload: dict) -> list[str]:
     for key, prefix in (
         ("evidence_id", "evidence"),
         ("analysis_id", "analysis"),
-        ("insight_id", "insight"),
         ("forecast_id", "forecast"),
         ("anomaly_id", "anomaly"),
         ("skill_name", "skill"),
@@ -329,8 +441,6 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_database_evidence is not None:
         refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
     refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
-    if request_state.latest_insight is not None:
-        refs.append(f"insight:{request_state.latest_insight.insight_id}")
     if request_state.latest_forecast is not None:
         refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
     if request_state.latest_anomaly is not None:

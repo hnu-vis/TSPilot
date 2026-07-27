@@ -51,8 +51,8 @@ Each model turn must be parsed as one `ReActTurn` with:
 ## Allowed actions
 
 - `todowrite`
-- `query_database`
-- `insight`
+- `sql_query`
+- `code_interpreter`
 - `forecast`
 - `anomaly`
 - `rag`
@@ -86,15 +86,15 @@ The outer agent does not yet plan fact execution at the level of
 
 Current practical routing is:
 
-1. retrieve evidence through `query_database`
+1. retrieve evidence through `sql_query`
 2. inspect the returned evidence family
 3. if the family is non-timeseries (`statistics`, `table`, `schema`,
    `metric_list`), prefer `terminate`
-4. if the family is `timeseries`, prefer `insight`, then optional `anomaly`
-   and `forecast`, then `terminate`
+4. if the family is `timeseries`, use `code_interpreter`, `anomaly`, or
+   `forecast` only when the current ReAct gap assessment requires them, then `terminate`
 
 This means the main routing boundary for many requests currently depends on the
-evidence family selected by `query_database`, not on a dedicated fact execution
+evidence family selected by `sql_query`, not on a dedicated fact execution
 plan.
 
 Design note:

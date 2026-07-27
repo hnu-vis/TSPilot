@@ -9,7 +9,7 @@ from schemas.analysis import AnalysisResult
 from schemas.api import Message
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
-from schemas.insight import InsightResult, RejectedFact, VerifiedFact
+from schemas.insight import RejectedFact, VerifiedFact
 from schemas.output import FinalAnswer
 from schemas.timeseries import AnomalyResult, ForecastResult
 from schemas.tool import ToolCall, ToolObservation
@@ -33,9 +33,7 @@ class RequestStateModel(BaseModel):
     status: Literal["running", "completed", "failed"]
     current_intent: str | None = None
     intent_profile: dict = Field(default_factory=dict)
-    requested_fact_types: list[str] = Field(default_factory=list)
-    answer_requirements: list[str] = Field(default_factory=list)
-    answer_coverage: dict[str, bool] = Field(default_factory=dict)
+    requested_capabilities: list[str] = Field(default_factory=list)
     focus: str | None = None
     todo_list: list[dict] = Field(default_factory=list)
     plan_current_step: int = 0
@@ -49,8 +47,6 @@ class RequestStateModel(BaseModel):
 
     latest_database_evidence: DatabaseEvidence | None = None
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
-    latest_insight: InsightResult | None = None
-    insight_artifacts: dict[str, InsightResult] = Field(default_factory=dict)
     latest_analysis_id: str | None = None
     analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None
@@ -77,14 +73,13 @@ class ConversationStateModel(BaseModel):
     recent_messages: list[Message] = Field(default_factory=list)
     session_summary: str | None = None
     intent_profile: dict = Field(default_factory=dict)
+    requested_capabilities: list[str] = Field(default_factory=list)
     todo_list: list[dict] = Field(default_factory=list)
     plan_current_step: int = 0
     planning_complete: bool = False
     recent_todo_summary: str | None = None
     latest_database_evidence: DatabaseEvidence | None = None
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
-    latest_insight: InsightResult | None = None
-    insight_artifacts: dict[str, InsightResult] = Field(default_factory=dict)
     latest_analysis_id: str | None = None
     analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None

@@ -13,14 +13,13 @@ def sync_from_request(
     conversation_state.database_context = request_state.database_context
     conversation_state.recent_messages = request_state.history[-10:]
     conversation_state.intent_profile = request_state.intent_profile
+    conversation_state.requested_capabilities = request_state.requested_capabilities
     conversation_state.todo_list = request_state.todo_list
     conversation_state.plan_current_step = request_state.plan_current_step
     conversation_state.planning_complete = request_state.planning_complete
     conversation_state.recent_todo_summary = request_state.todo_list[0]["content"] if request_state.todo_list else None
     conversation_state.latest_database_evidence = request_state.latest_database_evidence
     conversation_state.database_evidence_artifacts = request_state.database_evidence_artifacts
-    conversation_state.latest_insight = request_state.latest_insight
-    conversation_state.insight_artifacts = request_state.insight_artifacts
     conversation_state.latest_analysis_id = request_state.latest_analysis_id
     conversation_state.analysis_artifacts = request_state.analysis_artifacts
     conversation_state.latest_forecast = request_state.latest_forecast

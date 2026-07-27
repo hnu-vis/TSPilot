@@ -25,7 +25,7 @@ The prompt builder may expose only a bounded view of runtime state:
 - optional legacy `selected_database` / `selected_database_type`
 - time range and constraints
 - bounded recent conversation messages
-- current control state
+- minimal execution state
 - current todo list
 - latest observation summaries
 - latest evidence / analysis payloads
@@ -33,13 +33,22 @@ The prompt builder may expose only a bounded view of runtime state:
 - visualizations
 - `prompt_context_summary` when older context has been compacted
 
+The model-visible context must not expose runtime completion or repair state as
+global guidance, including:
+
+- `completion_state`
+- `latest_gap_assessment`
+- `latest_goal`
+- `decision_frame`
+- SQL `task_coverage` as a top-level or evidence-level routing signal
+
 The model must treat anything outside that window as unavailable.
 
 ## Allowed actions
 
 - `todowrite`
-- `query_database`
-- `insight`
+- `sql_query`
+- `code_interpreter`
 - `forecast`
 - `anomaly`
 - `rag`
@@ -54,6 +63,18 @@ The model must treat anything outside that window as unavailable.
 - instruct the model to prefer evidence-grounded output
 - instruct the model to rely on verified facts only
 - instruct the model to prefer deterministic recovery over guessing
+- instruct the model to identify user-visible task outputs before choosing tools
+- prevent fixed tool-chain templates for database-computable statistics
+
+## Task-first evidence rule
+
+- First translate the request into a task output contract: required measures, dimensions, time scope, grouping, comparisons, derived quantities, model outputs, and evidence quality notes.
+- After each observation, write `previous_observation_assessment` as the gap between the task output contract and current evidence: `covered`, `missing`, `can_answer`, and `next_action_reason`.
+- Choose tools to produce missing contract fields from grounded evidence; do not hard-code a tool chain for a task phrase.
+- Database-computable work should be satisfied by `sql_query` when returned columns or result shape explicitly cover the contract.
+- Use `code_interpreter` for supporting computation only when SQL evidence is grounded and database queries are impractical, repeatedly fail, or the user explicitly asks for code execution.
+- `missing` is only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in `missing`.
+- Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`.
 
 ## Example ReAct turn
 
@@ -71,7 +92,6 @@ Required fields:
 
 - `message`
 - `current_intent`
-- `requested_fact_types`
 - `focus`
 - `todos`
 
@@ -94,18 +114,6 @@ Optional fields:
 - `selected_database_type`
 - `history`
 
-### `insight`
-
-Required fields:
-
-- `database_evidence`
-- `requested_fact_types`
-- `focus`
-
-Optional fields:
-
-- `constraints`
-
 ### `forecast`
 
 Required fields:
@@ -114,14 +122,26 @@ Required fields:
 
 Optional fields:
 
-- `horizon`
+- `horizon` as explicit steps or a duration-like user phrase
+- `model_name`
+- `series_name`
 - `constraints`
+
+Contract notes:
+
+- a `forecast` observation with `status=succeeded` provides direct forecast points
+- a `forecast` observation with `status=requires_rolling` provides a forecast plan and is answerable unless the user explicitly requested executing every rolling chunk
+- `code_interpreter` may compute supporting statistics, but must not replace the registered `forecast` tool for a requested forecast
 
 ### `anomaly`
 
 Required fields:
 
 - `database_evidence`
+
+Contract notes:
+
+- `code_interpreter` may compute supporting statistics, but must not replace the registered `anomaly` tool for requested anomaly detection
 
 Optional fields:
 
@@ -197,12 +217,10 @@ The prompt must explicitly expose these fields to the model:
 ### request-state fields
 
 - `current_intent`
-- `requested_fact_types`
 - `focus`
 - `todo_list`
 - `database_context`
 - `latest_database_evidence`
-- `latest_insight`
 - `latest_forecast`
 - `latest_anomaly`
 - `latest_rag`
@@ -232,18 +250,6 @@ Valid `result_type` values:
 - `table`
 - `timeseries`
 
-### insight result fields
-
-- `insight_id`
-- `requested_fact_types`
-- `supported_fact_types`
-- `fact_candidates`
-- `completed_facts`
-- `verified_facts`
-- `rejected_facts`
-- `summary_blocks`
-- `visualizations`
-
 ### final answer fields
 
 - `title`
@@ -272,8 +278,8 @@ The prompt should guide the model with this order:
 
 1. inspect the request context and determine the current intent
 2. decide whether the request needs `todowrite`
-3. decide whether the request needs `query_database`
-4. decide requested fact families before calling `insight`
+3. decide whether the request needs `sql_query`
+4. decide whether grounded evidence needs `code_interpreter`
 5. call `forecast` or `anomaly` only when the evidence is time-series shaped
 6. call `rag` or `skill` only when the request genuinely needs extension capability
 7. call `terminate` when enough verified outputs exist and the ReAct loop should end; do not pass full runtime state back to the tool

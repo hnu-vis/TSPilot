@@ -15,6 +15,7 @@ def record_llm_token_usage(
     messages: list | None = None,
     output_text: str | None = None,
     model: str | None = None,
+    tool_name: str | None = None,
 ) -> dict | None:
     """Estimate LLM token usage with tiktoken and retain provider usage when present."""
 
@@ -28,17 +29,21 @@ def record_llm_token_usage(
     token_state = request_state.completion_state.setdefault("token_usage", _empty_usage())
     entry = {
         "source": source,
+        "tool_name": _tool_name_for_usage(source=source, output_text=response_text, tool_name=tool_name),
         "estimated": estimated_usage,
         "provider": provider_usage,
     }
     token_state["calls"].append(entry)
     totals = token_state["totals"]
     counted = estimated_usage or provider_usage or {}
-    totals["prompt_tokens"] += int(counted.get("prompt_tokens") or 0)
-    totals["completion_tokens"] += int(counted.get("completion_tokens") or 0)
-    totals["total_tokens"] += int(counted.get("total_tokens") or 0)
+    _add_usage(totals, counted)
     totals["call_count"] = len(token_state["calls"])
     totals["counting_method"] = "tiktoken_estimate" if estimated_usage else "provider_usage"
+    by_tool = token_state.setdefault("by_tool", {})
+    tool_bucket = by_tool.setdefault(entry["tool_name"] or "unknown", _empty_totals())
+    _add_usage(tool_bucket, counted)
+    tool_bucket["call_count"] += 1
+    tool_bucket["counting_method"] = totals["counting_method"]
     return entry
 
 
@@ -48,6 +53,7 @@ def token_usage_summary(request_state) -> dict | None:
         return None
     return {
         "totals": dict(usage.get("totals") or {}),
+        "by_tool": {str(key): dict(value) for key, value in dict(usage.get("by_tool") or {}).items()},
         "calls": list(usage.get("calls") or []),
     }
 
@@ -101,15 +107,47 @@ def extract_provider_token_usage(response: Any) -> dict | None:
 
 def _empty_usage() -> dict:
     return {
-        "totals": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "call_count": 0,
-            "counting_method": "tiktoken_estimate",
-        },
+        "totals": _empty_totals(),
+        "by_tool": {},
         "calls": [],
     }
+
+
+def _empty_totals() -> dict:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "call_count": 0,
+        "counting_method": "tiktoken_estimate",
+    }
+
+
+def _add_usage(target: dict, usage: dict) -> None:
+    target["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+    target["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+    target["total_tokens"] += int(usage.get("total_tokens") or 0)
+
+
+def _tool_name_for_usage(*, source: str, output_text: str | None, tool_name: str | None) -> str:
+    if tool_name:
+        return str(tool_name)
+    if source.startswith("sql_query."):
+        return "sql_query"
+    parsed = _json_object(output_text)
+    if isinstance(parsed, dict) and parsed.get("action"):
+        return str(parsed.get("action"))
+    return source
+
+
+def _json_object(text: str | None) -> dict | None:
+    if not text:
+        return None
+    try:
+        decoded = json.loads(str(text).strip())
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _encoding_for_model(model: str | None):

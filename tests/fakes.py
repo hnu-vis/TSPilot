@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 
+_LAST_CONTEXT: dict | None = None
+
 
 def _context_from_prompt(user_prompt: str) -> dict:
+    global _LAST_CONTEXT
     if "Runtime State JSON:\n" in user_prompt:
         context_json = user_prompt.split("Runtime State JSON:\n", 1)[1]
     else:
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-    return _compat_context(json.loads(context_json))
+    _LAST_CONTEXT = _compat_context(json.loads(context_json))
+    return _LAST_CONTEXT
 
 
 class FakeLLM:
@@ -18,9 +22,6 @@ class FakeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -67,7 +68,7 @@ class FakeLLM:
             action_input = _analysis_action_input(latest_evidence, context.get("message", "Analyze evidence."))
             return _turn(
                 "I have evidence and should run generated analysis code.",
-                "insight",
+                "code_interpreter",
                 action_input,
             )
 
@@ -96,9 +97,6 @@ class SandboxInsightLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -177,9 +175,6 @@ class CasualLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -204,9 +199,6 @@ class ComplexReActLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -223,11 +215,11 @@ class ComplexReActLLM:
             action_input = {
                 "message": context["message"],
                 "current_intent": "chat_analysis",
-                "requested_fact_types": ["trend", "anomaly", "forecast"],
+                "requested_capabilities": ["query", "analysis", "anomaly", "forecast"],
                 "focus": "先规划，再查库，随后做趋势、异常和预测分析，最后整合回答。",
                 "todos": [
                     {"content": "查询目标时间范围内的时序证据", "task_type": "query", "status": "in_progress", "priority": 1},
-                    {"content": "提炼趋势事实", "task_type": "insight", "status": "pending", "priority": 2},
+                    {"content": "提炼趋势事实", "task_type": "code_interpreter", "status": "pending", "priority": 2},
                     {"content": "检查异常点", "task_type": "anomaly", "status": "pending", "priority": 3},
                     {"content": "生成短期预测", "task_type": "forecast", "status": "pending", "priority": 4},
                     {"content": "汇总最终答案", "task_type": "answer", "status": "pending", "priority": 5},
@@ -256,7 +248,7 @@ class ComplexReActLLM:
             action_input = _analysis_action_input(latest_evidence, "整体趋势、变化幅度和关键峰值")
             return _turn(
                 "I need generated analysis before any downstream analytics summary.",
-                "insight",
+                "code_interpreter",
                 action_input,
             )
 
@@ -307,9 +299,6 @@ class RepeatingTodoLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -325,11 +314,11 @@ class RepeatingTodoLLM:
                 {
                     "message": "先规划，再查库。",
                     "current_intent": "chat_analysis",
-                    "requested_fact_types": ["trend", "anomaly"],
+                    "requested_capabilities": ["query", "analysis", "anomaly"],
                     "focus": "趋势和异常",
                     "todos": [
                         {"content": "查询时序数据", "task_type": "query", "status": "in_progress", "priority": 1},
-                        {"content": "分析趋势", "task_type": "insight", "status": "pending", "priority": 2},
+                        {"content": "分析趋势", "task_type": "code_interpreter", "status": "pending", "priority": 2},
                         {"content": "检查异常", "task_type": "anomaly", "status": "pending", "priority": 3},
                         {"content": "汇总结论", "task_type": "answer", "status": "pending", "priority": 4},
                     ],
@@ -350,8 +339,8 @@ class RepeatingTodoLLM:
 
         if _analysis_count(context) == 0:
             return _turn(
-                "I should run generated insight analysis.",
-                "insight",
+                "I should run generated code_interpreter analysis.",
+                "code_interpreter",
                 _analysis_action_input(context["latest_database_evidence"], "趋势和极值"),
             )
 
@@ -391,9 +380,6 @@ class TodoScopeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         query_response = _query_generation_response(user_prompt)
         if query_response is not None:
             return query_response
@@ -406,11 +392,11 @@ class TodoScopeLLM:
                 {
                     "message": "围绕趋势与异常进行分析。",
                     "current_intent": "chat_analysis",
-                    "requested_fact_types": ["trend", "anomaly"],
+                    "requested_capabilities": ["query", "analysis", "anomaly"],
                     "focus": "趋势和异常，不需要预测。",
                     "todos": [
                         {"content": "查询时序数据", "task_type": "query", "status": "completed", "priority": 1},
-                        {"content": "提炼趋势事实", "task_type": "insight", "status": "in_progress", "priority": 2},
+                        {"content": "提炼趋势事实", "task_type": "code_interpreter", "status": "in_progress", "priority": 2},
                         {"content": "检查异常", "task_type": "anomaly", "status": "pending", "priority": 3},
                         {"content": "汇总结论", "task_type": "answer", "status": "pending", "priority": 4},
                     ],
@@ -433,7 +419,7 @@ class TodoScopeLLM:
 
         if (
             latest_observation
-            and latest_observation["tool_name"] in {"format_answer", "terminate"}
+            and latest_observation["tool_name"] == "terminate"
             and latest_observation["success"] is False
         ):
             return _turn(
@@ -448,7 +434,7 @@ class TodoScopeLLM:
         if context.get("latest_database_evidence") is not None and _analysis_count(context) == 0:
             return _turn(
                 "I have evidence now and should run generated analysis.",
-                "insight",
+                "code_interpreter",
                 _analysis_action_input(context.get("latest_database_evidence"), "趋势"),
             )
 
@@ -478,7 +464,7 @@ class TodoScopeLLM:
             )
 
         return _turn(
-            "I will jump to forecast even though the current step is insight.",
+            "I will jump to forecast even though the current step is code_interpreter.",
             "forecast",
             {"horizon": 6},
         )
@@ -492,11 +478,9 @@ class BitcoinMultiQueryLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
         if "LLM SQL Query Generation JSON:" in user_prompt:
             raise AssertionError("BitcoinMultiQueryLLM uses explicit Flux queries.")
+        _context_from_prompt(user_prompt)
 
         self.agent_turn += 1
         database_context = {
@@ -551,7 +535,7 @@ class BitcoinMultiQueryLLM:
                 {
                     "message": "查询比特币 USD 价格多分项结果",
                     "current_intent": "database_query",
-                    "requested_fact_types": ["count", "earliest_rows", "latest_rows", "time_bounds"],
+                    "requested_capabilities": ["query", "analysis"],
                     "focus": "每项都必须有查询语句和实际返回行数",
                     "todos": [
                         {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
@@ -587,150 +571,64 @@ class BitcoinMultiQueryLLM:
         )
 
 
-class VerifierRepairLLM:
-    def __init__(self):
-        self.calls = 0
-        self.agent_turn = 0
-        self.verifier_calls = 0
-
-    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
-        self.calls += 1
-        user_prompt = messages[-1][1]
-        if "TSPilot Goal Verification JSON:" in user_prompt:
-            self.verifier_calls += 1
-            if self.verifier_calls == 1:
-                return _FakeResponse(
-                    json.dumps(
-                        {
-                            "can_answer": False,
-                            "reason": "The candidate only reports total count and misses the requested earliest rows.",
-                            "missing_items": ["earliest 5 raw records"],
-                            "unsupported_claims": [],
-                            "answerable_from": ["evidence:evi_influxdb2-bitcoin-sample_table"],
-                            "next_action_hint": "Run a focused sql_query for the earliest 5 Bitcoin USD records.",
-                            "confidence": 0.92,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-            return _FakeResponse(
-                json.dumps(
-                    {
-                        "can_answer": True,
-                        "reason": "The candidate includes both requested query outputs.",
-                        "missing_items": [],
-                        "unsupported_claims": [],
-                        "answerable_from": ["evidence:latest"],
-                        "next_action_hint": None,
-                        "confidence": 0.9,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-
-        runtime_response = _runtime_evaluation_response(user_prompt)
-        if runtime_response is not None:
-            return runtime_response
-        if "LLM SQL Query Generation JSON:" in user_prompt:
-            raise AssertionError("VerifierRepairLLM uses explicit Flux queries.")
-
-        self.agent_turn += 1
-        database_context = {
-            "database_id": "influxdb2-bitcoin-sample",
-            "database_type": "influxdb",
-        }
-        base_flux = (
-            'from(bucket: "bitcoin")\n'
-            "  |> range(start: 0)\n"
-            '  |> filter(fn: (r) => r._measurement == "coindesk")\n'
-            '  |> filter(fn: (r) => r.code == "USD")\n'
-            '  |> filter(fn: (r) => r.crypto == "bitcoin")\n'
-            '  |> filter(fn: (r) => r._field == "price")'
-        )
-
-        if self.agent_turn == 1:
-            return _turn(
-                "I should plan the two deliverables before querying.",
-                "todowrite",
-                {
-                    "message": "查询比特币 USD 的总数和最早5条",
-                    "current_intent": "database_query",
-                    "requested_fact_types": ["count", "earliest_rows"],
-                    "focus": "两个分项都必须有数据库证据",
-                    "todos": [
-                        {"content": "查询总记录数", "task_type": "query", "status": "in_progress", "priority": 1},
-                        {"content": "查询最早5条", "task_type": "query", "status": "pending", "priority": 2},
-                        {"content": "汇总最终答案", "task_type": "answer", "status": "pending", "priority": 3},
-                    ],
-                },
-            )
-        if self.agent_turn == 2:
-            return _turn(
-                "I will query the total count first.",
-                "sql_query",
-                {
-                    "database_context": database_context,
-                    "query_language": "flux",
-                    "purpose": "返回USD价格数据的总记录数",
-                    "query": base_flux
-                    + '\n  |> count()\n  |> keep(columns: ["_value"])\n  |> rename(columns: {_value: "count"})',
-                },
-            )
-        if self.agent_turn == 3:
-            return _turn(
-                "I have the count and will prematurely try to answer.",
-                "terminate",
-                {
-                    "summary_goal": "汇总比特币 USD 总数和最早5条",
-                    "direct_answer": "已完成总记录数查询，但尚未列出最早5条。",
-                    "include_fact_ids": [],
-                    "include_visualization_ids": [],
-                    "section_plan": ["summary", "query_results", "conclusion"],
-                },
-            )
-        if self.agent_turn == 4:
-            return _turn(
-                "Verifier reported missing earliest rows, so I need a focused query.",
-                "sql_query",
-                {
-                    "database_context": database_context,
-                    "query_language": "flux",
-                    "purpose": "返回按时间升序排列的最早5条原始记录",
-                    "query": base_flux
-                    + '\n  |> sort(columns: ["_time"], desc: false)\n  |> limit(n: 5)\n'
-                    + '  |> keep(columns: ["_time", "_value", "code", "crypto", "description", "symbol"])\n'
-                    + '  |> rename(columns: {_value: "price"})',
-                },
-            )
-        return _turn(
-            "Now both requested query outputs are present.",
-            "terminate",
-            {
-                "summary_goal": "汇总比特币 USD 总数和最早5条",
-                "direct_answer": "已完成总记录数和最早5条两个分项查询，结果均来自数据库 evidence。",
-                "include_fact_ids": [],
-                "include_visualization_ids": [],
-                "section_plan": ["summary", "query_results", "conclusion"],
-            },
-        )
-
-
 class _FakeResponse:
     def __init__(self, content: str):
         self.content = content
 
 
 def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
-    return _FakeResponse(
-        json.dumps(
-            {
-                "thought": thought,
-                "action": action,
-                "action_input": action_input,
-            },
-            ensure_ascii=False,
-        )
+    payload = {
+        "thought": thought,
+        "previous_observation_assessment": _auto_previous_observation_assessment(_LAST_CONTEXT),
+        "action": action,
+        "action_input": action_input,
+    }
+    return _FakeResponse(json.dumps(payload, ensure_ascii=False))
+
+
+def _auto_previous_observation_assessment(context: dict | None) -> dict | None:
+    if not context:
+        return None
+    observations = context.get("latest_observation_summaries") or []
+    if not observations:
+        return None
+    latest = observations[-1]
+    if not latest.get("success") or latest.get("tool_name") in {"todowrite", "todo_assessment"}:
+        return None
+    active_todo = next(
+        (todo for todo in context.get("todo_list") or [] if todo.get("status") == "in_progress"),
+        None,
     )
+    if not active_todo:
+        return None
+    task_type = str(active_todo.get("task_type") or "").lower()
+    tool_name = str(latest.get("tool_name") or "")
+    if task_type == "query" and tool_name != "sql_query":
+        return None
+    if task_type == "answer" and tool_name != "terminate":
+        return None
+    if task_type not in {"", "generic", "query", "answer"} and tool_name != task_type:
+        return None
+    payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+    return {
+        "completed_active_todo": True,
+        "reason": f"Previous {tool_name} observation satisfies active todo: {active_todo.get('content')}.",
+        "evidence_refs": _evidence_refs_from_payload(payload),
+    }
+
+
+def _evidence_refs_from_payload(payload: dict) -> list[str]:
+    refs = []
+    for key, prefix in (
+        ("evidence_id", "evidence"),
+        ("analysis_id", "analysis"),
+        ("forecast_id", "forecast"),
+        ("anomaly_id", "anomaly"),
+    ):
+        value = payload.get(key)
+        if value:
+            refs.append(f"{prefix}:{value}")
+    return refs
 
 
 def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
@@ -778,75 +676,6 @@ def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
     )
 
 
-def _runtime_evaluation_response(user_prompt: str) -> _FakeResponse | None:
-    if "TSPilot Plan Requirement JSON:" in user_prompt:
-        payload = json.loads(user_prompt.split("TSPilot Plan Requirement JSON:\n", 1)[1])
-        context = payload.get("context") or {}
-        message = str(context.get("message") or "")
-        requires_plan = "完成以下任务" in message or message.count(";") >= 3
-        return _FakeResponse(
-            json.dumps(
-                {
-                    "requires_plan": requires_plan,
-                    "reason": "multiple independently verifiable deliverables" if requires_plan else "single-step request",
-                    "deliverables": ["count", "head", "tail", "bounds"] if requires_plan else [],
-                    "confidence": 0.9,
-                    "next_action_hint": "call todowrite" if requires_plan else None,
-                },
-                ensure_ascii=False,
-            )
-        )
-    if "TSPilot Step Completion JSON:" in user_prompt:
-        payload = json.loads(user_prompt.split("TSPilot Step Completion JSON:\n", 1)[1])
-        context = payload.get("context") or {}
-        tool_payload = context.get("tool_payload") or {}
-        evidence_id = tool_payload.get("evidence_id")
-        return _FakeResponse(
-            json.dumps(
-                {
-                    "completed": bool(evidence_id or context.get("tool_name") in {"insight", "anomaly", "forecast", "format_answer", "terminate"}),
-                    "reason": "latest tool output satisfies the active todo",
-                    "missing_items": [],
-                    "satisfied_items": ["active_todo"],
-                    "evidence_refs": [f"evidence:{evidence_id}"] if evidence_id else [],
-                    "next_action_hint": None,
-                    "confidence": 0.9,
-                },
-                ensure_ascii=False,
-            )
-        )
-    if "TSPilot Answerability JSON:" in user_prompt:
-        return _FakeResponse(
-            json.dumps(
-                {
-                    "can_answer": True,
-                    "reason": "available outputs are sufficient for this test scenario",
-                    "missing_items": [],
-                    "answerable_from": ["evidence:latest"],
-                    "next_action_hint": None,
-                    "confidence": 0.9,
-                },
-                ensure_ascii=False,
-            )
-        )
-    if "TSPilot Goal Verification JSON:" in user_prompt:
-        return _FakeResponse(
-            json.dumps(
-                {
-                    "can_answer": True,
-                    "reason": "candidate final answer satisfies this test scenario",
-                    "missing_items": [],
-                    "unsupported_claims": [],
-                    "answerable_from": ["evidence:latest"],
-                    "next_action_hint": None,
-                    "confidence": 0.9,
-                },
-                ensure_ascii=False,
-            )
-        )
-    return None
-
-
 def _compat_context(context: dict) -> dict:
     if "task" not in context:
         return context
@@ -868,11 +697,10 @@ def _compat_context(context: dict) -> dict:
         "todo_list": state.get("todo_list"),
         "plan_current_step": state.get("plan_current_step"),
         "planning_complete": state.get("planning_complete"),
-        "requested_fact_types": state.get("requested_fact_types"),
+        "requested_capabilities": state.get("requested_capabilities"),
         "focus": state.get("focus"),
         "latest_database_evidence": evidence.get("latest"),
         "query_history": evidence.get("prior_queries") or [],
-        "latest_insight": outputs.get("latest_insight"),
         "analysis_workspace": outputs.get("analysis_workspace") or {},
         "latest_forecast": outputs.get("latest_forecast"),
         "latest_anomaly": outputs.get("latest_anomaly"),

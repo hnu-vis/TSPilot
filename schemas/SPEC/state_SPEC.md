@@ -29,7 +29,7 @@ This schema also depends on:
 
 - `status: Literal["running", "completed", "failed"]`
 - `current_intent: str | null`
-- `requested_fact_types: list[str]`
+- `requested_capabilities: list[str]`
 - `focus: str | null`
 - `todo_list: list[dict]`
 - `iteration: int`
@@ -52,7 +52,6 @@ This schema also depends on:
 
 ### Analysis state
 
-- `latest_insight: InsightResult | null`
 - `latest_forecast: ForecastResult | null`
 - `latest_anomaly: AnomalyResult | null`
 - `latest_rag: dict | null`
@@ -81,7 +80,6 @@ Fields:
 - `recent_messages: list[Message]`
 - `session_summary: str | null`
 - `latest_database_evidence: DatabaseEvidence | null`
-- `latest_insight: InsightResult | null`
 - `latest_forecast: ForecastResult | null`
 - `latest_anomaly: AnomalyResult | null`
 - `latest_rag: dict | null`

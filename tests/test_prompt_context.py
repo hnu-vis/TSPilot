@@ -5,7 +5,6 @@ from core.database.schema import schema_preview
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
-from schemas.insight import InsightResult
 from schemas.tool import ToolObservation
 from schemas.visualization import VisualizationPayload
 from app.settings import get_settings
@@ -31,7 +30,32 @@ def test_sql_query_prompt_keeps_schema_linking_inside_tool():
     assert "diagnostics.prompt_sampling" in system_prompt
 
 
-def test_prompt_context_exposes_context_budget_rule():
+def test_prompt_uses_dbgpt_style_todowrite_planning_rule():
+    settings = get_settings()
+    request = ChatRequest(
+        message=(
+            "请查询当前数据源中的比特币USD价格数据，并完成以下任务："
+            "1.返回总记录数；2.返回最早5条；3.返回最晚5条；"
+            "4.返回最早和最晚时间；5.展示每项查询语句和实际返回行数。"
+        ),
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    builder = DataAgentPromptBuilder()
+    system_prompt = builder.build_system_prompt()
+    context = builder.build_context(request_state, conversation_state)
+    todowrite_action = next(action for action in context["available_actions"] if action["action"] == "todowrite")
+
+    assert "3 or more independently verifiable user-visible steps" in system_prompt
+    assert "BEFORE starting work" in system_prompt
+    assert "query text, row counts" in system_prompt
+    assert "one grounded action can fully cover every deliverable" not in system_prompt
+    assert "3 or more independently verifiable user-visible steps" in todowrite_action["use_when"]
+
+
+def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():
     settings = get_settings()
     request = ChatRequest(
         message="找出最高价和最低价。",
@@ -42,32 +66,10 @@ def test_prompt_context_exposes_context_budget_rule():
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
 
-    assert "semantic_repair_directive" not in context["state"]["decision_frame"]
-    assert "Prompt context contains bounded previews only" in context["state"]["decision_frame"]["context_budget_rule"]
-
-
-def test_prompt_context_exposes_semantic_repair_directive():
-    settings = get_settings()
-    request = ChatRequest(
-        message="找出最高价。",
-        database_context={"database_id": "demo", "database_type": "influxdb"},
-    )
-    request_state = build_request_state(request, settings)
-    request_state.completion_state["semantic_repair_directive"] = {
-        "source": "goal_verifier",
-        "reason": "missing maximum value",
-        "missing_items": ["maximum value"],
-        "unsupported_claims": [],
-        "next_action_hint": "Run sql_query for the maximum value.",
-    }
-    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
-
-    builder = DataAgentPromptBuilder()
-    system_prompt = builder.build_system_prompt()
-    context = builder.build_context(request_state, conversation_state)
-
-    assert "semantic_repair_directive is present" in system_prompt
-    assert context["state"]["decision_frame"]["semantic_repair_directive"]["missing_items"] == ["maximum value"]
+    assert "decision_frame" not in context["state"]
+    assert "completion_state" not in context["state"]
+    assert "requested_capabilities" not in context["state"]
+    assert "semantic_repair_directive" not in context["state"]
 
 
 def test_prompt_context_handles_diagnostics_without_data_preview():
@@ -82,7 +84,7 @@ def test_prompt_context_handles_diagnostics_without_data_preview():
     assert summarized["diagnostics"]["prompt_sampling"]["visible_counts"] == {}
 
 
-def test_prompt_context_exposes_sql_query_task_coverage():
+def test_prompt_context_does_not_expose_sql_query_task_coverage_as_global_guidance():
     settings = get_settings()
     request = ChatRequest(
         message="返回总数和最早 3 条记录。",
@@ -117,11 +119,10 @@ def test_prompt_context_exposes_sql_query_task_coverage():
     )
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    coverage = context["evidence"]["latest"]["diagnostics"]["task_coverage"]
 
-    assert "diagnostics.task_coverage" in DataAgentPromptBuilder().build_system_prompt()
-    assert coverage["requires_followup"] is True
-    assert coverage["missing_or_uncertain"] == ["尚未返回最早 3 条记录"]
+    assert "diagnostics.task_coverage" not in DataAgentPromptBuilder().build_system_prompt()
+    assert "task_coverage" not in context["evidence"]["latest"]["diagnostics"]
+    assert "missing_or_uncertain" not in str(context)
 
 
 def test_prompt_builder_summarizes_heavy_context():
@@ -154,25 +155,20 @@ def test_prompt_builder_summarizes_heavy_context():
         "diagnostics": {},
     }
     apply_observation(request_state, observation, full_payload, _EvidenceSpec())
-    request_state.latest_insight = InsightResult(
-        insight_id="ins_demo",
-        verified_facts=[],
-        visualizations=[
-            VisualizationPayload(
-                visualization_id="viz_demo",
-                visualization_type="chart",
-                visualization_kind="line",
-                renderer="linechart",
-                title="Demo",
-                summary="Demo chart",
-                chart={
-                    "x_axis_data": [f"t{i}" for i in range(100)],
-                    "series_data": [{"name": "value", "data": list(range(100))}],
-                },
-            )
-        ],
-    )
-    request_state.visualizations = request_state.latest_insight.visualizations
+    request_state.visualizations = [
+        VisualizationPayload(
+            visualization_id="viz_demo",
+            visualization_type="chart",
+            visualization_kind="line",
+            renderer="linechart",
+            title="Demo",
+            summary="Demo chart",
+            chart={
+                "x_axis_data": [f"t{i}" for i in range(100)],
+                "series_data": [{"name": "value", "data": list(range(100))}],
+            },
+        )
+    ]
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
     sql_action = next(action for action in context["available_actions"] if action["action"] == "sql_query")
@@ -180,16 +176,12 @@ def test_prompt_builder_summarizes_heavy_context():
     assert any(action["action"] == "todowrite" for action in context["available_actions"])
     assert any(action["action"] == "code_interpreter" for action in context["available_actions"])
     assert any(action["action"] == "terminate" for action in context["available_actions"])
-    assert not any(action["action"] == "insight" for action in context["available_actions"])
     assert not any(action["action"] == "format_answer" for action in context["available_actions"])
     assert "prefer message" in sql_action["input"]
     assert "schema-linked generation" not in sql_action["input"]
     assert "automatic database querying" in sql_action["input"]
     assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True
     assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
-    guidance = " ".join(context["state"]["decision_frame"]["recommended_next_action_types"])
-    assert "continue with explicit read-only queries" in guidance
-    assert "A prior sql_query does not force code_interpreter" in context["state"]["decision_frame"]["sql_loop_rule"]
     assert len(context["evidence"]["latest"]["data"]["points"]) <= 8
     sampling = context["evidence"]["latest"]["diagnostics"]["prompt_sampling"]
     assert sampling["sampled_for_prompt"] is True

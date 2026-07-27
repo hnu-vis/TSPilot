@@ -21,7 +21,7 @@ Implement the single outer `data_agent`.
 
 - perform lightweight intent recognition
 - decide whether the request needs todo planning
-- decide whether the request needs query, insight, forecast, anomaly, rag, or skill
+- decide whether the request needs query, analysis, forecast, anomaly, rag, or skill
 - choose one outer action per turn
 - keep the prompt aligned with the schema and runtime contracts
 
@@ -55,7 +55,7 @@ defined in:
 - `schemas.state`
 - `schemas.database_context`
 - `schemas.database`
-- `schemas.insight`
+- `schemas.analysis`
 - `schemas.timeseries`
 - `schemas.output`
 - `schemas.agent_turn`

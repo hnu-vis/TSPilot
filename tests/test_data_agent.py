@@ -25,7 +25,7 @@ def test_parse_turn_rejects_repeated_json_turn_output():
         DataAgent(prompt_builder=None, llm=None)._parse_turn(repeated)
 
 
-def test_parse_turn_rejects_bare_format_answer_input():
+def test_parse_turn_rejects_bare_terminal_input():
     bare_input = {
         "summary_goal": "Answer the seasonality question.",
         "direct_answer": "No clear daily or weekly seasonality was found.",
@@ -42,7 +42,7 @@ def test_parse_turn_rejects_bare_todowrite_input():
     bare_input = {
         "message": "Plan database analysis.",
         "current_intent": "seasonality analysis",
-        "requested_fact_types": ["seasonality"],
+        "requested_capabilities": ["query", "analysis"],
         "focus": "Bitcoin USD",
         "todos": [
             {"content": "Query data", "task_type": "query", "status": "in_progress", "priority": 1}

@@ -8,10 +8,10 @@ from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
 from runtime.request_state import apply_observation_async, append_trace, build_final_response
+from core.completion import apply_previous_observation_assessment
 from runtime.trace import TraceEventModel
 from runtime.token_usage import token_usage_summary
 from schemas.api import ChatResponse
-from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
 from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
@@ -27,11 +27,10 @@ def _truncate_text(value: str, max_chars: int) -> str:
 class ReActLoop:
     """Execute the strict outer loop."""
 
-    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings, goal_verifier=None):
+    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
-        self._goal_verifier = goal_verifier
         self._trace_logger = ConversationTraceLogger(settings)
 
     async def run(
@@ -142,6 +141,11 @@ class ReActLoop:
                 {
                     "iteration": request_state.iteration,
                     "thought": turn.thought,
+                    "previous_observation_assessment": (
+                        turn.previous_observation_assessment.model_dump(mode="json")
+                        if turn.previous_observation_assessment
+                        else None
+                    ),
                     "action": turn.action,
                     "action_input": turn.action_input,
                     "action_intention": turn.action_intention,
@@ -149,7 +153,54 @@ class ReActLoop:
                 },
             )
 
-            allowed, reason = validate_action(request_state, turn.action)
+            if turn.previous_observation_assessment is not None:
+                had_active_todo = any(
+                    todo.get("status") == "in_progress"
+                    for todo in request_state.todo_list
+                    if isinstance(todo, dict)
+                )
+                assessment = apply_previous_observation_assessment(
+                    request_state,
+                    turn.previous_observation_assessment,
+                )
+                yield append_trace(
+                    request_state,
+                    "todo_assessment",
+                    {
+                        **assessment.model_dump(),
+                        "iteration": request_state.iteration,
+                        "assessment": turn.previous_observation_assessment.model_dump(mode="json"),
+                    },
+                )
+                if had_active_todo and turn.previous_observation_assessment.completed_active_todo and not assessment.completed:
+                    observation = ToolObservation(
+                        tool_name="todo_assessment",
+                        success=False,
+                        summary=assessment.reason,
+                        payload={
+                            "completion_state": request_state.completion_state,
+                            "recovery_hint": assessment.next_action_hint
+                            or "Use the latest observation to choose the next valid action.",
+                        },
+                        error=assessment.reason,
+                        payload_truncated=False,
+                        payload_ref=None,
+                    )
+                    request_state.observations.append(observation)
+                    yield append_trace(
+                        request_state,
+                        "observation",
+                        observation.model_dump(mode="json"),
+                    )
+                    sync_from_request(request_state, conversation_state)
+                    continue
+
+            allowed, reason = validate_action(
+                request_state,
+                turn.action,
+                turn.action_input,
+                action_reason=turn.action_reason,
+            )
             if not allowed:
                 observation = build_policy_observation(request_state, turn.action, reason or "Invalid action.")
                 request_state.observations.append(observation)
@@ -196,21 +247,6 @@ class ReActLoop:
                 )
                 sync_from_request(request_state, conversation_state)
                 continue
-            if execution_result.tool_spec.produces_terminal_payload:
-                verifier_observation = await self._verify_terminal_candidate(
-                    request_state,
-                    execution_result.full_payload,
-                )
-                if verifier_observation is not None:
-                    request_state.observations.append(verifier_observation)
-                    yield append_trace(
-                        request_state,
-                        "observation",
-                        verifier_observation.model_dump(mode="json"),
-                    )
-                    sync_from_request(request_state, conversation_state)
-                    continue
-
             execution_result.observation = await apply_observation_async(
                 request_state,
                 execution_result.observation,
@@ -245,98 +281,6 @@ class ReActLoop:
             request_state,
             "error",
             {"message": "Maximum iterations reached before a terminal payload was produced."},
-        )
-
-    async def _verify_terminal_candidate(
-        self,
-        request_state: RequestStateModel,
-        full_payload: dict,
-    ) -> ToolObservation | None:
-        if self._goal_verifier is None or request_state.database_context is None:
-            return None
-        try:
-            candidate = FinalAnswer.model_validate(full_payload)
-        except Exception as exc:
-            return ToolObservation(
-                tool_name="goal_verifier",
-                success=False,
-                summary=f"Final answer candidate was invalid: {exc}",
-                payload={
-                    "can_answer": False,
-                    "missing_items": ["valid_final_answer"],
-                    "unsupported_claims": [],
-                    "next_action_hint": "Call terminate again with a valid final answer payload.",
-                    "reason": str(exc),
-                },
-                error=str(exc),
-                payload_truncated=False,
-                payload_ref=None,
-            )
-        try:
-            verdict = await self._goal_verifier.verify_final_answer(
-                request_state=request_state,
-                candidate_answer=candidate,
-            )
-        except Exception as exc:
-            request_state.completion_state["goal_verifier_error"] = str(exc)
-            return ToolObservation(
-                tool_name="goal_verifier",
-                success=False,
-                summary=f"Final answer verification failed: {exc}",
-                payload={
-                    "can_answer": False,
-                    "missing_items": ["goal_verification"],
-                    "unsupported_claims": [],
-                    "next_action_hint": "Continue with grounded evidence or retry final assembly after resolving the verifier error.",
-                    "reason": str(exc),
-                },
-                error=str(exc),
-                payload_truncated=False,
-                payload_ref=None,
-            )
-
-        verdict_payload = verdict.model_dump(mode="json")
-        request_state.completion_state["latest_goal_verification"] = verdict_payload
-        if verdict.can_answer:
-            request_state.completion_state["goal_verifier_failures"] = 0
-            return None
-
-        previous_failures = int(request_state.completion_state.get("goal_verifier_failures") or 0)
-        max_rejections = max(0, int(getattr(self._settings, "goal_verifier_max_rejections", 1)))
-        if previous_failures >= max_rejections:
-            request_state.completion_state["goal_verifier_bypassed"] = {
-                **verdict_payload,
-                "candidate_summary": candidate.summary,
-                "failure_count": previous_failures,
-                "reason": verdict.reason or "Final answer did not satisfy the verifier.",
-            }
-            return None
-
-        failures = previous_failures + 1
-        request_state.completion_state["goal_verifier_failures"] = failures
-        request_state.completion_state["semantic_repair_directive"] = {
-            "source": "goal_verifier",
-            "reason": verdict.reason or "Final answer did not satisfy the user task.",
-            "missing_items": verdict.missing_items,
-            "unsupported_claims": verdict.unsupported_claims,
-            "next_action_hint": verdict.next_action_hint,
-            "candidate_summary": candidate.summary,
-            "failure_count": failures,
-        }
-        return ToolObservation(
-            tool_name="goal_verifier",
-            success=False,
-            summary="Final answer rejected by verifier: " + (verdict.reason or "missing required coverage"),
-            payload={
-                **verdict_payload,
-                "candidate_summary": candidate.summary,
-                "recovery_hint": verdict.next_action_hint
-                or "Use the missing_items and unsupported_claims to choose the next sql_query, insight, or corrected terminate action.",
-                "failure_count": failures,
-            },
-            error=verdict.reason or "Final answer did not satisfy the user task.",
-            payload_truncated=False,
-            payload_ref=None,
         )
 
     async def _map_trace_to_sse(
@@ -439,8 +383,7 @@ class ReActLoop:
     def _phase_for_action(self, action_name: str) -> str:
         mapping = {
             "sql_query": "tool_selection",
-            "insight": "analysis",
-            "format_answer": "answer_assembly",
+            "code_interpreter": "analysis",
             "terminate": "answer_assembly",
             "forecast": "analysis",
             "anomaly": "analysis",
@@ -453,8 +396,7 @@ class ReActLoop:
     def _message_for_action(self, action_name: str) -> str:
         mapping = {
             "sql_query": "正在查询数据源。",
-            "insight": "正在将证据转换为已验证事实。",
-            "format_answer": "正在组装最终回答。",
+            "code_interpreter": "正在执行数据分析。",
             "terminate": "正在结束并组装最终回答。",
             "forecast": "正在执行趋势预测。",
             "anomaly": "正在检测异常。",
@@ -480,16 +422,18 @@ class ReActLoop:
                 "query_language": action_input.get("query_language"),
                 "purpose": action_input.get("purpose"),
             }
-        if action_name == "insight":
+        if action_name == "code_interpreter":
             evidence = action_input.get("database_evidence") or {}
             evidence_id = evidence.get("evidence_id") if isinstance(evidence, dict) else evidence
+            code = str(action_input.get("analysis_code") or action_input.get("code") or "")
             return {
                 "evidence_id": evidence_id,
                 "analysis_goal": action_input.get("analysis_goal") or action_input.get("focus"),
                 "code_type": action_input.get("code_type"),
-                "analysis_code_chars": len(str(action_input.get("analysis_code") or "")),
+                "analysis_code_chars": len(code),
+                "code_preview": self._truncate_preview_text(code, 8000),
             }
-        if action_name in {"format_answer", "terminate"}:
+        if action_name == "terminate":
             return {
                 "has_result": bool(action_input.get("result") or action_input.get("direct_answer")),
                 "include_analysis_count": len(action_input.get("include_analysis_ids", [])),
@@ -514,7 +458,7 @@ class ReActLoop:
             "payload_truncated": payload.get("payload_truncated", False),
         }
         visible_payload = payload.get("payload") or {}
-        for key in ("evidence_id", "analysis_id", "analysis_goal", "code_type", "code_hash", "input_row_count", "insight_id", "forecast_id", "anomaly_id", "title", "summary"):
+        for key in ("evidence_id", "analysis_id", "analysis_goal", "code_type", "code_hash", "input_row_count", "forecast_id", "anomaly_id", "title", "summary"):
             if key in visible_payload:
                 preview[key] = visible_payload.get(key)
         if isinstance(visible_payload.get("result"), dict):
@@ -546,6 +490,12 @@ class ReActLoop:
             preview["result_count"] = len(visible_payload.get("results", []))
         if payload.get("tool_name") in {"sql_query", "query_database"}:
             preview.update(self._sql_payload_preview(visible_payload))
+        if payload.get("tool_name") == "code_interpreter":
+            preview.update(self._code_interpreter_payload_preview(visible_payload))
+        if payload.get("tool_name") == "forecast":
+            preview.update(self._forecast_payload_preview(visible_payload))
+        if payload.get("tool_name") == "anomaly":
+            preview.update(self._anomaly_payload_preview(visible_payload))
         if request_state is not None:
             preview.update(self._completion_payload_preview(request_state))
         return preview
@@ -608,13 +558,72 @@ class ReActLoop:
             "sample_points": points[:5],
             "sampling": diagnostics.get("prompt_sampling"),
             "schema_linking": self._schema_linking_payload_preview(diagnostics),
-            "task_coverage": diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else None,
+            "task_coverage": self._task_coverage_payload_preview(diagnostics),
             "truncated": bool(
                 visible_payload.get("payload_truncated")
                 or diagnostics.get("truncated")
                 or diagnostics.get("artifact_ref")
                 or payload_truncated_marker(visible_payload)
             ),
+        }
+
+    def _task_coverage_payload_preview(self, diagnostics: dict) -> dict | None:
+        coverage = diagnostics.get("task_coverage")
+        if not isinstance(coverage, dict):
+            return None
+        preview = dict(coverage)
+        if not isinstance(preview.get("missing"), list):
+            legacy_missing = preview.get("missing_or_uncertain")
+            preview["missing"] = legacy_missing if isinstance(legacy_missing, list) else []
+        if not isinstance(preview.get("runtime_missing"), list):
+            legacy_runtime_missing = preview.get("runtime_missing_or_uncertain")
+            preview["runtime_missing"] = legacy_runtime_missing if isinstance(legacy_runtime_missing, list) else []
+        preview.pop("missing_or_uncertain", None)
+        preview.pop("runtime_missing_or_uncertain", None)
+        return preview
+
+    def _code_interpreter_payload_preview(self, visible_payload: dict) -> dict:
+        result = visible_payload.get("result") if isinstance(visible_payload.get("result"), dict) else {}
+        diagnostics = visible_payload.get("diagnostics") if isinstance(visible_payload.get("diagnostics"), dict) else {}
+        return {
+            "analysis_goal": visible_payload.get("analysis_goal"),
+            "analysis_status": visible_payload.get("status"),
+            "analysis_summary": visible_payload.get("summary"),
+            "analysis_result": result,
+            "analysis_metrics": result.get("metrics") if isinstance(result.get("metrics"), dict) else {},
+            "analysis_details": result.get("details") if isinstance(result.get("details"), dict) else {},
+            "input_row_count": visible_payload.get("input_row_count"),
+            "input_evidence_id": visible_payload.get("input_evidence_id"),
+            "code_hash": visible_payload.get("code_hash"),
+            "code_type": visible_payload.get("code_type"),
+            "runtime_ms": diagnostics.get("runtime_ms"),
+            "input_columns": diagnostics.get("input_columns") if isinstance(diagnostics.get("input_columns"), list) else [],
+        }
+
+    def _forecast_payload_preview(self, visible_payload: dict) -> dict:
+        diagnostics = visible_payload.get("diagnostics") if isinstance(visible_payload.get("diagnostics"), dict) else {}
+        points = visible_payload.get("forecast_points") if isinstance(visible_payload.get("forecast_points"), list) else []
+        plan = visible_payload.get("forecast_plan")
+        if not isinstance(plan, dict):
+            plan = diagnostics.get("forecast_plan") if isinstance(diagnostics.get("forecast_plan"), dict) else None
+        return {
+            "forecast_status": visible_payload.get("status"),
+            "forecast_plan": plan,
+            "forecast_points": points[:12],
+            "forecast_point_count": len(points),
+            "model_name": visible_payload.get("model_name"),
+            "horizon": visible_payload.get("horizon"),
+        }
+
+    def _anomaly_payload_preview(self, visible_payload: dict) -> dict:
+        anomaly_points = visible_payload.get("anomaly_points") if isinstance(visible_payload.get("anomaly_points"), list) else []
+        scores = visible_payload.get("scores") if isinstance(visible_payload.get("scores"), list) else []
+        return {
+            "detector_name": visible_payload.get("detector_name"),
+            "anomaly_points": anomaly_points[:12],
+            "anomaly_scores": scores[:12],
+            "anomaly_point_count": len(anomaly_points),
+            "anomaly_span_count": len(visible_payload.get("anomaly_spans", [])) if isinstance(visible_payload.get("anomaly_spans"), list) else 0,
         }
 
     def _schema_linking_payload_preview(self, diagnostics: dict) -> dict | None:

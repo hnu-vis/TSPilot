@@ -46,7 +46,9 @@ class DataAgent(BaseAgent):
                         "Your previous response violated the ReAct output contract. "
                         "Return exactly one JSON object and nothing else. "
                         "The JSON object must use this schema: "
-                        "{\"thought\": str, \"action\": str, \"action_input\": object}. "
+                        "{\"thought\": str, \"previous_observation_assessment\": object|null, "
+                        "\"action_intention\": str|null, \"action_reason\": str|null, "
+                        "\"action\": str, \"action_input\": object}. "
                         "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
                         "Continue solving the original user task using the current context. "
                         f"Parser error: {first_error}",
@@ -112,6 +114,7 @@ class DataAgent(BaseAgent):
             raise ValueError("Action Input must decode to a JSON object.")
         return ReActTurn(
             thought=thought,
+            previous_observation_assessment=None,
             action_intention=self._regex_group(match, "intention"),
             action_reason=self._regex_group(match, "reason"),
             action=action,
@@ -142,6 +145,7 @@ class DataAgent(BaseAgent):
         thought = str(decoded.get("thought", "")).strip()
         return ReActTurn(
             thought=thought,
+            previous_observation_assessment=decoded.get("previous_observation_assessment"),
             action_intention=self._optional_string(decoded.get("action_intention") or decoded.get("intention")),
             action_reason=self._optional_string(decoded.get("action_reason") or decoded.get("reason")),
             action=action,

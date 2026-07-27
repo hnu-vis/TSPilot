@@ -27,13 +27,13 @@ Contract notes:
 Allowed outer action names:
 
 - `todowrite`
-- `query_database`
-- `insight`
+- `sql_query`
+- `code_interpreter`
 - `forecast`
 - `anomaly`
 - `rag`
 - `skill`
-- `format_answer`
+- `terminate`
 
 ## `ReActTurnParseError`
 
