@@ -9,7 +9,6 @@ from core.report.composer import (
     build_anomaly_section,
     build_forecast_section,
     build_summary,
-    missing_requirements,
     ordered_sections,
 )
 from schemas.output import AnswerReference, AnswerSection, FinalAnswer
@@ -83,19 +82,6 @@ class FormatAnswerTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
-        missing = (
-            []
-            if (
-                self._has_requested_analyses(request_state, validated_input.include_analysis_ids)
-                or self._has_requested_facts(request_state, validated_input.include_fact_ids)
-            )
-            else missing_requirements(request_state)
-        )
-        if missing:
-            raise ValueError(
-                "Final answer cannot be assembled yet. Missing required outputs: "
-                + ", ".join(missing)
-            )
         facts = [
             fact
             for fact in request_state.verified_facts
@@ -166,7 +152,7 @@ class FormatAnswerTool(BaseTool):
             evidence = request_state.latest_database_evidence
             for section in self._evidence_sections(evidence, request_state):
                 sections_by_type[section.section_type] = section
-        if request_state.todo_list and "plan" in request_state.answer_requirements:
+        if request_state.todo_list and "plan" in validated_input.section_plan:
             sections_by_type["plan"] = AnswerSection(
                 section_type="plan",
                 heading=self._label(request_state, "plan"),
@@ -344,6 +330,18 @@ class FormatAnswerTool(BaseTool):
                     parts.append(
                         f"The short-term forecast for {subject} contains {len(forecast_points)} points and overall {direction}, "
                         f"moving from {first_point.value:.2f} to {last_point.value:.2f}."
+                    )
+            elif request_state.latest_forecast.status == "requires_rolling":
+                plan = request_state.latest_forecast.forecast_plan
+                requested = plan.requested_steps if plan else request_state.latest_forecast.horizon
+                chunk = plan.recommended_chunk_steps if plan else None
+                if language == "zh":
+                    suffix = f"建议每次最多 {chunk} 步" if chunk else "需要分段执行"
+                    parts.append(f"{subject} 的预测跨度为 {requested} 个时间步，超过单次直接预测窗口，{suffix}。")
+                else:
+                    suffix = f"recommended chunk size is {chunk} steps" if chunk else "chunked execution is required"
+                    parts.append(
+                        f"The forecast horizon for {subject} is {requested} steps, which exceeds the direct forecast window; {suffix}."
                     )
 
         compact = " ".join(part.strip() for part in parts if part and part.strip())

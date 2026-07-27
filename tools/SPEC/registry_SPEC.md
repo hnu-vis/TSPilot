@@ -27,21 +27,17 @@ Fields:
 The registry must define exactly one `ToolSpec` for each prompt-visible action:
 
 - `todowrite`
-- `query_database`
-- `insight`
+- `sql_query`
+- `code_interpreter`
 - `forecast`
 - `anomaly`
 - `rag`
 - `skill`
 - `terminate`
 
-The registry may also keep hidden compatibility entries such as `format_answer`
-when older traces or tests still need to resolve them.
-
 ## Resolution rules
 
 - one action name resolves to exactly one `ToolSpec`
-- `prompt_visible = false` entries must never appear in the model action space
 - terminal actions must declare `produces_terminal_payload = true`
 - the prompt builder should derive tool metadata from the same registry used by
   the executor

@@ -14,7 +14,7 @@ from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
 from schemas.tool import ToolObservation
-from tools.insight import InsightInput, InsightTool
+from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 
 
 class _AnalysisSpec:
@@ -64,11 +64,11 @@ def test_generated_insight_executes_code_over_full_evidence():
     request_state = _request_state()
 
     result = asyncio.run(
-        InsightTool().execute(
-            InsightInput(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
                 database_evidence="evi_generated",
                 analysis_goal="threshold share",
-                analysis_code=(
+                code=(
                     "total = len(rows)\n"
                     "count = sum(1 for row in rows if float(row['value']) > 20)\n"
                     "result = {'summary': f'{count}/{total} rows are above 20', "
@@ -107,8 +107,8 @@ def test_multiple_generated_insights_accumulate_in_analysis_workspace():
         "summary": "second summary",
         "result": {"summary": "second summary", "metrics": {"b": 2}, "details": {}},
     }
-    apply_observation(request_state, ToolObservation(tool_name="insight", success=True, summary="ok", payload={}), first, _AnalysisSpec())
-    apply_observation(request_state, ToolObservation(tool_name="insight", success=True, summary="ok", payload={}), second, _AnalysisSpec())
+    apply_observation(request_state, ToolObservation(tool_name="code_interpreter", success=True, summary="ok", payload={}), first, _AnalysisSpec())
+    apply_observation(request_state, ToolObservation(tool_name="code_interpreter", success=True, summary="ok", payload={}), second, _AnalysisSpec())
 
     context = DataAgentPromptBuilder().build_context(
         request_state,
@@ -228,12 +228,12 @@ def test_generated_insight_supports_python_sandbox_v1():
     request_state = _request_state()
 
     result = asyncio.run(
-        InsightTool().execute(
-            InsightInput(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
                 database_evidence="evi_generated",
                 analysis_goal="sandbox threshold share",
                 code_type="python_sandbox_v1",
-                analysis_code=(
+                code=(
                     "total = len(rows)\n"
                     "count = sum(1 for row in rows if float(row['value']) > 20)\n"
                     "result = {'summary': f'{count}/{total} rows are above 20', "
@@ -246,7 +246,7 @@ def test_generated_insight_supports_python_sandbox_v1():
     )
 
     assert result["status"] == "succeeded"
-    assert result["code_type"] == "python_sandbox_v1"
-    assert result["diagnostics"]["sandbox"] == "subprocess_python_sandbox_v1"
+    assert result["code_type"] == "code_interpreter_v1"
+    assert result["diagnostics"]["sandbox"] == "subprocess_code_interpreter_v1"
     assert result["input_row_count"] == 3
     assert result["result"]["metrics"]["count"] == 2

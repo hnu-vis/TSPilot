@@ -16,8 +16,6 @@ def test_format_answer_allows_explicit_included_fact_without_unrelated_missing_r
         ChatRequest(message="请把价格分成高位、低位和中间区间"),
         get_settings(),
     )
-    request_state.answer_requirements = ["trend"]
-    request_state.answer_coverage = {"trend": False}
     fact = VerifiedFact(
         fact_id="fact_bucket",
         fact_type="categorization",
@@ -51,8 +49,6 @@ def test_format_answer_allows_statistics_evidence_for_count_direct_answer():
         ),
         get_settings(),
     )
-    request_state.answer_requirements = ["conclusion", "analysis"]
-    request_state.answer_coverage = {"conclusion": False, "analysis": False}
     request_state.latest_database_evidence = DatabaseEvidence(
         evidence_id="evi_count_stats",
         result_type="statistics",

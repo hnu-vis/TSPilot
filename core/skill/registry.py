@@ -20,12 +20,11 @@ def execute_skill(skill_name: str, task_context: dict, parameters: dict) -> dict
 
 def _reference_extractor(task_context: dict, parameters: dict) -> dict:
     references = []
-    for key in ("latest_database_evidence", "latest_insight", "latest_forecast", "latest_anomaly"):
+    for key in ("latest_database_evidence", "latest_forecast", "latest_anomaly"):
         payload = task_context.get(key)
         if isinstance(payload, dict):
             reference_id = (
                 payload.get("evidence_id")
-                or payload.get("insight_id")
                 or payload.get("forecast_id")
                 or payload.get("anomaly_id")
             )
@@ -38,14 +37,14 @@ def _next_step_advisor(task_context: dict, parameters: dict) -> dict:
     advice = []
     if not task_context.get("latest_database_evidence"):
         advice.append("sql_query")
-    elif not task_context.get("latest_insight"):
-        advice.append("insight")
+    elif not task_context.get("analysis_workspace"):
+        advice.append("code_interpreter")
     elif parameters.get("need_forecast"):
         advice.append("forecast")
     elif parameters.get("need_anomaly"):
         advice.append("anomaly")
     else:
-        advice.append("format_answer")
+        advice.append("terminate")
     return {"summary": f"Suggested next step: {advice[0]}.", "results": [{"recommended_actions": advice}]}
 
 

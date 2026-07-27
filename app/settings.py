@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     max_observation_chars: int = 1600
     max_visible_rows: int = 60
     max_visible_points: int = 240
-    goal_verifier_max_rejections: int = Field(default=1, alias="TSPILOT_GOAL_VERIFIER_MAX_REJECTIONS")
 
     @property
     def resolved_database_config_dir(self) -> Path:

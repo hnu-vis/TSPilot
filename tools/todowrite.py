@@ -21,7 +21,7 @@ class TodoItem(BaseModel):
 class TodoWriteInput(BaseModel):
     message: str | None = None
     current_intent: str | None = None
-    requested_fact_types: list[str] = Field(default_factory=list)
+    requested_capabilities: list[str] = Field(default_factory=list)
     focus: str | None = None
     todos: list[dict] = Field(default_factory=list)
     evidence_summary: dict | str | None = None
@@ -156,7 +156,7 @@ class TodoWriteTool(BaseTool):
             return "query"
         if any(token in normalized for token in ["查询", "查库", "取数", "query", "retrieve evidence"]):
             return "query"
-        if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "insight", "trend", "code interpreter"]):
+        if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "trend", "code interpreter"]):
             return "code_interpreter"
         if any(token in normalized for token in ["异常", "anomaly", "outlier"]):
             return "anomaly"

@@ -6,7 +6,6 @@ from functools import lru_cache
 from agents.data_agent import DataAgent
 from langchain_openai import ChatOpenAI
 from prompts.data_agent import DataAgentPromptBuilder
-from core.runtime_evaluator import RuntimeLLMEvaluator
 from runtime.react_loop import ReActLoop
 from runtime.tool_executor import ToolExecutor
 from app.settings import get_settings
@@ -49,15 +48,9 @@ def get_data_agent() -> DataAgent:
     return DataAgent(prompt_builder=get_prompt_builder(), llm=get_llm())
 
 
-@lru_cache(maxsize=1)
-def get_goal_verifier() -> RuntimeLLMEvaluator:
-    return RuntimeLLMEvaluator(llm=get_llm())
-
-
 def get_react_loop() -> ReActLoop:
     return ReActLoop(
         data_agent=get_data_agent(),
         tool_executor=get_tool_executor(),
         settings=get_settings(),
-        goal_verifier=get_goal_verifier(),
     )

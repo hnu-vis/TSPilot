@@ -16,6 +16,8 @@ class TerminateInput(BaseModel):
     include_fact_ids: list[str] = Field(default_factory=list)
     include_visualization_ids: list[str] = Field(default_factory=list)
     section_plan: list[str] = Field(default_factory=list)
+    unavailable_outputs: list[str] = Field(default_factory=list)
+    unavailable_reason: str | None = None
 
     @model_validator(mode="before")
     @classmethod

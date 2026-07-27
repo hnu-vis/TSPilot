@@ -9,7 +9,7 @@ Maintain a structured todo list for multi-step requests.
 - `todos: list[dict]`
 - optional `message: str`
 - optional `current_intent: str`
-- optional `requested_fact_types: list[str]`
+- optional `requested_capabilities: list[str]`
 - optional `focus: str`
 - optional `evidence_summary: dict | str | null`
 

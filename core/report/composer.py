@@ -5,28 +5,6 @@ from schemas.output import AnswerSection
 from schemas.state import RequestStateModel
 
 
-def missing_requirements(request_state: RequestStateModel) -> list[str]:
-    missing: list[str] = []
-    latest_evidence = request_state.latest_database_evidence
-    has_explicit_sql_query_evidence = bool(
-        latest_evidence is not None
-        and isinstance(latest_evidence.metadata, dict)
-        and latest_evidence.metadata.get("sql_query_mode") == "explicit"
-    )
-    has_database_answer_evidence = bool(
-        latest_evidence is not None
-        and latest_evidence.result_type in {"statistics", "table", "schema", "metric_list"}
-    )
-    for requirement in request_state.answer_requirements:
-        if requirement in {"plan", "conclusion"}:
-            continue
-        if has_explicit_sql_query_evidence or (requirement == "analysis" and has_database_answer_evidence):
-            continue
-        if not request_state.answer_coverage.get(requirement, False):
-            missing.append(requirement)
-    return missing
-
-
 def build_summary(
     request_state: RequestStateModel,
     facts: list,
@@ -75,6 +53,14 @@ def build_summary(
                 f"{subject} 的短期预测共 {len(forecast_points)} 个点，预测区间内整体{direction}，"
                 f"从 {first_point.value:.2f} 变化到 {last_point.value:.2f}。"
             )
+        elif request_state.latest_forecast.status == "requires_rolling":
+            plan = request_state.latest_forecast.forecast_plan
+            requested = plan.requested_steps if plan else request_state.latest_forecast.horizon
+            chunk = plan.recommended_chunk_steps if plan else None
+            parts.append(
+                f"{subject} 的预测跨度为 {requested} 个时间步，超过单次直接预测窗口"
+                f"{f'（建议每次最多 {chunk} 步）' if chunk else ''}，需要滚动预测。"
+            )
 
     compact = " ".join(part.strip() for part in parts if part and part.strip())
     return compact or fallback
@@ -82,7 +68,15 @@ def build_summary(
 
 def build_forecast_section(forecast) -> AnswerSection:
     forecast_points = forecast.forecast_points
-    if not forecast_points:
+    if forecast.status == "requires_rolling":
+        plan = forecast.forecast_plan
+        chunk = plan.recommended_chunk_steps if plan else None
+        reason = plan.reason if plan else "Requested horizon exceeds the direct forecast window."
+        content = (
+            f"该预测请求需要滚动预测：共 {forecast.horizon} 个时间步，"
+            f"单次直接预测上限为 {chunk or '未指定'} 个时间步。{reason}"
+        )
+    elif not forecast_points:
         content = f"已执行预测模型 {forecast.model_name}，但未返回预测点。"
     else:
         first_point = forecast_points[0]
@@ -101,7 +95,12 @@ def build_forecast_section(forecast) -> AnswerSection:
         section_type="forecast",
         heading="Forecast",
         content=content,
-        structured_payload={"forecast_id": forecast.forecast_id, "horizon": forecast.horizon},
+        structured_payload={
+            "forecast_id": forecast.forecast_id,
+            "horizon": forecast.horizon,
+            "status": forecast.status,
+            "forecast_plan": forecast.forecast_plan.model_dump(mode="json") if forecast.forecast_plan else None,
+        },
     )
 
 

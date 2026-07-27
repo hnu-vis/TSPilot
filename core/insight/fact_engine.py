@@ -16,6 +16,7 @@ CANONICAL_FACT_TYPES = (
     "distribution",
     "association",
     "outlier",
+    "forecast",
     "seasonality",
     "proportion",
     "categorization",
@@ -49,6 +50,11 @@ FACT_TYPE_ALIASES = {
     "outliers": "outlier",
     "anomaly": "outlier",
     "anomalies": "outlier",
+    "forecast": "forecast",
+    "forecasts": "forecast",
+    "prediction": "forecast",
+    "predictions": "forecast",
+    "predict": "forecast",
     "seasonality": "seasonality",
     "seasonal": "seasonality",
     "periodicity": "seasonality",
@@ -70,14 +76,16 @@ def canonicalize_fact_type(fact_type: str | None) -> str | None:
     return FACT_TYPE_ALIASES.get(normalized)
 
 
-def normalize_requested_fact_types(requested_fact_types: list[str]) -> list[str]:
+def normalize_requested_fact_types(requested_fact_types: list[str], *, allow_default: bool = True) -> list[str]:
     normalized: list[str] = []
-    requested = requested_fact_types or list(DEFAULT_FACT_TYPES)
+    requested = requested_fact_types or (list(DEFAULT_FACT_TYPES) if allow_default else [])
     for item in requested:
         canonical = canonicalize_fact_type(item)
         if canonical and canonical not in normalized:
             normalized.append(canonical)
-    return normalized or list(DEFAULT_FACT_TYPES)
+    if normalized:
+        return normalized
+    return list(DEFAULT_FACT_TYPES) if allow_default else []
 
 
 def evidence_rows(evidence: DatabaseEvidence) -> tuple[list[dict], list[str], str, str]:

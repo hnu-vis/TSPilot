@@ -23,11 +23,6 @@ class SkillTool(BaseTool):
                     if request_state.latest_database_evidence
                     else None
                 ),
-                "latest_insight": (
-                    request_state.latest_insight.model_dump(mode="json")
-                    if request_state.latest_insight
-                    else None
-                ),
                 "latest_forecast": (
                     request_state.latest_forecast.model_dump(mode="json")
                     if request_state.latest_forecast

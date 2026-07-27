@@ -8,15 +8,12 @@ from pydantic import BaseModel, Field
 from app.settings import Settings
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
-from schemas.insight import InsightResult
 from schemas.output import FinalAnswer
 from schemas.timeseries import AnomalyResult, ForecastResult
 from tools.anomaly import AnomalyInput, AnomalyTool
 from tools.base import BaseTool
 from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 from tools.forecast import ForecastInput, ForecastTool
-from tools.format_answer import FormatAnswerInput, FormatAnswerTool
-from tools.insight import InsightInput, InsightTool
 from tools.rag import RagInput, RagTool
 from tools.skill import SkillInput, SkillTool
 from tools.sql_query import SqlQueryInput, SqlQueryTool
@@ -65,7 +62,11 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
     specs = [
         ToolSpec(
             tool_name="todowrite",
-            description="Update or create a todo list.",
+            description=(
+                "Create the initial structured todo plan before starting complex tasks "
+                "that require 3 or more independently verifiable user-visible steps. "
+                "Do not use for simple single-step tasks or internal query preparation."
+            ),
             input_model=TodoWriteInput,
             output_model=TodoWriteResult,
             tool=TodoWriteTool(),
@@ -84,18 +85,6 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
             prompt_visible=True,
             runtime_access="request_and_conversation_read",
             result_target="evidence",
-            produces_terminal_payload=False,
-            supports_streaming=False,
-        ),
-        ToolSpec(
-            tool_name="insight",
-            description="Extract structured insights from existing evidence with lightweight generated Python analysis.",
-            input_model=InsightInput,
-            output_model=AnalysisResult,
-            tool=InsightTool(),
-            prompt_visible=False,
-            runtime_access="request_state_read",
-            result_target="analysis",
             produces_terminal_payload=False,
             supports_streaming=False,
         ),
@@ -157,18 +146,6 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
             runtime_access="request_state_read",
             result_target="analysis",
             produces_terminal_payload=False,
-            supports_streaming=False,
-        ),
-        ToolSpec(
-            tool_name="format_answer",
-            description="Assemble the final answer from verified outputs.",
-            input_model=FormatAnswerInput,
-            output_model=FinalAnswer,
-            tool=FormatAnswerTool(),
-            prompt_visible=False,
-            runtime_access="request_state_read",
-            result_target="presentation",
-            produces_terminal_payload=True,
             supports_streaming=False,
         ),
         ToolSpec(
