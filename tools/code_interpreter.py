@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from core.analysis.python_runner import AnalysisCodeError
 from sandbox import execute_python_sandbox_v1
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
@@ -54,6 +56,7 @@ class CodeInterpreterTool(BaseTool):
             timeout_seconds=int(constraints.get("timeout_seconds", 5)),
             work_dir=_code_interpreter_work_dir(request_state, code_hash),
         )
+        _validate_expected_result_schema(output.result, validated_input.expected_result_schema or {})
         result = AnalysisResult(
             analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
             analysis_goal=goal,
@@ -128,6 +131,66 @@ def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict]
                 if key not in columns:
                     columns.append(key)
     return rows, points, columns
+
+
+def _validate_expected_result_schema(result: dict, schema: dict) -> None:
+    if not schema:
+        return
+    _validate_schema_node(result, schema, path="result")
+
+
+def _validate_schema_node(value: Any, schema: Any, *, path: str) -> None:
+    if isinstance(schema, dict):
+        if not isinstance(value, dict):
+            raise AnalysisCodeError(f"analysis result field '{path}' must be an object.")
+        for key, child_schema in schema.items():
+            if key not in value:
+                raise AnalysisCodeError(f"analysis result is missing required field '{path}.{key}'.")
+            _validate_schema_node(value[key], child_schema, path=f"{path}.{key}")
+        return
+
+    if isinstance(schema, list):
+        if not isinstance(value, list):
+            raise AnalysisCodeError(f"analysis result field '{path}' must be an array.")
+        if schema:
+            item_schema = schema[0]
+            for index, item in enumerate(value):
+                _validate_schema_node(item, item_schema, path=f"{path}[{index}]")
+        return
+
+    if isinstance(schema, str):
+        _validate_type_name(value, schema, path=path)
+
+
+def _validate_type_name(value: Any, type_name: str, *, path: str) -> None:
+    normalized = type_name.strip().lower()
+    if not normalized or normalized == "any":
+        return
+    if "|" in normalized:
+        allowed = [item.strip() for item in normalized.split("|") if item.strip()]
+        if any(_matches_type(value, item) for item in allowed):
+            return
+        raise AnalysisCodeError(f"analysis result field '{path}' must match one of: {', '.join(allowed)}.")
+    if not _matches_type(value, normalized):
+        raise AnalysisCodeError(f"analysis result field '{path}' must be {normalized}.")
+
+
+def _matches_type(value: Any, type_name: str) -> bool:
+    if type_name in {"str", "string"}:
+        return isinstance(value, str)
+    if type_name in {"int", "integer"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if type_name in {"float", "number", "numeric"}:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if type_name in {"bool", "boolean"}:
+        return isinstance(value, bool)
+    if type_name in {"dict", "object"}:
+        return isinstance(value, dict)
+    if type_name in {"list", "array"}:
+        return isinstance(value, list)
+    if type_name in {"none", "null"}:
+        return value is None
+    return True
 
 
 def _code_hash(code: str) -> str:
