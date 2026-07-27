@@ -18,12 +18,22 @@ class DataAgentPromptBuilder:
             "Respond with exactly one JSON object and nothing else.\n"
             "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
             "Output schema: "
-            "{\"thought\": str, \"previous_observation_assessment\": object|null, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
+            "{\"thought\": str, \"task_contract\": object|null, \"previous_observation_assessment\": object|null, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
+            "task_contract is an LLM-authored output contract for the user's visible deliverables. "
+            "When state.task_contract is null and the request is data-oriented, include task_contract before or with the first non-terminal action. "
+            "Use {\"source\":\"llm\",\"goal\":str,\"required_outputs\":[{\"id\":str,\"description\":str,\"output_type\":str|null,\"evidence_kind\":str|null,\"required\":bool,\"measures\":list[str],\"dimensions\":list[str],\"time_scope\":object|str|null,\"success_criteria\":str|null}],\"constraints\":object,\"assumptions\":list[str],\"evidence_quality_notes\":list[str]}. "
+            "The contract must describe requested user-visible outputs, not internal tool stages. "
             "previous_observation_assessment must be null when there is no previous observation or the previous observation only created the todo plan. "
             "Otherwise, use {\"completed_active_todo\": bool, \"reason\": str|null, \"evidence_refs\": list[str], "
             "\"covered\": list[str], \"missing\": list[str], "
+            "\"completed_todos\": list[int|str], \"next_active_todo\": int|str|null, "
             "\"next_action_reason\": str|null, \"can_answer\": bool|null}. "
             "Set completed_active_todo=true only when your Thought concludes the latest Observation satisfies the currently active todo from before this turn; observation itself is factual, not a completion verdict.\n"
+            "Use completed_todos and next_active_todo to reconcile stale todo state against all accumulated evidence and task_contract coverage. "
+            "completed_todos may name todo priorities or exact todo contents for non-answer steps already satisfied by grounded evidence. "
+            "Never include an answer todo in completed_todos; the answer todo is completed only by terminate producing the final answer. "
+            "When state.task_contract exists, previous_observation_assessment.covered and missing must refer to task_contract.required_outputs ids or descriptions. "
+            "Do not set can_answer=true until every required task_contract output is covered or explicitly unavailable in terminate action_input.\n"
             "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
             "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
             "Language policy: task.response_language is authoritative for all model-authored natural-language text. "
@@ -78,7 +88,7 @@ class DataAgentPromptBuilder:
             "Action Input must be valid JSON.\n"
             "Use the exact action-input field names defined here.\n"
             "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
-            "\"focus\": str|null, \"todos\": list[object], "
+            "\"focus\": str|null, \"task_contract\": object|null, \"todos\": list[object], "
             "\"evidence_summary\": str|object|null}.\n"
             "Each todo item should use {\"content\": str, \"task_type\": \"query|code_interpreter|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
@@ -137,6 +147,11 @@ class DataAgentPromptBuilder:
                 "focus": request_state.focus,
                 "recent_todo_summary": conversation_state.recent_todo_summary,
                 "prompt_context_summary": request_state.prompt_context_summary,
+                "task_contract": (
+                    request_state.task_contract.model_dump(mode="json")
+                    if request_state.task_contract
+                    else None
+                ),
             },
             "evidence": {
                 "latest": latest_evidence,
@@ -175,6 +190,10 @@ class DataAgentPromptBuilder:
                 }
                 for observation in request_state.observations[-4:]
             ],
+            "recent_react_transcript": [
+                self._react_step_context(step)
+                for step in request_state.react_transcript[-6:]
+            ],
             "available_actions": self._available_actions(),
         }
 
@@ -183,7 +202,7 @@ class DataAgentPromptBuilder:
             {
                 "action": "todowrite",
                 "use_when": "Create the initial plan before starting work when todo_list is empty and the request needs 3 or more independently verifiable user-visible steps.",
-                "input": "message, current_intent, focus, todos, evidence_summary; todos may include acceptance_criteria",
+                "input": "message, current_intent, focus, task_contract, todos, evidence_summary; todos may include acceptance_criteria",
             },
             {
                 "action": "sql_query",
@@ -279,6 +298,37 @@ class DataAgentPromptBuilder:
         )
 
     def _react_transcript(self, request_state: RequestStateModel) -> str:
+        if request_state.react_transcript:
+            lines = []
+            for step in request_state.react_transcript[-6:]:
+                if step.question:
+                    lines.append(f"Question: {self._truncate_text(step.question, 800)}")
+                if step.thought:
+                    lines.append(f"Thought: {self._truncate_text(step.thought, 800)}")
+                if step.phase:
+                    lines.append(f"Phase: {self._truncate_text(step.phase, 300)}")
+                if step.action_intention:
+                    lines.append(f"Action Intention: {self._truncate_text(step.action_intention, 300)}")
+                if step.action_reason:
+                    lines.append(f"Action Reason: {self._truncate_text(step.action_reason, 500)}")
+                lines.append(f"Action: {step.action}")
+                lines.append(
+                    "Action Input: "
+                    + self._truncate_text(json.dumps(step.action_input, ensure_ascii=False), 2000)
+                )
+                if step.observation is not None:
+                    lines.append(
+                        "Observation: "
+                        + self._truncate_text(
+                            json.dumps(
+                                self._observation_context(step.observation),
+                                ensure_ascii=False,
+                            ),
+                            3000,
+                        )
+                    )
+            return "\n".join(lines) if lines else "(none)"
+
         if not request_state.tool_history and not request_state.observations:
             return "(none)"
         lines = []
@@ -315,6 +365,43 @@ class DataAgentPromptBuilder:
                     )
                 )
         return "\n".join(lines) if lines else "(none)"
+
+    def _react_step_context(self, step) -> dict:
+        return {
+            "iteration": step.iteration,
+            "question": self._truncate_text(step.question, 800),
+            "thought": self._truncate_text(step.thought, 800),
+            "phase": self._truncate_text(step.phase, 300),
+            "action_intention": self._truncate_text(step.action_intention, 300),
+            "action_reason": self._truncate_text(step.action_reason, 500),
+            "action": step.action,
+            "action_input": self._bounded_value(
+                step.action_input,
+                max_string_chars=1200,
+                max_list_items=8,
+                max_dict_items=16,
+            ),
+            "observation": (
+                self._observation_context(step.observation)
+                if step.observation is not None
+                else None
+            ),
+        }
+
+    def _observation_context(self, observation) -> dict:
+        context = {
+            "tool_name": observation.tool_name,
+            "success": observation.success,
+            "summary": observation.summary,
+            "payload": self._summarize_observation_payload(observation.payload),
+        }
+        if observation.error:
+            context["error"] = observation.error
+        if observation.payload_truncated:
+            context["payload_truncated"] = True
+        if observation.payload_ref:
+            context["payload_ref"] = observation.payload_ref
+        return context
 
     def _observation_iteration(self, observation, calls_by_iteration: dict[int, object]) -> int:
         for iteration in sorted(calls_by_iteration, reverse=True):
@@ -475,23 +562,19 @@ class DataAgentPromptBuilder:
             "recovery_hint",
             "error",
             "evidence_id",
+            "result_type",
             "analysis_id",
             "analysis_goal",
-            "code_type",
-            "code_hash",
             "input_evidence_id",
             "input_row_count",
             "forecast_id",
             "anomaly_id",
-            "summary",
             "current_step",
             "planning_complete",
-            "completed_count",
-            "pending_count",
             "query",
             "query_language",
             "columns",
-            "metadata",
+            "task_contract",
         ):
             if key in payload:
                 summarized[key] = self._bounded_value(payload[key], max_string_chars=1200, max_list_items=12, max_dict_items=16)
@@ -518,25 +601,39 @@ class DataAgentPromptBuilder:
             )
         if isinstance(payload.get("diagnostics"), dict):
             diagnostics = dict(payload["diagnostics"])
-            summarized["diagnostics"] = {
-                key: self._bounded_value(
-                    value,
+            summarized_diagnostics = {}
+            for key in ("summary_stats", "artifact_ref", "prompt_sampling"):
+                if key in diagnostics:
+                    summarized_diagnostics[key] = self._bounded_value(
+                        diagnostics[key],
+                        max_string_chars=1000,
+                        max_list_items=8,
+                        max_dict_items=16,
+                    )
+            if payload.get("error") and isinstance(diagnostics.get("query_trace"), dict):
+                summarized_diagnostics["query_trace"] = self._bounded_value(
+                    diagnostics["query_trace"],
                     max_string_chars=1000,
                     max_list_items=8,
                     max_dict_items=16,
                 )
-                for key, value in diagnostics.items()
-                if key in {"summary_stats", "query_trace", "sql_query", "artifact_ref", "snapshot_ref", "sandbox", "runtime_ms"}
-                or key == "prompt_sampling"
-            }
             summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
-            summarized["diagnostics"]["prompt_sampling"] = self._prompt_sampling(
+            summarized_diagnostics["prompt_sampling"] = self._prompt_sampling(
                 full_counts=summary_stats,
                 data=preview,
                 fallback=diagnostics.get("prompt_sampling") if isinstance(diagnostics.get("prompt_sampling"), dict) else None,
             )
+            summarized["diagnostics"] = summarized_diagnostics
         if isinstance(payload.get("todos"), list):
-            summarized["todos"] = payload["todos"][:8]
+            summarized["todos"] = [
+                {
+                    key: todo.get(key)
+                    for key in ("content", "task_type", "status", "priority", "acceptance_criteria")
+                    if todo.get(key) not in (None, "", [], {})
+                }
+                for todo in payload["todos"][:8]
+                if isinstance(todo, dict)
+            ]
         if isinstance(payload.get("verified_facts"), list):
             summarized["verified_facts"] = [
                 {

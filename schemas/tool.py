@@ -21,9 +21,22 @@ class ToolObservation(BaseModel):
     payload_ref: str | None = None
 
 
+class ReActTranscriptStep(BaseModel):
+    """One structured Thought/Action/Observation memory fragment."""
+
+    iteration: int
+    question: str | None = None
+    thought: str | None = None
+    phase: str | None = None
+    action_intention: str | None = None
+    action_reason: str | None = None
+    action: str
+    action_input: dict = Field(default_factory=dict)
+    observation: ToolObservation | None = None
+
+
 class ToolError(BaseModel):
     tool_name: str
     error_code: str
     message: str
     retryable: bool = False
-

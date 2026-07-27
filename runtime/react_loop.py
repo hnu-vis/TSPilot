@@ -7,7 +7,13 @@ from app.settings import Settings
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
-from runtime.request_state import apply_observation_async, append_trace, build_final_response
+from runtime.request_state import (
+    append_react_transcript_step,
+    apply_task_contract,
+    apply_observation_async,
+    append_trace,
+    build_final_response,
+)
 from core.completion import apply_previous_observation_assessment
 from runtime.trace import TraceEventModel
 from runtime.token_usage import token_usage_summary
@@ -131,10 +137,41 @@ class ReActLoop:
                 {
                     "iteration": request_state.iteration,
                     "thought": turn.thought,
+                    "task_contract": (
+                        turn.task_contract.model_dump(mode="json")
+                        if turn.task_contract
+                        else None
+                    ),
                     "action_intention": turn.action_intention,
                     "action_reason": turn.action_reason,
                 },
             )
+            try:
+                contract = apply_task_contract(request_state, turn.task_contract)
+            except Exception as exc:
+                observation = build_policy_observation(
+                    request_state,
+                    turn.action,
+                    f"Task contract was invalid: {exc}",
+                )
+                request_state.observations.append(observation)
+                append_react_transcript_step(
+                    request_state,
+                    iteration=request_state.iteration,
+                    thought=turn.thought,
+                    action=turn.action,
+                    action_input=turn.action_input,
+                    observation=observation,
+                    action_intention=turn.action_intention,
+                    action_reason=turn.action_reason,
+                )
+                yield append_trace(
+                    request_state,
+                    "observation",
+                    observation.model_dump(mode="json"),
+                )
+                sync_from_request(request_state, conversation_state)
+                continue
             yield append_trace(
                 request_state,
                 "action",
@@ -144,6 +181,11 @@ class ReActLoop:
                     "previous_observation_assessment": (
                         turn.previous_observation_assessment.model_dump(mode="json")
                         if turn.previous_observation_assessment
+                        else None
+                    ),
+                    "task_contract": (
+                        contract.model_dump(mode="json")
+                        if contract is not None
                         else None
                     ),
                     "action": turn.action,
@@ -187,6 +229,16 @@ class ReActLoop:
                         payload_ref=None,
                     )
                     request_state.observations.append(observation)
+                    append_react_transcript_step(
+                        request_state,
+                        iteration=request_state.iteration,
+                        thought=turn.thought,
+                        action=turn.action,
+                        action_input=turn.action_input,
+                        observation=observation,
+                        action_intention=turn.action_intention,
+                        action_reason=turn.action_reason,
+                    )
                     yield append_trace(
                         request_state,
                         "observation",
@@ -204,6 +256,16 @@ class ReActLoop:
             if not allowed:
                 observation = build_policy_observation(request_state, turn.action, reason or "Invalid action.")
                 request_state.observations.append(observation)
+                append_react_transcript_step(
+                    request_state,
+                    iteration=request_state.iteration,
+                    thought=turn.thought,
+                    action=turn.action,
+                    action_input=turn.action_input,
+                    observation=observation,
+                    action_intention=turn.action_intention,
+                    action_reason=turn.action_reason,
+                )
                 yield append_trace(
                     request_state,
                     "observation",
@@ -240,6 +302,16 @@ class ReActLoop:
                     payload_ref=None,
                 )
                 request_state.observations.append(observation)
+                append_react_transcript_step(
+                    request_state,
+                    iteration=request_state.iteration,
+                    thought=turn.thought,
+                    action=turn.action,
+                    action_input=turn.action_input,
+                    observation=observation,
+                    action_intention=turn.action_intention,
+                    action_reason=turn.action_reason,
+                )
                 yield append_trace(
                     request_state,
                     "observation",
@@ -253,6 +325,16 @@ class ReActLoop:
                 execution_result.full_payload,
                 execution_result.tool_spec,
                 thought=turn.thought,
+                action_reason=turn.action_reason,
+            )
+            append_react_transcript_step(
+                request_state,
+                iteration=request_state.iteration,
+                thought=turn.thought,
+                action=turn.action,
+                action_input=turn.action_input,
+                observation=execution_result.observation,
+                action_intention=turn.action_intention,
                 action_reason=turn.action_reason,
             )
             yield append_trace(
@@ -292,6 +374,19 @@ class ReActLoop:
         payload = event.payload
 
         if event_type == "thought":
+            iteration = payload.get("iteration")
+            step_id = self._step_event_id(iteration)
+            yield append_trace(
+                request_state,
+                "step.start",
+                {
+                    "type": "step.start",
+                    "step": iteration,
+                    "id": step_id,
+                    "title": f"react round {iteration}",
+                    "detail": "正在判断下一步。",
+                },
+            )
             yield append_trace(
                 request_state,
                 "thought",
@@ -306,10 +401,39 @@ class ReActLoop:
                     "reason": payload.get("action_reason"),
                 },
             )
+            yield append_trace(
+                request_state,
+                "step.chunk",
+                {
+                    "type": "step.chunk",
+                    "id": step_id,
+                    "step": iteration,
+                    "output_type": "thought",
+                    "content": payload.get("thought") or "",
+                },
+            )
             return
 
         if event_type == "action":
             action_name = str(payload.get("action", ""))
+            iteration = payload.get("iteration")
+            step_id = self._step_event_id(iteration)
+            yield append_trace(
+                request_state,
+                "step.meta",
+                {
+                    "type": "step.meta",
+                    "step": iteration,
+                    "id": step_id,
+                    "thought": payload.get("thought"),
+                    "action": action_name,
+                    "action_input": payload.get("action_input", {}),
+                    "task_contract": payload.get("task_contract"),
+                    "action_intention": payload.get("action_intention"),
+                    "action_reason": payload.get("action_reason"),
+                    "previous_observation_assessment": payload.get("previous_observation_assessment"),
+                },
+            )
             yield append_trace(
                 request_state,
                 "agent_step",
@@ -318,7 +442,7 @@ class ReActLoop:
                     "status": "running",
                     "phase": self._phase_for_action(action_name),
                     "message": self._message_for_action(action_name),
-                    "iteration": payload.get("iteration"),
+                    "iteration": iteration,
                 },
             )
             yield append_trace(
@@ -327,7 +451,7 @@ class ReActLoop:
                 {
                     "tool": action_name,
                     "summary": self._message_for_action(action_name),
-                    "iteration": payload.get("iteration"),
+                    "iteration": iteration,
                     "thought": payload.get("thought"),
                     "intention": payload.get("action_intention"),
                     "reason": payload.get("action_reason"),
@@ -338,6 +462,7 @@ class ReActLoop:
             return
 
         if event_type == "observation":
+            iteration = self._iteration_from_payload_ref(payload.get("payload_ref")) or request_state.iteration
             yield append_trace(
                 request_state,
                 "tool_result",
@@ -345,10 +470,21 @@ class ReActLoop:
                     "tool": payload.get("tool_name"),
                     "success": payload.get("success", False),
                     "summary": payload.get("summary"),
-                    "iteration": self._iteration_from_payload_ref(payload.get("payload_ref")) or request_state.iteration,
+                    "iteration": iteration,
                     "payload_preview": self._payload_preview(payload, request_state),
                     "observation": payload,
                     "payload_ref": payload.get("payload_ref"),
+                },
+            )
+            yield append_trace(
+                request_state,
+                "step.done",
+                {
+                    "type": "step.done",
+                    "step": iteration,
+                    "id": self._step_event_id(iteration),
+                    "status": "done" if payload.get("success", False) else "failed",
+                    "observation": payload,
                 },
             )
             return
@@ -379,6 +515,13 @@ class ReActLoop:
 
         if event_type in {"terminate", "error"}:
             yield append_trace(request_state, event_type, payload)
+
+    def _step_event_id(self, iteration) -> str:
+        try:
+            numeric = int(iteration)
+        except (TypeError, ValueError):
+            numeric = 0
+        return f"iteration-{numeric}"
 
     def _phase_for_action(self, action_name: str) -> str:
         mapping = {
@@ -458,7 +601,21 @@ class ReActLoop:
             "payload_truncated": payload.get("payload_truncated", False),
         }
         visible_payload = payload.get("payload") or {}
-        for key in ("evidence_id", "analysis_id", "analysis_goal", "code_type", "code_hash", "input_row_count", "forecast_id", "anomaly_id", "title", "summary"):
+        for key in (
+            "evidence_id",
+            "analysis_id",
+            "analysis_goal",
+            "code_type",
+            "code_hash",
+            "input_row_count",
+            "forecast_id",
+            "anomaly_id",
+            "title",
+            "summary",
+            "current_step",
+            "planning_complete",
+            "task_contract",
+        ):
             if key in visible_payload:
                 preview[key] = visible_payload.get(key)
         if isinstance(visible_payload.get("result"), dict):
@@ -476,6 +633,7 @@ class ReActLoop:
                     "task_type": todo.get("task_type"),
                     "status": todo.get("status"),
                     "priority": todo.get("priority"),
+                    "acceptance_criteria": todo.get("acceptance_criteria"),
                 }
                 for todo in todos[:12]
                 if isinstance(todo, dict)
@@ -517,6 +675,7 @@ class ReActLoop:
                     "task_type": todo.get("task_type"),
                     "status": todo.get("status"),
                     "priority": todo.get("priority"),
+                    "acceptance_criteria": todo.get("acceptance_criteria"),
                 }
                 for todo in request_state.todo_list[:12]
                 if isinstance(todo, dict)

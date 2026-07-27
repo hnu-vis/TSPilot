@@ -1227,6 +1227,84 @@ input:focus-visible {
   color: oklch(0.42 0.11 82);
 }
 
+.plan-preview-card {
+  gap: 10px;
+}
+
+.inspector-todo-list {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-todo-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  align-items: start;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 8px;
+}
+
+.inspector-todo-item.completed {
+  border-color: oklch(0.84 0.045 148);
+  background: oklch(0.97 0.02 148);
+}
+
+.inspector-todo-item.in_progress {
+  border-color: oklch(0.8 0.05 170);
+  background: var(--primary-soft);
+}
+
+.inspector-todo-index {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inspector-todo-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.inspector-todo-copy strong,
+.inspector-todo-copy small,
+.inspector-todo-copy em {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.inspector-todo-copy strong {
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.inspector-todo-copy small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inspector-todo-copy em {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
 .source-line {
   display: flex;
   min-width: 0;

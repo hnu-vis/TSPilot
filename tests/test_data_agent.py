@@ -73,6 +73,39 @@ def test_parse_turn_accepts_dbgpt_style_step_fields():
     assert turn.action_reason == "确认过滤条件"
 
 
+def test_parse_turn_accepts_llm_task_contract():
+    payload = {
+        "thought": "先明确用户可见输出合同。",
+        "task_contract": {
+            "source": "llm",
+            "goal": "返回总数和最早记录",
+            "required_outputs": [
+                {
+                    "id": "total_count",
+                    "description": "返回总记录数",
+                    "output_type": "count",
+                    "evidence_kind": "database",
+                    "required": True,
+                    "measures": ["count"],
+                    "dimensions": [],
+                    "time_scope": None,
+                    "success_criteria": "结果包含总记录数",
+                }
+            ],
+            "constraints": {},
+            "assumptions": [],
+            "evidence_quality_notes": [],
+        },
+        "action": "sql_query",
+        "action_input": {"message": "查询总数", "database_context": {"database_id": "demo", "database_type": "sqlite"}},
+    }
+
+    turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload, ensure_ascii=False))
+
+    assert turn.task_contract is not None
+    assert turn.task_contract.required_outputs[0].id == "total_count"
+
+
 def test_next_turn_repairs_invalid_first_model_output_once():
     valid_turn = {
         "thought": "Use the current state to assemble the answer.",

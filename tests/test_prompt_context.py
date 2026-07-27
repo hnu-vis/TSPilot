@@ -5,7 +5,8 @@ from core.database.schema import schema_preview
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
-from schemas.tool import ToolObservation
+from schemas.task_contract import TaskContract
+from schemas.tool import ReActTranscriptStep, ToolObservation
 from schemas.visualization import VisualizationPayload
 from app.settings import get_settings
 
@@ -72,6 +73,36 @@ def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():
     assert "semantic_repair_directive" not in context["state"]
 
 
+def test_prompt_context_exposes_task_contract_as_state():
+    settings = get_settings()
+    request = ChatRequest(
+        message="返回总数和最早 3 条。",
+        database_context={"database_id": "demo", "database_type": "influxdb"},
+    )
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    request_state.task_contract = TaskContract.model_validate(
+        {
+            "source": "llm",
+            "goal": "返回总数和最早 3 条",
+            "required_outputs": [
+                {"id": "total_count", "description": "总记录数"},
+                {"id": "earliest_rows", "description": "最早 3 条记录"},
+            ],
+            "constraints": {},
+            "assumptions": [],
+            "evidence_quality_notes": [],
+        }
+    )
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+    system_prompt = DataAgentPromptBuilder().build_system_prompt()
+
+    assert context["state"]["task_contract"]["required_outputs"][0]["id"] == "total_count"
+    assert "task_contract" in system_prompt
+    assert "required_outputs" in system_prompt
+
+
 def test_prompt_context_handles_diagnostics_without_data_preview():
     payload = {
         "summary": "analysis ok",
@@ -80,7 +111,7 @@ def test_prompt_context_handles_diagnostics_without_data_preview():
 
     summarized = DataAgentPromptBuilder()._summarize_observation_payload(payload)
 
-    assert summarized["diagnostics"]["runtime_ms"] == 12
+    assert "runtime_ms" not in summarized["diagnostics"]
     assert summarized["diagnostics"]["prompt_sampling"]["visible_counts"] == {}
 
 
@@ -280,6 +311,46 @@ def test_prompt_builder_exposes_sql_observation_details():
     assert payload["data_preview"]["rows"] == [{"avg_value": 12.3}, {"avg_value": 13.4}]
     assert payload["diagnostics"]["summary_stats"] == {"rows_count": 2}
     assert "irrelevant" not in payload["diagnostics"]
+
+
+def test_prompt_builder_prefers_structured_react_transcript():
+    settings = get_settings()
+    request = ChatRequest(message="算平均值")
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    request_state.react_transcript.append(
+        ReActTranscriptStep(
+            iteration=1,
+            question="算平均值",
+            thought="需要查询数据库。",
+            action_intention="查询均值",
+            action_reason="当前没有证据",
+            action="sql_query",
+            action_input={"query": "SELECT AVG(value) FROM metrics"},
+            observation=ToolObservation(
+                tool_name="sql_query",
+                success=True,
+                summary="Loaded 1 row.",
+                payload={
+                    "query": "SELECT AVG(value) FROM metrics",
+                    "query_language": "sql",
+                    "data": {"rows": [{"avg": 12.3}]},
+                },
+            ),
+        )
+    )
+
+    builder = DataAgentPromptBuilder()
+    prompt = builder.build_user_prompt(request_state, conversation_state)
+    context = builder.build_context(request_state, conversation_state)
+
+    assert "Question: 算平均值" in prompt
+    assert "Thought: 需要查询数据库。" in prompt
+    assert "Action Intention: 查询均值" in prompt
+    assert "Action Reason: 当前没有证据" in prompt
+    assert "Action: sql_query" in prompt
+    assert "Observation:" in prompt
+    assert context["recent_react_transcript"][0]["action"] == "sql_query"
 
 
 def test_prompt_builder_bounds_long_query_context():

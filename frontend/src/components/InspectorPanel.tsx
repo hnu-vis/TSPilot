@@ -1,4 +1,4 @@
-import { Activity, AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, LineChart, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { Activity, AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, LineChart, ListChecks, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
@@ -79,9 +79,11 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   const visibleMetrics = step.metrics.filter((metric) => metric.value !== '0' && metric.value !== '0/0');
   return (
     <>
-      {step.sqlDetail ? <QueryRunSummary step={step} /> : <StepStatusCard step={step} />}
+      {step.planDetail && <PlanPreview step={step} />}
 
-      {!step.sqlDetail && step.status !== 'error' && visibleMetrics.length > 0 && (
+      {step.sqlDetail ? <QueryRunSummary step={step} /> : !step.hasPrimaryDetail && <StepStatusCard step={step} />}
+
+      {!step.hasPrimaryDetail && step.status !== 'error' && visibleMetrics.length > 0 && (
         <section className="metric-grid" aria-label="Step metrics">
           {visibleMetrics.map((metric) => (
             <div key={metric.label} className="metric-tile">
@@ -108,7 +110,7 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
         <CompletionPreview detail={step.completionDetail} />
       )}
 
-      {!step.hasPrimaryDetail && <ReactStepCard step={step} />}
+      <ReactStepCard step={step} />
 
       {(step.artifactRefs.length > 0 || step.debugPayload) && (
         <AdvancedDetails step={step} />
@@ -120,7 +122,7 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   const detail = step.reactDetail;
   return (
-    <details className="inspector-card react-step-card collapsible-card">
+    <details className="inspector-card react-step-card collapsible-card" open>
       <summary className="collapsible-summary">
         <span>
           <ChevronDown size={15} className="collapsible-chevron" />
@@ -162,6 +164,62 @@ function StepStatusCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
       </div>
       <p className="step-summary">{step.summary}</p>
       <div className={`status-line ${step.status}`}>{statusLabel(step.status)}</div>
+    </section>
+  );
+}
+
+function PlanPreview({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  const detail = step.planDetail;
+  if (!detail) return null;
+  const requiredOutputs = recordsFrom(detail.taskContract?.required_outputs);
+  return (
+    <section className="inspector-card plan-preview-card">
+      <div className="inspector-card-title">
+        <ListChecks size={16} />
+        <h3>Todo list</h3>
+        <span className={`status-line compact ${detail.planningComplete ? 'complete' : step.status}`}>
+          {detail.completed}/{detail.total || detail.todos.length}
+        </span>
+      </div>
+
+      {detail.inProgress && <p className="step-summary">Current: {detail.inProgress}</p>}
+
+      {detail.todos.length > 0 && (
+        <ol className="inspector-todo-list">
+          {detail.todos.map((todo, index) => (
+            <li key={`${todo.priority ?? index}-${todo.content}`} className={`inspector-todo-item ${todo.status}`}>
+              <span className="inspector-todo-index">{todo.priority ?? index + 1}</span>
+              <span className="inspector-todo-copy">
+                <strong>{todo.content}</strong>
+                <small>
+                  {[formatLabel(todo.status), todo.taskType ? formatLabel(todo.taskType) : null]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </small>
+                {todo.acceptanceCriteria && <em>{todo.acceptanceCriteria}</em>}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {requiredOutputs.length > 0 && (
+        <div className="tool-result-section">
+          <div className="sample-table-caption">
+            <span>
+              <CheckCircle2 size={14} />
+              Required outputs
+            </span>
+          </div>
+          <div className="chip-list compact">
+            {requiredOutputs.slice(0, 12).map((output, index) => (
+              <span key={stringFrom(output.id) || stringFrom(output.description) || index}>
+                {stringFrom(output.description) || stringFrom(output.id) || `Output ${index + 1}`}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -768,6 +826,16 @@ function formatCell(value: unknown) {
   if (typeof value === 'number') return Number.isFinite(value) ? value.toLocaleString() : String(value);
   if (typeof value === 'string') return value;
   return JSON.stringify(value);
+}
+
+function stringFrom(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function recordsFrom(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+    : [];
 }
 
 function fencedQueryMarkdown(query: string, queryLanguage: string | null) {

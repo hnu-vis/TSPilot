@@ -6,6 +6,7 @@ from functools import lru_cache
 from agents.data_agent import DataAgent
 from langchain_openai import ChatOpenAI
 from prompts.data_agent import DataAgentPromptBuilder
+from runtime.plain_chat import PlainChatService
 from runtime.react_loop import ReActLoop
 from runtime.tool_executor import ToolExecutor
 from app.settings import get_settings
@@ -54,3 +55,7 @@ def get_react_loop() -> ReActLoop:
         tool_executor=get_tool_executor(),
         settings=get_settings(),
     )
+
+
+def get_plain_chat_service() -> PlainChatService:
+    return PlainChatService(llm=get_llm())

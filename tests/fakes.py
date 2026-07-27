@@ -698,6 +698,7 @@ def _compat_context(context: dict) -> dict:
         "plan_current_step": state.get("plan_current_step"),
         "planning_complete": state.get("planning_complete"),
         "requested_capabilities": state.get("requested_capabilities"),
+        "task_contract": state.get("task_contract"),
         "focus": state.get("focus"),
         "latest_database_evidence": evidence.get("latest"),
         "query_history": evidence.get("prior_queries") or [],

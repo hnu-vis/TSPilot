@@ -12,7 +12,8 @@ from schemas.database_context import DatabaseContext
 from schemas.insight import RejectedFact, VerifiedFact
 from schemas.output import FinalAnswer
 from schemas.timeseries import AnomalyResult, ForecastResult
-from schemas.tool import ToolCall, ToolObservation
+from schemas.task_contract import TaskContract
+from schemas.tool import ReActTranscriptStep, ToolCall, ToolObservation
 from schemas.visualization import VisualizationPayload
 
 
@@ -44,6 +45,7 @@ class RequestStateModel(BaseModel):
     context_status: Literal["ok", "summarized", "truncated", "overflowed"] = "ok"
     context_overflow_reason: str | None = None
     completion_state: dict = Field(default_factory=dict)
+    task_contract: TaskContract | None = None
 
     latest_database_evidence: DatabaseEvidence | None = None
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
@@ -63,6 +65,7 @@ class RequestStateModel(BaseModel):
 
     tool_history: list[ToolCall] = Field(default_factory=list)
     observations: list[ToolObservation] = Field(default_factory=list)
+    react_transcript: list[ReActTranscriptStep] = Field(default_factory=list)
     errors: list[dict] = Field(default_factory=list)
     prompt_context_summary: str | None = None
 
@@ -91,3 +94,5 @@ class ConversationStateModel(BaseModel):
     recent_visualizations: list[VisualizationPayload] = Field(default_factory=list)
     updated_at: str | None = None
     context_budget: dict | None = None
+    recent_react_transcript: list[ReActTranscriptStep] = Field(default_factory=list)
+    task_contract: TaskContract | None = None

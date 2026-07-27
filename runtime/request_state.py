@@ -24,7 +24,8 @@ from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
 from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
-from schemas.tool import ToolObservation
+from schemas.task_contract import TaskContract
+from schemas.tool import ReActTranscriptStep, ToolObservation
 
 if TYPE_CHECKING:
     from tools.registry import ToolSpec
@@ -90,6 +91,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         context_status="ok",
         context_overflow_reason=None,
         completion_state={},
+        task_contract=None,
         latest_database_evidence=None,
         database_evidence_artifacts={},
         latest_analysis_id=None,
@@ -106,6 +108,7 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         visualizations=[],
         tool_history=[],
         observations=[],
+        react_transcript=[],
         errors=[],
         prompt_context_summary=None,
     )
@@ -176,6 +179,8 @@ def build_conversation_state(request: ChatRequest, conversation_id: str) -> Conv
         recent_visualizations=[],
         updated_at=None,
         context_budget=None,
+        recent_react_transcript=[],
+        task_contract=None,
     )
 
 
@@ -310,6 +315,46 @@ def _project_rows(rows: list[dict], columns: list[str]) -> list[dict]:
 def append_trace(request_state: RequestStateModel, event_type: str, payload: dict) -> TraceEventModel:
     event = TraceEventModel(event_type=event_type, payload=payload)
     return event
+
+
+def apply_task_contract(request_state: RequestStateModel, raw_contract) -> TaskContract | None:
+    """Persist an LLM-authored task output contract when present."""
+
+    if raw_contract is None:
+        return None
+    contract = raw_contract if isinstance(raw_contract, TaskContract) else TaskContract.model_validate(raw_contract)
+    request_state.task_contract = contract
+    request_state.completion_state["task_contract"] = contract.model_dump(mode="json")
+    return contract
+
+
+def append_react_transcript_step(
+    request_state: RequestStateModel,
+    *,
+    iteration: int,
+    thought: str | None,
+    action: str,
+    action_input: dict | None,
+    observation: ToolObservation | None,
+    action_intention: str | None = None,
+    action_reason: str | None = None,
+    phase: str | None = None,
+) -> ReActTranscriptStep:
+    """Append a DB-GPT-style structured ReAct memory fragment."""
+
+    step = ReActTranscriptStep(
+        iteration=iteration,
+        question=request_state.message,
+        thought=thought,
+        phase=phase,
+        action_intention=action_intention,
+        action_reason=action_reason,
+        action=action,
+        action_input=action_input or {},
+        observation=observation,
+    )
+    request_state.react_transcript.append(step)
+    return step
 
 
 def build_final_response(request_state: RequestStateModel, trace_events: list[TraceEventModel]) -> ChatResponse:
@@ -521,6 +566,8 @@ def _is_large_value(value) -> bool:
 
 
 def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) -> None:
+    if isinstance(full_payload.get("task_contract"), dict):
+        apply_task_contract(request_state, full_payload["task_contract"])
     request_state.todo_list = [
         normalize_todo_for_completion(todo)
         for todo in list(full_payload.get("todos", []))

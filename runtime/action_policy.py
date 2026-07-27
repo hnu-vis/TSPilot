@@ -119,8 +119,24 @@ def _terminal_input_explains_unavailable_outputs(
 ) -> bool:
     gap = latest_gap_assessment(request_state)
     if not gap or not isinstance(action_input, dict):
-        return False
-    blocking_items = _gap_blocking_items(gap)
+        latest_goal = request_state.completion_state.get("latest_goal")
+        if not isinstance(latest_goal, dict) or not isinstance(action_input, dict):
+            return False
+        blocking_items = [
+            str(item).strip()
+            for item in latest_goal.get("missing_evidence", [])
+            if str(item).strip()
+        ]
+    else:
+        blocking_items = _gap_blocking_items(gap)
+        if not blocking_items:
+            latest_goal = request_state.completion_state.get("latest_goal")
+            if isinstance(latest_goal, dict):
+                blocking_items = [
+                    str(item).strip()
+                    for item in latest_goal.get("missing_evidence", [])
+                    if str(item).strip()
+                ]
     if not blocking_items:
         return False
     unavailable_outputs = action_input.get("unavailable_outputs")

@@ -23,6 +23,7 @@ class TodoWriteInput(BaseModel):
     current_intent: str | None = None
     requested_capabilities: list[str] = Field(default_factory=list)
     focus: str | None = None
+    task_contract: dict | None = None
     todos: list[dict] = Field(default_factory=list)
     evidence_summary: dict | str | None = None
 
@@ -46,6 +47,7 @@ class TodoWriteInput(BaseModel):
 
 class TodoWriteResult(BaseModel):
     summary: str
+    task_contract: dict | None = None
     todos: list[dict] = Field(default_factory=list)
     in_progress: dict | None = None
     current_step: int = 0
@@ -79,6 +81,7 @@ class TodoWriteTool(BaseTool):
         summary = self._build_summary(todos, completed_count, pending_count)
         return TodoWriteResult(
             summary=summary,
+            task_contract=validated_input.task_contract,
             todos=[todo.model_dump(mode="json") for todo in todos],
             in_progress=in_progress,
             current_step=current_step,

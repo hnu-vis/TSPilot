@@ -172,6 +172,9 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: agent_step" in body
     assert "event: tool_call" in body
     assert "event: tool_result" in body
+    assert "event: step.start" in body
+    assert "event: step.meta" in body
+    assert "event: step.done" in body
     assert "event: final_answer" in body
     assert "event: terminate" in body
     assert "event: thought" in body
@@ -223,6 +226,12 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
         assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 3
         assert log_payload["summary"]["used_tools"] == ["sql_query", "code_interpreter"]
         assert log_payload["state"]["tool_history"]
+        assert log_payload["state"]["react_transcript"]
+        first_step = log_payload["state"]["react_transcript"][0]
+        assert first_step["thought"]
+        assert first_step["action"]
+        assert first_step["action_input"] is not None
+        assert first_step["observation"]["tool_name"] == first_step["action"]
 
         index_entry = json.loads(index_path.read_text(encoding="utf-8").strip().splitlines()[-1])
         assert index_entry["request_id"] == payload["request_id"]
@@ -269,6 +278,9 @@ def test_chat_sse_path_persists_internal_and_public_trace_logs(tmp_path):
         assert "thought" in [event["event_type"] for event in log_payload["trace"]["internal"]]
         public_event_types = [event["event_type"] for event in log_payload["trace"]["public"]]
         assert "thought" in public_event_types
+        assert "step.start" in public_event_types
+        assert "step.meta" in public_event_types
+        assert "step.done" in public_event_types
         assert "tool_call" in public_event_types
         assert "tool_result" in public_event_types
         assert "final_answer" in public_event_types
@@ -465,10 +477,12 @@ def test_chat_json_path_can_answer_without_database_context():
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == []
+    assert payload["trace"] == []
     assert "TSPilot" in payload["answer"]["summary"]
     assert payload["answer"]["title"] is None
     assert payload["answer"]["sections"] == []
     assert payload["answer"]["references"] == []
+    assert payload["token_usage"]["totals"]["call_count"] == 1
 
 
 def test_chat_sse_path_can_answer_without_database_context():
@@ -482,7 +496,10 @@ def test_chat_sse_path_can_answer_without_database_context():
 
     assert response.status_code == 200
     assert "event: final_answer" in body
-    assert '"tool": "terminate"' in body
+    assert "event: tool_call" not in body
+    assert "event: tool_result" not in body
+    assert "event: step.start" not in body
+    assert '"tool": "terminate"' not in body
     assert "TSPilot" in body
 
 

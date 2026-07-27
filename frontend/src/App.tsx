@@ -169,6 +169,85 @@ export default function App() {
   };
 
   const handleStreamEvent = (conversationId: string, event: StreamEvent) => {
+    if (event.event === 'step.start') {
+      const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
+      const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
+      const title = stringFrom(event.data.title, 'task');
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'data_agent',
+        phase: 'tool_call',
+        status: 'running',
+        summary: stringFrom(event.data.detail, title),
+        tool: title,
+        updatedAt: now(),
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
+    if (event.event === 'step.chunk') {
+      if (event.data.output_type !== 'thought') return;
+      const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
+      const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
+      const content = stringFrom(event.data.content, '');
+      if (!content) return;
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'data_agent',
+        phase: 'reasoning',
+        status: 'running',
+        summary: content,
+        thought: content,
+        updatedAt: now(),
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
+    if (event.event === 'step.meta') {
+      const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
+      const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
+      const action = stringFrom(event.data.action, '');
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'data_agent',
+        phase: 'tool_call',
+        status: 'running',
+        summary: action || 'Processing step.',
+        tool: action || undefined,
+        thought: stringFrom(event.data.thought, ''),
+        actionInput: asRecord(event.data.action_input) || undefined,
+        toolCall: event.data,
+        updatedAt: now(),
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
+    if (event.event === 'step.done') {
+      const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
+      const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
+      const success = stringFrom(event.data.status, 'done') !== 'failed';
+      const observation = asRecord(event.data.observation);
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'data_agent',
+        phase: 'tool_result',
+        status: success ? 'complete' : 'error',
+        summary: observation ? stringFrom(observation.summary, success ? 'Step completed.' : 'Step failed.') : success ? 'Step completed.' : 'Step failed.',
+        tool: observation ? stringFrom(observation.tool_name, '') : undefined,
+        observation: observation || undefined,
+        updatedAt: now(),
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
     if (event.event === 'thought') {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;

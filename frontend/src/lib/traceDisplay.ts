@@ -53,6 +53,24 @@ export type CompletionDetail = {
   } | null;
 };
 
+export type PlanTodo = {
+  content: string;
+  taskType: string | null;
+  status: string;
+  priority: number | null;
+  acceptanceCriteria: string | null;
+};
+
+export type PlanDetail = {
+  todos: PlanTodo[];
+  total: number;
+  completed: number;
+  inProgress: string | null;
+  currentStep: number | null;
+  planningComplete: boolean | null;
+  taskContract: Record<string, unknown> | null;
+};
+
 export type CodeInterpreterDetail = {
   analysisGoal: string | null;
   code: string | null;
@@ -100,6 +118,7 @@ export type DisplayStep = {
   summary: string;
   metrics: DisplayMetric[];
   artifactRefs: string[];
+  planDetail: PlanDetail | null;
   sqlDetail: SqlDetail | null;
   codeInterpreterDetail: CodeInterpreterDetail | null;
   forecastDetail: ForecastDetail | null;
@@ -132,12 +151,14 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const completionDetail = completionDetailFor(preview);
   const status = statusForStep(step, completionDetail);
   const reactDetail = reactDetailFor(step, call, result);
+  const planDetail = planDetailFor(tool, preview);
   const sqlDetail = sqlDetailFor(tool, preview);
   const codeInterpreterDetail = codeInterpreterDetailFor(tool, preview, call, step);
   const forecastDetail = forecastDetailFor(tool, preview);
   const anomalyDetail = anomalyDetailFor(tool, preview);
   const schemaLinkingDetail = schemaLinkingDetailFor(tool, preview);
   const hasPrimaryDetail = Boolean(
+    planDetail ||
     sqlDetail ||
     codeInterpreterDetail ||
     forecastDetail ||
@@ -154,6 +175,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     summary: summaryForStep(step, preview),
     metrics,
     artifactRefs,
+    planDetail,
     sqlDetail,
     codeInterpreterDetail,
     forecastDetail,
@@ -176,6 +198,39 @@ function reactDetailFor(
     action: step.tool || stringFrom(call?.tool) || null,
     actionInput: asRecord(step.actionInput) || asRecord(call?.action_input) || asRecord(call?.input_preview),
     observation: asRecord(step.observation) || asRecord(result?.observation) || result,
+  };
+}
+
+function planDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): PlanDetail | null {
+  if (tool !== 'todowrite' && tool !== 'todo' && tool !== 'planner') return null;
+  if (!preview) return null;
+  const todos = recordsFrom(preview.todos)
+    .map((todo) => ({
+      content: stringFrom(todo.content) || '',
+      taskType: stringFrom(todo.task_type),
+      status: stringFrom(todo.status) || 'pending',
+      priority: numberFrom(todo.priority),
+      acceptanceCriteria: stringFrom(todo.acceptance_criteria),
+    }))
+    .filter((todo) => todo.content);
+  const progress = asRecord(preview.todo_progress);
+  const total = numberFrom(preview.todo_total) ?? numberFrom(progress?.total) ?? todos.length;
+  const completed = numberFrom(preview.completed_count)
+    ?? numberFrom(progress?.completed)
+    ?? todos.filter((todo) => todo.status === 'completed').length;
+  const inProgress = stringFrom(preview.in_progress) || stringFrom(progress?.in_progress);
+  const currentStep = numberFrom(preview.current_step);
+  const planningComplete = typeof preview.planning_complete === 'boolean' ? preview.planning_complete : null;
+  const taskContract = asRecord(preview.task_contract);
+  if (todos.length === 0 && !taskContract && total === 0) return null;
+  return {
+    todos,
+    total,
+    completed,
+    inProgress,
+    currentStep,
+    planningComplete,
+    taskContract,
   };
 }
 

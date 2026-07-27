@@ -31,3 +31,5 @@ def sync_from_request(
     conversation_state.recent_visualizations = request_state.visualizations[-6:]
     conversation_state.updated_at = datetime.now(timezone.utc).isoformat()
     conversation_state.context_budget = request_state.context_budget
+    conversation_state.recent_react_transcript = request_state.react_transcript[-12:]
+    conversation_state.task_contract = request_state.task_contract

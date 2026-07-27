@@ -11,6 +11,7 @@ from schemas.database import DatabaseEvidence
 from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
+from schemas.task_contract import TaskContract
 from schemas.tool import ToolCall, ToolObservation
 from tools.todowrite import TodoWriteInput, TodoWriteTool
 
@@ -152,6 +153,101 @@ def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():
         "end_value",
         "change_pct",
     ]
+
+
+def test_terminate_blocked_when_task_contract_outputs_not_covered():
+    request_state = RequestStateModel(
+        request_id="req-contract-missing",
+        message="返回总数和最早 3 条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "返回总数和最早 3 条",
+                "required_outputs": [
+                    {"id": "total_count", "description": "总记录数"},
+                    {"id": "earliest_rows", "description": "最早 3 条记录"},
+                ],
+            }
+        ),
+        latest_database_evidence={
+            "evidence_id": "evi_demo",
+            "result_type": "table",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...) |> count()",
+            "summary": "Loaded count.",
+            "data": {"rows": [{"count": 10}]},
+            "columns": ["count"],
+            "metadata": {},
+            "diagnostics": {},
+        },
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["total_count"],
+                "missing": ["earliest_rows"],
+                "can_answer": False,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "总数为 10。"})
+
+    assert allowed is False
+    assert "Task contract required outputs" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["earliest_rows"]
+
+
+def test_terminate_allows_explicit_unavailable_task_contract_outputs():
+    request_state = RequestStateModel(
+        request_id="req-contract-unavailable",
+        message="返回总数和最早 3 条。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "返回总数和最早 3 条",
+                "required_outputs": [
+                    {"id": "total_count", "description": "总记录数"},
+                    {"id": "earliest_rows", "description": "最早 3 条记录"},
+                ],
+            }
+        ),
+        latest_database_evidence={
+            "evidence_id": "evi_demo",
+            "result_type": "table",
+            "database": "demo",
+            "query_language": "flux",
+            "query": "from(...) |> count()",
+            "summary": "Loaded count.",
+            "data": {"rows": [{"count": 10}]},
+            "columns": ["count"],
+            "metadata": {},
+            "diagnostics": {},
+        },
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["total_count"],
+                "missing": ["earliest_rows"],
+                "can_answer": False,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(
+        request_state,
+        "terminate",
+        {
+            "direct_answer": "总数为 10，但无法取得最早 3 条。",
+            "unavailable_outputs": ["earliest_rows"],
+            "unavailable_reason": "当前数据源只返回聚合结果，原始行不可用。",
+        },
+    )
+
+    assert allowed is True
+    assert reason is None
 
 
 def test_terminate_allowed_when_latest_gap_assessment_can_answer():
@@ -1212,6 +1308,115 @@ def test_runtime_completes_answer_todo_after_terminal_payload():
     assert request_state.planning_complete is True
     assert request_state.completion_state["latest_step"]["completed"] is True
     assert request_state.completion_state["latest_step"]["tool_name"] == "terminate"
+
+
+def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
+    request_state = RequestStateModel(
+        request_id="req-policy-global-reconcile",
+        message="查询历史价格并预测。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询历史价格", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "生成预测", "task_type": "forecast", "status": "pending", "priority": 2},
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 3},
+        ],
+        plan_current_step=1,
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "查询历史价格并预测",
+                "required_outputs": [
+                    {"id": "historical_price_series", "description": "历史价格序列"},
+                    {"id": "forecast_24h", "description": "24小时预测"},
+                ],
+                "constraints": {},
+                "assumptions": [],
+                "evidence_quality_notes": [],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_price",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded prices.",
+            data={"points": [{"timestamp": "t1", "value": 1.0}]},
+        ),
+    )
+    request_state.observations.append(
+        ToolObservation(
+            tool_name="code_interpreter",
+            success=True,
+            summary="Forecast explanation ready.",
+            payload={"analysis_id": "ana_forecast", "input_evidence_id": "evi_price"},
+        )
+    )
+
+    result = apply_previous_observation_assessment(
+        request_state,
+        PreviousObservationAssessment(
+            completed_active_todo=True,
+            reason="历史序列和预测输出均已由现有证据覆盖。",
+            evidence_refs=["evidence:evi_price"],
+            covered=["historical_price_series", "forecast_24h"],
+            missing=[],
+            completed_todos=[1, 2],
+            next_active_todo=3,
+            can_answer=True,
+        ),
+    )
+
+    assert result.completed is True
+    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "completed", "in_progress"]
+    assert request_state.todo_list[2]["task_type"] == "answer"
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "已完成。"})
+    assert allowed is True
+    assert reason is None
+
+
+def test_runtime_rejects_global_reconcile_with_unknown_evidence_ref():
+    request_state = RequestStateModel(
+        request_id="req-policy-global-reconcile-bad-ref",
+        message="查询历史价格并预测。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询历史价格", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "查询历史价格",
+                "required_outputs": [
+                    {"id": "historical_price_series", "description": "历史价格序列"},
+                ],
+                "constraints": {},
+                "assumptions": [],
+                "evidence_quality_notes": [],
+            }
+        ),
+    )
+    request_state.observations.append(
+        ToolObservation(tool_name="sql_query", success=True, summary="Loaded prices.", payload={})
+    )
+
+    result = apply_previous_observation_assessment(
+        request_state,
+        PreviousObservationAssessment(
+            completed_active_todo=True,
+            reason="历史序列已覆盖。",
+            evidence_refs=["evidence:missing"],
+            covered=["historical_price_series"],
+            missing=[],
+            next_active_todo=2,
+            can_answer=True,
+        ),
+    )
+
+    assert result.completed is False
+    assert "evidence:missing" in result.missing_evidence
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
 
 
 def test_runtime_does_not_complete_non_answer_todo_after_terminal_payload():

@@ -47,6 +47,7 @@ class DataAgent(BaseAgent):
                         "Return exactly one JSON object and nothing else. "
                         "The JSON object must use this schema: "
                         "{\"thought\": str, \"previous_observation_assessment\": object|null, "
+                        "\"task_contract\": object|null, "
                         "\"action_intention\": str|null, \"action_reason\": str|null, "
                         "\"action\": str, \"action_input\": object}. "
                         "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
@@ -145,6 +146,7 @@ class DataAgent(BaseAgent):
         thought = str(decoded.get("thought", "")).strip()
         return ReActTurn(
             thought=thought,
+            task_contract=decoded.get("task_contract") or action_input.get("task_contract"),
             previous_observation_assessment=decoded.get("previous_observation_assessment"),
             action_intention=self._optional_string(decoded.get("action_intention") or decoded.get("intention")),
             action_reason=self._optional_string(decoded.get("action_reason") or decoded.get("reason")),

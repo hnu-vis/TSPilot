@@ -71,6 +71,15 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
             next_action_hint=_next_action_for_missing_required(missing_required),
         )
     gap = latest_gap_assessment(request_state)
+    contract_missing = _missing_contract_outputs(request_state, gap)
+    if contract_missing:
+        return GoalCompletionEvaluation(
+            can_answer=False,
+            reason="Task contract required outputs are not fully covered by the latest ReAct gap assessment.",
+            missing_evidence=contract_missing,
+            answerable_from=refs,
+            next_action_hint="Choose the smallest next action that covers the missing task_contract output.",
+        )
     if gap is not None:
         gap_missing = _gap_blocking_items(gap)
         can_answer = gap.get("can_answer")
@@ -113,6 +122,49 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
     return missing
 
 
+def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None) -> list[str]:
+    contract = request_state.task_contract
+    if contract is None:
+        return []
+    required = [
+        output
+        for output in contract.required_outputs
+        if output.required
+    ]
+    if not required:
+        return []
+    if gap is None:
+        return [output.id for output in required]
+    if gap.get("can_answer") is not True:
+        gap_missing = set(_gap_blocking_items(gap))
+        if gap_missing:
+            return [
+                output.id
+                for output in required
+                if output.id in gap_missing or output.description in gap_missing
+            ] or sorted(gap_missing)
+        return [output.id for output in required]
+    covered = {
+        str(item).strip()
+        for item in gap.get("covered", [])
+        if str(item).strip()
+    }
+    missing = {
+        str(item).strip()
+        for item in gap.get("missing", [])
+        if str(item).strip()
+    }
+    missing_required = []
+    for output in required:
+        keys = {output.id, output.description}
+        if keys & missing:
+            missing_required.append(output.id)
+            continue
+        if not keys & covered:
+            missing_required.append(output.id)
+    return missing_required
+
+
 def _next_action_for_missing_required(missing: list[str]) -> str:
     if "forecast" in missing:
         return "Call forecast with the latest time-series evidence before answering."
@@ -143,6 +195,16 @@ def apply_previous_observation_assessment(
         return CompletionEvaluation(False, "Active todo could not be located.", next_action_hint=None)
 
     previous_observation = request_state.observations[-1] if request_state.observations else None
+    reconciled = _reconcile_todos_from_global_assessment(
+        request_state,
+        assessment,
+        current_index=current_index,
+        current=current,
+        previous_observation=previous_observation,
+    )
+    if reconciled is not None:
+        return reconciled
+
     if not assessment.completed_active_todo:
         evaluation = CompletionEvaluation(
             False,
@@ -201,6 +263,8 @@ def gap_assessment_payload(assessment: PreviousObservationAssessment) -> dict:
         "evidence_refs": list(assessment.evidence_refs),
         "covered": list(assessment.covered),
         "missing": list(assessment.missing),
+        "completed_todos": list(assessment.completed_todos),
+        "next_active_todo": assessment.next_active_todo,
         "next_action_reason": assessment.next_action_reason,
         "can_answer": assessment.can_answer,
     }
@@ -302,6 +366,154 @@ def _hard_gate_previous_assessment(
         assessment.reason or "LLM assessment marked the active todo complete based on the previous observation.",
         evidence_refs=refs,
     )
+
+
+def _reconcile_todos_from_global_assessment(
+    request_state: RequestStateModel,
+    assessment: PreviousObservationAssessment,
+    *,
+    current_index: int,
+    current: dict,
+    previous_observation: ToolObservation | None,
+) -> CompletionEvaluation | None:
+    if str(current.get("task_type") or "").strip().lower() == "answer":
+        return None
+    gap = gap_assessment_payload(assessment)
+    if assessment.can_answer is not True:
+        return None
+    if _gap_blocking_items(gap):
+        return None
+    if _missing_contract_outputs(request_state, gap):
+        return None
+
+    refs = assessment.evidence_refs or _all_answer_refs(request_state)
+    invalid_refs = _invalid_evidence_refs(request_state, refs)
+    if invalid_refs:
+        evaluation = CompletionEvaluation(
+            False,
+            "LLM progress assessment referenced evidence that does not exist.",
+            missing_evidence=invalid_refs,
+            evidence_refs=refs,
+            next_action_hint="Use only real evidence, analysis, forecast, anomaly, rag, or skill refs from the current context.",
+        )
+        request_state.completion_state["latest_step"] = _assessment_state(
+            evaluation,
+            tool_name=previous_observation.tool_name if previous_observation else None,
+            todo_index=current_index,
+            todo=current,
+            accepted=False,
+        )
+        return evaluation
+
+    completed_any = False
+    for index, todo in enumerate(request_state.todo_list):
+        if todo.get("status") == "completed":
+            continue
+        task_type = str(todo.get("task_type") or "").strip().lower()
+        if task_type == "answer":
+            continue
+        completed_todo = normalize_todo_for_completion(dict(todo))
+        completed_todo["status"] = "completed"
+        completed_todo["result_ref"] = refs[0] if refs else completed_todo.get("result_ref")
+        completed_todo["completion_reason"] = assessment.reason or "LLM progress assessment says task contract evidence is covered."
+        request_state.todo_list[index] = completed_todo
+        completed_any = True
+
+    next_index = _requested_next_active_todo_index(request_state, assessment)
+    if next_index is None:
+        next_index = next(
+            (
+                index for index, todo in enumerate(request_state.todo_list)
+                if todo.get("status") != "completed"
+                and str(todo.get("task_type") or "").strip().lower() == "answer"
+            ),
+            None,
+        )
+    if next_index is None:
+        next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
+
+    if next_index is not None:
+        for index, todo in enumerate(request_state.todo_list):
+            if todo.get("status") == "in_progress":
+                updated = dict(todo)
+                updated["status"] = "pending"
+                request_state.todo_list[index] = updated
+        next_todo = dict(request_state.todo_list[next_index])
+        if next_todo.get("status") != "completed":
+            next_todo["status"] = "in_progress"
+            request_state.todo_list[next_index] = next_todo
+            request_state.plan_current_step = next_index + 1
+            request_state.planning_complete = False
+    else:
+        request_state.plan_current_step = len(request_state.todo_list)
+        request_state.planning_complete = True
+
+    evaluation = CompletionEvaluation(
+        bool(completed_any),
+        assessment.reason or "LLM progress assessment reconciled todo progress with covered task contract outputs.",
+        evidence_refs=refs,
+        next_action_hint=assessment.next_action_reason,
+    )
+    request_state.completion_state["latest_step"] = _assessment_state(
+        evaluation,
+        tool_name=previous_observation.tool_name if previous_observation else None,
+        todo_index=current_index,
+        todo=current,
+        accepted=evaluation.completed,
+    )
+    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+    return evaluation
+
+
+def _requested_next_active_todo_index(
+    request_state: RequestStateModel,
+    assessment: PreviousObservationAssessment,
+) -> int | None:
+    target = assessment.next_active_todo
+    if target is None:
+        return None
+    if isinstance(target, int):
+        return next(
+            (
+                index for index, todo in enumerate(request_state.todo_list)
+                if todo.get("priority") == target or index + 1 == target
+            ),
+            None,
+        )
+    normalized_target = str(target).strip().lower()
+    if not normalized_target:
+        return None
+    return next(
+        (
+            index for index, todo in enumerate(request_state.todo_list)
+            if str(todo.get("content") or "").strip().lower() == normalized_target
+            or str(todo.get("task_type") or "").strip().lower() == normalized_target
+        ),
+        None,
+    )
+
+
+def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) -> list[str]:
+    if not refs:
+        return ["evidence_refs"]
+    valid_refs = set(_all_answer_refs(request_state))
+    if request_state.latest_database_evidence is not None:
+        valid_refs.add(request_state.latest_database_evidence.evidence_id)
+    valid_refs.update(request_state.analysis_artifacts.keys())
+    valid_refs.update(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
+    if request_state.latest_forecast is not None:
+        valid_refs.add(request_state.latest_forecast.forecast_id)
+    if request_state.latest_anomaly is not None:
+        valid_refs.add(request_state.latest_anomaly.anomaly_id)
+    for observation in request_state.observations:
+        if observation.payload_ref:
+            valid_refs.add(observation.payload_ref)
+        payload = observation.payload if isinstance(observation.payload, dict) else {}
+        valid_refs.update(evidence_refs_for_payload(payload))
+    return [
+        ref for ref in refs
+        if str(ref).strip() and str(ref).strip() not in valid_refs
+    ]
 
 
 def _assessment_state(
