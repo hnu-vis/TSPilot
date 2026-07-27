@@ -28,15 +28,16 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
     request_state = _request_state()
     tool_spec = SimpleNamespace(result_target="analysis")
 
-    insight_payload = {
-        "insight_id": "ins_demo",
-        "requested_fact_types": ["seasonality"],
-        "supported_fact_types": ["seasonality"],
-        "fact_candidates": [{"fact_id": "f1", "fact_type": "seasonality", "statement": "candidate"}] * 10,
-        "completed_facts": [{"fact_id": "f1", "fact_type": "seasonality", "statement": "candidate", "focus": "btc"}] * 10,
-        "verified_facts": [{"fact_id": "f1", "fact_type": "seasonality", "statement": "no seasonality", "confidence": 0.4, "evidence": {}, "verification_rule": "rule"}] * 10,
-        "rejected_facts": [],
-        "summary_blocks": [{"text": "summary"}] * 10,
+    analysis_payload = {
+        "analysis_id": "ana_demo",
+        "analysis_goal": "seasonality",
+        "code_type": "python_rows_v1",
+        "code_hash": "sha256:demo",
+        "input_evidence_id": "evi_demo",
+        "input_row_count": 20,
+        "status": "succeeded",
+        "summary": "analysis summary",
+        "result": {"summary": "analysis summary", "metrics": {"row_count": 20}, "details": {}},
         "visualizations": [
             {
                 "visualization_id": "viz1",
@@ -55,22 +56,20 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
     }
     apply_observation(
         request_state,
-        ToolObservation(tool_name="insight", success=True, summary="ok", payload={}, error=None),
-        insight_payload,
+        ToolObservation(tool_name="code_interpreter", success=True, summary="ok", payload={}, error=None),
+        analysis_payload,
         tool_spec,
     )
 
-    assert "ins_demo" in request_state.insight_artifacts
-    snapshot_ref = request_state.latest_insight.diagnostics["snapshot_ref"]
-    assert Path(snapshot_ref["uri"]).exists()
-    assert request_state.latest_insight.visualizations[0].chart["x_axis_count"] == 20
-    enriched_insight = enrich_observation_payload(
+    enriched_analysis = enrich_observation_payload(
         request_state,
-        ToolObservation(tool_name="insight", success=True, summary="ok", payload={}, error=None),
-        insight_payload,
+        ToolObservation(tool_name="code_interpreter", success=True, summary="ok", payload={}, error=None),
+        analysis_payload,
         tool_spec,
     )
-    assert enriched_insight.payload["diagnostics"]["snapshot_ref"]["uri"] == snapshot_ref["uri"]
+    snapshot_ref = enriched_analysis.payload["diagnostics"]["snapshot_ref"]
+    assert "ana_demo" in request_state.analysis_artifacts
+    assert Path(snapshot_ref["uri"]).exists()
 
     anomaly_payload = {
         "anomaly_id": "an_demo",

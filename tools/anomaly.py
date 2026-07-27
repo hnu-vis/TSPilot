@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from core.timeseries.anomaly_adapter import detect_zscore_anomalies
+from core.timeseries.anomaly_registry import default_anomaly_detector_name, get_anomaly_detector
+from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
 from schemas.timeseries import AnomalyResult
@@ -13,6 +14,7 @@ from tools.base import BaseTool
 
 class AnomalyInput(BaseModel):
     database_evidence: DatabaseEvidence | dict | str | None = None
+    detector_name: str | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
 
@@ -22,17 +24,20 @@ class AnomalyTool(BaseTool):
         request_state = kwargs.get("request_state")
         database_evidence = validated_input.database_evidence
         if request_state is not None:
-            database_evidence = _resolve_database_evidence(database_evidence, request_state)
+            database_evidence = resolve_database_evidence(database_evidence, request_state, tool_label="Anomaly")
         if database_evidence is None:
             raise ValueError("Anomaly detection requires database_evidence or a latest_database_evidence in request state.")
-        preferred_series = validated_input.series_name or validated_input.constraints.get("series_name")
+        constraints = validated_input.constraints or {}
+        preferred_series = validated_input.series_name or constraints.get("series_name")
         series = normalize_timeseries_evidence(
             database_evidence,
             series_name=preferred_series,
             value_field=preferred_series,
         )
-        threshold = float(validated_input.constraints.get("zscore_threshold", 2.5))
-        anomaly_points, scores = detect_zscore_anomalies(series, threshold=threshold)
+        detector_name = validated_input.detector_name or constraints.get("detector_name") or default_anomaly_detector_name()
+        detector = get_anomaly_detector(detector_name)
+        detector_output = detector.detect(series, params=constraints)
+        anomaly_points = detector_output.anomaly_points
         visualization = VisualizationPayload(
             visualization_id=f"viz_anomaly_{database_evidence.evidence_id}",
             visualization_type="chart",
@@ -48,41 +53,21 @@ class AnomalyTool(BaseTool):
             },
             annotations=anomaly_points,
             binding_evidence_ids=[database_evidence.evidence_id],
-            requested_fact_types=["anomaly"],
+            requested_capabilities=["anomaly"],
             time_column=series.time_field,
             primary_measure=series.value_field,
             display_priority=2,
         )
         return AnomalyResult(
             anomaly_id=f"anomaly_{database_evidence.evidence_id}",
-            detector_name="zscore",
+            detector_name=detector.name,
             anomaly_points=anomaly_points,
-            anomaly_spans=[],
-            scores=scores,
-            diagnostics={"threshold": threshold},
+            anomaly_spans=detector_output.anomaly_spans,
+            scores=detector_output.scores,
+            diagnostics={
+                **detector_output.diagnostics,
+                "series_name": series.series_name,
+                "detector_registry_name": detector.name,
+            },
             visualizations=[visualization],
         ).model_dump(mode="json")
-
-
-def _resolve_database_evidence(database_evidence, request_state):
-    if database_evidence is None:
-        latest = request_state.latest_database_evidence
-        if latest is None:
-            return None
-        return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
-    if isinstance(database_evidence, str):
-        evidence_ref = database_evidence.strip()
-        if evidence_ref in {"latest", "latest_database_evidence", "current"}:
-            return _resolve_database_evidence(None, request_state)
-        if evidence_ref.startswith("evidence:"):
-            evidence_ref = evidence_ref.split(":", 1)[1]
-        resolved = request_state.database_evidence_artifacts.get(evidence_ref)
-        if resolved is None:
-            raise ValueError(f"Anomaly could not resolve database_evidence reference: {database_evidence}")
-        return resolved
-    if isinstance(database_evidence, dict):
-        evidence_id = database_evidence.get("evidence_id")
-        if evidence_id:
-            return request_state.database_evidence_artifacts.get(evidence_id) or DatabaseEvidence.model_validate(database_evidence)
-        return DatabaseEvidence.model_validate(database_evidence)
-    return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)

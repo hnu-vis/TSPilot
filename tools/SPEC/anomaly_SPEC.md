@@ -28,13 +28,14 @@ Run anomaly detection on normalized time-series evidence.
 
 1. validate that evidence is time-series shaped
 2. normalize timestamps and values
-3. choose anomaly detector
+3. choose a registered anomaly detector, which may be local or API-backed
 4. run anomaly detection
 5. package anomaly points, spans, and scores
 
 ## Contract notes
 
 - fail fast when input evidence is not `timeseries`
+- anomaly detector implementations must be selected through the registry
 - do not infer unrelated facts
 
 ## Must not do
