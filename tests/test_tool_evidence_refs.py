@@ -138,6 +138,146 @@ async def test_forecast_and_anomaly_tools_use_registered_models_from_input():
 
 
 @pytest.mark.asyncio
+async def test_anomaly_defaults_to_prior_raw_evidence_when_latest_is_outlier_filtered():
+    raw = _evidence()
+    cleaned = raw.model_copy(
+        update={
+            "evidence_id": "evi_cleaned",
+            "query": "unit:test |> filter outliers",
+            "summary": "cleaned evidence after excluding outliers",
+            "data": {
+                **raw.data,
+                "points": raw.data["points"][1:],
+            },
+            "metadata": {"purpose": "过滤异常点后的清洗序列"},
+        }
+    )
+    request_state = RequestStateModel(
+        request_id="req_anomaly_raw_policy",
+        message="检测异常并预测。",
+        status="running",
+        latest_database_evidence=cleaned,
+        database_evidence_artifacts={
+            raw.evidence_id: raw,
+            cleaned.evidence_id: cleaned,
+        },
+    )
+
+    class CountDetector:
+        name = "count_detector"
+
+        def detect(self, series, *, params: dict):
+            return AnomalyDetectorOutput(
+                anomaly_points=[],
+                scores=[],
+                diagnostics={"input_point_count": len(series.points)},
+            )
+
+    register_anomaly_detector(CountDetector())
+
+    result = await AnomalyTool().execute(
+        AnomalyInput(database_evidence="latest", detector_name="count_detector"),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["selected_evidence_id"] == "evi_cleaned"
+    assert result["diagnostics"]["resolved_evidence_id"] == "evi_ref"
+    assert result["diagnostics"]["input_point_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_anomaly_can_use_selected_cleaned_evidence_when_requested():
+    raw = _evidence()
+    cleaned = raw.model_copy(
+        update={
+            "evidence_id": "evi_cleaned",
+            "query": "unit:test |> filter outliers",
+            "summary": "cleaned evidence after excluding outliers",
+            "data": {
+                **raw.data,
+                "points": raw.data["points"][1:],
+            },
+            "metadata": {"purpose": "过滤异常点后的清洗序列"},
+        }
+    )
+    request_state = RequestStateModel(
+        request_id="req_anomaly_selected_policy",
+        message="在清洗序列上检测异常。",
+        status="running",
+        latest_database_evidence=cleaned,
+        database_evidence_artifacts={
+            raw.evidence_id: raw,
+            cleaned.evidence_id: cleaned,
+        },
+    )
+
+    class SelectedCountDetector:
+        name = "selected_count_detector"
+
+        def detect(self, series, *, params: dict):
+            return AnomalyDetectorOutput(
+                anomaly_points=[],
+                scores=[],
+                diagnostics={"input_point_count": len(series.points)},
+            )
+
+    register_anomaly_detector(SelectedCountDetector())
+
+    result = await AnomalyTool().execute(
+        AnomalyInput(
+            database_evidence="latest",
+            detector_name="selected_count_detector",
+            constraints={"input_policy": "selected"},
+        ),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["selected_evidence_id"] == "evi_cleaned"
+    assert result["diagnostics"]["resolved_evidence_id"] == "evi_cleaned"
+    assert result["diagnostics"]["input_point_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_anomaly_keeps_raw_flux_evidence_for_anomaly_detection_purpose():
+    evidence = _evidence().model_copy(
+        update={
+            "query_language": "flux",
+            "query": 'from(bucket: "bitcoin") |> filter(fn: (r) => r._field == "price")',
+            "summary": "Loaded 2679 raw rows across 1 series",
+            "metadata": {"purpose": "原始历史价格时序证据，用于后续异常检测。"},
+        }
+    )
+    request_state = RequestStateModel(
+        request_id="req_anomaly_flux_raw_policy",
+        message="查询原始价格并检测异常点。",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+
+    class FluxRawDetector:
+        name = "flux_raw_detector"
+
+        def detect(self, series, *, params: dict):
+            return AnomalyDetectorOutput(
+                anomaly_points=[],
+                scores=[],
+                diagnostics={"input_point_count": len(series.points)},
+            )
+
+    register_anomaly_detector(FluxRawDetector())
+
+    result = await AnomalyTool().execute(
+        AnomalyInput(database_evidence="latest", detector_name="flux_raw_detector"),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["selected_evidence_id"] == "evi_ref"
+    assert result["diagnostics"]["resolved_evidence_id"] == "evi_ref"
+    assert "input_policy_note" not in result["diagnostics"]
+
+
+@pytest.mark.asyncio
 async def test_forecast_and_anomaly_tools_reject_unknown_registered_model_names():
     evidence = _evidence()
     request_state = RequestStateModel(

@@ -116,6 +116,25 @@ def _build_rows_only_price_evidence_payload():
     }
 
 
+def _build_timestamp_only_evidence_payload():
+    rows = [
+        {"timestamp": "2023-01-01T00:00:00Z"},
+        {"timestamp": "2023-01-02T00:00:00Z"},
+    ]
+    return {
+        "evidence_id": "evi_timestamp_only",
+        "result_type": "timeseries",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "demo timestamp only query",
+        "summary": "Loaded 2 rows.",
+        "data": {"rows": rows, "time_field": "timestamp"},
+        "columns": ["timestamp"],
+        "metadata": {"database_type": "influxdb"},
+        "diagnostics": {},
+    }
+
+
 def test_request_state_keeps_summary_evidence_and_full_artifact():
     settings = get_settings()
     request = ChatRequest(message="分析趋势")
@@ -171,6 +190,49 @@ def test_code_interpreter_supports_database_evidence_point_aliases_for_rows_only
         "start_value": 10.0,
         "end_value": 12.0,
     }
+
+
+def test_code_interpreter_rejects_numeric_series_analysis_without_value_column():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 计算收益率、波动率和最大回撤")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_timestamp_only_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="numeric time-series values"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="计算收益率、波动率和最大回撤",
+                    code=(
+                        "result = {'summary': 'empty metrics', "
+                        "'metrics': {'row_count': 0, 'percentage_change': None, 'volatility': None, 'max_drawdown': 0.0}, "
+                        "'details': {'series_length': 0}}\n"
+                    ),
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_allows_non_numeric_row_count_analysis_without_value_column():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 统计行数")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_timestamp_only_evidence_payload(), _ToolSpec())
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="count rows",
+                code="result = {'summary': 'counted rows', 'metrics': {'row_count': len(rows)}, 'details': {}}\n",
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["metrics"]["row_count"] == 2
 
 
 def test_large_evidence_observation_and_prompt_are_prompt_safe():
@@ -360,6 +422,41 @@ def test_code_interpreter_rejects_text_only_outlier_treatment_note():
                 request_state=request_state,
             )
         )
+
+
+def test_code_interpreter_allows_cleaned_input_assumption_without_claiming_new_outlier_treatment():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 分析清洗后的序列")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="metrics on cleaned evidence",
+                code=(
+                    "values = [float(row['value']) for row in rows]\n"
+                    "result = {\n"
+                    "    'summary': '已计算清洗后序列的指标。',\n"
+                    "    'metrics': {'row_count': len(rows), 'start_value': values[0], 'end_value': values[-1]},\n"
+                    "    'details': {\n"
+                    "        'series_sorted': True,\n"
+                    "        'assumptions': ['使用清洗后的完整序列（剔除明显离群高值）作为输入。'],\n"
+                    "    },\n"
+                    "}\n"
+                ),
+                expected_result_schema={
+                    "summary": "str",
+                    "metrics": {"row_count": "int", "start_value": "number", "end_value": "number"},
+                    "details": {"series_sorted": "bool", "assumptions": "list"},
+                },
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["metrics"]["row_count"] == 40
 
 
 def test_code_interpreter_rejects_outlier_treatment_without_excluded_row_list():

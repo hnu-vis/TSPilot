@@ -13,6 +13,7 @@ from core.analysis.python_runner import AnalysisCodeError
 from sandbox import execute_python_sandbox_v1
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
+from schemas.data_fact import DataFactRequest
 from tools.base import BaseTool
 
 
@@ -22,6 +23,7 @@ class CodeInterpreterInput(BaseModel):
     code: str
     expected_result_schema: dict | None = None
     constraints: dict | None = Field(default_factory=dict)
+    fact_requests: list[DataFactRequest] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -47,6 +49,12 @@ class CodeInterpreterTool(BaseTool):
         goal = validated_input.analysis_goal or "Code interpreter analysis"
         code_hash = _code_hash(validated_input.code)
         constraints = validated_input.constraints or {}
+        requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
+        if requires_numeric_series and rows and not points:
+            raise AnalysisCodeError(
+                "code_interpreter analysis requires numeric time-series values, but the selected evidence "
+                "does not expose a usable timestamp/value pair. Query evidence with a numeric value column first."
+            )
         output = execute_python_sandbox_v1(
             code=validated_input.code,
             rows=rows,
@@ -59,6 +67,7 @@ class CodeInterpreterTool(BaseTool):
         )
         _validate_expected_result_schema(output.result, validated_input.expected_result_schema or {})
         _validate_outlier_treatment_transparency(output.result)
+        _validate_result_has_numeric_analysis(output.result, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
         result = AnalysisResult(
             analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
             analysis_goal=goal,
@@ -197,6 +206,56 @@ def _validate_outlier_treatment_transparency(result: dict) -> None:
         raise AnalysisCodeError("analysis result using outlier treatment must include details.adjusted_metrics as an object.")
 
 
+def _analysis_requires_numeric_series(goal: str | None, expected_schema: dict) -> bool:
+    text = " ".join([goal or "", _flatten_text(expected_schema)]).lower()
+    markers = {
+        "return",
+        "returns",
+        "volatility",
+        "drawdown",
+        "yield",
+        "pct_change",
+        "percentage_change",
+        "price change",
+        "trend",
+        "收益",
+        "收益率",
+        "波动",
+        "回撤",
+        "涨跌",
+        "价格变化",
+        "趋势",
+    }
+    return any(marker in text for marker in markers)
+
+
+def _validate_result_has_numeric_analysis(result: dict, *, requires_numeric_series: bool, input_rows: int) -> None:
+    if not requires_numeric_series or input_rows == 0:
+        return
+    metrics = result.get("metrics") if isinstance(result, dict) else None
+    if not isinstance(metrics, dict) or not metrics:
+        raise AnalysisCodeError("code_interpreter numeric analysis must return non-empty result.metrics.")
+
+    meaningful_values = [
+        value for key, value in metrics.items()
+        if str(key).lower() not in {"row_count", "count", "n", "series_length", "return_count"}
+    ]
+    if meaningful_values and any(value is not None for value in meaningful_values):
+        return
+
+    details = result.get("details") if isinstance(result, dict) else None
+    if isinstance(details, dict):
+        for key in ("raw_metrics", "adjusted_metrics"):
+            nested_metrics = details.get(key)
+            if isinstance(nested_metrics, dict) and any(value is not None for value in nested_metrics.values()):
+                return
+
+    raise AnalysisCodeError(
+        "code_interpreter numeric analysis produced no non-empty computed metric values; "
+        "use evidence with numeric values and compute the requested metrics."
+    )
+
+
 def _result_indicates_outlier_treatment(result: dict) -> bool:
     if not isinstance(result, dict):
         return False
@@ -218,7 +277,7 @@ def _result_indicates_outlier_treatment(result: dict) -> bool:
         "离群",
         "调整",
     }
-    text = _flatten_text(result).lower()
+    text = _flatten_outlier_relevant_text(result).lower()
     if any(marker in text for marker in textual_markers):
         return True
     metrics = result.get("metrics")
@@ -262,6 +321,21 @@ def _flatten_text(value: Any) -> str:
         return " ".join(_flatten_text(item) for item in value.values())
     if isinstance(value, list):
         return " ".join(_flatten_text(item) for item in value)
+    return ""
+
+
+def _flatten_outlier_relevant_text(value: Any, *, key: str | None = None) -> str:
+    if key is not None and key.strip().lower() in {"assumption", "assumptions", "input_assumption", "input_assumptions"}:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(
+            _flatten_outlier_relevant_text(item, key=str(child_key))
+            for child_key, item in value.items()
+        )
+    if isinstance(value, list):
+        return " ".join(_flatten_outlier_relevant_text(item, key=key) for item in value)
     return ""
 
 
