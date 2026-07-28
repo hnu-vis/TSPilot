@@ -8,6 +8,7 @@ from schemas.api import ChatRequest
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
 from schemas.insight import VerifiedFact
+from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesPoint
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
 
@@ -191,6 +192,51 @@ def test_format_answer_does_not_render_internal_reference_dataset_query_section(
     )
 
     assert "query" not in [section["section_type"] for section in result["sections"]]
+
+
+def test_format_answer_forecast_section_uses_full_count_from_prompt_safe_metadata():
+    request_state = build_request_state(
+        ChatRequest(
+            message="预测未来 24 小时",
+            database_context={"database_id": "demo", "database_type": "influxdb"},
+        ),
+        get_settings(),
+    )
+    points = [TimeSeriesPoint(timestamp=f"t{i}", value=float(i)) for i in range(12)]
+    request_state.latest_forecast = ForecastResult(
+        forecast_id="forecast_demo",
+        model_name="linear_regression",
+        horizon=96,
+        status="succeeded",
+        forecast_plan=ForecastPlan(
+            mode="rolling",
+            horizon_source="duration_from_user",
+            requested_steps=96,
+            resolved_steps=96,
+            sampling_interval_seconds=900,
+            forecast_duration_seconds=86400,
+            max_direct_steps=48,
+            recommended_chunk_steps=48,
+        ),
+        forecast_points=points,
+        diagnostics={
+            "forecast_point_count": 96,
+            "forecast_first_point": {"timestamp": "t0", "value": 0.0},
+            "forecast_last_point": {"timestamp": "t95", "value": 95.0},
+        },
+    )
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(summary_goal="总结预测", section_plan=["forecast"]),
+            request_state=request_state,
+        )
+    )
+
+    forecast_section = next(section for section in result["sections"] if section["section_type"] == "forecast")
+    assert "96 个短期预测点" in forecast_section["content"]
+    assert "前 12 个点" in forecast_section["content"]
+    assert "最后一个预测值为 95.00" in forecast_section["content"]
 
 
 def test_format_answer_assembles_selected_analysis_results():

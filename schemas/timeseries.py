@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from schemas.data_fact import DataFact, FactCoverage
 from schemas.visualization import VisualizationPayload
 
 
@@ -22,7 +23,7 @@ class TimeSeriesSeries(BaseModel):
 
 
 class ForecastPlan(BaseModel):
-    mode: Literal["direct", "requires_rolling"]
+    mode: Literal["direct", "rolling", "requires_rolling"]
     horizon_source: Literal["explicit_steps", "duration_from_user", "inferred_short_term_default"]
     requested_steps: int
     resolved_steps: int
@@ -45,6 +46,9 @@ class ForecastResult(BaseModel):
     confidence_interval: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
+    produced_facts: list[DataFact] = Field(default_factory=list)
+    rejected_facts: list[DataFact] = Field(default_factory=list)
+    fact_coverage: FactCoverage | None = None
 
 
 class AnomalyResult(BaseModel):
@@ -55,3 +59,6 @@ class AnomalyResult(BaseModel):
     scores: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
+    produced_facts: list[DataFact] = Field(default_factory=list)
+    rejected_facts: list[DataFact] = Field(default_factory=list)
+    fact_coverage: FactCoverage | None = None

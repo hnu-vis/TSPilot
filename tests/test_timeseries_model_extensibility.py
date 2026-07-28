@@ -9,7 +9,9 @@ import pytest
 from core.timeseries.anomaly_registry import register_api_anomaly_detector
 from core.timeseries.forecast_registry import register_api_forecast_model
 from schemas.database import DatabaseEvidence
+from schemas.analysis import AnalysisResult
 from schemas.state import RequestStateModel
+from schemas.timeseries import AnomalyResult
 from tools.anomaly import AnomalyInput, AnomalyTool
 from tools.forecast import ForecastInput, ForecastTool
 from tools.sql_query import _ExplicitQueryExecutor
@@ -80,7 +82,7 @@ async def test_forecast_uses_short_term_default_for_fuzzy_horizon():
 
 
 @pytest.mark.asyncio
-async def test_forecast_returns_rolling_plan_when_horizon_exceeds_direct_window():
+async def test_forecast_runs_rolling_chunks_when_horizon_exceeds_direct_window():
     result = await ForecastTool().execute(
         ForecastInput(
             database_evidence=_bitcoin_evidence(),
@@ -89,11 +91,127 @@ async def test_forecast_returns_rolling_plan_when_horizon_exceeds_direct_window(
         )
     )
 
-    assert result["status"] == "requires_rolling"
-    assert result["forecast_points"] == []
-    assert result["forecast_plan"]["mode"] == "requires_rolling"
+    assert result["status"] == "succeeded"
+    assert len(result["forecast_points"]) == 2920
+    assert result["forecast_plan"]["mode"] == "rolling"
     assert result["forecast_plan"]["requested_steps"] == 2920
     assert result["forecast_plan"]["recommended_chunk_steps"] == 48
+    assert result["diagnostics"]["rolling_chunk_count"] == 61
+
+
+@pytest.mark.asyncio
+async def test_forecast_excludes_points_from_latest_anomaly_by_default():
+    evidence = _bitcoin_evidence(count=6)
+    anomaly = AnomalyResult(
+        anomaly_id=f"anomaly_{evidence.evidence_id}",
+        detector_name="zscore",
+        anomaly_points=[{"timestamp": evidence.data["points"][0]["timestamp"], "value": evidence.data["points"][0]["value"], "score": 9.0}],
+        diagnostics={"resolved_evidence_id": evidence.evidence_id},
+    )
+    request_state = RequestStateModel(
+        request_id="req_forecast_exclude_anomaly",
+        message="检测异常后预测。",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        latest_anomaly=anomaly,
+        anomaly_artifacts={anomaly.anomaly_id: anomaly},
+    )
+
+    result = await ForecastTool().execute(
+        ForecastInput(database_evidence="latest", horizon=2),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["input_policy"] == "exclude_detected_anomalies"
+    assert result["diagnostics"]["excluded_anomaly_count"] == 1
+    assert result["diagnostics"]["training_point_count_before_policy"] == 6
+    assert result["diagnostics"]["training_point_count_after_policy"] == 5
+    assert result["diagnostics"]["source_anomaly_id"] == anomaly.anomaly_id
+
+
+@pytest.mark.asyncio
+async def test_forecast_can_keep_selected_raw_points_when_requested():
+    evidence = _bitcoin_evidence(count=6)
+    anomaly = AnomalyResult(
+        anomaly_id=f"anomaly_{evidence.evidence_id}",
+        detector_name="zscore",
+        anomaly_points=[{"timestamp": evidence.data["points"][0]["timestamp"], "value": evidence.data["points"][0]["value"], "score": 9.0}],
+        diagnostics={"resolved_evidence_id": evidence.evidence_id},
+    )
+    request_state = RequestStateModel(
+        request_id="req_forecast_keep_raw",
+        message="按原始数据预测。",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        latest_anomaly=anomaly,
+        anomaly_artifacts={anomaly.anomaly_id: anomaly},
+    )
+
+    result = await ForecastTool().execute(
+        ForecastInput(database_evidence="latest", horizon=2, constraints={"input_policy": "raw"}),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["input_policy"] == "raw"
+    assert result["diagnostics"]["excluded_anomaly_count"] == 0
+    assert result["diagnostics"]["training_point_count_before_policy"] == 6
+    assert result["diagnostics"]["training_point_count_after_policy"] == 6
+
+
+@pytest.mark.asyncio
+async def test_forecast_excludes_code_interpreter_outlier_rows_when_matching_anomaly_is_unavailable():
+    evidence = _bitcoin_evidence(count=6)
+    unrelated_anomaly = AnomalyResult(
+        anomaly_id="anomaly_other_evidence",
+        detector_name="zscore",
+        anomaly_points=[],
+        diagnostics={"resolved_evidence_id": "other_evidence"},
+    )
+    analysis = AnalysisResult(
+        analysis_id="ana_outlier_rows",
+        analysis_goal="transparent outlier treatment",
+        code_hash="sha256:test",
+        input_evidence_id=evidence.evidence_id,
+        input_row_count=6,
+        status="succeeded",
+        summary="excluded one outlier",
+        result={
+            "summary": "excluded one outlier",
+            "metrics": {},
+            "details": {
+                "excluded_rows": [
+                    {
+                        "timestamp": evidence.data["points"][0]["timestamp"],
+                        "value": evidence.data["points"][0]["value"],
+                    }
+                ]
+            },
+        },
+        diagnostics={},
+    )
+    request_state = RequestStateModel(
+        request_id="req_forecast_exclude_analysis_outliers",
+        message="先分析异常再预测。",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        latest_anomaly=unrelated_anomaly,
+        anomaly_artifacts={unrelated_anomaly.anomaly_id: unrelated_anomaly},
+        latest_analysis_id=analysis.analysis_id,
+        analysis_artifacts={analysis.analysis_id: analysis},
+    )
+
+    result = await ForecastTool().execute(
+        ForecastInput(database_evidence="latest", horizon=2),
+        request_state=request_state,
+    )
+
+    assert result["diagnostics"]["excluded_anomaly_count"] == 1
+    assert result["diagnostics"]["source_analysis_id"] == "ana_outlier_rows"
+    assert result["diagnostics"]["training_point_count_before_policy"] == 6
+    assert result["diagnostics"]["training_point_count_after_policy"] == 5
 
 
 @pytest.mark.asyncio

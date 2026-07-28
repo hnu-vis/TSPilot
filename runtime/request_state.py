@@ -24,6 +24,7 @@ from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
 from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
+from core.data_fact import data_fact_prompt_view, register_data_facts_from_payload
 from schemas.task_contract import TaskContract
 from schemas.tool import ReActTranscriptStep, ToolObservation
 
@@ -416,6 +417,9 @@ def apply_observation(
         _apply_presentation_payload(request_state, full_payload)
         _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
 
+    if tool_spec.result_target in {"evidence", "analysis"}:
+        register_data_facts_from_payload(request_state, observation.tool_name, full_payload)
+
     safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
     request_state.observations.append(safe_observation)
     return safe_observation
@@ -476,6 +480,16 @@ def enrich_observation_payload(
         payload = request_state.final_answer_draft.model_dump(mode="json")
 
     payload = _deduplicate_observation_payload(observation, payload)
+    if tool_spec.result_target in {"evidence", "analysis"} and isinstance(payload, dict):
+        payload = {
+            **payload,
+            "data_fact_context": data_fact_prompt_view(request_state),
+            "fact_coverage": request_state.fact_coverage.model_dump(mode="json"),
+            "produced_facts": [
+                fact.model_dump(mode="json")
+                for fact in request_state.fact_set.facts[-8:]
+            ],
+        }
 
     return observation.model_copy(
         update={
@@ -735,6 +749,9 @@ def _build_prompt_safe_evidence(evidence):
         columns=evidence.columns,
         metadata=dict(evidence.metadata),
         diagnostics=diagnostics,
+        produced_facts=list(getattr(evidence, "produced_facts", []) or []),
+        rejected_facts=list(getattr(evidence, "rejected_facts", []) or []),
+        fact_coverage=getattr(evidence, "fact_coverage", None),
     )
 
 
@@ -800,6 +817,14 @@ def _build_prompt_safe_forecast(forecast, request_state: RequestStateModel):
     from schemas.timeseries import ForecastResult
 
     payload = forecast.model_dump(mode="json")
+    full_points = payload.get("forecast_points", [])
+    if isinstance(full_points, list):
+        diagnostics = dict(payload.get("diagnostics") or {})
+        diagnostics["forecast_point_count"] = len(full_points)
+        if full_points:
+            diagnostics["forecast_first_point"] = full_points[0]
+            diagnostics["forecast_last_point"] = full_points[-1]
+        payload["diagnostics"] = diagnostics
     payload["forecast_points"] = payload.get("forecast_points", [])[:12]
     payload["confidence_interval"] = payload.get("confidence_interval", [])[:12]
     payload["visualizations"] = [

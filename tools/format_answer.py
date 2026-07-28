@@ -9,8 +9,10 @@ from core.report.composer import (
     build_anomaly_section,
     build_forecast_section,
     build_summary,
+    forecast_point_bounds,
     ordered_sections,
 )
+from schemas.data_fact import DataFact
 from schemas.output import AnswerReference, AnswerSection, FinalAnswer
 from schemas.state import RequestStateModel
 from tools.base import BaseTool
@@ -82,7 +84,23 @@ class FormatAnswerTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
-        facts = [
+        data_facts = [
+            fact
+            for fact in request_state.fact_set.facts
+            if (
+                fact.status == "verified"
+                and (not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids)
+            )
+        ]
+        unavailable_facts = [
+            fact
+            for fact in request_state.fact_set.facts
+            if (
+                fact.status == "unavailable"
+                and (not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids)
+            )
+        ]
+        legacy_facts = [
             fact
             for fact in request_state.verified_facts
             if not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids
@@ -100,14 +118,16 @@ class FormatAnswerTool(BaseTool):
             analysis_summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
             summary = build_summary(
                 request_state,
-                facts,
+                legacy_facts,
                 analysis_summary or fallback_summary,
                 prefer_fallback=bool(analysis_summary),
             )
+        elif data_facts:
+            summary = self._data_fact_summary(data_facts, fallback_summary)
         else:
             summary = build_summary(
                 request_state,
-                facts,
+                legacy_facts,
                 fallback_summary,
             )
         if request_state.database_context is None and direct_answer:
@@ -127,12 +147,22 @@ class FormatAnswerTool(BaseTool):
             content=summary,
             structured_payload=None,
         )
-        if facts:
+        if data_facts or unavailable_facts:
             sections_by_type["facts"] = AnswerSection(
                 section_type="facts",
                 heading=self._label(request_state, "verified_facts"),
-                content="\n".join(f"- {fact.statement}" for fact in facts),
-                structured_payload={"fact_ids": [fact.fact_id for fact in facts]},
+                content=self._render_data_fact_section(data_facts, unavailable_facts),
+                structured_payload={
+                    "fact_ids": [fact.fact_id for fact in data_facts],
+                    "unavailable_fact_ids": [fact.fact_id for fact in unavailable_facts],
+                },
+            )
+        elif legacy_facts:
+            sections_by_type["facts"] = AnswerSection(
+                section_type="facts",
+                heading=self._label(request_state, "verified_facts"),
+                content="\n".join(f"- {fact.statement}" for fact in legacy_facts),
+                structured_payload={"fact_ids": [fact.fact_id for fact in legacy_facts]},
             )
         if analyses:
             sections_by_type["analysis"] = AnswerSection(
@@ -148,7 +178,12 @@ class FormatAnswerTool(BaseTool):
         database_evidence = self._database_evidence_inventory(request_state)
         if len(database_evidence) > 1:
             sections_by_type["query_results"] = self._database_query_results_section(database_evidence, request_state)
-        if len(database_evidence) <= 1 and request_state.latest_database_evidence is not None and not facts:
+        if (
+            len(database_evidence) <= 1
+            and request_state.latest_database_evidence is not None
+            and not data_facts
+            and not legacy_facts
+        ):
             evidence = request_state.latest_database_evidence
             for section in self._evidence_sections(evidence, request_state):
                 sections_by_type[section.section_type] = section
@@ -185,7 +220,7 @@ class FormatAnswerTool(BaseTool):
             heading=self._label(request_state, "conclusion"),
             content=summary,
             structured_payload={
-                "has_facts": bool(facts),
+                "has_facts": bool(data_facts or legacy_facts),
                 "has_analysis": bool(analyses),
                 "has_anomaly": request_state.latest_anomaly is not None,
                 "has_forecast": request_state.latest_forecast is not None,
@@ -207,9 +242,18 @@ class FormatAnswerTool(BaseTool):
                 source_type="fact",
                 source_id=fact.fact_id,
                 label=fact.fact_type,
+                evidence=self._data_fact_reference_payload(fact),
+            )
+            for fact in [*data_facts, *unavailable_facts]
+        )
+        references.extend(
+            AnswerReference(
+                source_type="fact",
+                source_id=fact.fact_id,
+                label=fact.fact_type,
                 evidence=fact.evidence,
             )
-            for fact in facts
+            for fact in legacy_facts
         )
         references.extend(
             AnswerReference(
@@ -282,6 +326,32 @@ class FormatAnswerTool(BaseTool):
         )
         return answer.model_dump(mode="json")
 
+    def _data_fact_summary(self, facts: list[DataFact], fallback_summary: str) -> str:
+        statements = [fact.statement.strip() for fact in facts if fact.statement.strip()]
+        return " ".join(statements[:3]) or fallback_summary
+
+    def _render_data_fact_section(self, facts: list[DataFact], unavailable_facts: list[DataFact]) -> str:
+        lines = [f"- {fact.statement}" for fact in facts if fact.statement]
+        lines.extend(
+            f"- {fact.statement}"
+            for fact in unavailable_facts
+            if fact.statement
+        )
+        return "\n".join(lines)
+
+    def _data_fact_reference_payload(self, fact: DataFact) -> dict:
+        return {
+            "name": fact.name,
+            "status": fact.status,
+            "value": fact.value,
+            "method": fact.method,
+            "evidence_refs": [ref.model_dump(mode="json") for ref in fact.evidence_refs],
+            "calculation_trace": fact.calculation_trace,
+            "quality_flags": fact.quality_flags,
+            "unavailable_reason": fact.unavailable_reason,
+            "derived_from": fact.derived_from,
+        }
+
     def _build_summary(self, request_state: RequestStateModel, facts: list, summary_goal: str) -> str:
         subject = self._subject_label(request_state)
         parts: list[str] = []
@@ -317,18 +387,17 @@ class FormatAnswerTool(BaseTool):
         if request_state.latest_forecast is not None:
             forecast_points = request_state.latest_forecast.forecast_points
             if forecast_points:
-                first_point = forecast_points[0]
-                last_point = forecast_points[-1]
+                first_point, last_point, point_count = forecast_point_bounds(request_state.latest_forecast)
                 if language == "zh":
                     direction = "上升" if last_point.value > first_point.value else "下降" if last_point.value < first_point.value else "基本持平"
                     parts.append(
-                        f"{subject} 的短期预测共 {len(forecast_points)} 个点，预测区间内整体{direction}，"
+                        f"{subject} 的短期预测共 {point_count} 个点，预测区间内整体{direction}，"
                         f"从 {first_point.value:.2f} 变化到 {last_point.value:.2f}。"
                     )
                 else:
                     direction = "rises" if last_point.value > first_point.value else "falls" if last_point.value < first_point.value else "stays roughly flat"
                     parts.append(
-                        f"The short-term forecast for {subject} contains {len(forecast_points)} points and overall {direction}, "
+                        f"The short-term forecast for {subject} contains {point_count} points and overall {direction}, "
                         f"moving from {first_point.value:.2f} to {last_point.value:.2f}."
                     )
             elif request_state.latest_forecast.status == "requires_rolling":

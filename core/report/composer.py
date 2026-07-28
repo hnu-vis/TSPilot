@@ -46,11 +46,10 @@ def build_summary(
     if request_state.latest_forecast is not None:
         forecast_points = request_state.latest_forecast.forecast_points
         if forecast_points:
-            first_point = forecast_points[0]
-            last_point = forecast_points[-1]
+            first_point, last_point, point_count = forecast_point_bounds(request_state.latest_forecast)
             direction = trend_direction(first_point.value, last_point.value)
             parts.append(
-                f"{subject} 的短期预测共 {len(forecast_points)} 个点，预测区间内整体{direction}，"
+                f"{subject} 的短期预测共 {point_count} 个点，预测区间内整体{direction}，"
                 f"从 {first_point.value:.2f} 变化到 {last_point.value:.2f}。"
             )
         elif request_state.latest_forecast.status == "requires_rolling":
@@ -79,16 +78,20 @@ def build_forecast_section(forecast) -> AnswerSection:
     elif not forecast_points:
         content = f"已执行预测模型 {forecast.model_name}，但未返回预测点。"
     else:
-        first_point = forecast_points[0]
-        last_point = forecast_points[-1]
+        first_point, last_point, point_count = forecast_point_bounds(forecast)
         direction = trend_direction(first_point.value, last_point.value)
         preview = "\n".join(
             f"- {point.timestamp}: {point.value:.2f}" for point in forecast_points[:5]
         )
+        preview_note = (
+            f" 预测点预览显示前 {len(forecast_points)} 个点。"
+            if point_count > len(forecast_points)
+            else ""
+        )
         content = (
-            f"使用 {forecast.model_name} 生成了 {len(forecast_points)} 个短期预测点。"
+            f"使用 {forecast.model_name} 生成了 {point_count} 个短期预测点。"
             f" 预测走势整体{direction}，首个预测值为 {first_point.value:.2f}，"
-            f"最后一个预测值为 {last_point.value:.2f}。\n"
+            f"最后一个预测值为 {last_point.value:.2f}。{preview_note}\n"
             f"预测点预览：\n{preview}"
         )
     return AnswerSection(
@@ -182,3 +185,22 @@ def trend_direction(start_value: float, end_value: float) -> str:
     if end_value < start_value:
         return "下降"
     return "基本持平"
+
+
+def forecast_point_bounds(forecast):
+    diagnostics = forecast.diagnostics if isinstance(forecast.diagnostics, dict) else {}
+    points = forecast.forecast_points
+    first_payload = diagnostics.get("forecast_first_point") if isinstance(diagnostics.get("forecast_first_point"), dict) else None
+    last_payload = diagnostics.get("forecast_last_point") if isinstance(diagnostics.get("forecast_last_point"), dict) else None
+    point_count = diagnostics.get("forecast_point_count")
+    if not isinstance(point_count, int) or point_count < len(points):
+        point_count = len(points)
+    first_point = _point_from_payload(first_payload) if first_payload else points[0]
+    last_point = _point_from_payload(last_payload) if last_payload else points[-1]
+    return first_point, last_point, point_count
+
+
+def _point_from_payload(payload: dict):
+    from schemas.timeseries import TimeSeriesPoint
+
+    return TimeSeriesPoint.model_validate(payload)

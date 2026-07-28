@@ -14,6 +14,7 @@ from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.forecast_registry import default_forecast_model_name, get_forecast_model
 from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
+from schemas.data_fact import DataFactRequest
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesSeries
 from schemas.visualization import VisualizationPayload
 from tools.base import BaseTool
@@ -67,6 +68,7 @@ class ForecastInput(BaseModel):
     model_name: str | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
+    fact_requests: list[DataFactRequest] = Field(default_factory=list)
 
     @field_validator("horizon", mode="before")
     @classmethod
@@ -100,42 +102,27 @@ class ForecastTool(BaseTool):
             series_name=preferred_series,
             value_field=preferred_series,
         )
+        series, input_policy_diagnostics = _apply_forecast_input_policy(
+            series=series,
+            database_evidence=database_evidence,
+            request_state=request_state,
+            constraints=constraints,
+        )
         quality = _validate_forecast_evidence_quality(database_evidence, series, request_state, constraints)
         forecast_plan = _resolve_forecast_plan(validated_input, constraints, series)
         horizon = forecast_plan.requested_steps
         model_name = validated_input.model_name or constraints.get("model_name") or default_forecast_model_name()
         model = get_forecast_model(model_name)
-        if forecast_plan.mode == "requires_rolling":
-            visualization = _forecast_visualization(
-                database_evidence=database_evidence,
+        if forecast_plan.mode == "rolling":
+            model_output = _rolling_forecast(
+                model=model,
                 series=series,
-                forecast_points=[],
                 horizon=horizon,
-                summary=(
-                    f"{series.value_field} requires rolling forecast for {horizon} points; "
-                    f"direct forecast is capped at {forecast_plan.max_direct_steps} points."
-                ),
+                chunk_steps=forecast_plan.recommended_chunk_steps or forecast_plan.max_direct_steps,
+                params=constraints,
             )
-            diagnostics = {
-                "series_name": series.series_name,
-                "model_registry_name": model.name,
-                "horizon": horizon,
-                "forecast_plan": forecast_plan.model_dump(mode="json"),
-                "input_quality": quality,
-            }
-            return ForecastResult(
-                forecast_id=f"forecast_{database_evidence.evidence_id}",
-                model_name=model.name,
-                horizon=horizon,
-                status="requires_rolling",
-                forecast_plan=forecast_plan,
-                forecast_points=[],
-                confidence_interval=[],
-                diagnostics=diagnostics,
-                visualizations=[visualization],
-            ).model_dump(mode="json")
-
-        model_output = model.forecast(series, horizon=horizon, params=constraints)
+        else:
+            model_output = model.forecast(series, horizon=horizon, params=constraints)
         forecast_points = model_output.forecast_points
         visualization = _forecast_visualization(
             database_evidence=database_evidence,
@@ -159,6 +146,7 @@ class ForecastTool(BaseTool):
                 "horizon": horizon,
                 "forecast_plan": forecast_plan.model_dump(mode="json"),
                 "input_quality": quality,
+                **input_policy_diagnostics,
             },
             visualizations=[visualization],
         ).model_dump(mode="json")
@@ -228,7 +216,7 @@ def _resolve_forecast_plan(
     forecast_start, forecast_end = _forecast_bounds(series, sampling_interval, requested_steps)
     if requested_steps > max_direct_steps:
         return ForecastPlan(
-            mode="requires_rolling",
+            mode="rolling",
             horizon_source=horizon_source,
             requested_steps=requested_steps,
             resolved_steps=requested_steps,
@@ -240,7 +228,7 @@ def _resolve_forecast_plan(
             recommended_chunk_steps=max_direct_steps,
             reason=(
                 f"Requested horizon {requested_steps} exceeds max direct forecast "
-                f"window {max_direct_steps}; use rolling forecast chunks."
+                f"window {max_direct_steps}; forecast will be generated in rolling chunks."
             ),
         )
 
@@ -278,6 +266,195 @@ def _horizon_steps_from_value(value: Any) -> int | None:
         match = re.search(r"\d+", value)
         if match:
             return max(1, int(match.group(0)))
+    return None
+
+
+def _rolling_forecast(
+    *,
+    model,
+    series: TimeSeriesSeries,
+    horizon: int,
+    chunk_steps: int,
+    params: dict,
+):
+    from core.timeseries.forecast_registry import ForecastModelOutput
+
+    remaining = max(1, horizon)
+    chunk_steps = max(1, chunk_steps)
+    working_series = series.model_copy(deep=True)
+    forecast_points = []
+    confidence_interval = []
+    chunk_diagnostics = []
+    chunk_index = 0
+    while remaining > 0:
+        chunk_index += 1
+        current_horizon = min(chunk_steps, remaining)
+        chunk_output = model.forecast(working_series, horizon=current_horizon, params=params)
+        if len(chunk_output.forecast_points) != current_horizon:
+            raise ValueError(
+                f"Rolling forecast chunk {chunk_index} returned "
+                f"{len(chunk_output.forecast_points)} points; expected {current_horizon}."
+            )
+        forecast_points.extend(chunk_output.forecast_points)
+        confidence_interval.extend(chunk_output.confidence_interval)
+        chunk_diagnostics.append(
+            {
+                "chunk_index": chunk_index,
+                "requested_steps": current_horizon,
+                "returned_steps": len(chunk_output.forecast_points),
+                "diagnostics": chunk_output.diagnostics,
+            }
+        )
+        working_series = working_series.model_copy(
+            update={"points": [*working_series.points, *chunk_output.forecast_points]}
+        )
+        remaining -= current_horizon
+
+    return ForecastModelOutput(
+        forecast_points=forecast_points,
+        confidence_interval=confidence_interval,
+        diagnostics={
+            "model_family": "rolling",
+            "rolling_chunks": chunk_diagnostics,
+            "rolling_chunk_count": chunk_index,
+            "rolling_chunk_steps": chunk_steps,
+        },
+    )
+
+
+def _apply_forecast_input_policy(
+    *,
+    series: TimeSeriesSeries,
+    database_evidence: DatabaseEvidence,
+    request_state,
+    constraints: dict,
+) -> tuple[TimeSeriesSeries, dict]:
+    policy = str(constraints.get("input_policy") or "exclude_detected_anomalies").strip().lower()
+    diagnostics = {
+        "input_policy": policy,
+        "selected_evidence_id": database_evidence.evidence_id,
+        "training_point_count_before_policy": len(series.points),
+        "training_point_count_after_policy": len(series.points),
+        "excluded_anomaly_count": 0,
+    }
+    if policy in {"selected", "current", "as_provided", "raw"} or request_state is None:
+        return series, diagnostics
+
+    exclusion_keys, source = _forecast_exclusion_keys(database_evidence, request_state)
+    if not exclusion_keys:
+        if source:
+            diagnostics["input_policy_note"] = source
+        return series, diagnostics
+
+    filtered_points = [
+        point
+        for point in series.points
+        if _point_key(point.timestamp, point.value) not in exclusion_keys
+    ]
+    excluded_count = len(series.points) - len(filtered_points)
+    if excluded_count <= 0:
+        return series, diagnostics
+    if len(filtered_points) < 2:
+        raise ValueError("Forecast cannot exclude detected anomalies because fewer than two training points would remain.")
+
+    diagnostics.update(
+        {
+            "training_point_count_after_policy": len(filtered_points),
+            "excluded_anomaly_count": excluded_count,
+            **source,
+        }
+    )
+    return series.model_copy(update={"points": filtered_points}), diagnostics
+
+
+def _forecast_exclusion_keys(
+    database_evidence: DatabaseEvidence,
+    request_state,
+) -> tuple[set[tuple[str, float]], dict | str | None]:
+    anomaly = getattr(request_state, "latest_anomaly", None)
+    if anomaly is not None:
+        anomaly_diagnostics = anomaly.diagnostics if isinstance(anomaly.diagnostics, dict) else {}
+        anomaly_evidence_id = anomaly_diagnostics.get("resolved_evidence_id") or _evidence_id_from_anomaly_id(anomaly.anomaly_id)
+        if anomaly_evidence_id == database_evidence.evidence_id:
+            keys = _keys_from_rows(anomaly.anomaly_points)
+            if keys:
+                return keys, {
+                    "source_anomaly_id": anomaly.anomaly_id,
+                    "input_policy_note": "forecast training excluded points detected by the anomaly tool",
+                }
+        elif anomaly_evidence_id:
+            anomaly_note = "latest anomaly result belongs to a different evidence artifact"
+        else:
+            anomaly_note = None
+    else:
+        anomaly_note = None
+
+    analysis = _latest_analysis_for_evidence(database_evidence, request_state)
+    if analysis is not None:
+        details = analysis.result.get("details") if isinstance(analysis.result, dict) else None
+        excluded_rows = details.get("excluded_rows") if isinstance(details, dict) else None
+        keys = _keys_from_rows(excluded_rows)
+        if keys:
+            return keys, {
+                "source_analysis_id": analysis.analysis_id,
+                "input_policy_note": "forecast training excluded rows reported by code_interpreter outlier treatment",
+            }
+    return set(), anomaly_note
+
+
+def _latest_analysis_for_evidence(database_evidence: DatabaseEvidence, request_state):
+    artifacts = getattr(request_state, "analysis_artifacts", {}) or {}
+    latest_analysis_id = getattr(request_state, "latest_analysis_id", None)
+    ordered = []
+    if latest_analysis_id and latest_analysis_id in artifacts:
+        ordered.append(artifacts[latest_analysis_id])
+    ordered.extend(
+        analysis
+        for analysis_id, analysis in artifacts.items()
+        if analysis_id != latest_analysis_id
+    )
+    for analysis in ordered:
+        if getattr(analysis, "input_evidence_id", None) == database_evidence.evidence_id:
+            return analysis
+    return None
+
+
+def _keys_from_rows(rows: Any) -> set[tuple[str, float]]:
+    if not isinstance(rows, list):
+        return set()
+    keys = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _point_key(
+            row.get("timestamp") or row.get("_time") or row.get("time"),
+            row.get("value") if row.get("value") is not None else row.get("price") if row.get("price") is not None else row.get("_value"),
+        )
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def _point_key(timestamp: Any, value: Any) -> tuple[str, float] | None:
+    if timestamp is None or value is None:
+        return None
+    parsed = _parse_timestamp(str(timestamp))
+    if parsed is None:
+        normalized_timestamp = str(timestamp)
+    else:
+        normalized_timestamp = parsed.isoformat()
+    try:
+        normalized_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized_timestamp, normalized_value
+
+
+def _evidence_id_from_anomaly_id(anomaly_id: str | None) -> str | None:
+    text = str(anomaly_id or "")
+    prefix = "anomaly_"
+    if text.startswith(prefix):
+        return text[len(prefix):]
     return None
 
 
