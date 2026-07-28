@@ -103,6 +103,7 @@ class ConversationTraceLogger:
                 "max_iterations": request_state.max_iterations,
                 "error": response.error,
                 "errors": request_state.errors,
+                "llm_diagnostics": (request_state.completion_state or {}).get("llm_diagnostics"),
                 "todo_count": len(request_state.todo_list),
                 "observation_count": len(request_state.observations),
                 "internal_trace_event_count": len(internal_trace),

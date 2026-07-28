@@ -31,8 +31,9 @@ export async function fetchModel(): Promise<string> {
   return payload.model || 'backend model';
 }
 
-export async function fetchDatabasePreview(databaseId: string): Promise<DatabasePreviewResponse> {
-  const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/preview`);
+export async function fetchDatabasePreview(databaseId: string, options?: { refresh?: boolean }): Promise<DatabasePreviewResponse> {
+  const search = options?.refresh ? '?refresh=true' : '';
+  const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/preview${search}`);
   if (!response.ok) throw new Error(`Failed to preview database: ${response.status}`);
   return response.json();
 }

@@ -2,6 +2,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -21,6 +22,7 @@ from .engine import (
 )
 from .schema import schema_preview, metric_list_preview
 from .repair import classify_query_error, should_retry_query
+from .profile_cache import DEFAULT_PROFILE_TTL_SECONDS, profile_is_fresh, profile_path, read_profile, utc_now_iso, write_profile
 try:
     from .semantic_context import MetricContextBuilder
 except Exception:
@@ -86,6 +88,7 @@ class DatabaseFactory:
     _config_dir = _project_root / "configs" / "databases"
     _database_dir = _project_root / "cache_data" / "database"
     _database_file = _database_dir / "databases.json"
+    _profile_dir = _database_dir / "profiles"
     _TYPE_ALIASES = {
         "timescale": DatabaseType.TIMESCALEDB.value,
         "timescaledb": DatabaseType.TIMESCALEDB.value,
@@ -454,6 +457,80 @@ class DatabaseFactory:
         return ConnectorFactory.create(db_type=db_type, **kwargs)
 
     @classmethod
+    def profile_cache_path(cls, db_id: str) -> Path:
+        """Return the persistent profile cache path for one database."""
+        return profile_path(cls._profile_dir, db_id)
+
+    @classmethod
+    def read_profile_cache(cls, db_id: str) -> dict[str, Any] | None:
+        """Read one stored database profile cache payload."""
+        return read_profile(cls._profile_dir, db_id)
+
+    @classmethod
+    def profile_ttl_seconds(cls, config: dict) -> int:
+        """Return configured profile cache TTL in seconds."""
+        raw_value = config.get("schema_profile_ttl_seconds", config.get("profile_ttl_seconds", DEFAULT_PROFILE_TTL_SECONDS))
+        try:
+            return max(1, int(raw_value))
+        except Exception:
+            return DEFAULT_PROFILE_TTL_SECONDS
+
+    @classmethod
+    async def load_schema_with_profile_cache(
+        cls,
+        db_id: str,
+        config: dict,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[DatabaseSchema, dict[str, Any]]:
+        """Load schema and merge a persistent data profile when available."""
+        ttl_seconds = cls.profile_ttl_seconds(config)
+        cached = cls.read_profile_cache(db_id)
+        cached_profile = cached.get("data_profile") if isinstance(cached, dict) else None
+        use_cache = (
+            isinstance(cached_profile, dict)
+            and not force_refresh
+            and profile_is_fresh(cached or {}, ttl_seconds=ttl_seconds)
+        )
+        connector_config = dict(config)
+        if use_cache:
+            connector_config["schema_data_profile_enabled"] = False
+        connector = await cls.create_connector(**connector_config)
+        async with connector:
+            schema = await connector.get_schema()
+        if use_cache:
+            schema.metadata["data_profile"] = cached_profile
+            schema.metadata["profile_cache"] = {
+                "source": "persistent_cache",
+                "path": str(cls.profile_cache_path(db_id)),
+                "generated_at": cached.get("generated_at"),
+                "ttl_seconds": ttl_seconds,
+                "fresh": True,
+            }
+            return schema, schema.metadata["profile_cache"]
+
+        data_profile = schema.metadata.get("data_profile")
+        cache_meta = {
+            "source": "live_refresh" if data_profile else "unavailable",
+            "path": str(cls.profile_cache_path(db_id)),
+            "generated_at": utc_now_iso(),
+            "ttl_seconds": ttl_seconds,
+            "fresh": bool(data_profile),
+        }
+        if isinstance(data_profile, dict):
+            payload = {
+                "database_id": db_id,
+                "database_type": config.get("type") or config.get("db_type"),
+                "generated_at": cache_meta["generated_at"],
+                "ttl_seconds": ttl_seconds,
+                "data_profile": data_profile,
+            }
+            write_profile(cls._profile_dir, db_id, payload)
+            cache_meta["source"] = "live_refresh_persisted"
+        schema.metadata["profile_cache"] = cache_meta
+        return schema, cache_meta
+
+    @classmethod
     async def add_database(cls, **config) -> str:
         """Add a new database configuration."""
         await cls._ensure_loaded()
@@ -462,6 +539,7 @@ class DatabaseFactory:
         config["status"] = config.get("status", "disconnected")
         cls._databases[db_id] = config
         await cls.save_databases()
+        await cls.refresh_database_profile(db_id)
         return db_id
 
     @classmethod
@@ -482,6 +560,7 @@ class DatabaseFactory:
         cls._databases[db_id] = next_config
         cls._connectors.pop(db_id, None)
         await cls.save_databases()
+        await cls.refresh_database_profile(db_id)
         return next_config
 
     @classmethod
@@ -492,9 +571,29 @@ class DatabaseFactory:
             del cls._databases[db_id]
             if db_id in cls._connectors:
                 del cls._connectors[db_id]
+            try:
+                cls.profile_cache_path(db_id).unlink(missing_ok=True)
+            except Exception:
+                pass
             await cls.save_databases()
             return True
         return False
+
+    @classmethod
+    async def refresh_database_profile(cls, db_id: str) -> dict[str, Any]:
+        """Refresh and persist one database profile without failing config writes."""
+        await cls._ensure_loaded()
+        config = cls._databases.get(db_id)
+        if not isinstance(config, dict):
+            return {"success": False, "error": f"Database '{db_id}' was not found."}
+        if isinstance(config.get("reference_dataset"), dict):
+            return {"success": False, "skipped": True, "reason": "reference_dataset_profile_is_derived_from_config"}
+        try:
+            _schema, cache_meta = await cls.load_schema_with_profile_cache(db_id, config, force_refresh=True)
+            return {"success": cache_meta.get("source") != "unavailable", "profile_cache": cache_meta}
+        except Exception as exc:
+            logger.debug(f"Failed to refresh profile for {db_id}: {exc}")
+            return {"success": False, "error": str(exc), "profile_cache": {"path": str(cls.profile_cache_path(db_id))}}
 
     @classmethod
     async def health_check(cls) -> bool:

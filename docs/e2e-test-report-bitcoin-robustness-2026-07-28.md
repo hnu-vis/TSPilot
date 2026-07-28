@@ -188,3 +188,92 @@ Task contract required outputs are not fully covered by the latest ReAct gap ass
 - 最终摘要：`该时间段查询结果为空（0 行），没有可用的 Bitcoin USD 数据，因此无法计算起始值、结束值、涨跌幅、最高值和最低值。`
 
 结论：空数据库证据现在可以通过 `unavailable_outputs` + `unavailable_reason` 覆盖缺失的派生指标，不再要求 code_interpreter 产出不存在的数值，也不再卡在 terminate block 循环。
+
+## Data Profile 补充
+
+当前结构 schema 已能提供：
+
+- measurement：`coindesk`
+- field：`price`
+- tags：`code`, `crypto`, `description`, `symbol`
+- tag value domains：`USD`, `EUR`, `GBP` 和 `bitcoin`
+
+但结构 schema 不能证明每个时间段都有数据。因此新增 InfluxDB `metadata.data_profile`，用于表达每个 measurement/field/tag series 的时间覆盖范围和点数。
+
+Bitcoin preview 现在包含：
+
+| code | crypto | start | end | point_count |
+| --- | --- | --- | --- | ---: |
+| EUR | bitcoin | `2023-01-04T23:04:00Z` | `2023-02-03T22:47:00Z` | 2680 |
+| GBP | bitcoin | `2023-01-04T23:04:00Z` | `2023-02-03T22:47:00Z` | 2680 |
+| USD | bitcoin | `2023-01-04T23:04:00Z` | `2023-02-03T22:47:00Z` | 2680 |
+
+复测：
+
+- 临时服务：`http://127.0.0.1:5681`
+- preview 检查：`/api/v1/resources/databases/influxdb2-bitcoin-sample/preview`
+- E2E 产物：`cache_data/e2e_runs/bitcoin_data_profile_2026-07-28/empty_range_with_data_profile.json`
+- 请求：`Bitcoin USD 2022-01-01 到 2022-01-02`
+- 结果：`completed`
+- used_tools：`sql_query`
+- 耗时：29.7s
+- 摘要：`该时间范围内未查到 Bitcoin USD 数据，原因是数据库查询返回 0 行；因此起始值、结束值、涨跌幅、最高最低值均无法计算。`
+
+结论：schema 现在不只是结构信息，也带有轻量 data profile。模型可以区分“字段/tag 存在但请求时间范围没有覆盖数据”和“字段或过滤条件不存在”。当前实现仍保留一次真实查询作为证据，不会仅凭 schema profile 伪造结果。
+
+## Persistent Profile Cache 补充
+
+Data profile 已改为持久缓存形态：
+
+- 缓存目录：`cache_data/database/profiles/`
+- Bitcoin 缓存文件：`cache_data/database/profiles/influxdb2-bitcoin-sample.json`
+- 默认 TTL：900 秒
+- 强制刷新：`GET /api/v1/resources/databases/{database_id}/preview?refresh=true`
+- 普通读取：`GET /api/v1/resources/databases/{database_id}/preview`
+- 新增/更新数据库配置后，会尝试刷新 profile；刷新失败不阻断配置保存。
+- 测试连接成功后，也会尝试刷新 profile。
+
+验证结果：
+
+1. 强制刷新 preview：
+   - `profile_cache.source=live_refresh_persisted`
+   - 写入路径：`cache_data/database/profiles/influxdb2-bitcoin-sample.json`
+   - profile sources：3 条，分别为 `EUR/GBP/USD`。
+
+2. 普通 preview：
+   - `profile_cache.source=persistent_cache`
+   - `source_count=3`
+
+3. 空区间对话复测：
+   - 产物：`cache_data/e2e_runs/bitcoin_profile_cache_2026-07-28/empty_range_with_profile_cache.json`
+   - 请求：`Bitcoin USD 2022-01-01 到 2022-01-02`
+   - 结果：`completed`
+   - used_tools：`sql_query`
+   - 耗时：15.28s
+   - 摘要：`查询结果为空：在指定时间范围内没有找到 Bitcoin USD 记录，所以无法提供起始值、结束值、涨跌幅、最高值和最低值。原因是数据库在该条件下返回 0 行。`
+
+结论：对话前不再需要每次动态扫描 data profile。系统默认使用持久 profile cache，过期或用户点击数据库页面 Refresh 时再刷新。
+
+## Structured Action 批量复测
+
+在 DataAgent 改为结构化 function/tool calling 后，使用已重启的 `5680` 后端执行批量 E2E：
+
+- 产物目录：`cache_data/e2e_runs/structured_action_batch_2026-07-28/`
+- 共同数据库：`influxdb2-bitcoin-sample`
+- 共同结果：HTTP/SSE 正常，无 error event，`llm_diagnostics=null`，未触发 ReAct JSON repair。
+
+| case | 请求 | 状态 | 首个 tool_call | 总耗时 | 工具链 | 结果/问题 |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| `normal_metrics` | Bitcoin USD 2023-01-04 到 2023-02-03 起始/结束/涨跌幅/最高最低 | completed | 8.10s | 33.63s | `sql_query -> code_interpreter -> code_interpreter -> terminate` | 有问题：第一次 code 因 outlier 透明字段缺失失败；第二次改为“不剔除任何异常值”，最终被 1e14 脏值污染。 |
+| `empty_range` | Bitcoin USD 2022-01-01 到 2022-01-02 同类指标 | completed | 2.38s | 11.25s | `sql_query -> terminate` | 正确：返回 0 行并说明起始值、结束值、涨跌幅、最高最低无法计算。 |
+| `gbp_metrics` | Bitcoin GBP 2023-01-04 到 2023-02-03 同类指标 | completed | 3.86s | 18.53s | `sql_query -> code_interpreter -> terminate` | 有问题：未识别/剔除 1e14 量级异常值，起始值和最高值被污染。 |
+| `simple_count` | Bitcoin USD 2023-01-04 到 2023-02-03 条数 | completed | 2.27s | 8.68s | `sql_query -> terminate` | 正确：返回 `2680`。 |
+| `invalid_asset` | Ethereum USD 同时间段同类指标 | completed | 2.76s | 27.48s | `sql_query -> sql_query -> sql_query -> terminate` | 可接受但偏慢：多次尝试后说明数据源中无 Ethereum USD 记录。 |
+
+本轮结论：
+
+1. 结构化 action 输出已经解决原先的非法 JSON 和 repair 延迟问题。
+2. 首个业务工具调用稳定提前到 2.27s-8.10s，明显优于 repair 时代的 30s 级等待。
+3. 新的主要风险转移到 code_interpreter 的异常值策略：当第一次 outlier 处理因透明字段校验失败后，模型可能改成“保留全部数据”来通过 schema，导致结果被明显脏值污染。
+
+后续需做系统性修复：当数据中出现极端值且指标会被极端值支配时，code_interpreter 不能通过“未剔除任何异常值”绕过透明异常处理要求；至少必须同时返回 raw_metrics 与 adjusted_metrics，并在 final answer 中明确区分原始结果和清洗后结果。

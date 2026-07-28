@@ -1580,7 +1580,8 @@ input:focus-visible {
 }
 
 .database-kv-list,
-.object-column-list {
+.object-column-list,
+.database-profile-list {
   display: grid;
   gap: 7px;
 }
@@ -1731,6 +1732,53 @@ input:focus-visible {
 
 .database-sample-table {
   min-width: 520px;
+}
+
+.database-profile-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.database-profile-cache {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.database-profile-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 8px;
+}
+
+.database-profile-row strong,
+.database-profile-row span,
+.database-profile-row small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.database-profile-row strong {
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.database-profile-row span,
+.database-profile-row small {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .object-detail-header {

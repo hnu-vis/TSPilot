@@ -99,6 +99,7 @@ export type DatabaseConnectionTest = {
   latency_ms?: number | null;
   version?: string | null;
   error?: string | null;
+  profile_refresh?: Record<string, unknown> | null;
 };
 
 export type DatabasePreviewColumn = {
@@ -132,6 +133,7 @@ export type DatabasePreviewResponse = {
   summary?: string;
   preview?: DatabasePreviewPayload;
   error?: string;
+  profile_cache?: Record<string, unknown> | null;
 };
 
 export type KnowledgeResource = {

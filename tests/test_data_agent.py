@@ -107,8 +107,9 @@ def test_parse_turn_accepts_dbgpt_style_step_fields():
 
 def test_repair_prompt_requires_explicit_action_and_action_input():
     llm = _RepairCapturingLLM()
+    request_state = _RequestState()
 
-    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(None, None))
+    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(request_state, None))
 
     assert turn.action == "sql_query"
     repair_prompt = llm.messages[1][-1][1]
@@ -116,6 +117,12 @@ def test_repair_prompt_requires_explicit_action_and_action_input():
     assert "action_input field is mandatory" in repair_prompt
     assert "todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate" in repair_prompt
     assert "Do not return only thought, task_contract, action_intention, or action_reason" in repair_prompt
+    repairs = request_state.completion_state["llm_diagnostics"]["react_turn_repairs"]
+    assert repairs[0]["source"] == "data_agent.next_turn"
+    assert repairs[0]["repair_index"] == 0
+    assert "missing 'action'" in repairs[0]["parser_error"]
+    assert repairs[0]["failed_output"]["char_count"] > 0
+    assert repairs[0]["failed_output"]["starts_with"].startswith('{"thought"')
 
 
 def test_next_turn_allows_second_llm_repair_attempt_without_guessing_action_locally():
@@ -182,12 +189,28 @@ def test_next_turn_repairs_invalid_first_model_output_once():
     assert turn.action_input["direct_answer"] == "Done."
 
 
+def test_next_turn_uses_structured_output_when_available():
+    llm = _StructuredLLM()
+
+    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(_RequestState(), None))
+
+    assert turn.action == "sql_query"
+    assert turn.action_input["message"] == "查询数据"
+    assert llm.calls == 1
+    assert llm.structured_calls == 1
+
+
 class _PromptBuilder:
     def build_system_prompt(self):
         return "system"
 
     def build_user_prompt(self, request_state, conversation_state):
         return "Context JSON:\n{}"
+
+
+class _RequestState:
+    def __init__(self):
+        self.completion_state = {}
 
 
 class _BadThenGoodLLM:
@@ -204,3 +227,26 @@ class _BadThenGoodLLM:
 class _Response:
     def __init__(self, content: str):
         self.content = content
+
+
+class _StructuredLLM:
+    def __init__(self):
+        self.calls = 0
+        self.structured_calls = 0
+
+    def with_structured_output(self, schema, **kwargs):
+        self.structured_schema = schema
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        self.structured_calls += 1
+        return {
+            "raw": _Response(""),
+            "parsed": self.structured_schema(
+                thought="需要查询。",
+                action="sql_query",
+                action_input={"message": "查询数据", "database_context": {"database_id": "demo", "database_type": "sqlite"}},
+            ),
+            "parsing_error": None,
+        }

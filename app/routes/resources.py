@@ -6,7 +6,7 @@ from time import perf_counter
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.settings import get_settings
@@ -78,7 +78,8 @@ async def create_database_resource(payload: DatabaseConfigPayload) -> dict:
         raise HTTPException(status_code=409, detail=f"Database '{config['name']}' already exists.")
     db_id = await DatabaseFactory.add_database(**config)
     saved_config = await DatabaseFactory.get_database(db_id)
-    return {"database": _public_database_config(db_id, saved_config or config)}
+    profile_cache = DatabaseFactory.read_profile_cache(db_id)
+    return {"database": _public_database_config(db_id, saved_config or config), "profile_cache": profile_cache}
 
 
 @router.get("/databases/{database_id}")
@@ -127,8 +128,10 @@ async def test_database_resource(database_id: str) -> dict:
     if result.get("success"):
         connector = await DatabaseFactory.create_connector(**dict(config))
         await DatabaseFactory.mark_connected(database_id, connector)
+        profile_result = await DatabaseFactory.refresh_database_profile(database_id)
     else:
         await DatabaseFactory.mark_disconnected(database_id)
+        profile_result = None
 
     latest_config = await DatabaseFactory.get_database(database_id) or config
     return {
@@ -138,11 +141,12 @@ async def test_database_resource(database_id: str) -> dict:
         "latency_ms": result.get("latency_ms") or latency_ms,
         "version": result.get("version"),
         "error": result.get("error"),
+        "profile_refresh": profile_result,
     }
 
 
 @router.get("/databases/{database_id}/preview")
-async def preview_database_resource(database_id: str) -> dict:
+async def preview_database_resource(database_id: str, refresh: bool = Query(default=False)) -> dict:
     """Return a lightweight schema or metric preview for one database."""
     config = await DatabaseFactory.get_database(database_id)
     if not config:
@@ -160,9 +164,11 @@ async def preview_database_resource(database_id: str) -> dict:
         }
 
     try:
-        connector = await DatabaseFactory.create_connector(**dict(config))
-        async with connector:
-            schema = await connector.get_schema()
+        schema, profile_cache = await DatabaseFactory.load_schema_with_profile_cache(
+            database_id,
+            dict(config),
+            force_refresh=refresh,
+        )
     except Exception as exc:
         return {
             "database": public_config,
@@ -179,6 +185,7 @@ async def preview_database_resource(database_id: str) -> dict:
             "preview_kind": "metrics",
             "summary": f"Loaded {len(preview.get('metrics', []))} metrics.",
             "preview": preview,
+            "profile_cache": profile_cache,
         }
 
     preview = schema_preview(schema)
@@ -187,6 +194,7 @@ async def preview_database_resource(database_id: str) -> dict:
         "preview_kind": "schema",
         "summary": f"Loaded {len(preview.get('tables_or_measurements', []))} schema objects.",
         "preview": preview,
+        "profile_cache": profile_cache,
     }
 
 

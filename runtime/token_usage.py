@@ -16,6 +16,7 @@ def record_llm_token_usage(
     output_text: str | None = None,
     model: str | None = None,
     tool_name: str | None = None,
+    duration_ms: int | None = None,
 ) -> dict | None:
     """Estimate LLM token usage with tiktoken and retain provider usage when present."""
 
@@ -33,6 +34,8 @@ def record_llm_token_usage(
         "estimated": estimated_usage,
         "provider": provider_usage,
     }
+    if duration_ms is not None:
+        entry["duration_ms"] = int(duration_ms)
     token_state["calls"].append(entry)
     totals = token_state["totals"]
     counted = estimated_usage or provider_usage or {}

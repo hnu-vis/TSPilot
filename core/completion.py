@@ -169,7 +169,12 @@ def _requires_specialized_capability(
 def _requires_code_analysis(request_state: RequestStateModel) -> bool:
     contract = request_state.task_contract
     if contract is None:
-        return False
+        requirements = {
+            str(item).strip().lower()
+            for item in (request_state.requested_capabilities or [])
+            if str(item).strip()
+        }
+        return "analysis" in requirements
     for output in contract.required_outputs:
         if not output.required:
             continue

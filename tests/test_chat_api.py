@@ -28,6 +28,7 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
         settings.max_iterations = max_iterations
 
     deps.get_llm = lambda: llm
+    deps.get_data_agent_llm = lambda: llm
     deps.get_data_agent.cache_clear()
     deps.get_tool_registry.cache_clear()
     deps.get_tool_executor.cache_clear()

@@ -338,6 +338,10 @@ class InfluxDBConnector(DBConnector):
                             existing.append(value)
             if value_domains:
                 schema.metadata["value_domains"] = value_domains
+            if self._schema_data_profile_enabled():
+                data_profile = await self._build_data_profile_v2(value_domains=value_domains)
+                if data_profile:
+                    schema.metadata["data_profile"] = data_profile
 
         except Exception as e:
             schema.metadata["error"] = str(e)
@@ -951,6 +955,162 @@ class InfluxDBConnector(DBConnector):
             if value_column not in domains["_field"]:
                 domains["_field"].append(value_column)
         return {str(measurement): domains}
+
+    async def _build_data_profile_v2(self, *, value_domains: dict[str, dict[str, list[str]]]) -> dict[str, Any] | None:
+        """Build lightweight time-coverage profiles for bounded schema grounding."""
+        if not value_domains:
+            return None
+        max_series = self._data_profile_max_series()
+        profiles: list[dict[str, Any]] = []
+        diagnostics: dict[str, Any] = {"max_series": max_series, "truncated": False}
+        for measurement, domains in value_domains.items():
+            if len(profiles) >= max_series:
+                diagnostics["truncated"] = True
+                break
+            fields = domains.get("_field") if isinstance(domains, dict) else None
+            if not isinstance(fields, list):
+                continue
+            tag_columns = [
+                key for key, values in domains.items()
+                if key != "_field" and isinstance(values, list) and values
+            ]
+            group_columns = self._data_profile_group_columns(tag_columns)
+            for field in fields:
+                if len(profiles) >= max_series:
+                    diagnostics["truncated"] = True
+                    break
+                field_profiles = await self._query_data_profile_v2(
+                    measurement=str(measurement),
+                    field=str(field),
+                    group_columns=group_columns,
+                    remaining=max_series - len(profiles),
+                )
+                profiles.extend(field_profiles)
+        if not profiles:
+            return None
+        return {
+            "contract_version": "data_profile.v1",
+            "profile_kind": "time_coverage",
+            "sources": profiles,
+            "diagnostics": diagnostics,
+        }
+
+    def _schema_data_profile_enabled(self) -> bool:
+        raw_value = self.config.extra.get("schema_data_profile_enabled", True)
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(raw_value)
+
+    def _data_profile_max_series(self) -> int:
+        raw_value = self.config.extra.get("schema_data_profile_max_series", 100)
+        try:
+            return max(1, min(int(raw_value), 500))
+        except Exception:
+            return 100
+
+    def _data_profile_group_columns(self, tag_columns: list[str]) -> list[str]:
+        preferred = ["code", "crypto", "description", "symbol"]
+        selected = [column for column in preferred if column in tag_columns]
+        for column in tag_columns:
+            if column not in selected:
+                selected.append(column)
+            if len(selected) >= 4:
+                break
+        return selected[:4]
+
+    async def _query_data_profile_v2(
+        self,
+        *,
+        measurement: str,
+        field: str,
+        group_columns: list[str],
+        remaining: int,
+    ) -> list[dict[str, Any]]:
+        if not self._query_api or remaining <= 0:
+            return []
+        group_clause = (
+            "  |> group(columns: ["
+            + ", ".join(f'"{self._escape_flux_string(column)}"' for column in group_columns)
+            + "])\n"
+            if group_columns
+            else "  |> group()\n"
+        )
+        base = (
+            f'from(bucket: "{self._escape_flux_string(self.config.bucket)}")\n'
+            "  |> range(start: 1970-01-01T00:00:00Z)\n"
+            f'  |> filter(fn: (r) => r._measurement == "{self._escape_flux_string(measurement)}")\n'
+            f'  |> filter(fn: (r) => r._field == "{self._escape_flux_string(field)}")\n'
+            f"{group_clause}"
+        )
+        try:
+            first_rows = self._query_profile_rows(base + "  |> first()\n", group_columns=group_columns)
+            last_rows = self._query_profile_rows(base + "  |> last()\n", group_columns=group_columns)
+            count_rows = self._query_profile_rows(base + '  |> count(column: "_value")\n', group_columns=group_columns)
+        except Exception:
+            return []
+        merged: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
+        for key, row in first_rows.items():
+            profile = merged.setdefault(
+                key,
+                {
+                    "measurement": measurement,
+                    "field": field,
+                    "tags": dict(key),
+                },
+            )
+            if row.get("time"):
+                profile["start"] = row["time"]
+        for key, row in last_rows.items():
+            profile = merged.setdefault(
+                key,
+                {
+                    "measurement": measurement,
+                    "field": field,
+                    "tags": dict(key),
+                },
+            )
+            if row.get("time"):
+                profile["end"] = row["time"]
+        for key, row in count_rows.items():
+            profile = merged.setdefault(
+                key,
+                {
+                    "measurement": measurement,
+                    "field": field,
+                    "tags": dict(key),
+                },
+            )
+            count = row.get("value")
+            if isinstance(count, (int, float)):
+                profile["point_count"] = int(count)
+        return [
+            profile
+            for profile in list(merged.values())[:remaining]
+            if profile.get("start") or profile.get("end") or profile.get("point_count") is not None
+        ]
+
+    def _query_profile_rows(self, query: str, *, group_columns: list[str]) -> dict[tuple[tuple[str, str], ...], dict[str, Any]]:
+        rows: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
+        tables = self._query_api.query(query=query, org=self.config.org, params={"bucket": self.config.bucket})
+        for table in tables or []:
+            for record in getattr(table, "records", []) or []:
+                values = getattr(record, "values", {}) or {}
+                tags = {
+                    column: str(values.get(column))
+                    for column in group_columns
+                    if values.get(column) not in (None, "")
+                }
+                key = tuple(sorted(tags.items()))
+                value = values.get("_value")
+                timestamp = values.get("_time")
+                if hasattr(timestamp, "isoformat"):
+                    timestamp = timestamp.isoformat().replace("+00:00", "Z")
+                rows[key] = {
+                    "tags": tags,
+                    "time": str(timestamp) if timestamp not in (None, "") else None,
+                    "value": value,
+                }
+        return rows
 
     def _escape_flux_string(self, value: str) -> str:
         """Escape a Flux string literal value."""

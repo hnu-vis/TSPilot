@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from agents.base import BaseAgent
 from prompts.data_agent import DataAgentPromptBuilder
@@ -17,6 +18,7 @@ class DataAgent(BaseAgent):
     def __init__(self, prompt_builder: DataAgentPromptBuilder, llm):
         self._prompt_builder = prompt_builder
         self._llm = llm
+        self._structured_llm = self._build_structured_llm(llm)
 
     async def next_turn(
         self,
@@ -25,7 +27,7 @@ class DataAgent(BaseAgent):
     ) -> ReActTurn:
         system_prompt = self._prompt_builder.build_system_prompt()
         user_prompt = self._prompt_builder.build_user_prompt(request_state, conversation_state)
-        content = await self._invoke_model(
+        content, structured_turn = await self._invoke_turn(
             [
                 ("system", system_prompt),
                 ("user", user_prompt),
@@ -33,13 +35,23 @@ class DataAgent(BaseAgent):
             request_state=request_state,
             source="data_agent.next_turn",
         )
+        if structured_turn is not None:
+            return structured_turn
         try:
             return self._parse_turn(content)
         except ValueError as first_error:
+            self._record_repair_attempt(
+                request_state,
+                source="data_agent.next_turn",
+                repair_index=0,
+                parser_error=first_error,
+                failed_content=content,
+                final_attempt=False,
+            )
             repaired_content = content
             last_error = first_error
             for repair_index in range(2):
-                repaired_content = await self._invoke_model(
+                repaired_content, structured_turn = await self._invoke_turn(
                     [
                         ("system", system_prompt),
                         ("user", user_prompt),
@@ -49,9 +61,19 @@ class DataAgent(BaseAgent):
                     request_state=request_state,
                     source="data_agent.contract_repair",
                 )
+                if structured_turn is not None:
+                    return structured_turn
                 try:
                     return self._parse_turn(repaired_content)
                 except ValueError as repair_error:
+                    self._record_repair_attempt(
+                        request_state,
+                        source="data_agent.contract_repair",
+                        repair_index=repair_index + 1,
+                        parser_error=repair_error,
+                        failed_content=repaired_content,
+                        final_attempt=repair_index == 1,
+                    )
                     last_error = repair_error
                     continue
             try:
@@ -93,7 +115,9 @@ class DataAgent(BaseAgent):
         )
 
     async def _invoke_model(self, messages, *, request_state=None, source: str = "data_agent") -> str:
+        started_at = time.perf_counter()
         response = await self._llm.ainvoke(messages)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
         content = getattr(response, "content", response)
         if isinstance(content, list):
             content = "".join(
@@ -101,8 +125,95 @@ class DataAgent(BaseAgent):
                 for item in content
             )
         content = str(content)
-        record_llm_token_usage(request_state, source=source, response=response, messages=messages, output_text=content)
+        record_llm_token_usage(
+            request_state,
+            source=source,
+            response=response,
+            messages=messages,
+            output_text=content,
+            duration_ms=duration_ms,
+        )
         return content
+
+    async def _invoke_turn(self, messages, *, request_state=None, source: str = "data_agent") -> tuple[str, ReActTurn | None]:
+        if self._structured_llm is None:
+            return await self._invoke_model(messages, request_state=request_state, source=source), None
+
+        started_at = time.perf_counter()
+        result = await self._structured_llm.ainvoke(messages)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        raw_response = result.get("raw") if isinstance(result, dict) else result
+        parsed = result.get("parsed") if isinstance(result, dict) else None
+        parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
+        if isinstance(parsed, ReActTurn):
+            content = json.dumps(parsed.model_dump(mode="json"), ensure_ascii=False)
+            record_llm_token_usage(
+                request_state,
+                source=source,
+                response=raw_response,
+                messages=messages,
+                output_text=content,
+                duration_ms=duration_ms,
+            )
+            return content, parsed
+
+        content = self._structured_failure_text(result, parsing_error)
+        record_llm_token_usage(
+            request_state,
+            source=source,
+            response=raw_response,
+            messages=messages,
+            output_text=content,
+            duration_ms=duration_ms,
+        )
+        return content, None
+
+    def _build_structured_llm(self, llm):
+        builder = getattr(llm, "with_structured_output", None)
+        if not callable(builder):
+            return None
+        try:
+            return builder(ReActTurn, method="function_calling", include_raw=True)
+        except Exception:
+            return None
+
+    def _structured_failure_text(self, result, parsing_error) -> str:
+        if parsing_error is not None:
+            return str(parsing_error)
+        if isinstance(result, dict):
+            raw = result.get("raw")
+            content = getattr(raw, "content", None)
+            if content:
+                return str(content)
+            tool_calls = getattr(raw, "tool_calls", None)
+            if tool_calls:
+                return json.dumps(tool_calls, ensure_ascii=False)
+        return str(result)
+
+    def _record_repair_attempt(
+        self,
+        request_state,
+        *,
+        source: str,
+        repair_index: int,
+        parser_error: ValueError,
+        failed_content: str,
+        final_attempt: bool,
+    ) -> None:
+        if request_state is None:
+            return
+        diagnostics = request_state.completion_state.setdefault("llm_diagnostics", {})
+        repairs = diagnostics.setdefault("react_turn_repairs", [])
+        repairs.append(
+            {
+                "source": source,
+                "repair_index": repair_index,
+                "final_attempt": final_attempt,
+                "parser_error_type": parser_error.__class__.__name__,
+                "parser_error": _truncate_middle(str(parser_error), max_chars=2000),
+                "failed_output": _failed_output_summary(failed_content),
+            }
+        )
 
     def _parse_turn(self, content: str) -> ReActTurn:
         stripped = content.strip()
@@ -192,3 +303,19 @@ class DataAgent(BaseAgent):
         except IndexError:
             value = None
         return self._optional_string(value)
+
+
+def _failed_output_summary(content: str) -> dict:
+    text = str(content or "")
+    return {
+        "char_count": len(text),
+        "starts_with": text[:500],
+        "ends_with": text[-500:] if len(text) > 500 else "",
+    }
+
+
+def _truncate_middle(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    edge = max((max_chars - 20) // 2, 1)
+    return f"{text[:edge]} ... <truncated> ... {text[-edge:]}"

@@ -72,6 +72,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [sourcesCollapsed, setSourcesCollapsed] = useState(false);
+  const [refreshProfile, setRefreshProfile] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [previewState, setPreviewState] = useState<PreviewState>({
@@ -100,7 +101,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
       error: null,
       data: current.databaseId === activeDatabaseId ? current.data : null,
     }));
-    fetchDatabasePreview(activeDatabaseId)
+    fetchDatabasePreview(activeDatabaseId, { refresh: refreshProfile })
       .then((data) => {
         if (!cancelled) setPreviewState({ databaseId: activeDatabaseId, loading: false, error: null, data });
       })
@@ -113,6 +114,9 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
             data: null,
           });
         }
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshProfile(false);
       });
 
     return () => {
@@ -125,6 +129,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   const fields = preview?.fields || [];
   const labelsOrTags = preview?.labels_or_tags || [];
   const metadataEntries = objectEntries(preview?.metadata);
+  const profileRows = useMemo(() => collectDataProfileRows(preview), [preview]);
   const [selectedObjectKey, setSelectedObjectKey] = useState<string | null>(null);
   const activeObject = useMemo(() => {
     if (schemaObjects.length === 0) return null;
@@ -308,7 +313,10 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                   className="icon-text-button"
                   type="button"
                   disabled={previewState.loading}
-                  onClick={() => setReloadToken((value) => value + 1)}
+                  onClick={() => {
+                    setRefreshProfile(true);
+                    setReloadToken((value) => value + 1);
+                  }}
                 >
                   <RefreshCw size={14} />
                   <span>{previewState.loading ? 'Loading' : 'Refresh'}</span>
@@ -359,6 +367,8 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                     fields={fields}
                     labelsOrTags={labelsOrTags}
                     metadataEntries={metadataEntries}
+                    profileRows={profileRows}
+                    profileCache={previewState.data?.profile_cache || null}
                   />
                 ) : (
                   <EmptyPreview label="Select a schema object to inspect details." />
@@ -612,11 +622,15 @@ function ObjectDetail({
   fields,
   labelsOrTags,
   metadataEntries,
+  profileRows,
+  profileCache,
 }: {
   item: DatabasePreviewObject;
   fields: Array<Record<string, unknown>>;
   labelsOrTags: Array<Record<string, unknown>>;
   metadataEntries: Array<[string, unknown]>;
+  profileRows: Array<Record<string, unknown>>;
+  profileCache: Record<string, unknown> | null;
 }) {
   const columns = item.columns || [];
   const fieldValues = item.field_values || [];
@@ -644,6 +658,11 @@ function ObjectDetail({
           <SampleRows rows={sampleRows} />
         </div>
 
+        <div className="object-detail-block compact">
+          <SectionTitle icon={RefreshCw} title="Data Profile" count={profileRows.length} />
+          <DataProfile rows={profileRows.filter((row) => String(row.measurement || row.source || '') === item.name)} cache={profileCache} />
+        </div>
+
         {(relatedValues.length > 0 || metadataEntries.length > 0) && (
           <div className="object-detail-block compact">
             <SectionTitle icon={Database} title="Context" count={relatedValues.length + metadataEntries.length} />
@@ -652,6 +671,34 @@ function ObjectDetail({
         )}
       </div>
     </>
+  );
+}
+
+function DataProfile({ rows, cache }: { rows: Array<Record<string, unknown>>; cache: Record<string, unknown> | null }) {
+  const cacheText = cache
+    ? `${formatValue(cache.source)} · ${formatValue(cache.generated_at)}`
+    : 'n/a';
+  if (rows.length === 0) {
+    return (
+      <div className="database-profile-block">
+        <div className="database-profile-cache">Cache: {cacheText}</div>
+        <EmptyPreview label="No data profile returned." />
+      </div>
+    );
+  }
+  return (
+    <div className="database-profile-block">
+      <div className="database-profile-cache">Cache: {cacheText}</div>
+      <div className="database-profile-list">
+        {rows.slice(0, 12).map((row, index) => (
+          <div key={index} className="database-profile-row">
+            <strong>{profileSeriesLabel(row)}</strong>
+            <span>{formatValue(row.start)} → {formatValue(row.end)}</span>
+            <small>{formatValue(row.point_count)} points</small>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -741,6 +788,28 @@ function schemaObjectKey(item: DatabasePreviewObject | null) {
 function collectSchemaObjects(preview: DatabasePreviewPayload | null): DatabasePreviewObject[] {
   if (!preview) return [];
   return [...(preview.tables_or_measurements || []), ...(preview.metrics || [])];
+}
+
+function collectDataProfileRows(preview: DatabasePreviewPayload | null): Array<Record<string, unknown>> {
+  const metadata = preview?.metadata;
+  if (!metadata || typeof metadata !== 'object') return [];
+  const profile = (metadata as Record<string, unknown>).data_profile;
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return [];
+  const sources = (profile as Record<string, unknown>).sources;
+  return Array.isArray(sources)
+    ? sources.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    : [];
+}
+
+function profileSeriesLabel(row: Record<string, unknown>) {
+  const field = formatValue(row.field);
+  const tags = row.tags && typeof row.tags === 'object' && !Array.isArray(row.tags)
+    ? Object.entries(row.tags as Record<string, unknown>)
+      .slice(0, 3)
+      .map(([key, value]) => `${key}=${formatValue(value)}`)
+      .join(', ')
+    : '';
+  return tags ? `${field} · ${tags}` : field;
 }
 
 function totalColumns(objects: DatabasePreviewObject[]) {

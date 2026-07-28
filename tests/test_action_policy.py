@@ -360,6 +360,42 @@ def test_terminate_blocks_derived_contract_outputs_without_code_analysis():
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
 
 
+def test_terminate_blocks_analysis_capability_without_task_contract_until_code_runs():
+    request_state = RequestStateModel(
+        request_id="req-analysis-capability-without-contract",
+        message="计算涨跌幅和最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        requested_capabilities=["query", "analysis"],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded requested rows.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 10.0},
+                    {"timestamp": "2023-01-02T00:00:00Z", "value": 12.0},
+                ]
+            },
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["database_evidence"],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "涨跌幅 20%。"})
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+
+
 def test_terminate_cannot_mark_required_analysis_unavailable_after_code_failure():
     request_state = RequestStateModel(
         request_id="req-derived-analysis-unavailable-bypass",

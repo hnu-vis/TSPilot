@@ -558,9 +558,10 @@ class SqlQueryTool(BaseTool):
         if isinstance(reference_dataset, dict):
             return None, self._reference_dataset_schema_preview(config)
         try:
-            connector = await DatabaseFactory.create_connector(**config)
-            async with connector:
-                schema = await connector.get_schema()
+            schema, _profile_cache = await DatabaseFactory.load_schema_with_profile_cache(
+                validated_input.database_context.database_id,
+                dict(config),
+            )
             return schema, schema_preview(schema)
         except Exception:
             if validated_input.database_context.schema_hint:
