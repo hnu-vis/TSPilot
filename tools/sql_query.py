@@ -16,6 +16,7 @@ from core.database.schema import schema_preview
 from core.database.schema_linking import SchemaLinkingPipeline
 from schemas.state import RequestStateModel
 from schemas.database_context import DatabaseContext
+from schemas.data_fact import DataFactRequest
 from tools.base import BaseTool
 
 
@@ -25,6 +26,7 @@ class _ExplicitQueryInput(BaseModel):
     query_language: str | None = None
     purpose: str | None = None
     constraints: dict = Field(default_factory=dict)
+    fact_requests: list[DataFactRequest] = Field(default_factory=list)
 
 
 class SqlQueryInput(BaseModel):
@@ -36,6 +38,7 @@ class SqlQueryInput(BaseModel):
     selected_database: str | None = None
     selected_database_type: str | None = None
     history: list[dict] = Field(default_factory=list)
+    fact_requests: list[DataFactRequest] = Field(default_factory=list)
     query: str | None = None
     query_language: str | None = None
     purpose: str | None = None
@@ -493,6 +496,7 @@ class SqlQueryTool(BaseTool):
                     query_language=validated_input.query_language,
                     purpose=validated_input.purpose,
                     constraints=validated_input.constraints,
+                    fact_requests=validated_input.fact_requests,
                 ),
                 mode="explicit",
                 **kwargs,
@@ -651,6 +655,7 @@ class SqlQueryTool(BaseTool):
                 query_language=generated.query_language or self._infer_query_language(config),
                 purpose=generated.purpose,
                 constraints=validated_input.constraints,
+                fact_requests=validated_input.fact_requests,
             ),
             mode="llm",
             extra_metadata={

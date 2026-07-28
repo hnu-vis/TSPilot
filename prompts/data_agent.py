@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+from core.data_fact import data_fact_prompt_view, prompt_fact_memory_view
 from schemas.state import ConversationStateModel, RequestStateModel
 
 
@@ -28,6 +29,7 @@ class DataAgentPromptBuilder:
             "previous_observation_assessment must be null when there is no previous observation or the previous observation only created the todo plan. "
             "Otherwise, use {\"completed_active_todo\": bool, \"reason\": str|null, \"evidence_refs\": list[str], "
             "\"covered\": list[str], \"missing\": list[str], "
+            "\"covered_facts\": list[str], \"missing_facts\": list[str], \"unavailable_facts\": list[str], \"next_fact_need\": str|null, "
             "\"completed_todos\": list[int|str], \"next_active_todo\": int|str|null, "
             "\"next_action_reason\": str|null, \"can_answer\": bool|null}. "
             "Set completed_active_todo=true only when your Thought concludes the latest Observation satisfies the currently active todo from before this turn; observation itself is factual, not a completion verdict.\n"
@@ -66,6 +68,8 @@ class DataAgentPromptBuilder:
             "Task-first evidence rule:\n"
             "- Before choosing the next tool, translate the user's request into a task output contract: required measures, dimensions, time scope, grouping, comparisons, derived quantities, model outputs, and evidence quality notes.\n"
             "- After each observation, fill previous_observation_assessment as a gap assessment between that output contract and current evidence: covered, missing, can_answer, and next_action_reason. This is required even when there is no active todo to complete.\n"
+            "- DataFact is a structured memory layer under ReAct. Use action_input.fact_requests to tell a tool what facts you need; do not put computed values in fact_requests. Tools may return produced_facts, rejected_facts, unavailable facts, and fact_coverage. Fact coverage is diagnostic and planning context, not a hard success/failure condition.\n"
+            "- If fact_coverage is missing but observation/artifacts contain sufficient grounded evidence, you may continue or terminate with references. If the final answer contains precise numeric claims, those claims must come from produced DataFacts or verified analysis/database artifacts, never from mental arithmetic in terminate.\n"
             "- Treat tools as ways to produce or verify that contract. Do not choose a tool chain by template; choose the smallest next action that fills missing contract fields from grounded evidence.\n"
             "- A sql_query result is database evidence only. Use it for raw rows, database-returned columns, query text, row counts, grouping/filter validation, and simple database facts. "
             "Do not use the final answer to perform arithmetic, statistical analysis, anomaly/outlier reasoning, normalization, trend judgment, or multi-field derivation.\n"
@@ -79,10 +83,10 @@ class DataAgentPromptBuilder:
             "- sql_query: query the selected datasource and return database evidence, including the actual backend query text when available. "
             "Use automatic message-based input for normal database requests. Use explicit query/query_language only when repairing a failed generated query, or when the user supplied an exact query. "
             "It is the primary database-analysis action for raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
-            "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed.\n"
+            "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed, but do not replace the only raw time-series evidence with a cleaned/outlier-filtered query when anomaly detection is requested. Keep raw evidence as the anomaly baseline; use cleaned subsets only as additional evidence or inside code_interpreter-derived adjusted metrics.\n"
             "- code_interpreter: execute Python code in a subprocess over existing full evidence artifacts. Use it when the user explicitly asks for code interpreter, or when any requested output requires arithmetic, derived metrics, statistical analysis, threshold/outlier policy, comparisons across returned fields, correlations, normalization, windowed calculations, custom loops, or multi-step dataframe-like computation. It may support a forecast/anomaly workflow with statistics, but it must not replace the registered forecast or anomaly tool when the user asks for prediction or anomaly detection.\n"
-            "- anomaly: detect anomalies from existing time-series evidence only. Use detector_name only when the user names a supported detector; otherwise omit it and use the default registered detector.\n"
-            "- forecast: generate a forecast plan/result from existing time-series evidence only. It accepts explicit step counts or duration-like horizons such as '1 day'. Use model_name only when the user names a supported forecast model; otherwise omit it and use the default registered model. A forecast observation with status 'succeeded' or 'requires_rolling' is forecast evidence that can be answered from.\n"
+            "- anomaly: detect anomalies from existing raw time-series evidence by default. If latest evidence is a cleaned/outlier-filtered subset and prior raw evidence exists, anomaly will use the raw evidence unless constraints.input_policy='selected'. Use detector_name only when the user names a supported detector; otherwise omit it and use the default registered detector.\n"
+            "- forecast: generate a forecast plan/result from existing time-series evidence only. It accepts explicit step counts or duration-like horizons such as '1 day'. Use model_name only when the user names a supported forecast model; otherwise omit it and use the default registered model. By default, if an anomaly result exists for the same evidence, forecast excludes those detected anomaly points from its training input and records that policy in diagnostics; set constraints.input_policy='raw' only when the user explicitly asks for raw-data forecasting. Only a forecast observation with status 'succeeded' and non-empty forecast_points is complete forecast evidence.\n"
             "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
             "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
             "- terminate: end the ReAct loop when verified outputs already answer the task, and provide the final response payload. "
@@ -98,9 +102,9 @@ class DataAgentPromptBuilder:
             "Each todo item should use {\"content\": str, \"task_type\": \"query|code_interpreter|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
             "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
             "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction. For database plans, split by requested result: count, earliest/latest rows, grouped results, time bounds, comparisons, and final answer. Do not split by internal preparation stages.\n"
-            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object}. This is the normal path for database queries.\n"
-            "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
-            "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient raw evidence, issue another explicit sql_query that corrects or validates the data. "
+            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object, \"fact_requests\": list[object]}. This is the normal path for database queries.\n"
+            "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
+            "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient raw evidence, issue another explicit sql_query that corrects or validates the data. When suspicious extreme values are part of the requested analysis, preserve the raw query artifact; do not use a cleaned re-query as the sole input for anomaly detection. "
             "For data questions requiring exact grouping, ranking, period checks, or source validation, prefer an explicit sql_query when the database can return the needed evidence directly. "
             "For calculations over returned evidence, including extrema, boundary comparisons, percentage changes, median/quantile, threshold proportions, outlier policy, or comparison across categories, use code_interpreter after the SQL evidence is sufficiently grounded. Do not calculate final facts from prompt previews or inside terminate. "
             "If code_interpreter excludes, filters, winsorizes, flags, or otherwise treats outliers/anomalies, its result.details must include the explicit outlier_rule, threshold_or_formula, rationale, excluded_rows, and both raw_metrics and adjusted_metrics when an adjusted result is presented. Do not silently replace raw metrics with adjusted metrics. "
@@ -108,12 +112,12 @@ class DataAgentPromptBuilder:
             "The adjusted_metrics must be recomputed from exactly the rows left after removing details.excluded_rows, and excluded_rows must be the row list, not only a count. "
             "In code_interpreter, rows, points, and database_evidence rows/points/series are aliases for the same grounded evidence; choose one collection as the base input and do not concatenate aliases or double-count duplicate timestamp/value records. "
             "If the user asks for forecast or anomaly detection, code_interpreter output alone is not enough to answer; call the corresponding registered tool before terminate.\n"
-            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough. "
+            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object, \"fact_requests\": list[object]}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough. "
             "In code_interpreter code, prefer the injected rows and points variables as the analysis input; do not assume database_evidence['data']['series'] exists. Use Python literals such as None/True/False, never JSON literals null/true/false. "
             "When the user needs precise or detailed analysis, set expected_result_schema to the exact nested fields the answer will need, such as {\"metrics\":{\"row_count\":\"int\",\"min_value\":\"number\",\"max_value\":\"number\"},\"details\":{\"findings\":[{\"label\":\"str\",\"value\":\"number\",\"evidence_ref\":\"str\"}]}}; the runtime rejects code_interpreter output that misses those fields or returns the wrong JSON types. "
             "When any outlier treatment is used, include expected_result_schema fields for details.outlier_rule, details.threshold_or_formula, details.rationale, details.excluded_rows, details.raw_metrics, and details.adjusted_metrics.\n"
-            "For anomaly, use: {\"database_evidence\": str|object|null, \"detector_name\": str|null, \"series_name\": str|null, \"constraints\": object}. Omit detector_name unless the user requested a specific supported detector.\n"
-            "For forecast, use: {\"database_evidence\": str|object|null, \"horizon\": int|str|object|null, \"model_name\": str|null, \"series_name\": str|null, \"constraints\": object}. Pass fuzzy user durations as strings when the user did not specify exact steps; the forecast tool resolves sampling interval and may return status='requires_rolling' with forecast_plan instead of points for long horizons. Omit model_name unless the user requested a specific supported model.\n"
+            "For anomaly, use: {\"database_evidence\": str|object|null, \"detector_name\": str|null, \"series_name\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Omit detector_name unless the user requested a specific supported detector. Omit constraints.input_policy for normal raw-data anomaly detection; set input_policy='selected' only when the user explicitly asks to detect anomalies in an already cleaned subset.\n"
+            "For forecast, use: {\"database_evidence\": str|object|null, \"horizon\": int|str|object|null, \"model_name\": str|null, \"series_name\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Pass fuzzy user durations as strings when the user did not specify exact steps; the forecast tool resolves sampling interval and performs rolling chunks when needed. Omit model_name unless the user requested a specific supported model. Omit constraints.input_policy for normal forecasting after anomaly detection; set input_policy='raw' only when the user explicitly asks to include known anomalies in training.\n"
             "For terminate, use: {\"result\": str|null, \"summary_goal\": str|null, \"direct_answer\": str|null, "
             "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str], "
             "\"unavailable_outputs\": list[str], \"unavailable_reason\": str|null}.\n"
@@ -164,6 +168,9 @@ class DataAgentPromptBuilder:
                     if request_state.task_contract
                     else None
                 ),
+                "data_fact_context": data_fact_prompt_view(request_state),
+                "long_term_fact_memory": prompt_fact_memory_view(self._database_id_for_fact_memory(request_state)),
+                "conversation_fact_memory": self._conversation_fact_memory(conversation_state),
             },
             "evidence": {
                 "latest": latest_evidence,
@@ -187,6 +194,7 @@ class DataAgentPromptBuilder:
                     fact.model_dump(mode="json")
                     for fact in request_state.verified_facts
                 ],
+                "data_facts": data_fact_prompt_view(request_state),
                 "visualizations": [
                     self._summarize_visualization(visualization)
                     for visualization in request_state.visualizations
@@ -219,22 +227,22 @@ class DataAgentPromptBuilder:
             {
                 "action": "sql_query",
                 "use_when": "Database evidence is missing, or a read-only follow-up query can compute the exact aggregation, grouping, ranking, filter validation, or diagnostic needed to answer correctly.",
-                "input": "prefer message, database_context, time_range, constraints for automatic database querying; use query/query_language only for repair or for a user-supplied exact query",
+                "input": "prefer message, database_context, time_range, constraints, fact_requests for automatic database querying; use query/query_language only for repair or for a user-supplied exact query",
             },
             {
                 "action": "code_interpreter",
                 "use_when": "Evidence is available and the user explicitly asks for code interpreter, or the analysis needs fuller Python features such as imports, iterators, correlation, normalization, windows, or custom multi-step computation.",
-                "input": "database_evidence, analysis_goal, code, expected_result_schema, constraints",
+                "input": "database_evidence, analysis_goal, code, expected_result_schema, constraints, fact_requests",
             },
             {
                 "action": "anomaly",
                 "use_when": "Time-series evidence is available and the user specifically needs anomaly/spike/outlier detection.",
-                "input": "database_evidence, detector_name, series_name, constraints",
+                "input": "database_evidence, detector_name, series_name, constraints, fact_requests",
             },
             {
                 "action": "forecast",
                 "use_when": "Time-series evidence is available and the user specifically asks for prediction or forecast.",
-                "input": "database_evidence, horizon, model_name, series_name, constraints",
+                "input": "database_evidence, horizon, model_name, series_name, constraints, fact_requests",
             },
             {
                 "action": "rag",
@@ -252,6 +260,29 @@ class DataAgentPromptBuilder:
                 "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan, unavailable_outputs, unavailable_reason",
             },
         ]
+
+    def _conversation_fact_memory(self, conversation_state: ConversationStateModel) -> dict:
+        facts = list(conversation_state.recent_fact_memory or [])[-12:]
+        return {
+            "summary": conversation_state.fact_memory_summary,
+            "recent": [
+                {
+                    "fact_id": fact.fact_id,
+                    "name": fact.name,
+                    "fact_type": fact.fact_type,
+                    "status": fact.status,
+                    "statement": fact.statement,
+                }
+                for fact in facts
+            ],
+        }
+
+    def _database_id_for_fact_memory(self, request_state: RequestStateModel) -> str | None:
+        if request_state.selected_database:
+            return request_state.selected_database
+        if request_state.database_context is not None:
+            return request_state.database_context.database_id
+        return None
 
     def _execution_state(self, request_state: RequestStateModel) -> dict:
         last_success = next((item for item in reversed(request_state.observations) if item.success), None)

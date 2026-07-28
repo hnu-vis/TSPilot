@@ -61,6 +61,18 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
         return GoalCompletionEvaluation(True, "No database context is required for this response.")
 
     refs = _all_answer_refs(request_state)
+    analysis_quality_gaps = _analysis_quality_gaps(request_state)
+    if analysis_quality_gaps:
+        return GoalCompletionEvaluation(
+            can_answer=False,
+            reason="Derived analysis is inconsistent with detected anomalies on the same evidence.",
+            missing_evidence=analysis_quality_gaps,
+            answerable_from=refs,
+            next_action_hint=(
+                "Rerun code_interpreter on the affected evidence and include transparent outlier treatment "
+                "details, or explicitly compute metrics on the anomaly-adjusted series."
+            ),
+        )
     missing_required = _missing_required_tool_outputs(request_state)
     if missing_required:
         return GoalCompletionEvaluation(
@@ -115,7 +127,7 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
         if str(item).strip()
     }
     missing: list[str] = []
-    if _requires_specialized_capability(request_state, requirements, "forecast") and request_state.latest_forecast is None:
+    if _requires_specialized_capability(request_state, requirements, "forecast") and not _latest_forecast_is_usable(request_state):
         missing.append("forecast")
     if _requires_specialized_capability(request_state, requirements, "anomaly") and request_state.latest_anomaly is None:
         missing.append("anomaly")
@@ -346,6 +358,7 @@ def apply_previous_observation_assessment(
         return evaluation
 
     evaluation = _hard_gate_previous_assessment(
+        request_state=request_state,
         current=current,
         assessment=assessment,
         previous_observation=previous_observation,
@@ -409,6 +422,7 @@ def _gap_blocking_items(gap: dict) -> list[str]:
 
 def _hard_gate_previous_assessment(
     *,
+    request_state: RequestStateModel,
     current: dict,
     assessment: PreviousObservationAssessment,
     previous_observation: ToolObservation | None,
@@ -425,6 +439,7 @@ def _hard_gate_previous_assessment(
 
     tool_name = previous_observation.tool_name
     payload = previous_observation.payload if isinstance(previous_observation.payload, dict) else {}
+    refs = assessment.evidence_refs or evidence_refs_for_payload(payload)
     current_task_type = str(current.get("task_type") or "").strip().lower()
     if current_task_type in {"generic", "plan"}:
         current_task_type = "" if current_task_type == "generic" else "query"
@@ -434,16 +449,37 @@ def _hard_gate_previous_assessment(
     if tool_name == "terminate" and current_task_type != "answer":
         return CompletionEvaluation(False, "Terminal observations cannot complete non-answer todo steps.")
     if current_task_type == "answer" and tool_name != "terminate":
+        if _action_is_prerequisite_repair(tool_name, current_task_type, previous_observation):
+            return CompletionEvaluation(
+                False,
+                f"Previous observation '{tool_name}' updated prerequisite evidence while final answer todo is active.",
+                evidence_refs=refs,
+                next_action_hint="Assemble the final answer after all evidence quality checks pass.",
+            )
         return CompletionEvaluation(False, "Only a terminal final-answer observation can complete an answer todo.")
     if current_task_type and not _action_matches_task_type(tool_name, current_task_type):
+        if _action_is_prerequisite_repair(tool_name, current_task_type, previous_observation):
+            return CompletionEvaluation(
+                False,
+                f"Previous observation '{tool_name}' provided prerequisite evidence for active todo '{current_task_type}'.",
+                evidence_refs=refs,
+                next_action_hint=_hint_for_task_type(current_task_type),
+            )
         return CompletionEvaluation(
             False,
             f"Previous observation '{tool_name}' does not match active todo type '{current_task_type}'.",
             next_action_hint=_hint_for_task_type(current_task_type),
         )
 
-    refs = assessment.evidence_refs or evidence_refs_for_payload(payload)
     if tool_name == "sql_query":
+        if _query_requires_followup(payload):
+            return CompletionEvaluation(
+                False,
+                "SQL observation is incomplete for the requested evidence contract.",
+                missing_evidence=_query_runtime_missing(payload) or ["complete_query_result"],
+                evidence_refs=refs,
+                next_action_hint=_query_next_action_hint(payload) or "Issue a focused sql_query for the missing fields.",
+            )
         if _query_returned_no_rows(payload) and not _assessment_accepts_empty_result(assessment):
             return CompletionEvaluation(
                 False,
@@ -475,6 +511,27 @@ def _hard_gate_previous_assessment(
                 missing_evidence=[f"{tool_name}_artifact"],
                 next_action_hint=_hint_for_task_type(current_task_type or tool_name),
             )
+        if tool_name == "forecast" and not _forecast_payload_is_usable(payload):
+            return CompletionEvaluation(
+                False,
+                "Forecast observation did not provide completed forecast points.",
+                missing_evidence=["forecast"],
+                evidence_refs=refs,
+                next_action_hint="Run forecast to completion so the result status is succeeded and forecast_points is non-empty.",
+            )
+        if tool_name == "code_interpreter":
+            analysis_quality_gaps = _analysis_quality_gaps(request_state)
+            if analysis_quality_gaps:
+                return CompletionEvaluation(
+                    False,
+                    "Derived analysis is inconsistent with detected anomalies on the same evidence.",
+                    missing_evidence=analysis_quality_gaps,
+                    evidence_refs=refs,
+                    next_action_hint=(
+                        "Rerun code_interpreter on the affected evidence and include transparent outlier treatment "
+                        "details, or explicitly compute metrics on the anomaly-adjusted series."
+                    ),
+                )
     elif tool_name == "terminate":
         if not _has_final_answer_payload(payload):
             return CompletionEvaluation(
@@ -483,6 +540,17 @@ def _hard_gate_previous_assessment(
                 missing_evidence=["final_answer"],
                 evidence_refs=refs,
                 next_action_hint="Assemble the final answer again after evidence is ready.",
+            )
+        analysis_quality_gaps = _analysis_quality_gaps(request_state)
+        if analysis_quality_gaps:
+            return CompletionEvaluation(
+                False,
+                "Final answer cannot rely on analysis that conflicts with detected anomalies.",
+                missing_evidence=analysis_quality_gaps,
+                evidence_refs=refs,
+                next_action_hint=(
+                    "Rerun code_interpreter with transparent outlier treatment before assembling the final answer."
+                ),
             )
 
     return CompletionEvaluation(
@@ -509,6 +577,25 @@ def _reconcile_todos_from_global_assessment(
         return None
     if _missing_contract_outputs(request_state, gap):
         return None
+    analysis_quality_gaps = _analysis_quality_gaps(request_state)
+    if analysis_quality_gaps:
+        evaluation = CompletionEvaluation(
+            False,
+            "Global progress assessment cannot complete todos while analysis conflicts with detected anomalies.",
+            missing_evidence=analysis_quality_gaps,
+            evidence_refs=assessment.evidence_refs or _all_answer_refs(request_state),
+            next_action_hint=(
+                "Rerun code_interpreter on the affected evidence and include transparent outlier treatment details."
+            ),
+        )
+        request_state.completion_state["latest_step"] = _assessment_state(
+            evaluation,
+            tool_name=previous_observation.tool_name if previous_observation else None,
+            todo_index=current_index,
+            todo=current,
+            accepted=False,
+        )
+        return evaluation
 
     refs = assessment.evidence_refs or _all_answer_refs(request_state)
     invalid_refs = _invalid_evidence_refs(request_state, refs)
@@ -529,6 +616,36 @@ def _reconcile_todos_from_global_assessment(
         )
         return evaluation
 
+    missing_todo_outputs = []
+    todo_refs: dict[int, str] = {}
+    for index, todo in enumerate(request_state.todo_list):
+        if todo.get("status") == "completed":
+            continue
+        task_type = str(todo.get("task_type") or "").strip().lower()
+        if task_type == "answer":
+            continue
+        todo_ref = _artifact_ref_for_todo(request_state, task_type)
+        if todo_ref is None:
+            missing_todo_outputs.append(str(todo.get("content") or task_type or index + 1))
+        else:
+            todo_refs[index] = todo_ref
+    if missing_todo_outputs:
+        evaluation = CompletionEvaluation(
+            False,
+            "Global progress assessment cannot complete todos without matching tool artifacts.",
+            missing_evidence=missing_todo_outputs,
+            evidence_refs=refs,
+            next_action_hint="Run the tool that matches the active todo before terminating.",
+        )
+        request_state.completion_state["latest_step"] = _assessment_state(
+            evaluation,
+            tool_name=previous_observation.tool_name if previous_observation else None,
+            todo_index=current_index,
+            todo=current,
+            accepted=False,
+        )
+        return evaluation
+
     completed_any = False
     for index, todo in enumerate(request_state.todo_list):
         if todo.get("status") == "completed":
@@ -538,7 +655,7 @@ def _reconcile_todos_from_global_assessment(
             continue
         completed_todo = normalize_todo_for_completion(dict(todo))
         completed_todo["status"] = "completed"
-        completed_todo["result_ref"] = refs[0] if refs else completed_todo.get("result_ref")
+        completed_todo["result_ref"] = todo_refs.get(index) or completed_todo.get("result_ref")
         completed_todo["completion_reason"] = assessment.reason or "LLM progress assessment says task contract evidence is covered."
         request_state.todo_list[index] = completed_todo
         completed_any = True
@@ -617,6 +734,33 @@ def _requested_next_active_todo_index(
     )
 
 
+def _artifact_ref_for_todo(request_state: RequestStateModel, task_type: str) -> str | None:
+    if task_type == "query":
+        evidence = request_state.latest_database_evidence
+        return f"evidence:{evidence.evidence_id}" if evidence is not None else None
+    if task_type == "code_interpreter":
+        analysis_id = request_state.latest_analysis_id
+        if analysis_id and _analysis_quality_gaps(request_state, analysis_ids={analysis_id}):
+            return None
+        return f"analysis:{analysis_id}" if analysis_id else None
+    if task_type == "forecast":
+        forecast = request_state.latest_forecast
+        if forecast is not None and _latest_forecast_is_usable(request_state):
+            return f"forecast:{forecast.forecast_id}"
+        return None
+    if task_type == "anomaly":
+        anomaly = request_state.latest_anomaly
+        return f"anomaly:{anomaly.anomaly_id}" if anomaly is not None else None
+    if task_type == "rag" and request_state.latest_rag:
+        return "rag:latest"
+    if task_type == "skill" and request_state.latest_skill:
+        return f"skill:{request_state.latest_skill.get('skill_name', 'latest')}"
+    if not task_type:
+        refs = _all_answer_refs(request_state)
+        return refs[0] if refs else None
+    return None
+
+
 def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) -> list[str]:
     if not refs:
         return ["evidence_refs"]
@@ -625,7 +769,7 @@ def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) ->
         valid_refs.add(request_state.latest_database_evidence.evidence_id)
     valid_refs.update(request_state.analysis_artifacts.keys())
     valid_refs.update(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
-    if request_state.latest_forecast is not None:
+    if _latest_forecast_is_usable(request_state):
         valid_refs.add(request_state.latest_forecast.forecast_id)
     if request_state.latest_anomaly is not None:
         valid_refs.add(request_state.latest_anomaly.anomaly_id)
@@ -667,6 +811,26 @@ def _action_matches_task_type(tool_name: str, task_type: str) -> bool:
     return tool_name == task_type
 
 
+def _action_is_prerequisite_repair(
+    tool_name: str,
+    task_type: str,
+    previous_observation: ToolObservation | None,
+) -> bool:
+    if previous_observation is None or not previous_observation.success:
+        return False
+    if task_type == "code_interpreter" and tool_name == "sql_query":
+        return True
+    if task_type in {"anomaly", "forecast"} and tool_name == "sql_query":
+        return True
+    if task_type in {"anomaly", "forecast", "answer"} and tool_name == "code_interpreter":
+        return True
+    if task_type in {"forecast", "answer"} and tool_name == "anomaly":
+        return True
+    if task_type == "answer" and tool_name in {"sql_query", "forecast"}:
+        return True
+    return False
+
+
 def _task_coverage(payload: dict) -> dict:
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
     coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
@@ -694,6 +858,22 @@ def _query_returned_no_rows(payload: dict) -> bool:
     if points is not None:
         return len(points) == 0
     return False
+
+
+def _query_requires_followup(payload: dict) -> bool:
+    coverage = _task_coverage(payload)
+    return bool(coverage.get("runtime_requires_followup"))
+
+
+def _query_runtime_missing(payload: dict) -> list[str]:
+    coverage = _task_coverage(payload)
+    return _string_items(coverage.get("runtime_missing")) or _string_items(coverage.get("missing"))
+
+
+def _query_next_action_hint(payload: dict) -> str | None:
+    coverage = _task_coverage(payload)
+    hint = coverage.get("next_action_hint")
+    return str(hint).strip() if str(hint or "").strip() else None
 
 
 def _is_schema_only_query(payload: dict) -> bool:
@@ -777,7 +957,7 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_database_evidence is not None:
         refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
     refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
-    if request_state.latest_forecast is not None:
+    if _latest_forecast_is_usable(request_state):
         refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
     if request_state.latest_anomaly is not None:
         refs.append(f"anomaly:{request_state.latest_anomaly.anomaly_id}")
@@ -786,3 +966,80 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_skill:
         refs.append(f"skill:{request_state.latest_skill.get('skill_name', 'latest')}")
     return refs
+
+
+def _latest_forecast_is_usable(request_state: RequestStateModel) -> bool:
+    forecast = request_state.latest_forecast
+    if forecast is None:
+        return False
+    full_forecast = request_state.forecast_artifacts.get(forecast.forecast_id)
+    return _forecast_payload_is_usable(
+        (full_forecast or forecast).model_dump(mode="json")
+    )
+
+
+def _analysis_quality_gaps(request_state: RequestStateModel, analysis_ids: set[str] | None = None) -> list[str]:
+    gaps: list[str] = []
+    for analysis_id, analysis in request_state.analysis_artifacts.items():
+        if analysis_ids is not None and analysis_id not in analysis_ids:
+            continue
+        if _analysis_conflicts_with_detected_anomalies(request_state, analysis):
+            gaps.append(f"analysis:{analysis_id}:requires_outlier_transparency")
+    return gaps
+
+
+def _analysis_conflicts_with_detected_anomalies(request_state: RequestStateModel, analysis) -> bool:
+    input_evidence_id = str(getattr(analysis, "input_evidence_id", "") or "").strip()
+    if not input_evidence_id:
+        return False
+    if _analysis_has_transparent_outlier_treatment(analysis):
+        return False
+    for anomaly in request_state.anomaly_artifacts.values():
+        if not _anomaly_has_points(anomaly):
+            continue
+        if _anomaly_matches_evidence(anomaly, input_evidence_id):
+            return True
+    return False
+
+
+def _analysis_has_transparent_outlier_treatment(analysis) -> bool:
+    result = getattr(analysis, "result", None)
+    details = result.get("details") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        return False
+    required = {
+        "outlier_rule",
+        "threshold_or_formula",
+        "rationale",
+        "excluded_rows",
+        "raw_metrics",
+        "adjusted_metrics",
+    }
+    return required <= set(details)
+
+
+def _anomaly_has_points(anomaly) -> bool:
+    points = getattr(anomaly, "anomaly_points", None)
+    return isinstance(points, list) and len(points) > 0
+
+
+def _anomaly_matches_evidence(anomaly, evidence_id: str) -> bool:
+    diagnostics = getattr(anomaly, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        for key in ("resolved_evidence_id", "selected_evidence_id", "input_evidence_id"):
+            if str(diagnostics.get(key) or "").strip() == evidence_id:
+                return True
+    anomaly_id = str(getattr(anomaly, "anomaly_id", "") or "")
+    return anomaly_id == f"anomaly_{evidence_id}" or anomaly_id.endswith(evidence_id)
+
+
+def _forecast_payload_is_usable(payload: dict) -> bool:
+    if str(payload.get("status") or "").strip().lower() != "succeeded":
+        return False
+    forecast_points = payload.get("forecast_points")
+    if not isinstance(forecast_points, list) or not forecast_points:
+        return False
+    horizon = payload.get("horizon")
+    if isinstance(horizon, int) and horizon > 0:
+        return len(forecast_points) >= horizon
+    return True

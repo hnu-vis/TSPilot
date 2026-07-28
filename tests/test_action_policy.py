@@ -12,6 +12,7 @@ from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
 from schemas.state import RequestStateModel
 from schemas.task_contract import TaskContract
+from schemas.timeseries import AnomalyResult, ForecastPlan, ForecastResult, TimeSeriesPoint
 from schemas.tool import ToolCall, ToolObservation
 from tools.todowrite import TodoWriteInput, TodoWriteTool
 
@@ -110,6 +111,54 @@ def test_terminate_requires_forecast_tool_output_when_forecast_is_requested():
             },
         ),
         latest_analysis_id="ana_stats",
+    )
+
+    allowed, reason = validate_action(request_state, "terminate")
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
+
+
+def test_terminate_rejects_incomplete_forecast_artifact_when_forecast_is_requested():
+    forecast = ForecastResult(
+        forecast_id="forecast_btc",
+        model_name="linear_regression",
+        horizon=96,
+        status="requires_rolling",
+        forecast_plan=ForecastPlan(
+            mode="requires_rolling",
+            horizon_source="duration_from_user",
+            requested_steps=96,
+            resolved_steps=96,
+            sampling_interval_seconds=900,
+            forecast_duration_seconds=86400,
+            max_direct_steps=48,
+            recommended_chunk_steps=48,
+        ),
+        forecast_points=[],
+    )
+    request_state = RequestStateModel(
+        request_id="req-incomplete-forecast",
+        message="预测 Bitcoin USD 接下来 24 小时走势",
+        status="running",
+        database_context=DatabaseContext(database_id="influxdb2-bitcoin-sample", database_type="influxdb"),
+        requested_capabilities=["query", "forecast"],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_btc",
+            result_type="timeseries",
+            database="influxdb2-bitcoin-sample",
+            summary="Loaded Bitcoin rows.",
+            data={
+                "points": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
+                    {"timestamp": "2023-01-01T01:00:00Z", "value": 2.0},
+                ]
+            },
+        ),
+        latest_forecast=forecast,
+        forecast_artifacts={forecast.forecast_id: forecast},
     )
 
     allowed, reason = validate_action(request_state, "terminate")
@@ -1597,6 +1646,144 @@ def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
     assert latest_goal["missing_evidence"] == []
 
 
+def test_runtime_keeps_query_todo_active_when_sql_missing_projected_value_field():
+    request_state = RequestStateModel(
+        request_id="req-policy-query-missing-value",
+        message="查询价格序列",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询价格序列", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "回答", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    request_state.observations.append(
+        ToolObservation(
+            tool_name="sql_query",
+            success=True,
+            summary="Loaded timestamp-only rows.",
+            payload={
+                "evidence_id": "evi_missing_price",
+                "result_type": "table",
+                "data": {"rows": [{"timestamp": "2023-01-01T00:00:00Z"}]},
+                "columns": ["timestamp"],
+                "diagnostics": {
+                    "task_coverage": {
+                        "runtime_missing": ["selected result fields are not present in returned columns: price"],
+                        "runtime_requires_followup": True,
+                        "next_action_hint": "Query again and return the price value column.",
+                    }
+                },
+            },
+        )
+    )
+
+    result = apply_previous_observation_assessment(
+        request_state,
+        PreviousObservationAssessment(
+            completed_active_todo=True,
+            reason="查询已返回行。",
+            evidence_refs=["evidence:evi_missing_price"],
+            covered=["price"],
+            missing=[],
+            can_answer=False,
+        ),
+    )
+
+    assert result.completed is False
+    assert "selected result fields" in result.missing_evidence[0]
+    assert request_state.todo_list[0]["status"] == "in_progress"
+
+
+def test_runtime_allows_sql_prerequisite_repair_during_code_interpreter_todo():
+    request_state = RequestStateModel(
+        request_id="req-policy-code-prereq-sql",
+        message="用 code interpreter 计算收益率",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "计算收益率", "task_type": "code_interpreter", "status": "in_progress", "priority": 1},
+            {"content": "回答", "task_type": "answer", "status": "pending", "priority": 2},
+        ],
+        plan_current_step=1,
+    )
+    request_state.observations.append(
+        ToolObservation(
+            tool_name="sql_query",
+            success=True,
+            summary="Loaded numeric evidence.",
+            payload={
+                "evidence_id": "evi_price",
+                "result_type": "timeseries",
+                "data": {"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+                "columns": ["timestamp", "value"],
+            },
+        )
+    )
+
+    result = apply_previous_observation_assessment(
+        request_state,
+        PreviousObservationAssessment(
+            completed_active_todo=True,
+            reason="补齐了 code 所需数值证据。",
+            evidence_refs=["evidence:evi_price"],
+            covered=["evidence"],
+            missing=["metrics"],
+            can_answer=False,
+        ),
+    )
+
+    assert result.completed is False
+    assert "prerequisite evidence" in result.reason
+    assert request_state.todo_list[0]["status"] == "in_progress"
+    assert request_state.completion_state["latest_step"]["completed"] is False
+
+
+def test_goal_blocks_raw_analysis_after_matching_anomaly_points_are_detected():
+    analysis = {
+        "analysis_id": "ana_raw",
+        "analysis_goal": "calculate return volatility drawdown",
+        "code_type": "code_interpreter_v1",
+        "code_hash": "sha256:test",
+        "input_evidence_id": "evi_price",
+        "input_row_count": 3,
+        "status": "succeeded",
+        "summary": "raw metrics",
+        "result": {
+            "summary": "raw metrics",
+            "metrics": {"percentage_change": -0.99, "max_drawdown": -0.99},
+            "details": {"method": "raw series"},
+        },
+    }
+    anomaly = AnomalyResult(
+        anomaly_id="anomaly_evi_price",
+        detector_name="zscore",
+        anomaly_points=[{"timestamp": "t1", "value": 1_000_000.0, "score": 50.0}],
+        anomaly_spans=[],
+        scores=[],
+        diagnostics={"resolved_evidence_id": "evi_price"},
+    )
+    request_state = RequestStateModel(
+        request_id="req-policy-analysis-anomaly-conflict",
+        message="计算收益率并检测异常",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        latest_analysis_id="ana_raw",
+        analysis_artifacts={"ana_raw": analysis},
+        latest_anomaly=anomaly,
+        anomaly_artifacts={anomaly.anomaly_id: anomaly},
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "done"})
+
+    assert allowed is False
+    assert "Derived analysis is inconsistent" in (reason or "")
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
+        "analysis:ana_raw:requires_outlier_transparency"
+    ]
+
+
 def test_runtime_keeps_query_todo_active_for_schema_only_sql_observation():
     request_state = RequestStateModel(
         request_id="req-policy-count-schema",
@@ -1816,8 +2003,11 @@ def test_runtime_keeps_todo_active_for_runtime_coverage_gap():
 
     assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
     _assess_previous_complete(request_state)
-    assert [todo["status"] for todo in request_state.todo_list] == ["completed", "in_progress"]
-    assert request_state.completion_state["latest_step"]["completed"] is True
+    assert [todo["status"] for todo in request_state.todo_list] == ["in_progress", "pending"]
+    assert request_state.completion_state["latest_step"]["completed"] is False
+    assert request_state.completion_state["latest_step"]["missing_evidence"] == [
+        "selected result fields are not present in returned columns: count"
+    ]
 
 
 def test_runtime_completes_answer_todo_after_terminal_payload():
@@ -1884,7 +2074,15 @@ def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
             summary="Loaded prices.",
             data={"points": [{"timestamp": "t1", "value": 1.0}]},
         ),
+        latest_forecast=ForecastResult(
+            forecast_id="forecast_price",
+            model_name="linear_regression",
+            horizon=1,
+            status="succeeded",
+            forecast_points=[TimeSeriesPoint(timestamp="t2", value=2.0)],
+        ),
     )
+    request_state.forecast_artifacts[request_state.latest_forecast.forecast_id] = request_state.latest_forecast
     request_state.observations.append(
         ToolObservation(
             tool_name="code_interpreter",
@@ -1910,6 +2108,8 @@ def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
 
     assert result.completed is True
     assert [todo["status"] for todo in request_state.todo_list] == ["completed", "completed", "in_progress"]
+    assert request_state.todo_list[0]["result_ref"] == "evidence:evi_price"
+    assert request_state.todo_list[1]["result_ref"] == "forecast:forecast_price"
     assert request_state.todo_list[2]["task_type"] == "answer"
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "已完成。"})
     assert allowed is True
