@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,7 @@ class CodeInterpreterTool(BaseTool):
             work_dir=_code_interpreter_work_dir(request_state, code_hash),
         )
         _validate_expected_result_schema(output.result, validated_input.expected_result_schema or {})
+        _validate_outlier_treatment_transparency(output.result)
         result = AnalysisResult(
             analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
             analysis_goal=goal,
@@ -123,6 +125,20 @@ def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict]
                     row[key] = value
             rows.append(row)
     points = [dict(point) for point in data.get("points", []) or [] if isinstance(point, dict)]
+    if not points and rows:
+        inferred_time_field = _first_present_key(rows, [time_field, "timestamp", "_time", "time"])
+        inferred_value_field = _first_present_key(rows, [value_field, "value", "price", "_value"])
+        if inferred_time_field and inferred_value_field:
+            points = []
+            for row in rows:
+                point = {
+                    "timestamp": row.get(inferred_time_field),
+                    "value": row.get(inferred_value_field),
+                }
+                for key, value in row.items():
+                    if key not in {inferred_time_field, inferred_value_field}:
+                        point[key] = value
+                points.append(point)
     columns = list(evidence.columns or [])
     if not columns and rows:
         columns = []
@@ -133,10 +149,120 @@ def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict]
     return rows, points, columns
 
 
+def _first_present_key(rows: list[dict], candidates: list[str]) -> str | None:
+    for key in candidates:
+        if any(key in row for row in rows):
+            return key
+    return None
+
+
 def _validate_expected_result_schema(result: dict, schema: dict) -> None:
     if not schema:
         return
     _validate_schema_node(result, schema, path="result")
+
+
+def _validate_outlier_treatment_transparency(result: dict) -> None:
+    if not _result_indicates_outlier_treatment(result):
+        return
+    details = result.get("details")
+    if not isinstance(details, dict):
+        raise AnalysisCodeError("analysis result using outlier treatment must include result.details.")
+    required = {
+        "outlier_rule",
+        "threshold_or_formula",
+        "rationale",
+        "excluded_rows",
+        "raw_metrics",
+        "adjusted_metrics",
+    }
+    missing = sorted(key for key in required if key not in details)
+    if missing:
+        raise AnalysisCodeError(
+            "analysis result using outlier treatment must include transparent details fields: "
+            + ", ".join(missing)
+        )
+    if not str(details.get("outlier_rule") or "").strip():
+        raise AnalysisCodeError("analysis result using outlier treatment must include non-empty details.outlier_rule.")
+    if not str(details.get("rationale") or "").strip():
+        raise AnalysisCodeError("analysis result using outlier treatment must include non-empty details.rationale.")
+    if not isinstance(details.get("excluded_rows"), list):
+        raise AnalysisCodeError("analysis result using outlier treatment must include details.excluded_rows as a list.")
+    duplicate_excluded_rows = _duplicate_json_rows(details["excluded_rows"])
+    if duplicate_excluded_rows:
+        raise AnalysisCodeError("analysis result using outlier treatment must not include duplicate details.excluded_rows.")
+    if not isinstance(details.get("raw_metrics"), dict):
+        raise AnalysisCodeError("analysis result using outlier treatment must include details.raw_metrics as an object.")
+    if not isinstance(details.get("adjusted_metrics"), dict):
+        raise AnalysisCodeError("analysis result using outlier treatment must include details.adjusted_metrics as an object.")
+
+
+def _result_indicates_outlier_treatment(result: dict) -> bool:
+    if not isinstance(result, dict):
+        return False
+    textual_markers = {
+        "outlier",
+        "anomaly",
+        "anomalous",
+        "excluded",
+        "exclude",
+        "filtered",
+        "filter",
+        "winsor",
+        "adjusted",
+        "有效",
+        "剔除",
+        "过滤",
+        "排除",
+        "异常",
+        "离群",
+        "调整",
+    }
+    text = _flatten_text(result).lower()
+    if any(marker in text for marker in textual_markers):
+        return True
+    metrics = result.get("metrics")
+    details = result.get("details")
+    if isinstance(metrics, dict):
+        if metrics.get("has_outlier_like_values") is True or metrics.get("has_outliers") is True:
+            return True
+        for key in metrics:
+            key_text = str(key).lower()
+            if key_text in {"used_point_count", "filtered_count", "excluded_count"}:
+                return True
+    if isinstance(details, dict):
+        for key in details:
+            key_text = str(key).lower()
+            if key_text in {"excluded_rows", "outlier_like_values", "outliers", "adjusted_metrics"}:
+                return True
+    return False
+
+
+def _duplicate_json_rows(rows: list) -> bool:
+    seen: set[str] = set()
+    for row in rows:
+        key = json_dumps_stable(row)
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def json_dumps_stable(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _flatten_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_flatten_text(item) for item in value.values())
+    if isinstance(value, list):
+        return " ".join(_flatten_text(item) for item in value)
+    return ""
 
 
 def _validate_schema_node(value: Any, schema: Any, *, path: str) -> None:

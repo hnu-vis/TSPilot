@@ -45,7 +45,13 @@ def _execute(payload: dict) -> dict:
     metadata = dict(payload.get("metadata") or {})
     diagnostics = dict(payload.get("diagnostics") or {})
     database_evidence = {
-        "data": {"rows": rows, "points": points},
+        "rows": rows,
+        "points": points,
+        "data": {
+            "rows": rows,
+            "points": points,
+            "series": [{"points": points}] if points else [],
+        },
         "columns": columns,
         "metadata": metadata,
         "diagnostics": diagnostics,

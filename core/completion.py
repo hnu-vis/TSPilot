@@ -115,11 +115,130 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
         if str(item).strip()
     }
     missing: list[str] = []
-    if "forecast" in requirements and request_state.latest_forecast is None:
+    if _requires_specialized_capability(request_state, requirements, "forecast") and request_state.latest_forecast is None:
         missing.append("forecast")
-    if "anomaly" in requirements and request_state.latest_anomaly is None:
+    if _requires_specialized_capability(request_state, requirements, "anomaly") and request_state.latest_anomaly is None:
         missing.append("anomaly")
+    if (
+        _requires_code_analysis(request_state)
+        and request_state.latest_analysis_id is None
+        and not _latest_database_evidence_is_empty(request_state)
+    ):
+        missing.append("analysis")
     return missing
+
+
+def _latest_database_evidence_is_empty(request_state: RequestStateModel) -> bool:
+    evidence = request_state.latest_database_evidence
+    if evidence is None:
+        return False
+    data = evidence.data if isinstance(evidence.data, dict) else {}
+    row_like_keys = ("rows", "points")
+    for key in row_like_keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return len(value) == 0
+    series = data.get("series")
+    if isinstance(series, list):
+        return all(
+            not isinstance(item, dict)
+            or not isinstance(item.get("points"), list)
+            or len(item.get("points")) == 0
+            for item in series
+        )
+    return "no rows" in str(evidence.summary or "").lower()
+
+
+def _requires_specialized_capability(
+    request_state: RequestStateModel,
+    requirements: set[str],
+    capability: str,
+) -> bool:
+    if capability not in requirements:
+        return False
+    contract = request_state.task_contract
+    if contract is None:
+        return True
+    return any(
+        output.required
+        and str(output.evidence_kind or "").strip().lower() == capability
+        for output in contract.required_outputs
+    )
+
+
+def _requires_code_analysis(request_state: RequestStateModel) -> bool:
+    contract = request_state.task_contract
+    if contract is None:
+        return False
+    for output in contract.required_outputs:
+        if not output.required:
+            continue
+        if _contract_output_requires_code_analysis(output):
+            return True
+    return False
+
+
+def _contract_output_requires_code_analysis(output) -> bool:
+    evidence_kind = str(output.evidence_kind or "").strip().lower()
+    if evidence_kind in {"derived", "analysis", "statistical", "computed", "calculated"}:
+        return True
+
+    searchable = " ".join(
+        [
+            str(output.id or ""),
+            str(output.description or ""),
+            str(output.output_type or ""),
+            " ".join(str(item) for item in output.measures),
+            " ".join(str(item) for item in output.dimensions),
+            str(output.success_criteria or ""),
+        ]
+    ).lower()
+    analysis_terms = {
+        "analysis",
+        "analyze",
+        "computed",
+        "calculated",
+        "derived",
+        "change",
+        "pct",
+        "percent",
+        "percentage",
+        "ratio",
+        "rate",
+        "delta",
+        "growth",
+        "return",
+        "trend",
+        "volatility",
+        "drawdown",
+        "correlation",
+        "normalize",
+        "window",
+        "rolling",
+        "median",
+        "quantile",
+        "std",
+        "variance",
+        "涨跌",
+        "变化",
+        "变动",
+        "涨幅",
+        "跌幅",
+        "百分比",
+        "占比",
+        "比例",
+        "收益",
+        "回报",
+        "趋势",
+        "波动",
+        "回撤",
+        "相关",
+        "标准差",
+        "方差",
+        "中位数",
+        "分位",
+    }
+    return any(term in searchable for term in analysis_terms)
 
 
 def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None) -> list[str]:

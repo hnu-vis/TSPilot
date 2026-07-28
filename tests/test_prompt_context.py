@@ -56,6 +56,20 @@ def test_prompt_uses_dbgpt_style_todowrite_planning_rule():
     assert "3 or more independently verifiable user-visible steps" in todowrite_action["use_when"]
 
 
+def test_prompt_requires_transparent_outlier_treatment_in_code_analysis():
+    system_prompt = DataAgentPromptBuilder().build_system_prompt()
+
+    assert "Do not silently replace raw metrics with adjusted metrics" in system_prompt
+    assert "do not use a first-difference/spike detector to clean level metrics" in system_prompt
+    assert "excluded_rows must be the row list, not only a count" in system_prompt
+    assert "do not concatenate aliases or double-count duplicate timestamp/value records" in system_prompt
+    assert "details.outlier_rule" in system_prompt
+    assert "details.threshold_or_formula" in system_prompt
+    assert "details.excluded_rows" in system_prompt
+    assert "details.raw_metrics" in system_prompt
+    assert "details.adjusted_metrics" in system_prompt
+
+
 def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():
     settings = get_settings()
     request = ChatRequest(

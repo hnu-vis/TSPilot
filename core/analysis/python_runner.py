@@ -117,7 +117,13 @@ def execute_python_rows_v1(
         "points": [dict(point) for point in points],
         "columns": list(columns),
         "database_evidence": {
-            "data": {"rows": [dict(row) for row in rows], "points": [dict(point) for point in points]},
+            "rows": [dict(row) for row in rows],
+            "points": [dict(point) for point in points],
+            "data": {
+                "rows": [dict(row) for row in rows],
+                "points": [dict(point) for point in points],
+                "series": [{"points": [dict(point) for point in points]}] if points else [],
+            },
             "columns": list(columns),
             "metadata": dict(metadata),
             "diagnostics": dict(diagnostics),

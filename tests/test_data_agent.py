@@ -8,6 +8,38 @@ import pytest
 from agents.data_agent import DataAgent
 
 
+class _RepairCapturingLLM:
+    def __init__(self):
+        self.messages = []
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        self.messages.append(messages)
+        if self.calls == 1:
+            return '{"thought":"需要查询","action_intention":"查询数据"}'
+        return (
+            '{"thought":"补齐 action","action":"sql_query",'
+            '"action_input":{"message":"查询数据","database_context":{"database_id":"demo","database_type":"sqlite"}}}'
+        )
+
+
+class _TwoBadThenGoodLLM:
+    def __init__(self):
+        self.messages = []
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        self.messages.append(messages)
+        if self.calls <= 2:
+            return '{"thought":"需要查询"} {"action":"sql_query","action_input":{}}'
+        return (
+            '{"thought":"补齐 action","action":"sql_query",'
+            '"action_input":{"message":"查询数据","database_context":{"database_id":"demo","database_type":"sqlite"}}}'
+        )
+
+
 def test_parse_turn_rejects_repeated_json_turn_output():
     first_turn = {
         "thought": "Plan first.",
@@ -71,6 +103,29 @@ def test_parse_turn_accepts_dbgpt_style_step_fields():
     assert turn.action == "sql_query"
     assert turn.action_intention == "拉取原始数据"
     assert turn.action_reason == "确认过滤条件"
+
+
+def test_repair_prompt_requires_explicit_action_and_action_input():
+    llm = _RepairCapturingLLM()
+
+    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(None, None))
+
+    assert turn.action == "sql_query"
+    repair_prompt = llm.messages[1][-1][1]
+    assert "action field is mandatory" in repair_prompt
+    assert "action_input field is mandatory" in repair_prompt
+    assert "todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate" in repair_prompt
+    assert "Do not return only thought, task_contract, action_intention, or action_reason" in repair_prompt
+
+
+def test_next_turn_allows_second_llm_repair_attempt_without_guessing_action_locally():
+    llm = _TwoBadThenGoodLLM()
+
+    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(None, None))
+
+    assert turn.action == "sql_query"
+    assert llm.calls == 3
+    assert "final repair attempt" in llm.messages[2][-1][1]
 
 
 def test_parse_turn_accepts_llm_task_contract():

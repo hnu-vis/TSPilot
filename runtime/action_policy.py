@@ -48,10 +48,17 @@ def validate_action(
     if repeat_failure_reason:
         return False, repeat_failure_reason
     if action_name in TERMINAL_ACTIONS:
+        evaluation = evaluate_goal_completion(request_state)
+        request_state.completion_state["latest_goal"] = evaluation.model_dump()
+        goal_covered_despite_todos = _terminal_goal_covered_despite_todos(request_state, evaluation)
+        unavailable_outputs_explained = (
+            not _missing_specialized_tool_output(evaluation.missing_evidence)
+            and _terminal_input_explains_unavailable_outputs(request_state, action_input)
+        )
         active_todo = next((todo for todo in request_state.todo_list if todo.get("status") == "in_progress"), None)
         if active_todo is not None:
             active_type = str(active_todo.get("task_type") or "").strip().lower()
-            if active_type != "answer":
+            if active_type != "answer" and not goal_covered_despite_todos and not unavailable_outputs_explained:
                 return (
                     False,
                     "Final answer is blocked because the active todo is not an answer step. "
@@ -62,15 +69,19 @@ def validate_action(
             if todo.get("status") != "completed"
             and str(todo.get("task_type") or "").strip().lower() != "answer"
         ]
-        if pending_non_answer:
+        if pending_non_answer and not goal_covered_despite_todos and not unavailable_outputs_explained:
             return (
                 False,
                 "Final answer is blocked because non-answer todo steps are still incomplete.",
             )
-        evaluation = evaluate_goal_completion(request_state)
-        request_state.completion_state["latest_goal"] = evaluation.model_dump()
         if not evaluation.can_answer:
-            if _terminal_input_explains_unavailable_outputs(request_state, action_input):
+            if _missing_specialized_tool_output(evaluation.missing_evidence):
+                return (
+                    False,
+                    "Final answer is blocked because the current goal is not complete: "
+                    + evaluation.reason,
+                )
+            if unavailable_outputs_explained:
                 return True, None
             return (
                 False,
@@ -78,6 +89,31 @@ def validate_action(
                 + evaluation.reason,
             )
     return True, None
+
+
+def _terminal_goal_covered_despite_todos(
+    request_state: RequestStateModel,
+    evaluation,
+) -> bool:
+    if not evaluation.can_answer:
+        return False
+    if not evaluation.answerable_from:
+        return False
+    gap = latest_gap_assessment(request_state)
+    if not gap:
+        return False
+    if gap.get("can_answer") is not True:
+        return False
+    return not _gap_blocking_items(gap)
+
+
+def _missing_specialized_tool_output(missing_evidence: list[str]) -> bool:
+    missing = {
+        str(item).strip().lower()
+        for item in missing_evidence
+        if str(item).strip()
+    }
+    return bool(missing & {"analysis", "forecast", "anomaly"})
 
 
 def _repeated_failed_action_without_strategy_change(

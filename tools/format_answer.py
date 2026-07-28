@@ -424,8 +424,53 @@ class FormatAnswerTool(BaseTool):
                 )
                 if metric_text:
                     lines.append(f"  {self._label(request_state, 'metrics')}: {metric_text}")
+            transparency_lines = self._render_analysis_transparency_details(analysis)
+            if transparency_lines:
+                lines.extend(f"  {line}" for line in transparency_lines)
             blocks.append("\n".join(lines))
         return "\n".join(blocks)
+
+    def _render_analysis_transparency_details(self, analysis) -> list[str]:
+        result = analysis.result if isinstance(analysis.result, dict) else {}
+        details = result.get("details")
+        if not isinstance(details, dict):
+            return []
+        transparency_keys = {
+            "outlier_rule",
+            "threshold_or_formula",
+            "rationale",
+            "excluded_rows",
+            "raw_metrics",
+            "adjusted_metrics",
+        }
+        if not transparency_keys & set(details):
+            return []
+
+        lines: list[str] = []
+        for key, label in (
+            ("outlier_rule", "outlier_rule"),
+            ("threshold_or_formula", "threshold_or_formula"),
+            ("rationale", "rationale"),
+        ):
+            value = details.get(key)
+            if value is not None and str(value).strip():
+                lines.append(f"{label}: {value}")
+
+        excluded_rows = details.get("excluded_rows")
+        if isinstance(excluded_rows, list):
+            lines.append(f"excluded_rows: {len(excluded_rows)}")
+
+        for key in ("raw_metrics", "adjusted_metrics"):
+            value = details.get(key)
+            if isinstance(value, dict) and value:
+                metric_text = ", ".join(
+                    f"{metric_key}: {metric_value}"
+                    for metric_key, metric_value in value.items()
+                    if metric_value is not None
+                )
+                if metric_text:
+                    lines.append(f"{key}: {metric_text}")
+        return lines
 
     def _usable_direct_answer(self, direct_answer: str | None) -> str | None:
         if not direct_answer or not direct_answer.strip():

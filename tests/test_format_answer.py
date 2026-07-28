@@ -244,6 +244,55 @@ def test_format_answer_assembles_selected_analysis_results():
     assert [ref["source_type"] for ref in result["references"]] == ["analysis", "analysis"]
 
 
+def test_format_answer_renders_outlier_transparency_details_in_analysis_section():
+    request_state = build_request_state(
+        ChatRequest(message="展示异常值处理依据"),
+        get_settings(),
+    )
+    analysis = AnalysisResult(
+        analysis_id="ana_outlier",
+        analysis_goal="outlier treatment",
+        code_hash="sha256:outlier",
+        input_evidence_id="evi",
+        input_row_count=4,
+        status="succeeded",
+        summary="已计算原始和调整后指标。",
+        result={
+            "summary": "已计算原始和调整后指标。",
+            "metrics": {"change_pct": 1.2},
+            "details": {
+                "outlier_rule": "value > 1,000,000",
+                "threshold_or_formula": "> 1,000,000",
+                "rationale": "数量级明显高于主体价格区间",
+                "excluded_rows": [{"timestamp": "t1", "value": 1000001}],
+                "raw_metrics": {"start_value": 1000001},
+                "adjusted_metrics": {"start_value": 10},
+            },
+        },
+        diagnostics={},
+    )
+    request_state.analysis_artifacts = {analysis.analysis_id: analysis}
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(
+                summary_goal="汇总",
+                include_analysis_ids=["ana_outlier"],
+                section_plan=["analysis"],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    content = result["sections"][0]["content"]
+    assert "outlier_rule: value > 1,000,000" in content
+    assert "threshold_or_formula: > 1,000,000" in content
+    assert "rationale: 数量级明显高于主体价格区间" in content
+    assert "excluded_rows: 1" in content
+    assert "raw_metrics: start_value: 1000001" in content
+    assert "adjusted_metrics: start_value: 10" in content
+
+
 def test_format_answer_preserves_direct_answer_when_analysis_exists():
     request_state = build_request_state(
         ChatRequest(message="分析趋势", database_context={"database_id": "demo", "database_type": "influxdb"}),

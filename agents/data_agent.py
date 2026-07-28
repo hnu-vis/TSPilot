@@ -36,28 +36,24 @@ class DataAgent(BaseAgent):
         try:
             return self._parse_turn(content)
         except ValueError as first_error:
-            repaired_content = await self._invoke_model(
-                [
-                    ("system", system_prompt),
-                    ("user", user_prompt),
-                    ("assistant", content),
-                    (
-                        "user",
-                        "Your previous response violated the ReAct output contract. "
-                        "Return exactly one JSON object and nothing else. "
-                        "The JSON object must use this schema: "
-                        "{\"thought\": str, \"previous_observation_assessment\": object|null, "
-                        "\"task_contract\": object|null, "
-                        "\"action_intention\": str|null, \"action_reason\": str|null, "
-                        "\"action\": str, \"action_input\": object}. "
-                        "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
-                        "Continue solving the original user task using the current context. "
-                        f"Parser error: {first_error}",
-                    ),
-                ],
-                request_state=request_state,
-                source="data_agent.contract_repair",
-            )
+            repaired_content = content
+            last_error = first_error
+            for repair_index in range(2):
+                repaired_content = await self._invoke_model(
+                    [
+                        ("system", system_prompt),
+                        ("user", user_prompt),
+                        ("assistant", repaired_content),
+                        ("user", self._repair_prompt(last_error, final_attempt=repair_index == 1)),
+                    ],
+                    request_state=request_state,
+                    source="data_agent.contract_repair",
+                )
+                try:
+                    return self._parse_turn(repaired_content)
+                except ValueError as repair_error:
+                    last_error = repair_error
+                    continue
             try:
                 return self._parse_turn(repaired_content)
             except ValueError as second_error:
@@ -65,6 +61,36 @@ class DataAgent(BaseAgent):
                     f"Model failed to produce exactly one valid ReAct JSON object after repair. "
                     f"first_error={first_error}; second_error={second_error}"
                 ) from second_error
+
+    def _repair_prompt(self, parser_error: ValueError, *, final_attempt: bool) -> str:
+        skeleton = (
+            '{"thought":"","previous_observation_assessment":null,"task_contract":null,'
+            '"action_intention":null,"action_reason":null,"action":"sql_query","action_input":{}}'
+        )
+        extra = (
+            "This is the final repair attempt. Start from this skeleton and replace action/action_input with the correct next tool call: "
+            + skeleton
+            if final_attempt
+            else ""
+        )
+        return (
+            "Your previous response violated the ReAct output contract. "
+            "Return exactly one JSON object and nothing else. "
+            "The JSON object must use this schema: "
+            "{\"thought\": str, \"previous_observation_assessment\": object|null, "
+            "\"task_contract\": object|null, "
+            "\"action_intention\": str|null, \"action_reason\": str|null, "
+            "\"action\": str, \"action_input\": object}. "
+            "The top-level action field is mandatory and must be exactly one of: "
+            "todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate. "
+            "The top-level action_input field is mandatory and must be an object matching that action. "
+            "Do not return only thought, task_contract, action_intention, or action_reason. "
+            "If you already know the next step from your thought/intention, put the corresponding tool name in action and its input in action_input. "
+            f"{extra} "
+            "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
+            "Continue solving the original user task using the current context. "
+            f"Parser error: {parser_error}"
+        )
 
     async def _invoke_model(self, messages, *, request_state=None, source: str = "data_agent") -> str:
         response = await self._llm.ainvoke(messages)

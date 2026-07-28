@@ -120,6 +120,120 @@ def test_terminate_requires_forecast_tool_output_when_forecast_is_requested():
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
 
 
+def test_terminate_requires_anomaly_tool_when_contract_requires_anomaly_evidence():
+    request_state = RequestStateModel(
+        request_id="req-anomaly-contract-required",
+        message="检测异常点。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "anomaly"],
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "检测异常点",
+                "required_outputs": [
+                    {"id": "series", "description": "时序数据", "evidence_kind": "database"},
+                    {"id": "anomaly_points", "description": "异常点", "evidence_kind": "anomaly"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded series.",
+            data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["series"],
+                "missing": ["anomaly_points"],
+                "can_answer": False,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "未发现异常。"})
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["anomaly"]
+
+
+def test_terminate_allows_code_outlier_analysis_without_anomaly_artifact_when_contract_requires_analysis():
+    request_state = RequestStateModel(
+        request_id="req-outlier-analysis-contract",
+        message="计算指标，如果发现明显异常值，请说明规则、剔除行和剔除前后指标。",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "analysis", "anomaly"],
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算指标并说明异常值处理",
+                "required_outputs": [
+                    {"id": "series", "description": "时序数据", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "analysis"},
+                    {"id": "outlier_treatment", "description": "异常规则、剔除行、剔除前后指标", "evidence_kind": "analysis"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded series.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 1000001.0},
+                    {"timestamp": "2023-01-02T00:00:00Z", "value": 10.0},
+                    {"timestamp": "2023-01-03T00:00:00Z", "value": 12.0},
+                ]
+            },
+        ),
+        latest_analysis_id="ana_outlier",
+        analysis_artifacts={
+            "ana_outlier": {
+                "analysis_id": "ana_outlier",
+                "analysis_goal": "计算异常值处理后的指标",
+                "code_type": "code_interpreter_v1",
+                "code_hash": "sha256:outlier",
+                "input_evidence_id": "evi_series",
+                "input_row_count": 3,
+                "status": "succeeded",
+                "summary": "Computed outlier treatment.",
+                "result": {
+                    "summary": "Computed outlier treatment.",
+                    "metrics": {"pct_change": 20.0},
+                    "details": {
+                        "outlier_rule": "value > 1000000",
+                        "threshold_or_formula": "> 1000000",
+                        "rationale": "extreme value",
+                        "excluded_rows": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1000001.0}],
+                        "raw_metrics": {"start_value": 1000001.0},
+                        "adjusted_metrics": {"start_value": 10.0},
+                    },
+                },
+                "diagnostics": {},
+            }
+        },
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["series", "pct_change", "outlier_treatment"],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "基于 code 结果回答。"})
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+
+
 def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():
     request_state = RequestStateModel(
         request_id="req-gap-missing",
@@ -197,6 +311,348 @@ def test_terminate_blocked_when_task_contract_outputs_not_covered():
     assert allowed is False
     assert "Task contract required outputs" in reason
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["earliest_rows"]
+
+
+def test_terminate_blocks_derived_contract_outputs_without_code_analysis():
+    request_state = RequestStateModel(
+        request_id="req-derived-analysis-required",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "start_value", "description": "起始值", "evidence_kind": "database"},
+                    {"id": "end_value", "description": "结束值", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "derived"},
+                    {"id": "high_low", "description": "最高最低", "evidence_kind": "derived"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded requested rows.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 10.0},
+                    {"timestamp": "2023-01-02T00:00:00Z", "value": 12.0},
+                ]
+            },
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["start_value", "end_value", "pct_change", "high_low"],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "涨跌幅 20%。"})
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+
+
+def test_terminate_cannot_mark_required_analysis_unavailable_after_code_failure():
+    request_state = RequestStateModel(
+        request_id="req-derived-analysis-unavailable-bypass",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "start_value", "description": "起始值", "evidence_kind": "database"},
+                    {"id": "end_value", "description": "结束值", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "analysis"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded requested rows.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 10.0},
+                    {"timestamp": "2023-01-02T00:00:00Z", "value": 12.0},
+                ]
+            },
+        ),
+        observations=[
+            ToolObservation(
+                tool_name="code_interpreter",
+                success=False,
+                summary="analysis failed",
+                payload={},
+                error="sandbox failed",
+            )
+        ],
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["start_value", "end_value"],
+                "missing": ["pct_change"],
+                "can_answer": False,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(
+        request_state,
+        "terminate",
+        {
+            "direct_answer": "涨跌幅不可用。",
+            "unavailable_outputs": ["pct_change"],
+            "unavailable_reason": "code_interpreter failed.",
+        },
+    )
+
+    assert allowed is False
+    assert reason is not None
+    assert "Required specialized tool output is missing" in reason
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+
+
+def test_terminate_allows_derived_contract_outputs_with_code_analysis():
+    request_state = RequestStateModel(
+        request_id="req-derived-analysis-present",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "start_value", "description": "起始值", "evidence_kind": "database"},
+                    {"id": "end_value", "description": "结束值", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "derived"},
+                    {"id": "high_low", "description": "最高最低", "evidence_kind": "derived"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded requested rows.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 10.0},
+                    {"timestamp": "2023-01-02T00:00:00Z", "value": 12.0},
+                ]
+            },
+        ),
+        latest_analysis_id="ana_price_metrics",
+        analysis_artifacts={
+            "ana_price_metrics": {
+                "analysis_id": "ana_price_metrics",
+                "analysis_goal": "计算价格指标",
+                "code_type": "code_interpreter_v1",
+                "code_hash": "sha256:demo",
+                "input_evidence_id": "evi_prices",
+                "input_row_count": 2,
+                "status": "succeeded",
+                "summary": "Computed price metrics in code.",
+                "result": {
+                    "summary": "Computed price metrics in code.",
+                    "metrics": {"pct_change": 20.0},
+                    "details": {},
+                },
+                "diagnostics": {},
+            }
+        },
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["start_value", "end_value", "pct_change", "high_low"],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "涨跌幅 20%。"})
+
+    assert allowed is True
+    assert reason is None
+
+
+def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos():
+    request_state = RequestStateModel(
+        request_id="req-derived-analysis-covered-stale-todos",
+        message="查询 Bitcoin USD 2023-01-04 到 2023-02-03，计算起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询 Bitcoin USD 数据", "task_type": "query", "status": "completed", "priority": 1},
+            {"content": "整理边界值", "task_type": "answer", "status": "in_progress", "priority": 2},
+            {"content": "计算涨跌幅", "task_type": "code_interpreter", "status": "pending", "priority": 3},
+        ],
+        plan_current_step=2,
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "query_text", "description": "查询对象和时间范围", "evidence_kind": "database"},
+                    {"id": "row_count", "description": "数据点数量", "evidence_kind": "database"},
+                    {"id": "start_value", "description": "起始值", "evidence_kind": "database"},
+                    {"id": "end_value", "description": "结束值", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "derived"},
+                    {"id": "max_value", "description": "最高值", "evidence_kind": "derived"},
+                    {"id": "min_value", "description": "最低值", "evidence_kind": "derived"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded Bitcoin rows.",
+            data={
+                "rows": [
+                    {"timestamp": "2023-01-04T00:00:00Z", "value": 16858.2362},
+                    {"timestamp": "2023-02-03T00:00:00Z", "value": 23428.6802},
+                ]
+            },
+        ),
+        latest_analysis_id="ana_price_metrics",
+        analysis_artifacts={
+            "ana_price_metrics": {
+                "analysis_id": "ana_price_metrics",
+                "analysis_goal": "计算价格指标",
+                "code_type": "code_interpreter_v1",
+                "code_hash": "sha256:demo",
+                "input_evidence_id": "evi_prices",
+                "input_row_count": 2,
+                "status": "succeeded",
+                "summary": "Computed price metrics in code.",
+                "result": {
+                    "summary": "Computed price metrics in code.",
+                    "metrics": {"pct_change": 38.97468229802119, "max_value": 24104.6943, "min_value": 16702.3044},
+                    "details": {},
+                },
+                "diagnostics": {},
+            }
+        },
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": [
+                    "query_text",
+                    "row_count",
+                    "start_value",
+                    "end_value",
+                    "pct_change",
+                    "max_value",
+                    "min_value",
+                ],
+                "missing": [],
+                "can_answer": True,
+            }
+        },
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "基于 code 结果回答。"})
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+
+
+def test_terminate_still_blocks_stale_non_answer_todos_without_global_gap_coverage():
+    request_state = RequestStateModel(
+        request_id="req-derived-analysis-stale-todos-not-covered",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询数据", "task_type": "query", "status": "completed", "priority": 1},
+            {"content": "整理答案", "task_type": "answer", "status": "in_progress", "priority": 2},
+            {"content": "计算涨跌幅", "task_type": "code_interpreter", "status": "pending", "priority": 3},
+        ],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_prices",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded rows.",
+            data={"rows": [{"timestamp": "2023-01-01T00:00:00Z", "value": 10.0}]},
+        ),
+    )
+
+    allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "证据不足。"})
+
+    assert allowed is False
+    assert reason == "Final answer is blocked because non-answer todo steps are still incomplete."
+
+
+def test_terminate_allows_unavailable_outputs_from_empty_database_evidence_with_active_query_todo():
+    request_state = RequestStateModel(
+        request_id="req-empty-derived-unavailable",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        todo_list=[
+            {"content": "查询该时间区间的原始价格序列", "task_type": "query", "status": "in_progress", "priority": 1},
+            {"content": "计算涨跌幅", "task_type": "code_interpreter", "status": "pending", "priority": 2},
+            {"content": "回答问题", "task_type": "answer", "status": "pending", "priority": 3},
+        ],
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "start_value", "description": "起始值", "evidence_kind": "database"},
+                    {"id": "end_value", "description": "结束值", "evidence_kind": "database"},
+                    {"id": "pct_change", "description": "涨跌幅", "evidence_kind": "analysis"},
+                    {"id": "high_low", "description": "最高最低", "evidence_kind": "analysis"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_empty",
+            result_type="timeseries",
+            database="demo",
+            summary="The query completed but returned no rows.",
+            data={"rows": [], "points": []},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["empty_database_result"],
+                "missing": ["start_value", "end_value", "pct_change", "high_low"],
+                "can_answer": False,
+                "next_action_reason": "The selected range contains no rows, so requested metrics are unavailable.",
+            }
+        },
+    )
+
+    allowed, reason = validate_action(
+        request_state,
+        "terminate",
+        {
+            "direct_answer": "该区间没有数据，无法计算起始值、结束值、涨跌幅、最高最低。",
+            "unavailable_outputs": ["start_value", "end_value", "pct_change", "high_low"],
+            "unavailable_reason": "The database query returned no rows for the requested time range.",
+        },
+    )
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
+        "start_value",
+        "end_value",
+        "pct_change",
+        "high_low",
+    ]
 
 
 def test_terminate_allows_explicit_unavailable_task_contract_outputs():

@@ -97,6 +97,25 @@ def _build_large_evidence_payload(size: int = 20_000):
     }
 
 
+def _build_rows_only_price_evidence_payload():
+    rows = [
+        {"timestamp": "2023-01-01T00:00:00Z", "price": 10.0, "code": "USD"},
+        {"timestamp": "2023-01-02T00:00:00Z", "price": 12.0, "code": "USD"},
+    ]
+    return {
+        "evidence_id": "evi_rows_only_price",
+        "result_type": "timeseries",
+        "database": "demo",
+        "query_language": "flux",
+        "query": "demo rows only query",
+        "summary": "Loaded 2 rows.",
+        "data": {"rows": rows, "time_field": "timestamp"},
+        "columns": ["timestamp", "price", "code"],
+        "metadata": {"database_type": "influxdb"},
+        "diagnostics": {},
+    }
+
+
 def test_request_state_keeps_summary_evidence_and_full_artifact():
     settings = get_settings()
     request = ChatRequest(message="分析趋势")
@@ -114,6 +133,44 @@ def test_request_state_keeps_summary_evidence_and_full_artifact():
     assert len(request_state.database_evidence_artifacts["evi_demo_full"].data["points"]) == 40
     assert len(request_state.observations[-1].payload["data"]["points"]) == 24
     assert len(request_state.observations[-1].payload["data"]["series"][0]["points"]) == 12
+
+
+def test_code_interpreter_supports_database_evidence_point_aliases_for_rows_only_price_data():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 计算价格变化")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_rows_only_price_evidence_payload(), _ToolSpec())
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="rows-only price compatibility",
+                code=(
+                    "pts = database_evidence['points']\n"
+                    "series_pts = database_evidence['data']['series'][0]['points']\n"
+                    "result = {\n"
+                    "    'summary': 'computed from aliased points',\n"
+                    "    'metrics': {\n"
+                    "        'point_count': len(pts),\n"
+                    "        'series_point_count': len(series_pts),\n"
+                    "        'start_value': float(pts[0]['value']),\n"
+                    "        'end_value': float(pts[-1]['value']),\n"
+                    "    },\n"
+                    "    'details': {},\n"
+                    "}\n"
+                ),
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["metrics"] == {
+        "point_count": 2,
+        "series_point_count": 2,
+        "start_value": 10.0,
+        "end_value": 12.0,
+    }
 
 
 def test_large_evidence_observation_and_prompt_are_prompt_safe():
@@ -253,6 +310,156 @@ def test_code_interpreter_enforces_expected_result_schema():
     )
 
     assert result["result"]["details"]["findings"][0]["value"] == 39.0
+
+
+def test_code_interpreter_rejects_opaque_outlier_treatment():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="outlier treatment"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="opaque outlier treatment",
+                    code=(
+                        "result = {\n"
+                        "    'summary': 'filtered outliers',\n"
+                        "    'metrics': {'has_outlier_like_values': True, 'used_point_count': 38},\n"
+                        "    'details': {'outlier_like_values': rows[:2]},\n"
+                        "}\n"
+                    ),
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_rejects_text_only_outlier_treatment_note():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="outlier treatment"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="text-only outlier treatment",
+                    code=(
+                        "result = {\n"
+                        "    'summary': '已基于数据库证据计算区间涨跌幅。',\n"
+                        "    'metrics': {'row_count': len(rows), 'start_value': rows[2]['value']},\n"
+                        "    'details': {'note': '原始结果中前两条为异常巨大值，因此起始值采用区间内首个有效价格。'},\n"
+                        "}\n"
+                    ),
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_rejects_outlier_treatment_without_excluded_row_list():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    with pytest.raises(AnalysisCodeError, match="excluded_rows as a list"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="bad excluded rows type",
+                    code=(
+                        "result = {\n"
+                        "    'summary': 'filtered outliers with count only',\n"
+                        "    'metrics': {'outlier_count': 2},\n"
+                        "    'details': {\n"
+                        "        'outlier_rule': 'value > threshold',\n"
+                        "        'threshold_or_formula': 'value > threshold',\n"
+                        "        'rationale': 'extreme values',\n"
+                        "        'excluded_rows': 2,\n"
+                        "        'raw_metrics': {'row_count': len(rows)},\n"
+                        "        'adjusted_metrics': {'row_count': len(rows) - 2},\n"
+                        "    },\n"
+                        "}\n"
+                    ),
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_rejects_duplicate_excluded_rows():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    duplicate = {"timestamp": "2023-01-01T00:00:00Z", "value": 1000001.0}
+    with pytest.raises(AnalysisCodeError, match="duplicate details.excluded_rows"):
+        asyncio.run(
+            CodeInterpreterTool().execute(
+                CodeInterpreterInput(
+                    analysis_goal="duplicate excluded rows",
+                    code=(
+                        f"duplicate = {duplicate!r}\n"
+                        "result = {\n"
+                        "    'summary': 'filtered duplicate outliers',\n"
+                        "    'metrics': {'outlier_count': 2},\n"
+                        "    'details': {\n"
+                        "        'outlier_rule': 'value > threshold',\n"
+                        "        'threshold_or_formula': 'value > threshold',\n"
+                        "        'rationale': 'extreme values',\n"
+                        "        'excluded_rows': [duplicate, duplicate],\n"
+                        "        'raw_metrics': {'row_count': len(rows)},\n"
+                        "        'adjusted_metrics': {'row_count': len(rows) - 1},\n"
+                        "    },\n"
+                        "}\n"
+                    ),
+                ),
+                request_state=request_state,
+            )
+        )
+
+
+def test_code_interpreter_allows_transparent_outlier_treatment():
+    settings = get_settings()
+    request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
+    request_state = build_request_state(request, settings)
+    observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
+    apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="transparent outlier treatment",
+                code=(
+                    "excluded = rows[:2]\n"
+                    "result = {\n"
+                    "    'summary': 'filtered outliers with explicit rule',\n"
+                    "    'metrics': {'has_outlier_like_values': True, 'used_point_count': len(rows) - len(excluded)},\n"
+                    "    'details': {\n"
+                    "        'outlier_rule': 'manual demonstration rule',\n"
+                    "        'threshold_or_formula': 'first two rows are excluded for this test fixture',\n"
+                    "        'rationale': 'test-only fixture validates transparent reporting',\n"
+                    "        'excluded_rows': excluded,\n"
+                    "        'raw_metrics': {'row_count': len(rows)},\n"
+                    "        'adjusted_metrics': {'row_count': len(rows) - len(excluded)},\n"
+                    "    },\n"
+                    "}\n"
+                ),
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["details"]["excluded_rows"] == _build_full_evidence_payload()["data"]["rows"][:2]
 
 
 def test_code_interpreter_rejects_result_missing_expected_detail_field():
