@@ -179,12 +179,38 @@ def _terminal_input_explains_unavailable_outputs(
     unavailable_reason = str(action_input.get("unavailable_reason") or "").strip()
     if not isinstance(unavailable_outputs, list) or not unavailable_reason:
         return False
+    if _latest_database_evidence_is_empty(request_state):
+        return any(str(item).strip() for item in unavailable_outputs)
     unavailable_set = {
         str(item).strip()
         for item in unavailable_outputs
         if str(item).strip()
     }
     return all(item in unavailable_set for item in blocking_items)
+
+
+def _latest_database_evidence_is_empty(request_state: RequestStateModel) -> bool:
+    evidence = request_state.latest_database_evidence
+    if evidence is None:
+        return False
+    data = evidence.data if isinstance(evidence.data, dict) else {}
+    rows = data.get("rows")
+    points = data.get("points")
+    if isinstance(rows, list) and len(rows) > 0:
+        return False
+    if isinstance(points, list) and len(points) > 0:
+        return False
+    if isinstance(rows, list) or isinstance(points, list):
+        return True
+    series = data.get("series")
+    if isinstance(series, list):
+        return all(
+            not isinstance(item, dict)
+            or not isinstance(item.get("points"), list)
+            or len(item.get("points")) == 0
+            for item in series
+        )
+    return "no rows" in str(evidence.summary or "").lower()
 
 
 def _gap_blocking_items(gap: dict) -> list[str]:

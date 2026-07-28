@@ -655,6 +655,56 @@ def test_terminate_allows_unavailable_outputs_from_empty_database_evidence_with_
     ]
 
 
+def test_terminate_allows_human_labels_for_unavailable_outputs_when_database_evidence_is_empty():
+    request_state = RequestStateModel(
+        request_id="req-empty-contract-human-labels",
+        message="查询起始值、结束值、涨跌幅、最高最低。",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "计算边界值和涨跌幅",
+                "required_outputs": [
+                    {"id": "r1", "description": "指定时间范围内的可用数据", "evidence_kind": "database"},
+                    {"id": "r2", "description": "起始值、结束值、最高值、最低值", "evidence_kind": "database_or_analysis"},
+                    {"id": "r3", "description": "涨跌幅", "evidence_kind": "analysis"},
+                    {"id": "r4", "description": "若查不到数据，明确说明原因", "evidence_kind": "database"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_empty",
+            result_type="table",
+            database="demo",
+            summary="The query completed but returned no rows.",
+            data={"rows": []},
+        ),
+        completion_state={
+            "latest_gap_assessment": {
+                "covered": ["r1", "r4"],
+                "missing": ["r2", "r3"],
+                "can_answer": False,
+                "next_action_reason": "The selected range contains no rows, so requested metrics are unavailable.",
+            }
+        },
+    )
+
+    allowed, reason = validate_action(
+        request_state,
+        "terminate",
+        {
+            "direct_answer": "该区间没有数据，无法计算起始值、结束值、涨跌幅、最高最低。",
+            "unavailable_outputs": ["起始值", "结束值", "涨跌幅", "最高值", "最低值"],
+            "unavailable_reason": "查询返回 0 行，缺少可用于计算的原始价格序列。",
+        },
+    )
+
+    assert allowed is True
+    assert reason is None
+    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["r2", "r3"]
+
+
 def test_terminate_allows_explicit_unavailable_task_contract_outputs():
     request_state = RequestStateModel(
         request_id="req-contract-unavailable",
