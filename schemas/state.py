@@ -9,6 +9,7 @@ from schemas.analysis import AnalysisResult
 from schemas.api import Message
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
+from schemas.data_fact import DataFact, FactCoverage, FactEvent, FactSet
 from schemas.insight import RejectedFact, VerifiedFact
 from schemas.output import FinalAnswer
 from schemas.timeseries import AnomalyResult, ForecastResult
@@ -57,6 +58,9 @@ class RequestStateModel(BaseModel):
     anomaly_artifacts: dict[str, AnomalyResult] = Field(default_factory=dict)
     latest_rag: dict | None = None
     latest_skill: dict | None = None
+    fact_set: FactSet = Field(default_factory=FactSet)
+    fact_coverage: FactCoverage = Field(default_factory=FactCoverage)
+    fact_events: list[FactEvent] = Field(default_factory=list)
     verified_facts: list[VerifiedFact] = Field(default_factory=list)
     rejected_facts: list[RejectedFact] = Field(default_factory=list)
 
@@ -91,6 +95,8 @@ class ConversationStateModel(BaseModel):
     anomaly_artifacts: dict[str, AnomalyResult] = Field(default_factory=dict)
     latest_rag: dict | None = None
     latest_skill: dict | None = None
+    recent_fact_memory: list[DataFact] = Field(default_factory=list)
+    fact_memory_summary: str | None = None
     recent_visualizations: list[VisualizationPayload] = Field(default_factory=list)
     updated_at: str | None = None
     context_budget: dict | None = None

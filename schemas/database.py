@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from schemas.data_fact import DataFact, FactCoverage
+
 
 class DatabaseEvidence(BaseModel):
     """Normalized database evidence."""
@@ -19,4 +21,6 @@ class DatabaseEvidence(BaseModel):
     columns: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     diagnostics: dict = Field(default_factory=dict)
-
+    produced_facts: list[DataFact] = Field(default_factory=list)
+    rejected_facts: list[DataFact] = Field(default_factory=list)
+    fact_coverage: FactCoverage | None = None

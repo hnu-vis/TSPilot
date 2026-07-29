@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from schemas.data_fact import DataFact, FactCoverage
+
 
 class AnalysisResult(BaseModel):
     analysis_id: str
@@ -17,6 +19,9 @@ class AnalysisResult(BaseModel):
     summary: str
     result: dict = Field(default_factory=dict)
     diagnostics: dict = Field(default_factory=dict)
+    produced_facts: list[DataFact] = Field(default_factory=list)
+    rejected_facts: list[DataFact] = Field(default_factory=list)
+    fact_coverage: FactCoverage | None = None
 
     @model_validator(mode="after")
     def validate_succeeded_result_contract(self):

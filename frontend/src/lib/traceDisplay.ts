@@ -1,4 +1,4 @@
-import type { FinalAnswer, TraceStep } from '../types';
+import type { DataFact, DataFactRequest, FactCoverage, FinalAnswer, TraceStep } from '../types';
 
 export type DisplayMetric = {
   label: string;
@@ -103,6 +103,13 @@ export type AnomalyDetail = {
   spanCount: number | null;
 };
 
+export type FactDetail = {
+  requested: DataFactRequest[];
+  produced: DataFact[];
+  coverage: FactCoverage | null;
+  contextSummary: Record<string, unknown> | null;
+};
+
 export type ReactDetail = {
   thought: string | null;
   action: string | null;
@@ -123,6 +130,7 @@ export type DisplayStep = {
   codeInterpreterDetail: CodeInterpreterDetail | null;
   forecastDetail: ForecastDetail | null;
   anomalyDetail: AnomalyDetail | null;
+  factDetail: FactDetail | null;
   schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
   reactDetail: ReactDetail;
@@ -156,6 +164,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const codeInterpreterDetail = codeInterpreterDetailFor(tool, preview, call, step);
   const forecastDetail = forecastDetailFor(tool, preview);
   const anomalyDetail = anomalyDetailFor(tool, preview);
+  const factDetail = factDetailFor(preview, call, step);
   const schemaLinkingDetail = schemaLinkingDetailFor(tool, preview);
   const hasPrimaryDetail = Boolean(
     planDetail ||
@@ -163,6 +172,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     codeInterpreterDetail ||
     forecastDetail ||
     anomalyDetail ||
+    factDetail ||
     schemaLinkingDetail ||
     completionDetail,
   );
@@ -180,6 +190,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     codeInterpreterDetail,
     forecastDetail,
     anomalyDetail,
+    factDetail,
     schemaLinkingDetail,
     completionDetail,
     reactDetail,
@@ -334,6 +345,10 @@ function metricsForTool(
   addMetric(metrics, 'Points', numberFrom(preview?.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
   addMetric(metrics, 'Series', numberFrom(preview?.series_count) ?? nestedNumber(preview, ['summary_stats', 'series_count']));
   addMetric(metrics, 'Facts', numberFrom(preview?.verified_fact_count));
+  const producedFacts = recordsFrom(preview?.produced_facts);
+  if (producedFacts.length > 0 && !metrics.some((metric) => metric.label === 'Facts')) {
+    addMetric(metrics, 'Facts', producedFacts.length);
+  }
   addMetric(metrics, 'Samples', numberFrom(preview?.input_row_count));
   addMetric(metrics, 'Anomalies', numberFrom(preview?.anomaly_count) ?? numberFrom(preview?.anomaly_point_count));
   addMetric(metrics, 'Forecast points', numberFrom(preview?.forecast_point_count));
@@ -349,6 +364,78 @@ function metricsForTool(
   addMetric(metrics, 'Visuals', numberFrom(preview?.visualization_count));
 
   return metrics;
+}
+
+function factDetailFor(
+  preview: Record<string, unknown> | null,
+  call: Record<string, unknown> | null,
+  step: TraceStep,
+): FactDetail | null {
+  const actionInput = asRecord(step.actionInput) || asRecord(call?.action_input);
+  const requested = recordsFrom(actionInput?.fact_requests)
+    .map((item) => ({
+      name: stringFrom(item.name) || '',
+      fact_type: stringFrom(item.fact_type) || 'custom',
+      subject: stringFrom(item.subject),
+      time_range: asRecord(item.time_range),
+      dimensions: asRecord(item.dimensions) || {},
+      requirements: asRecord(item.requirements) || {},
+    }))
+    .filter((item) => item.name);
+  const produced = recordsFrom(preview?.produced_facts)
+    .map((item) => dataFactFromRecord(item))
+    .filter((item): item is DataFact => Boolean(item));
+  const coverage = coverageFromRecord(asRecord(preview?.fact_coverage));
+  const contextSummary = asRecord(asRecord(preview?.data_fact_context)?.summary);
+  if (requested.length === 0 && produced.length === 0 && !coverage && !contextSummary) return null;
+  return {
+    requested,
+    produced,
+    coverage,
+    contextSummary,
+  };
+}
+
+function dataFactFromRecord(item: Record<string, unknown>): DataFact | null {
+  const factId = stringFrom(item.fact_id);
+  const name = stringFrom(item.name);
+  if (!factId || !name) return null;
+  return {
+    fact_id: factId,
+    name,
+    fact_type: stringFrom(item.fact_type) || 'custom',
+    statement: stringFrom(item.statement) || name,
+    value: item.value,
+    unit: stringFrom(item.unit),
+    subject: stringFrom(item.subject),
+    dimensions: asRecord(item.dimensions) || {},
+    time_range: asRecord(item.time_range),
+    method: stringFrom(item.method) || 'tool',
+    evidence_refs: recordsFrom(item.evidence_refs).map((ref) => ({
+      source_type: stringFrom(ref.source_type) || 'artifact',
+      source_id: stringFrom(ref.source_id) || '',
+      label: stringFrom(ref.label),
+      locator: asRecord(ref.locator) || {},
+    })).filter((ref) => ref.source_id),
+    calculation_trace: asRecord(item.calculation_trace) || {},
+    status: stringFrom(item.status) || 'verified',
+    confidence: numberFrom(item.confidence),
+    quality_flags: stringsFrom(item.quality_flags),
+    unavailable_reason: stringFrom(item.unavailable_reason),
+    derived_from: stringsFrom(item.derived_from),
+  };
+}
+
+function coverageFromRecord(record: Record<string, unknown> | null): FactCoverage | null {
+  if (!record) return null;
+  return {
+    requested: stringsFrom(record.requested),
+    verified: stringsFrom(record.verified),
+    missing: stringsFrom(record.missing),
+    unavailable: stringsFrom(record.unavailable),
+    rejected: stringsFrom(record.rejected),
+    partial: stringsFrom(record.partial),
+  };
 }
 
 function artifactRefsFor(preview: Record<string, unknown> | null, result: Record<string, unknown> | null) {

@@ -28,6 +28,17 @@ def sync_from_request(
     conversation_state.anomaly_artifacts = request_state.anomaly_artifacts
     conversation_state.latest_rag = request_state.latest_rag
     conversation_state.latest_skill = request_state.latest_skill
+    reusable_facts = [
+        fact
+        for fact in request_state.fact_set.facts
+        if fact.status in {"verified", "unavailable"} and fact.evidence_refs
+    ]
+    conversation_state.recent_fact_memory = reusable_facts[-24:]
+    if reusable_facts:
+        latest = reusable_facts[-8:]
+        conversation_state.fact_memory_summary = "; ".join(
+            f"{fact.name}: {fact.status}" for fact in latest
+        )
     conversation_state.recent_visualizations = request_state.visualizations[-6:]
     conversation_state.updated_at = datetime.now(timezone.utc).isoformat()
     conversation_state.context_budget = request_state.context_budget

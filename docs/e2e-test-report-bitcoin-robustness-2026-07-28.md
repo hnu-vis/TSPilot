@@ -219,6 +219,225 @@ Bitcoin preview 现在包含：
 - 耗时：29.7s
 - 摘要：`该时间范围内未查到 Bitcoin USD 数据，原因是数据库查询返回 0 行；因此起始值、结束值、涨跌幅、最高最低值均无法计算。`
 
+## Fact Memory / DataFact 链路复测
+
+本轮复测时间：`2026-07-28 20:59-21:09 Asia/Shanghai`
+
+测试目标：
+
+- 验证 Bitcoin 数据库上的常见任务是否能完成完整 ReAct/tool/final answer 链路。
+- 验证 `fact_requests` 是否进入 tool action input。
+- 验证 `produced_facts`、`fact_coverage`、`fact references` 是否进入 observation/final answer。
+- 验证 long-term fact memory 是否可读、是否会沉淀 fact definition / recipe。
+
+测试接口：
+
+- `POST http://127.0.0.1:5680/api/v1/chat`
+- `GET http://127.0.0.1:5680/api/v1/resources/fact-memory`
+- `GET http://127.0.0.1:5680/api/v1/resources/databases/influxdb2-bitcoin-sample/fact-memory`
+
+测试产物：
+
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/summary.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/01_range_metrics.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/02_empty_range.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/03_exclude_threshold.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/04_periodicity_custom.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/05_raw_no_exclusion.json`
+- `cache_data/e2e_runs/bitcoin_fact_memory_2026-07-28/06_single_day_fact_trace_confirm.json`
+
+### 结果汇总
+
+| Case | 请求重点 | 终态 | 耗时 | 工具链 | 结论 |
+| --- | --- | --- | ---: | --- | --- |
+| 01_range_metrics | 2023-01-04 到 2023-02-03 起止/涨跌/最高最低 | completed | 31.68s | `sql_query`, `code_interpreter` | 业务完成；LLM 在 `sql_query.action_input` 中带了 `fact_requests`；但 final answer 没有 fact references。 |
+| 02_empty_range | 2022-01-01 到 2022-01-02 空数据 | completed | 22.04s | `sql_query` | 正确返回无数据不可计算；空数据路径本轮可用。 |
+| 03_exclude_threshold | 显式剔除 `price > 1000000` | completed | 27.59s | `sql_query`, `code_interpreter` | 业务完成并解释剔除原因；但结束值为 `23491.0923`，与早前复测的 `23428.6802` 不一致，需要核查时间边界/排序/字段口径。 |
+| 04_periodicity_custom | 周期性/custom fact 风格分析 | completed | 192.36s | `sql_query` x4, `code_interpreter` x6 | 最终回答“未可靠确认周期性”；但 61 个 trace event，耗时过长，存在多轮重试。 |
+| 05_raw_no_exclusion | 明确要求原始数据不剔除 | completed | 29.70s | `sql_query`, `code_interpreter` | 正确使用原始异常值口径：起始/最高为 `168249475888010.0`，涨跌幅 `-99.99999998607503%`。 |
+| 06_single_day_fact_trace_confirm | 单日短区间复测 DataFact trace | completed | 109.24s | `sql_query` x3, `code_interpreter` x6 | 严重错误：最终给出全 0 指标；9 次工具调用后 completed，说明当前链路仍会接受错误 analysis artifact。 |
+
+### DataFact 观测
+
+正向信号：
+
+- `01_range_metrics` 的第一轮 `sql_query.action_input` 已包含 `fact_requests`：
+  - `start_value`
+  - `end_value`
+  - `highest_value`
+  - `lowest_value`
+  - `percentage_change`
+- 这说明 ReAct prompt 已经能让 LLM 用 fact request 表达“需要哪些事实”。
+
+问题：
+
+- 本轮所有 chat response 中：
+  - `answer.references` 的 `source_type=fact` 数量均为 0。
+  - `trace observation.payload.produced_facts` 均为空数组。
+  - `fact_coverage.requested` 在 observation 中为空。
+- 但本地用同一条 SQL observation 复放 `register_data_facts_from_payload()` 可以生成：
+  - `data_coverage`
+  - `start_value`
+  - `end_value`
+  - `highest_value`
+  - `lowest_value`
+
+初步判断：
+
+- 这不是 fact runtime 完全不可用，而是当前 5680 运行链路中 tool input 的 `fact_requests` 没有稳定传到 `ToolCall.tool_input` / fact registration 阶段，或运行进程存在 reload 后模块版本不一致。
+- 需要进一步检查运行时 worker 是否加载了最新 `SqlQueryInput.fact_requests`、`CodeInterpreterInput.fact_requests` 和 `register_data_facts_from_payload()`。
+
+### Long-Term Fact Memory 观测
+
+API 可用：
+
+- `GET /api/v1/resources/fact-memory`
+  - definitions：6
+  - recipes：7
+  - storage path：`cache_data/database/fact_memory/global.json`
+- `GET /api/v1/resources/databases/influxdb2-bitcoin-sample/fact-memory`
+  - definitions：5
+  - recipes：1
+  - storage path：`cache_data/database/fact_memory/influxdb2-bitcoin-sample.json`
+
+当前 global memory 中包含：
+
+- system definitions：
+  - `point_value`
+  - `extreme`
+  - `change`
+  - `seasonality`
+  - `custom`
+- observed definition：
+  - `data_coverage`
+- observed recipes：
+  - `start_value`
+  - `end_value`
+  - `highest_value`
+  - `lowest_value`
+  - `percentage_change`
+
+注意：
+
+- long-term memory 当前沉淀的是 fact definition / recipe，不是具体数值结果。
+- 也就是说它会记住“`percentage_change` 这类 fact 通常需要 code_interpreter，要求 start/end/current evidence 和 calculation trace”，但不会把“某个日期区间的 Bitcoin 涨跌幅”当作以后可直接复用的答案。
+
+### 新发现的问题
+
+#### P0：单日短区间可 completed 但返回全 0 错误指标
+
+`06_single_day_fact_trace_confirm` 返回：
+
+```text
+起始值：0.0；结束值：0.0；涨跌幅：0.00%；最高值：0.0；最低值：0.0。
+```
+
+但 query reference 显示 SQL 实际返回了 90 行。analysis artifact 里也显示：
+
+```json
+{
+  "input_row_count": 90,
+  "result": {
+    "metrics": {
+      "start_value": 0.0,
+      "end_value": 0.0,
+      "high_value": 0.0,
+      "low_value": 0.0
+    },
+    "details": {
+      "row_count": 0
+    }
+  }
+}
+```
+
+根因判断：
+
+- SQL query 使用 `keep(columns: ["_time", "price"])`，返回 preview 只有 `timestamp` 列，没有数值列。
+- code_interpreter 基于缺失 value 的 rows 运行，最终为了满足 expected schema，用 `0.0` 填充了空数据结果。
+- 当前 validator 只检查字段类型，不检查 `input_row_count=90` 与 `result.details.row_count=0` 的矛盾，也不检查数值列缺失时不应返回 verified numeric metrics。
+
+通用修复方向：
+
+- code_interpreter validator 应增加 evidence/result consistency check：
+  - 如果 `input_row_count > 0` 且任务要求数值指标，但 normalized numeric row count 为 0，则不能返回全 0 指标。
+  - 这类情况应返回 failed/partial/unavailable，并让 ReAct 修正 SQL evidence shape。
+- sql_query planner/generator 应避免生成只保留 `_time` 而丢失 `_value` 的 Flux query；如果用户要求计算，query evidence 必须包含 time + value。
+- final answer 对 analysis artifact 需要做合理性 gate：`row_count=0` 但 answer 输出具体数值时应阻止 terminate。
+
+#### P1：DataFact 没有进入最终 answer references
+
+虽然 action input 已出现 `fact_requests`，但最终 answer 仍只引用 query/analysis，不引用 fact。
+
+影响：
+
+- 前端 Data facts 面板在本轮 E2E 中无法展示真实 produced facts。
+- final answer 仍主要基于 analysis artifact，而不是 DataFact references。
+- long-term fact memory 会沉淀 recipe，但当前 request 的 DataFact instance 没有形成稳定闭环。
+
+通用修复方向：
+
+- 确认运行时 worker 加载最新 tool input schema。
+- 在 `ToolExecutor` 记录 `ToolCall.tool_input` 后增加 debug/trace preview，明确显示 validated input 是否保留 `fact_requests`。
+- 在 `apply_observation` 后增加最小 telemetry：
+  - `fact_registration.requested_count`
+  - `fact_registration.produced_count`
+  - `fact_registration.coverage`
+- `terminate` 阶段若当前 request 有 `fact_set.facts`，应自动纳入 fact references，而不完全依赖 LLM 手写 `include_fact_ids`。
+
+#### P1：周期性/custom fact 分析可完成但重试过多
+
+`04_periodicity_custom`：
+
+- 耗时：192.36s
+- trace events：61
+- 工具链：10 次 tool call
+
+根因判断：
+
+- `seasonality/custom` 的 fact definition 已在 long-term memory 中，但还没有强约束 code_interpreter 的 output schema。
+- LLM 仍在多次尝试 SQL/code，而不是按 recipe 一次性生成合规 analysis。
+
+通用修复方向：
+
+- 从 long-term fact recipe 生成 `expected_result_schema`，而不是只把 recipe 放进 prompt。
+- 对 custom/seasonality analysis 要求输出 `method`、`period`、`strength`、`limitations`、`evidence_refs`。
+
+#### P2：显式阈值剔除结果与历史复测不一致
+
+本轮 `03_exclude_threshold` 给出：
+
+- end_value：`23491.0923`
+- percentage_change：`39.3449%`
+
+早前同类复测记录为：
+
+- end_value：`23428.6802`
+- percentage_change：`38.97468229802119%`
+
+需要核查：
+
+- 是否本轮 query stop/time boundary 与早前不同。
+- 是否 code 使用了不同排序或末尾行。
+- 是否数据源有新增或重复点。
+
+### 本轮结论
+
+任务完成率表面上较高：6 条复测均 `completed`，但鲁棒性仍不足。
+
+最关键的问题不是 React 前端，而是后端证据链：
+
+1. DataFact request 已进入 action input，但 DataFact instance 没有稳定进入 observation/final answer。
+2. code_interpreter 可以在输入 evidence 缺少数值列时用 `0.0` 填充并通过 schema，导致错误答案 completed。
+3. long-term memory 已能沉淀 fact definition/recipe，但还没有反向约束当前 request 的 DataFact production 和 final answer gate。
+
+下一步优先级：
+
+1. 修复 query evidence shape：计算任务必须返回 time + value，不允许只有 timestamp。
+2. 修复 code_interpreter consistency validator：禁止用全 0/空 rows 伪造数值指标。
+3. 修复 DataFact registration trace：确保 `fact_requests` 经 validated tool input 保留，并产出 `produced_facts`。
+4. 让 final answer 自动引用当前 request 的 DataFact，不完全依赖 LLM 填 `include_fact_ids`。
+
 结论：schema 现在不只是结构信息，也带有轻量 data profile。模型可以区分“字段/tag 存在但请求时间范围没有覆盖数据”和“字段或过滤条件不存在”。当前实现仍保留一次真实查询作为证据，不会仅凭 schema profile 伪造结果。
 
 ## Persistent Profile Cache 补充

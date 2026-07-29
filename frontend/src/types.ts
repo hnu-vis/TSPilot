@@ -46,6 +46,92 @@ export type FinalAnswer = {
   visualizations?: Array<Record<string, unknown>>;
 };
 
+export type FactStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;
+
+export type FactEvidenceRef = {
+  source_type: string;
+  source_id: string;
+  label?: string | null;
+  locator?: Record<string, unknown>;
+};
+
+export type DataFact = {
+  fact_id: string;
+  name: string;
+  fact_type: string;
+  statement: string;
+  value?: unknown;
+  unit?: string | null;
+  subject?: string | null;
+  dimensions?: Record<string, unknown>;
+  time_range?: Record<string, unknown> | null;
+  method: string;
+  evidence_refs?: FactEvidenceRef[];
+  calculation_trace?: Record<string, unknown>;
+  status: FactStatus;
+  confidence?: number | null;
+  quality_flags?: string[];
+  unavailable_reason?: string | null;
+  derived_from?: string[];
+};
+
+export type DataFactRequest = {
+  name: string;
+  fact_type: string;
+  subject?: string | null;
+  time_range?: Record<string, unknown> | null;
+  dimensions?: Record<string, unknown>;
+  requirements?: Record<string, unknown>;
+};
+
+export type FactCoverage = {
+  requested?: string[];
+  verified?: string[];
+  missing?: string[];
+  unavailable?: string[];
+  rejected?: string[];
+  partial?: string[];
+};
+
+export type FactDefinition = {
+  fact_type: string;
+  description: string;
+  required_evidence?: string[];
+  preferred_tool?: string | null;
+  output_schema?: Record<string, unknown>;
+  verification_requirements?: string[];
+  report_guidance?: string | null;
+  scope?: string;
+  source?: string;
+  updated_at?: string | null;
+};
+
+export type FactRecipe = {
+  recipe_id: string;
+  fact_type: string;
+  name: string;
+  preferred_tool: string;
+  fact_request_template?: Record<string, unknown>;
+  expected_result_schema?: Record<string, unknown>;
+  verification_notes?: string[];
+  scope?: string;
+  source?: string;
+  updated_at?: string | null;
+};
+
+export type FactMemory = {
+  definitions: FactDefinition[];
+  recipes: FactRecipe[];
+  storage_path?: string | null;
+  updated_at?: string | null;
+};
+
+export type FactMemoryResponse = {
+  database?: DatabaseResource;
+  memory: FactMemory;
+  prompt_view?: Record<string, unknown>;
+};
+
 export type TraceStatus = 'running' | 'complete' | 'error';
 
 export type TraceStep = {

@@ -3,6 +3,7 @@ import type {
   DatabaseConnectionTest,
   DatabasePreviewResponse,
   DatabaseResource,
+  FactMemoryResponse,
   FinalAnswer,
   KnowledgeResource,
   StreamEvent,
@@ -35,6 +36,15 @@ export async function fetchDatabasePreview(databaseId: string, options?: { refre
   const search = options?.refresh ? '?refresh=true' : '';
   const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/preview${search}`);
   if (!response.ok) throw new Error(`Failed to preview database: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchFactMemory(databaseId?: string | null): Promise<FactMemoryResponse> {
+  const path = databaseId
+    ? `/resources/databases/${encodeURIComponent(databaseId)}/fact-memory`
+    : '/resources/fact-memory';
+  const response = await fetch(`${API_BASE}${path}`);
+  if (!response.ok) throw new Error(`Failed to load fact memory: ${response.status}`);
   return response.json();
 }
 

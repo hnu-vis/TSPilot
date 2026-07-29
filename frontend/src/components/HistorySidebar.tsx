@@ -2,7 +2,7 @@ import { BookOpen, BrainCircuit, Database, Edit3, MessageSquarePlus, Search, Tra
 import { useState } from 'react';
 import type { Conversation } from '../types';
 
-export type WorkspaceView = 'chat' | 'database';
+export type WorkspaceView = 'chat' | 'database' | 'fact-memory';
 
 type Props = {
   conversations: Conversation[];
@@ -186,6 +186,14 @@ const workspaceNavItems: Array<{
     view: 'database',
   },
   {
+    id: 'fact-memory',
+    label: 'Fact Memory',
+    hint: 'Manage fact definitions and recipes',
+    icon: BrainCircuit,
+    enabled: true,
+    view: 'fact-memory',
+  },
+  {
     id: 'knowledge',
     label: 'Knowledge base',
     hint: 'Knowledge management is planned',
@@ -196,7 +204,7 @@ const workspaceNavItems: Array<{
     id: 'skills',
     label: 'Skills',
     hint: 'Skill management is planned',
-    icon: BrainCircuit,
+    icon: BookOpen,
     enabled: false,
   },
 ];

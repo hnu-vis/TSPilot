@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatThread } from './components/ChatThread';
 import { Composer } from './components/Composer';
 import { DatabaseManager } from './components/DatabaseManager';
+import { FactMemoryManager } from './components/FactMemoryManager';
 import { HistorySidebar, type WorkspaceView } from './components/HistorySidebar';
 import { InspectorPanel } from './components/InspectorPanel';
 import {
@@ -59,6 +60,7 @@ export default function App() {
     ),
   );
   const isDatabaseView = activeView === 'database';
+  const isFactMemoryView = activeView === 'fact-memory';
   const isInspectorVisible = activeView === 'chat' && hasConversationContent;
 
   const chatHasConversationContent = Boolean(
@@ -402,7 +404,7 @@ export default function App() {
         onDelete={handleDeleteConversation}
       />
 
-      <main className={`workspace ${chatHasConversationContent ? '' : 'empty-workspace'} ${isDatabaseView ? 'database-workspace' : ''}`}>
+      <main className={`workspace ${chatHasConversationContent ? '' : 'empty-workspace'} ${isDatabaseView || isFactMemoryView ? 'database-workspace' : ''}`}>
         <header className="topbar">
           <button
             type="button"
@@ -413,8 +415,14 @@ export default function App() {
             <Menu size={17} />
           </button>
           <div className="topbar-title">
-            <h1>{isDatabaseView ? 'Database' : activeConversation.title}</h1>
-            <p>{isDatabaseView ? 'Manage available data sources and inspect schema before analysis.' : 'Ask, inspect the agent process, and continue from previous context.'}</p>
+            <h1>{isDatabaseView ? 'Database' : isFactMemoryView ? 'Fact Memory' : activeConversation.title}</h1>
+            <p>
+              {isDatabaseView
+                ? 'Manage available data sources and inspect schema before analysis.'
+                : isFactMemoryView
+                  ? 'Manage reusable fact definitions, recipes, and verification guidance.'
+                  : 'Ask, inspect the agent process, and continue from previous context.'}
+            </p>
           </div>
         </header>
 
@@ -424,6 +432,11 @@ export default function App() {
             selectedDatabaseId={activeConversation.selectedDatabaseId}
             onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
             onDatabasesChange={refreshResources}
+          />
+        ) : isFactMemoryView ? (
+          <FactMemoryManager
+            databases={resources.databases}
+            selectedDatabaseId={activeConversation.selectedDatabaseId}
           />
         ) : (
           <section className={`thread-area ${hasConversationContent ? '' : 'empty-thread-area'}`}>

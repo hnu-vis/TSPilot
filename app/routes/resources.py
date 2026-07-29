@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.settings import get_settings
 from core.database import DatabaseFactory, metric_list_preview, schema_preview
+from core.data_fact.memory import prompt_fact_memory_view, read_fact_memory
 
 router = APIRouter(prefix="/api/v1/resources", tags=["resources"])
 
@@ -195,6 +196,30 @@ async def preview_database_resource(database_id: str, refresh: bool = Query(defa
         "summary": f"Loaded {len(preview.get('tables_or_measurements', []))} schema objects.",
         "preview": preview,
         "profile_cache": profile_cache,
+    }
+
+
+@router.get("/fact-memory")
+async def get_global_fact_memory() -> dict:
+    """Return long-term fact definition and recipe memory."""
+    memory = read_fact_memory(None)
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "prompt_view": prompt_fact_memory_view(None),
+    }
+
+
+@router.get("/databases/{database_id}/fact-memory")
+async def get_database_fact_memory(database_id: str) -> dict:
+    """Return fact definition and recipe memory scoped to one database."""
+    config = await DatabaseFactory.get_database(database_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
+    memory = read_fact_memory(database_id)
+    return {
+        "database": _public_database_config(database_id, config),
+        "memory": memory.model_dump(mode="json"),
+        "prompt_view": prompt_fact_memory_view(database_id),
     }
 
 

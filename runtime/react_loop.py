@@ -624,6 +624,14 @@ class ReActLoop:
             preview["visualization_count"] = len(visible_payload.get("visualizations", []))
         if "verified_facts" in visible_payload:
             preview["verified_fact_count"] = len(visible_payload.get("verified_facts", []))
+        if "produced_facts" in visible_payload:
+            produced_facts = visible_payload.get("produced_facts", [])
+            preview["produced_facts"] = produced_facts[:8] if isinstance(produced_facts, list) else []
+            preview["verified_fact_count"] = len(preview["produced_facts"])
+        if "fact_coverage" in visible_payload:
+            preview["fact_coverage"] = visible_payload.get("fact_coverage")
+        if "data_fact_context" in visible_payload:
+            preview["data_fact_context"] = visible_payload.get("data_fact_context")
         if "todos" in visible_payload:
             todos = visible_payload.get("todos", [])
             preview["todo_total"] = len(todos)

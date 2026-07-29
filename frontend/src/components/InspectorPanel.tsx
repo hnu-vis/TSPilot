@@ -104,6 +104,8 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.anomalyDetail && <AnomalyPreview detail={step.anomalyDetail} />}
 
+      {step.factDetail && <FactPreview detail={step.factDetail} />}
+
       {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
 
       {step.completionDetail && shouldShowCompletion(step.completionDetail) && (
@@ -515,6 +517,97 @@ function AnomalyPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
   );
 }
 
+function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['factDetail']> }) {
+  const coverageItems = factCoverageItems(detail.coverage);
+  return (
+    <section className="inspector-card data-fact-preview">
+      <div className="inspector-card-title sql-detail-title">
+        <CheckCircle2 size={16} />
+        <h3>Data facts</h3>
+        {detail.produced.length > 0 && <span className="query-language-badge">{detail.produced.length} facts</span>}
+      </div>
+
+      {detail.requested.length > 0 && (
+        <div className="tool-result-section">
+          <div className="sample-table-caption">
+            <span>
+              <ListChecks size={14} />
+              Requested facts
+            </span>
+          </div>
+          <div className="chip-list compact">
+            {detail.requested.slice(0, 16).map((request) => (
+              <span key={`${request.name}-${request.fact_type}`}>{request.name} · {request.fact_type}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {coverageItems.length > 0 && (
+        <div className="fact-coverage-grid" aria-label="Fact coverage">
+          {coverageItems.map((item) => (
+            <div key={item.label} className={`fact-coverage-tile ${item.status}`}>
+              <span>{item.label}</span>
+              <strong>{item.values.length}</strong>
+              {item.values.length > 0 && <small>{item.values.slice(0, 4).join(', ')}</small>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {detail.produced.length > 0 ? (
+        <div className="data-fact-list">
+          {detail.produced.map((fact) => (
+            <details key={fact.fact_id} className={`data-fact-card ${fact.status}`} open={fact.status !== 'verified'}>
+              <summary>
+                <span>
+                  <StatusIcon status={fact.status === 'verified' ? 'complete' : fact.status === 'unavailable' ? 'attention' : 'error'} />
+                  <strong>{fact.name}</strong>
+                  <code>{fact.fact_type}</code>
+                </span>
+                <span className={`status-line compact ${factStatusClass(fact.status)}`}>{formatLabel(fact.status)}</span>
+              </summary>
+              <p className="step-summary">{fact.statement}</p>
+              <dl className="answer-metric-grid">
+                <div>
+                  <dt>Method</dt>
+                  <dd>{fact.method}</dd>
+                </div>
+                {fact.value !== undefined && (
+                  <div>
+                    <dt>Value</dt>
+                    <dd>{formatCell(fact.value)}</dd>
+                  </div>
+                )}
+                {fact.unavailable_reason && (
+                  <div>
+                    <dt>Reason</dt>
+                    <dd>{fact.unavailable_reason}</dd>
+                  </div>
+                )}
+              </dl>
+              {fact.evidence_refs && fact.evidence_refs.length > 0 && (
+                <div className="chip-list compact">
+                  {fact.evidence_refs.map((reference) => (
+                    <span key={`${reference.source_type}-${reference.source_id}`}>
+                      {reference.source_type}:{reference.source_id}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {fact.calculation_trace && Object.keys(fact.calculation_trace).length > 0 && (
+                <pre className="debug-json">{JSON.stringify(fact.calculation_trace, null, 2)}</pre>
+              )}
+            </details>
+          ))}
+        </div>
+      ) : (
+        <p className="sample-note">No structured facts were produced for this step.</p>
+      )}
+    </section>
+  );
+}
+
 function StructuredResult({
   title,
   summary,
@@ -819,6 +912,24 @@ function shouldShowCompletion(detail: ReturnType<typeof toDisplayStep>['completi
   if (detail.missingItems.length > 0) return true;
   if (detail.nextActionHint) return true;
   return false;
+}
+
+function factCoverageItems(coverage: NonNullable<ReturnType<typeof toDisplayStep>['factDetail']>['coverage']) {
+  if (!coverage) return [];
+  return [
+    { label: 'Verified', status: 'complete', values: coverage.verified || [] },
+    { label: 'Missing', status: 'attention', values: coverage.missing || [] },
+    { label: 'Unavailable', status: 'attention', values: coverage.unavailable || [] },
+    { label: 'Rejected', status: 'error', values: coverage.rejected || [] },
+    { label: 'Partial', status: 'running', values: coverage.partial || [] },
+  ].filter((item) => item.values.length > 0 || item.label === 'Verified');
+}
+
+function factStatusClass(status: string) {
+  if (status === 'verified') return 'complete';
+  if (status === 'unavailable' || status === 'partial') return 'attention';
+  if (status === 'rejected') return 'error';
+  return 'running';
 }
 
 function formatCell(value: unknown) {
