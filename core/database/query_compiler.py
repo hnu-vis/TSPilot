@@ -37,7 +37,7 @@ class CompiledQuery:
 class QueryCompiler:
     """Dispatch query-plan compilation by database dialect."""
 
-    SQL_DIALECTS = {"postgresql", "timescaledb", "questdb", "clickhouse", "generic", "sql"}
+    SQL_DIALECTS = {"postgresql", "timescaledb", "questdb", "clickhouse", "openmldb", "generic", "sql"}
 
     def compile(
         self,

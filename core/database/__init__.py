@@ -58,6 +58,8 @@ from .connectors import (
     QuestDBConfig,
     ClickHouseConnector,
     ClickHouseConfig,
+    OpenMLDBConnector,
+    OpenMLDBConfig,
 )
 
 try:
@@ -611,6 +613,7 @@ class ConnectorFactory:
         DatabaseType.IOTDB: (IoTDBConnector, IoTDBConfig),
         DatabaseType.QUESTDB: (QuestDBConnector, QuestDBConfig),
         DatabaseType.CLICKHOUSE: (ClickHouseConnector, ClickHouseConfig),
+        DatabaseType.OPENMLDB: (OpenMLDBConnector, OpenMLDBConfig),
     }
 
     @classmethod

@@ -36,6 +36,7 @@ class DatabaseType(str, Enum):
     IOTDB = "iotdb"
     QUESTDB = "questdb"
     CLICKHOUSE = "clickhouse"
+    OPENMLDB = "openmldb"
     POSTGRESQL = "postgresql"
 
 

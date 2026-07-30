@@ -5,6 +5,7 @@ from .prometheus import DevMockPrometheusConnector, PrometheusConnector, Prometh
 from .iotdb import IoTDBConnector, IoTDBConfig
 from .questdb import QuestDBConnector, QuestDBConfig
 from .clickhouse import ClickHouseConnector, ClickHouseConfig
+from .openmldb import OpenMLDBConnector, OpenMLDBConfig
 
 __all__ = [
     "InfluxDBConnector",
@@ -20,4 +21,6 @@ __all__ = [
     "QuestDBConfig",
     "ClickHouseConnector",
     "ClickHouseConfig",
+    "OpenMLDBConnector",
+    "OpenMLDBConfig",
 ]
