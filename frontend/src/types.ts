@@ -148,6 +148,9 @@ export type TraceStep = {
   toolCall?: Record<string, unknown>;
   toolResult?: Record<string, unknown>;
   error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  elapsedSeconds?: number;
   updatedAt: string;
 };
 

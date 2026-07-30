@@ -209,6 +209,7 @@ export default function App() {
     if (event.event === 'step.start') {
       const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
+      const timestamp = now();
       const title = stringFrom(event.data.title, 'task');
       const step: TraceStep = {
         id,
@@ -218,7 +219,9 @@ export default function App() {
         status: 'running',
         summary: stringFrom(event.data.detail, title),
         tool: title,
-        updatedAt: now(),
+        startedAt: stringFrom(event.data.started_at) || timestamp,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -230,6 +233,7 @@ export default function App() {
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
       const content = stringFrom(event.data.content, '');
       if (!content) return;
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -238,7 +242,9 @@ export default function App() {
         status: 'running',
         summary: content,
         thought: content,
-        updatedAt: now(),
+        startedAt: stringFrom(event.data.started_at) || undefined,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -248,6 +254,7 @@ export default function App() {
       const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
       const action = stringFrom(event.data.action, '');
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -259,7 +266,9 @@ export default function App() {
         thought: stringFrom(event.data.thought, ''),
         actionInput: asRecord(event.data.action_input) || undefined,
         toolCall: event.data,
-        updatedAt: now(),
+        startedAt: stringFrom(event.data.started_at) || undefined,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -270,6 +279,7 @@ export default function App() {
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
       const success = stringFrom(event.data.status, 'done') !== 'failed';
       const observation = asRecord(event.data.observation);
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -279,7 +289,9 @@ export default function App() {
         summary: observation ? stringFrom(observation.summary, success ? 'Step completed.' : 'Step failed.') : success ? 'Step completed.' : 'Step failed.',
         tool: observation ? stringFrom(observation.tool_name, '') : undefined,
         observation: observation || undefined,
-        updatedAt: now(),
+        completedAt: timestamp,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -288,6 +300,7 @@ export default function App() {
     if (event.event === 'thought') {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -296,7 +309,9 @@ export default function App() {
         status: statusFrom(event.data.status, 'running'),
         summary: stringFrom(event.data.message, 'Thinking about the next action.'),
         thought: stringFrom(event.data.thought, ''),
-        updatedAt: now(),
+        startedAt: stringFrom(event.data.started_at) || undefined,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -305,6 +320,7 @@ export default function App() {
     if (event.event === 'agent_step') {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -312,7 +328,10 @@ export default function App() {
         phase: stringFrom(event.data.phase, 'intent'),
         status: statusFrom(event.data.status, 'running'),
         summary: stringFrom(event.data.message, 'Processing request.'),
-        updatedAt: now(),
+        tool: stringFrom(event.data.tool, '') || undefined,
+        startedAt: stringFrom(event.data.started_at) || timestamp,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -321,6 +340,7 @@ export default function App() {
     if (event.event === 'tool_call') {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -332,7 +352,9 @@ export default function App() {
         thought: stringFrom(event.data.thought, ''),
         toolCall: event.data,
         actionInput: asRecord(event.data.action_input) || asRecord(event.data.input_preview) || undefined,
-        updatedAt: now(),
+        startedAt: stringFrom(event.data.started_at) || timestamp,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -342,6 +364,7 @@ export default function App() {
       const iteration = numberFrom(event.data.iteration, 0);
       const id = `iteration-${iteration || Date.now()}`;
       const success = Boolean(event.data.success);
+      const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
@@ -352,7 +375,9 @@ export default function App() {
         tool: stringFrom(event.data.tool, 'tool'),
         toolResult: event.data,
         observation: asRecord(event.data.observation) || event.data,
-        updatedAt: now(),
+        completedAt: timestamp,
+        elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
+        updatedAt: timestamp,
       };
       updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
       return;
@@ -502,6 +527,10 @@ function stringFrom(value: unknown, fallback: string) {
 
 function numberFrom(value: unknown, fallback: number) {
   return typeof value === 'number' ? value : fallback;
+}
+
+function optionalNumberFrom(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function statusFrom(value: unknown, fallback: TraceStep['status']): TraceStep['status'] {

@@ -198,6 +198,12 @@ export function upsertTraceStep(conversation: Conversation, step: TraceStep): Co
 }
 
 function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
+  const startedAt = existing.startedAt ?? keepValue(incoming.startedAt, existing.startedAt);
+  const completedAt = keepValue(incoming.completedAt, existing.completedAt);
+  const elapsedSeconds = incoming.elapsedSeconds
+    ?? elapsedSecondsBetween(startedAt, incoming.completedAt ? completedAt : undefined)
+    ?? existing.elapsedSeconds
+    ?? elapsedSecondsBetween(startedAt, completedAt);
   return {
     ...existing,
     ...incoming,
@@ -207,12 +213,23 @@ function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
     observation: keepValue(incoming.observation, existing.observation),
     toolCall: keepValue(incoming.toolCall, existing.toolCall),
     toolResult: keepValue(incoming.toolResult, existing.toolResult),
+    startedAt,
+    completedAt,
+    elapsedSeconds,
   };
 }
 
 function keepValue<T>(incoming: T | null | undefined, existing: T | undefined): T | undefined {
   if (incoming === null || incoming === undefined || incoming === '') return existing;
   return incoming;
+}
+
+function elapsedSecondsBetween(startedAt?: string, completedAt?: string): number | undefined {
+  if (!startedAt || !completedAt) return undefined;
+  const started = Date.parse(startedAt);
+  const completed = Date.parse(completedAt);
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started) return undefined;
+  return Math.round((completed - started) / 100) / 10;
 }
 
 function compactConversationForStorage(conversation: Conversation): Conversation {
