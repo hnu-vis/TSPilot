@@ -1,9 +1,13 @@
 """Single outer ReAct loop."""
 from __future__ import annotations
 
+import asyncio
+import re
+import time
 from typing import AsyncIterator
 
 from app.settings import Settings
+from core.database.dialects import dialect_for_database
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
@@ -22,6 +26,9 @@ from schemas.state import ConversationStateModel, RequestStateModel
 from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
 from schemas.tool import ToolObservation
+from tools.base import StructuredToolError
+
+HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -83,11 +90,12 @@ class ReActLoop:
                     "message": "正在判断下一步。",
                     "iteration": 1,
                     "placeholder": True,
+                    "elapsed_seconds": 0.0,
                 },
             )
             public_trace.append(placeholder_event)
             yield placeholder_event
-            async for event in self._iterate(request_state, conversation_state):
+            async for event in self._iterate(request_state, conversation_state, emit_heartbeats=True):
                 internal_trace.append(event)
                 async for mapped in self._map_trace_to_sse(request_state, event):
                     public_trace.append(mapped)
@@ -117,11 +125,31 @@ class ReActLoop:
         self,
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
+        *,
+        emit_heartbeats: bool = False,
     ) -> AsyncIterator[TraceEventModel]:
         while request_state.iteration < request_state.max_iterations:
             request_state.iteration += 1
             try:
-                turn = await self._data_agent.next_turn(request_state, conversation_state)
+                turn_task = asyncio.create_task(self._data_agent.next_turn(request_state, conversation_state))
+                async for heartbeat in self._heartbeat_until_done(
+                    request_state,
+                    turn_task,
+                    emit_heartbeats=emit_heartbeats,
+                    phase="reasoning",
+                    message="正在生成下一步 ReAct 动作",
+                    iteration=request_state.iteration,
+                ):
+                    yield heartbeat
+                turn = await turn_task
+            except asyncio.CancelledError:
+                if "turn_task" in locals() and not turn_task.done():
+                    turn_task.cancel()
+                    try:
+                        await turn_task
+                    except asyncio.CancelledError:
+                        pass
+                raise
             except Exception as exc:
                 request_state.status = "failed"
                 request_state.errors.append({"stage": "agent", "message": str(exc)})
@@ -275,28 +303,58 @@ class ReActLoop:
                 continue
 
             try:
-                execution_result = await self._tool_executor.execute(
+                tool_task = asyncio.create_task(self._tool_executor.execute(
                     turn.action,
                     turn.action_input,
                     request_state,
                     conversation_state,
                     action_reason=turn.action_reason or turn.thought,
-                )
+                ))
+                async for heartbeat in self._heartbeat_until_done(
+                    request_state,
+                    tool_task,
+                    emit_heartbeats=emit_heartbeats,
+                    phase=self._phase_for_action(turn.action),
+                    message=f"正在执行 {turn.action}",
+                    iteration=request_state.iteration,
+                    tool=turn.action,
+                ):
+                    yield heartbeat
+                execution_result = await tool_task
+            except asyncio.CancelledError:
+                if "tool_task" in locals() and not tool_task.done():
+                    tool_task.cancel()
+                    try:
+                        await tool_task
+                    except asyncio.CancelledError:
+                        pass
+                raise
             except Exception as exc:
                 error_detail = _truncate_text(str(exc), 2000)
                 message = f"Tool '{turn.action}' failed: {error_detail}"
                 request_state.errors.append({"stage": turn.action, "message": error_detail})
-                observation = ToolObservation(
-                    tool_name=turn.action,
-                    success=False,
-                    summary=message,
-                    payload={
+                if isinstance(exc, StructuredToolError):
+                    payload = {
+                        **exc.to_observation_payload(),
+                        "recovery_hint": (
+                            "Use this structured failure observation to choose the next best ReAct action. "
+                            "Do not repeat an equivalent failing action unless the action_input materially addresses the diagnostics."
+                        ),
+                    }
+                else:
+                    payload = {
                         "error": error_detail,
                         "recovery_hint": (
                             "Use the current context and this failure observation to choose the next best action. "
                             "You may correct the tool input, call a prerequisite tool, update todos, or answer with caveats."
                         ),
-                    },
+                    }
+                payload.update(self._failure_strategy_payload(request_state, turn.action, payload))
+                observation = ToolObservation(
+                    tool_name=turn.action,
+                    success=False,
+                    summary=message,
+                    payload=payload,
                     error=message,
                     payload_truncated=False,
                     payload_ref=None,
@@ -365,6 +423,40 @@ class ReActLoop:
             {"message": "Maximum iterations reached before a terminal payload was produced."},
         )
 
+    async def _heartbeat_until_done(
+        self,
+        request_state: RequestStateModel,
+        task: asyncio.Task,
+        *,
+        emit_heartbeats: bool,
+        phase: str,
+        message: str,
+        iteration: int,
+        tool: str | None = None,
+    ) -> AsyncIterator[TraceEventModel]:
+        if not emit_heartbeats:
+            return
+        started_at = time.monotonic()
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL_SECONDS)
+            except TimeoutError:
+                elapsed = round(time.monotonic() - started_at, 1)
+                payload = {
+                    "agent": "data_agent",
+                    "status": "running",
+                    "phase": phase,
+                    "message": message,
+                    "iteration": iteration,
+                    "heartbeat": True,
+                    "elapsed_seconds": elapsed,
+                }
+                if tool:
+                    payload["tool"] = tool
+                yield append_trace(request_state, "agent_step", payload)
+            else:
+                return
+
     async def _map_trace_to_sse(
         self,
         request_state: RequestStateModel,
@@ -372,6 +464,10 @@ class ReActLoop:
     ) -> AsyncIterator[TraceEventModel]:
         event_type = event.event_type
         payload = event.payload
+
+        if event_type == "agent_step":
+            yield event
+            return
 
         if event_type == "thought":
             iteration = payload.get("iteration")
@@ -577,12 +673,16 @@ class ReActLoop:
                 "code_preview": self._truncate_preview_text(code, 8000),
             }
         if action_name == "terminate":
+            include_analysis_ids = action_input.get("include_analysis_ids")
+            include_fact_ids = action_input.get("include_fact_ids")
+            include_visualization_ids = action_input.get("include_visualization_ids")
+            section_plan = action_input.get("section_plan")
             return {
                 "has_result": bool(action_input.get("result") or action_input.get("direct_answer")),
-                "include_analysis_count": len(action_input.get("include_analysis_ids", [])),
-                "include_fact_count": len(action_input.get("include_fact_ids", [])),
-                "include_visualization_count": len(action_input.get("include_visualization_ids", [])),
-                "section_plan": action_input.get("section_plan", []),
+                "include_analysis_count": len(include_analysis_ids) if isinstance(include_analysis_ids, list) else 0,
+                "include_fact_count": len(include_fact_ids) if isinstance(include_fact_ids, list) else 0,
+                "include_visualization_count": len(include_visualization_ids) if isinstance(include_visualization_ids, list) else 0,
+                "section_plan": section_plan if isinstance(section_plan, list) else [],
             }
         if action_name == "todowrite":
             return {
@@ -602,6 +702,14 @@ class ReActLoop:
         }
         visible_payload = payload.get("payload") or {}
         for key in (
+            "error_type",
+            "retryable",
+            "recommended_next_action",
+            "recommended_strategy",
+            "blocked_strategy",
+            "failure_signature",
+            "repeated_failure_count",
+            "missing_requirements",
             "evidence_id",
             "analysis_id",
             "analysis_goal",
@@ -618,6 +726,20 @@ class ReActLoop:
         ):
             if key in visible_payload:
                 preview[key] = visible_payload.get(key)
+        if isinstance(visible_payload.get("diagnostics"), dict):
+            diagnostics_payload = visible_payload["diagnostics"]
+            if "missing_required_filters" in diagnostics_payload:
+                preview["missing_required_filters"] = diagnostics_payload.get("missing_required_filters")
+            for diagnostic_key in (
+                "query_shape_issues",
+                "query_task_contract",
+                "recommended_downstream_action",
+                "strategy_hint",
+                "classification",
+                "next_action_hint",
+            ):
+                if diagnostic_key in diagnostics_payload:
+                    preview[diagnostic_key] = diagnostics_payload.get(diagnostic_key)
         if isinstance(visible_payload.get("result"), dict):
             preview["result_preview"] = visible_payload["result"]
         if "visualizations" in visible_payload:
@@ -665,6 +787,54 @@ class ReActLoop:
         if request_state is not None:
             preview.update(self._completion_payload_preview(request_state))
         return preview
+
+    def _failure_strategy_payload(self, request_state: RequestStateModel, tool_name: str, payload: dict) -> dict:
+        signature = self._failure_signature(tool_name, payload)
+        recent = []
+        for observation in reversed(request_state.observations[-8:]):
+            if observation.success:
+                break
+            obs_payload = observation.payload if isinstance(observation.payload, dict) else {}
+            if self._failure_signature(observation.tool_name, obs_payload) == signature:
+                recent.append(observation)
+            else:
+                break
+        repeated_count = len(recent) + 1
+        strategy = {
+            "failure_signature": signature,
+            "repeated_failure_count": repeated_count,
+        }
+        if repeated_count >= 2:
+            strategy["blocked_strategy"] = (
+                "Equivalent failures are repeating. Change the evidence strategy or choose the recommended downstream tool; "
+                "do not repeat the same action_input shape."
+            )
+            diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+            recommended = diagnostics.get("recommended_downstream_action") or payload.get("recommended_next_action")
+            if tool_name == "sql_query" and recommended == "code_interpreter":
+                strategy["recommended_next_action"] = "sql_query"
+                strategy["recommended_strategy"] = "Ask sql_query for raw/simple evidence only, then use code_interpreter for derived computation."
+            elif tool_name == "terminate":
+                strategy["recommended_next_action"] = diagnostics.get("next_action_hint") or "inspect_missing_outputs"
+            elif recommended:
+                strategy["recommended_next_action"] = recommended
+        return strategy
+
+    def _failure_signature(self, tool_name: str, payload: dict) -> str:
+        diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+        parts = [
+            str(tool_name),
+            str(payload.get("error_type") or ""),
+            str(diagnostics.get("query_language") or ""),
+            str(diagnostics.get("recommended_downstream_action") or ""),
+            self._normalize_error_text(str(payload.get("error") or "")),
+        ]
+        return "|".join(parts)
+
+    def _normalize_error_text(self, text: str) -> str:
+        text = re.sub(r"\d{4}-\d{2}-\d{2}[T ][^\\s'\",)]+", "<timestamp>", text)
+        text = re.sub(r"\b\d+\b", "<n>", text)
+        return text[:500]
 
     def _completion_payload_preview(self, request_state: RequestStateModel) -> dict:
         latest_step = request_state.completion_state.get("latest_step")
@@ -799,6 +969,13 @@ class ReActLoop:
         linking = logical_plan.get("schema_linking") if isinstance(logical_plan.get("schema_linking"), dict) else None
         if not linking:
             return None
+        database_type = (
+            query_trace.get("adapter_type")
+            or logical_plan.get("adapter_type")
+            or logical_plan.get("database_type")
+            or diagnostics.get("database_type")
+        )
+        internal_columns = dialect_for_database(database_type).internal_columns()
         filters = logical_plan.get("filters") if isinstance(logical_plan.get("filters"), list) else []
         required_filters = [
             {
@@ -809,7 +986,7 @@ class ReActLoop:
             }
             for item in filters
             if isinstance(item, dict)
-            and item.get("column") not in {"_measurement", "_field", "_time", "time", "timestamp", "_start", "_stop", "result", "table"}
+            and item.get("column") not in internal_columns
         ]
         field_mappings = query_trace.get("field_mappings") if isinstance(query_trace.get("field_mappings"), list) else []
         return {

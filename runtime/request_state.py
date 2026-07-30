@@ -15,6 +15,7 @@ from core.completion import (
     normalize_todo_for_completion,
 )
 from core.intent import build_intent_profile_fallback
+from core.database.dialects import query_language_for_database_type
 from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
 from runtime.language import detect_response_language
@@ -262,12 +263,7 @@ def _build_schema_hint(config: dict, settings: Settings) -> dict:
 
 
 def _query_language_for_database_type(database_type: str) -> str:
-    normalized = database_type.lower()
-    if normalized == "influxdb":
-        return "flux"
-    if normalized == "prometheus":
-        return "promql"
-    return "sql"
+    return query_language_for_database_type(database_type)
 
 
 def _resolve_dataset_path(raw_path: object, settings: Settings) -> Path | None:
@@ -419,6 +415,7 @@ def apply_observation(
 
     if tool_spec.result_target in {"evidence", "analysis"}:
         register_data_facts_from_payload(request_state, observation.tool_name, full_payload)
+        _advance_todo_after_artifact(request_state, observation.tool_name, full_payload, tool_spec.result_target)
 
     safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
     request_state.observations.append(safe_observation)
@@ -448,6 +445,10 @@ async def apply_observation_async(
     elif tool_spec.result_target == "presentation":
         _apply_presentation_payload(request_state, full_payload)
         _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
+
+    if tool_spec.result_target in {"evidence", "analysis"}:
+        register_data_facts_from_payload(request_state, observation.tool_name, full_payload)
+        _advance_todo_after_artifact(request_state, observation.tool_name, full_payload, tool_spec.result_target)
 
     safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
     request_state.observations.append(safe_observation)
@@ -661,6 +662,84 @@ def _complete_answer_todo_after_terminal(
         "todo": current_todo,
     }
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+
+
+def _advance_todo_after_artifact(
+    request_state: RequestStateModel,
+    tool_name: str,
+    full_payload: dict,
+    result_target: str,
+) -> None:
+    if not request_state.todo_list:
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
+    current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
+    if current_index is None:
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
+    current = normalize_todo_for_completion(dict(request_state.todo_list[current_index]))
+    task_type = str(current.get("task_type") or "").strip().lower()
+    if not _tool_covers_todo_type(tool_name, result_target, task_type):
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
+    ref = _artifact_ref_for_tool(tool_name, full_payload)
+    current["status"] = "completed"
+    current["result_ref"] = ref
+    current["completion_reason"] = f"Tool '{tool_name}' produced artifact {ref}."
+    request_state.todo_list[current_index] = current
+    next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
+    if next_index is not None:
+        next_todo = dict(request_state.todo_list[next_index])
+        next_todo["status"] = "in_progress"
+        request_state.todo_list[next_index] = next_todo
+        request_state.plan_current_step = next_index + 1
+        request_state.planning_complete = False
+    else:
+        request_state.plan_current_step = len(request_state.todo_list)
+        request_state.planning_complete = True
+    request_state.completion_state["latest_step"] = {
+        "completed": True,
+        "reason": current["completion_reason"],
+        "missing_evidence": [],
+        "evidence_refs": [ref] if ref else [],
+        "next_action_hint": None,
+        "tool_name": tool_name,
+        "todo_index": current_index,
+        "todo": current,
+    }
+    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+
+
+def _tool_covers_todo_type(tool_name: str, result_target: str, task_type: str) -> bool:
+    if task_type in {"answer", "plan"}:
+        return False
+    if task_type in {"generic", ""}:
+        return result_target in {"evidence", "analysis"}
+    if task_type in {"query", "database", "database_evidence", "sql"}:
+        return result_target == "evidence" or tool_name in {"sql_query", "query_database"}
+    if task_type in {"analysis", "code_interpreter", "derived", "statistical", "statistics"}:
+        return tool_name == "code_interpreter"
+    if task_type == "anomaly":
+        return tool_name == "anomaly"
+    if task_type == "forecast":
+        return tool_name == "forecast"
+    if task_type in {"rag", "knowledge"}:
+        return tool_name == "rag"
+    return result_target in {"evidence", "analysis"}
+
+
+def _artifact_ref_for_tool(tool_name: str, payload: dict) -> str | None:
+    if tool_name in {"sql_query", "query_database"} and payload.get("evidence_id"):
+        return f"evidence:{payload['evidence_id']}"
+    if tool_name == "code_interpreter" and payload.get("analysis_id"):
+        return f"analysis:{payload['analysis_id']}"
+    if tool_name == "forecast" and payload.get("forecast_id"):
+        return f"forecast:{payload['forecast_id']}"
+    if tool_name == "anomaly" and payload.get("anomaly_id"):
+        return f"anomaly:{payload['anomaly_id']}"
+    if tool_name == "rag":
+        return "rag:latest"
+    return None
 
 
 def _apply_evidence_payload(request_state: RequestStateModel, full_payload: dict) -> None:

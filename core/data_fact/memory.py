@@ -67,36 +67,32 @@ def prompt_fact_memory_view(database_id: str | None = None) -> dict:
             updated_at=scoped_memory.updated_at or global_memory.updated_at,
         )
     )
+    definitions = memory.definitions[:12]
+    recipes = memory.recipes[:8]
     return {
+        "summary": {
+            "definition_count": len(memory.definitions),
+            "recipe_count": len(memory.recipes),
+            "available_fact_types": [item.fact_type for item in definitions],
+            "available_recipes": [item.name for item in recipes],
+        },
         "definitions": [
             {
                 "fact_type": item.fact_type,
-                "description": item.description,
-                "required_evidence": item.required_evidence,
                 "preferred_tool": item.preferred_tool,
-                "output_schema": item.output_schema,
-                "verification_requirements": item.verification_requirements,
-                "report_guidance": item.report_guidance,
                 "scope": item.scope,
-                "source": item.source,
             }
-            for item in memory.definitions[:24]
+            for item in definitions
         ],
         "recipes": [
             {
-                "recipe_id": item.recipe_id,
                 "fact_type": item.fact_type,
                 "name": item.name,
                 "preferred_tool": item.preferred_tool,
-                "fact_request_template": item.fact_request_template,
-                "expected_result_schema": item.expected_result_schema,
-                "verification_notes": item.verification_notes,
                 "scope": item.scope,
-                "source": item.source,
             }
-            for item in memory.recipes[:24]
+            for item in recipes
         ],
-        "storage_path": memory.storage_path,
         "updated_at": memory.updated_at,
     }
 

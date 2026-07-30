@@ -30,6 +30,36 @@ def validate_action(
 ) -> tuple[bool, str | None]:
     if action_name not in VALID_ACTIONS:
         return False, f"Action '{action_name}' is not part of the runtime contract."
+    capabilities = {
+        str(item).strip().lower()
+        for item in (request_state.requested_capabilities or [])
+        if str(item).strip()
+    }
+    if action_name == "rag" and request_state.database_context is not None and "rag" not in capabilities:
+        return (
+            False,
+            "RAG is not required by the structured intent profile for this database task. "
+            "Use database evidence, analysis, anomaly, forecast, or terminate with grounded caveats.",
+        )
+    constraints = runtime_action_constraints(request_state)
+    required_actions = {
+        str(item.get("action") or "").strip()
+        for item in constraints.get("required_actions", [])
+        if isinstance(item, dict) and str(item.get("action") or "").strip()
+    }
+    prohibited_actions = {
+        str(item).strip()
+        for item in constraints.get("prohibited_actions", [])
+        if str(item).strip()
+    }
+    if action_name in prohibited_actions:
+        return False, constraints.get("reason") or f"Action '{action_name}' is not allowed in the current state."
+    if required_actions and action_name not in required_actions:
+        return (
+            False,
+            (constraints.get("reason") or "The current state requires a different next action.")
+            + f" Required actions: {sorted(required_actions)}.",
+        )
     if action_name == "todowrite" and request_state.todo_list:
         return (
             False,
@@ -224,10 +254,171 @@ def _gap_blocking_items(gap: dict) -> list[str]:
 def _requires_initial_todo_plan(request_state: RequestStateModel) -> bool:
     if request_state.todo_list or request_state.database_context is None:
         return False
+    profile = request_state.intent_profile if isinstance(request_state.intent_profile, dict) else {}
+    if profile.get("needs_plan") is True:
+        return True
     message = str(request_state.message or "")
-    numbered_items = re.findall(r"(?<!\d)(?:\d+|[一二三四五六七八九十]+)[\.\、\)]\s*\S", message)
+    numbered_items = re.findall(r"(?<!\d)(?:\d+|[一二三四五六七八九十]+)(?:[\.\、\)]|\s+)\s*\S", message)
     bullet_items = re.findall(r"(?:^|\n)\s*[-*]\s+\S", message)
     return len(numbered_items) + len(bullet_items) >= 3
+
+
+def runtime_action_constraints(request_state: RequestStateModel) -> dict:
+    """Return runtime-owned next-action constraints derived from structured state."""
+
+    if _requires_initial_todo_plan(request_state):
+        return {
+            "required_actions": [
+                {
+                    "action": "todowrite",
+                    "reason": "The user requested a multi-step deliverable and no todo plan exists.",
+                }
+            ],
+            "prohibited_actions": sorted(VALID_ACTIONS - {"todowrite"}),
+            "missing_outputs": ["todo_plan"],
+            "reason": "Create the initial todo plan before querying or answering.",
+        }
+
+    capabilities = {
+        str(item).strip().lower()
+        for item in (request_state.requested_capabilities or [])
+        if str(item).strip()
+    }
+    has_database_evidence = not _latest_database_evidence_is_empty(request_state) and request_state.latest_database_evidence is not None
+    required: list[dict] = []
+    missing: list[str] = []
+
+    if "anomaly" in capabilities and request_state.latest_anomaly is None:
+        missing.append("anomaly")
+        required.append(
+            {
+                "action": "anomaly" if has_database_evidence else "sql_query",
+                "reason": "Anomaly output is required by the structured intent profile.",
+                "input_guidance": {"database_evidence": "latest"} if has_database_evidence else {"constraints": {"evidence_shape": "raw_timeseries"}},
+            }
+        )
+    elif "forecast" in capabilities and not _latest_forecast_is_usable(request_state):
+        missing.append("forecast")
+        required.append(
+            {
+                "action": "forecast" if has_database_evidence else "sql_query",
+                "reason": "Forecast output is required by the structured intent profile.",
+                "input_guidance": {"database_evidence": "latest", "horizon": "derive from user request"} if has_database_evidence else {"constraints": {"evidence_shape": "raw_timeseries"}},
+            }
+        )
+
+    downstream_analysis = None
+    specialized_covered = (
+        ("anomaly" in capabilities and request_state.latest_anomaly is not None)
+        or ("forecast" in capabilities and _latest_forecast_is_usable(request_state))
+    )
+    if not specialized_covered:
+        downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
+    if downstream_analysis and request_state.latest_analysis_id is None:
+        required.append(
+            {
+                "action": "code_interpreter",
+                "reason": "Latest database evidence declares uncovered derived outputs for downstream analysis.",
+                "input_guidance": {
+                    "database_evidence": "latest",
+                    "analysis_request": downstream_analysis,
+                },
+            }
+        )
+        missing.append("analysis")
+
+    shape_recovery = _latest_query_shape_recovery(request_state)
+    if shape_recovery:
+        action = "sql_query"
+        if has_database_evidence and shape_recovery.get("recommended_downstream_action") == "code_interpreter":
+            action = "code_interpreter"
+        required.append(
+            {
+                "action": action,
+                "reason": "The previous sql_query failed dialect/query-task shape validation.",
+                "input_guidance": shape_recovery,
+            }
+        )
+        missing.append("query_shape_recovery")
+
+    if not required:
+        prohibited = []
+        if request_state.database_context is not None and "rag" not in capabilities:
+            prohibited.append("rag")
+        return {
+            "required_actions": [],
+            "prohibited_actions": prohibited,
+            "missing_outputs": [],
+            "reason": "No runtime-enforced action constraint is active.",
+        }
+    prohibited = ["terminate"]
+    if request_state.database_context is not None and "rag" not in capabilities:
+        prohibited.append("rag")
+    return {
+        "required_actions": required[:1],
+        "prohibited_actions": prohibited,
+        "missing_outputs": missing,
+        "reason": required[0]["reason"],
+    }
+
+
+def _latest_query_requests_downstream_analysis(request_state: RequestStateModel) -> dict | None:
+    evidence = request_state.latest_database_evidence
+    if evidence is None:
+        return None
+    diagnostics = evidence.diagnostics if isinstance(evidence.diagnostics, dict) else {}
+    task_coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
+    contract = task_coverage.get("query_task_contract") if isinstance(task_coverage.get("query_task_contract"), dict) else None
+    if contract is None:
+        llm_generation = diagnostics.get("llm_query_generation") if isinstance(diagnostics.get("llm_query_generation"), dict) else {}
+        contract = llm_generation.get("query_task_contract") if isinstance(llm_generation.get("query_task_contract"), dict) else None
+    if not isinstance(contract, dict):
+        return None
+    if str(contract.get("downstream_action") or "").strip().lower() != "code_interpreter":
+        return None
+    missing = task_coverage.get("missing") if isinstance(task_coverage.get("missing"), list) else []
+    return {
+        "goal": request_state.message,
+        "query_task_contract": contract,
+        "required_outputs": contract.get("required_outputs") or missing,
+        "missing": missing,
+    }
+
+
+def _latest_forecast_is_usable(request_state: RequestStateModel) -> bool:
+    forecast = request_state.latest_forecast
+    if forecast is None:
+        return False
+    points = getattr(forecast, "forecast_points", None)
+    return isinstance(points, list) and bool(points)
+
+
+def _latest_query_shape_recovery(request_state: RequestStateModel) -> dict | None:
+    latest = request_state.observations[-1] if request_state.observations else None
+    if latest is None or latest.tool_name != "sql_query" or latest.success:
+        return None
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    error_type = str(payload.get("error_type") or "").strip()
+    if error_type != "query_shape_invalid":
+        return None
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else payload
+    issues = diagnostics.get("query_shape_issues") if isinstance(diagnostics.get("query_shape_issues"), list) else []
+    recommended_shape = next(
+        (
+            str(issue.get("recommended_shape") or "").strip()
+            for issue in issues
+            if isinstance(issue, dict) and str(issue.get("recommended_shape") or "").strip()
+        ),
+        None,
+    )
+    if recommended_shape != "raw_series":
+        return None
+    return {
+        "constraints": {"evidence_shape": "raw_timeseries"},
+        "recommended_shape": recommended_shape,
+        "recommended_downstream_action": diagnostics.get("recommended_downstream_action"),
+        "query_shape_issues": issues,
+    }
 
 
 def build_policy_observation(

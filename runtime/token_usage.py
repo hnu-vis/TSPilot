@@ -62,9 +62,12 @@ def token_usage_summary(request_state) -> dict | None:
 
 
 def estimate_token_usage(messages: list, output_text: str, *, model: str | None = None) -> dict | None:
-    encoding = _encoding_for_model(model)
-    prompt_tokens = _count_messages(messages, encoding)
-    completion_tokens = len(encoding.encode(output_text or ""))
+    try:
+        encoding = _encoding_for_model(model)
+        prompt_tokens = _count_messages(messages, encoding)
+        completion_tokens = len(encoding.encode(output_text or ""))
+    except Exception:
+        return None
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,

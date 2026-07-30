@@ -96,6 +96,12 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
         gap_missing = _gap_blocking_items(gap)
         can_answer = gap.get("can_answer")
         if can_answer is False or (gap_missing and can_answer is not True):
+            if gap_missing and _gap_missing_is_covered_by_artifacts(request_state, gap_missing):
+                return GoalCompletionEvaluation(
+                    True,
+                    "Verified artifacts cover the latest ReAct gap assessment missing outputs.",
+                    answerable_from=refs,
+                )
             return GoalCompletionEvaluation(
                 can_answer=False,
                 reason="Latest ReAct gap assessment says the user request is not fully covered.",
@@ -127,14 +133,23 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
         if str(item).strip()
     }
     missing: list[str] = []
-    if _requires_specialized_capability(request_state, requirements, "forecast") and not _latest_forecast_is_usable(request_state):
+    if (
+        _requires_specialized_capability(request_state, requirements, "forecast")
+        and not _latest_forecast_is_usable(request_state)
+        and not _verified_facts_cover_specialized_capability(request_state, "forecast")
+    ):
         missing.append("forecast")
-    if _requires_specialized_capability(request_state, requirements, "anomaly") and request_state.latest_anomaly is None:
+    if (
+        _requires_specialized_capability(request_state, requirements, "anomaly")
+        and request_state.latest_anomaly is None
+        and not _verified_facts_cover_specialized_capability(request_state, "anomaly")
+    ):
         missing.append("anomaly")
     if (
         _requires_code_analysis(request_state)
         and request_state.latest_analysis_id is None
         and not _latest_database_evidence_is_empty(request_state)
+        and not _verified_facts_cover_required_analysis(request_state)
     ):
         missing.append("analysis")
     return missing
@@ -181,16 +196,131 @@ def _requires_specialized_capability(
 def _requires_code_analysis(request_state: RequestStateModel) -> bool:
     contract = request_state.task_contract
     if contract is None:
-        requirements = {
-            str(item).strip().lower()
-            for item in (request_state.requested_capabilities or [])
-            if str(item).strip()
-        }
-        return "analysis" in requirements
+        return False
     for output in contract.required_outputs:
         if not output.required:
             continue
-        if _contract_output_requires_code_analysis(output):
+        if _contract_output_requires_code_analysis(output) and not _contract_output_is_covered_by_verified_fact(request_state, output):
+            return True
+    return False
+
+
+def _verified_facts_cover_required_analysis(request_state: RequestStateModel) -> bool:
+    """Return whether current verified facts already ground the requested answer.
+
+    Specialized tools should be required because the answer contract has an
+    uncovered derived output, not merely because intent classification labeled
+    the request as analytical. A database aggregate or point lookup represented
+    as a verified DataFact is valid evidence for precise numeric answers.
+    """
+
+    contract = request_state.task_contract
+    verified = _verified_answer_facts(request_state)
+    if not verified:
+        return False
+    if contract is None:
+        return True
+    required = [output for output in contract.required_outputs if output.required]
+    if not required:
+        return True
+    analysis_outputs = [
+        output
+        for output in required
+        if _contract_output_requires_code_analysis(output)
+    ]
+    if not analysis_outputs:
+        return True
+    return all(_contract_output_is_covered_by_verified_fact(request_state, output) for output in analysis_outputs)
+
+
+def _verified_facts_cover_specialized_capability(request_state: RequestStateModel, capability: str) -> bool:
+    allowed_sources = {capability.strip().lower()}
+    return any(_fact_has_allowed_source(fact, allowed_sources) for fact in _verified_answer_facts(request_state))
+
+
+def _verified_answer_facts(request_state: RequestStateModel) -> list:
+    facts = list(getattr(getattr(request_state, "fact_set", None), "facts", []) or [])
+    verified = []
+    for fact in facts:
+        if getattr(fact, "status", None) != "verified":
+            continue
+        if getattr(fact, "fact_type", None) == "data_coverage":
+            continue
+        if not getattr(fact, "evidence_refs", None):
+            continue
+        verified.append(fact)
+    return verified
+
+
+def _contract_output_is_covered_by_verified_fact(request_state: RequestStateModel, output) -> bool:
+    facts = _verified_answer_facts(request_state)
+    if not facts:
+        return False
+    output_keys = _contract_output_keys(output)
+    allowed_sources = _contract_allowed_source_types(output)
+    for fact in facts:
+        if output_keys and _fact_keys(fact) & output_keys:
+            if not allowed_sources or _fact_has_allowed_source(fact, allowed_sources):
+                return True
+        if not output_keys and allowed_sources and _fact_has_allowed_source(fact, allowed_sources):
+            return True
+    return False
+
+
+def _contract_output_keys(output) -> set[str]:
+    keys = {
+        str(getattr(output, "id", "") or "").strip().lower(),
+        str(getattr(output, "output_type", "") or "").strip().lower(),
+    }
+    keys.update(str(item).strip().lower() for item in getattr(output, "measures", []) or [])
+    keys.update(str(item).strip().lower() for item in getattr(output, "dimensions", []) or [])
+    return {key for key in keys if key}
+
+
+def _fact_keys(fact) -> set[str]:
+    keys = {
+        str(getattr(fact, "fact_id", "") or "").strip().lower(),
+        str(getattr(fact, "name", "") or "").strip().lower(),
+        str(getattr(fact, "fact_type", "") or "").strip().lower(),
+        str(getattr(fact, "subject", "") or "").strip().lower(),
+        str(getattr(fact, "unit", "") or "").strip().lower(),
+    }
+    dimensions = getattr(fact, "dimensions", None)
+    if isinstance(dimensions, dict):
+        for key, value in dimensions.items():
+            keys.add(str(key).strip().lower())
+            if isinstance(value, (str, int, float, bool)):
+                keys.add(str(value).strip().lower())
+    trace = getattr(fact, "calculation_trace", None)
+    if isinstance(trace, dict):
+        for key in ("value_key", "metric_key", "operator", "operation", "measure", "field"):
+            value = trace.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                keys.add(str(value).strip().lower())
+    return {key for key in keys if key}
+
+
+def _contract_allowed_source_types(output) -> set[str]:
+    evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+    if not evidence_kind:
+        return set()
+    if evidence_kind in {"query", "database", "database_evidence", "sql", "raw"}:
+        return {"query", "database", "database_evidence", "sql_query"}
+    if evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
+        return {"analysis", "code_interpreter"}
+    if evidence_kind == "forecast":
+        return {"forecast"}
+    if evidence_kind == "anomaly":
+        return {"anomaly"}
+    return {evidence_kind}
+
+
+def _fact_has_allowed_source(fact, allowed_sources: set[str]) -> bool:
+    method = str(getattr(fact, "method", "") or "").strip().lower()
+    if method in allowed_sources:
+        return True
+    for ref in getattr(fact, "evidence_refs", []) or []:
+        if str(getattr(ref, "source_type", "") or "").strip().lower() in allowed_sources:
             return True
     return False
 
@@ -270,16 +400,30 @@ def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None
     if not required:
         return []
     if gap is None:
-        return [output.id for output in required]
+        return [
+            output.id
+            for output in required
+            if not _contract_output_is_covered_by_state(request_state, output)
+        ]
     if gap.get("can_answer") is not True:
         gap_missing = set(_gap_blocking_items(gap))
         if gap_missing:
-            return [
+            uncovered_gap_missing = [
                 output.id
                 for output in required
-                if output.id in gap_missing or output.description in gap_missing
-            ] or sorted(gap_missing)
-        return [output.id for output in required]
+                if (output.id in gap_missing or output.description in gap_missing)
+                and not _contract_output_is_covered_by_state(request_state, output)
+            ]
+            return uncovered_gap_missing or (
+                []
+                if all(_contract_output_is_covered_by_state(request_state, output) for output in required)
+                else sorted(gap_missing)
+            )
+        return [
+            output.id
+            for output in required
+            if not _contract_output_is_covered_by_state(request_state, output)
+        ]
     covered = {
         str(item).strip()
         for item in gap.get("covered", [])
@@ -293,12 +437,29 @@ def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None
     missing_required = []
     for output in required:
         keys = {output.id, output.description}
+        if _contract_output_is_covered_by_state(request_state, output):
+            continue
         if keys & missing:
             missing_required.append(output.id)
             continue
         if not keys & covered:
             missing_required.append(output.id)
     return missing_required
+
+
+def _contract_output_is_covered_by_state(request_state: RequestStateModel, output) -> bool:
+    if _contract_output_is_covered_by_verified_fact(request_state, output):
+        return True
+    evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+    if evidence_kind in {"query", "database", "database_evidence", "sql", "raw"}:
+        return request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state)
+    if evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
+        return request_state.latest_analysis_id is not None
+    if evidence_kind == "forecast":
+        return _latest_forecast_is_usable(request_state)
+    if evidence_kind == "anomaly":
+        return request_state.latest_anomaly is not None
+    return False
 
 
 def _next_action_for_missing_required(missing: list[str]) -> str:
@@ -418,6 +579,27 @@ def _gap_blocking_items(gap: dict) -> list[str]:
     if isinstance(values, list):
         items.extend(str(item).strip() for item in values if str(item).strip())
     return items
+
+
+def _gap_missing_is_covered_by_artifacts(request_state: RequestStateModel, missing: list[str]) -> bool:
+    if not missing:
+        return False
+    missing_keys = {
+        str(item).strip().lower()
+        for item in missing
+        if str(item).strip()
+    }
+    if not missing_keys:
+        return False
+    structured_coverage = {
+        "forecast": _latest_forecast_is_usable(request_state),
+        "anomaly": request_state.latest_anomaly is not None,
+        "analysis": request_state.latest_analysis_id is not None or _verified_facts_cover_required_analysis(request_state),
+        "database_evidence": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
+        "query": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
+    }
+    known_missing_keys = set(structured_coverage)
+    return all(key in known_missing_keys and structured_coverage[key] for key in missing_keys)
 
 
 def _hard_gate_previous_assessment(
@@ -773,6 +955,7 @@ def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) ->
         valid_refs.add(request_state.latest_forecast.forecast_id)
     if request_state.latest_anomaly is not None:
         valid_refs.add(request_state.latest_anomaly.anomaly_id)
+    valid_refs.update(f"fact:{fact.fact_id}" for fact in _verified_answer_facts(request_state))
     for observation in request_state.observations:
         if observation.payload_ref:
             valid_refs.add(observation.payload_ref)
@@ -957,6 +1140,7 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_database_evidence is not None:
         refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
     refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
+    refs.extend(f"fact:{fact.fact_id}" for fact in _verified_answer_facts(request_state))
     if _latest_forecast_is_usable(request_state):
         refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
     if request_state.latest_anomaly is not None:

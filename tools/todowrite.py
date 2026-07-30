@@ -1,6 +1,8 @@
 """Todo writer tool."""
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, model_validator
 
 from core.completion import normalize_todo_for_completion
@@ -63,6 +65,8 @@ class TodoWriteTool(BaseTool):
             for index, todo in enumerate(validated_input.todos, start=1)
             if (normalized := self._normalize_todo(index, todo)) is not None
         ]
+        if self._looks_like_placeholder_plan(todos):
+            todos = self._todos_from_message(validated_input.message or validated_input.focus or "")
         if not todos:
             todos = [
                 TodoItem(
@@ -90,7 +94,39 @@ class TodoWriteTool(BaseTool):
             pending_count=pending_count,
         ).model_dump(mode="json")
 
+    def _looks_like_placeholder_plan(self, todos: list[TodoItem]) -> bool:
+        if not todos:
+            return False
+        placeholder_count = sum(1 for todo in todos if re.fullmatch(r"step_\d+", str(todo.content or "")))
+        return placeholder_count == len(todos)
+
+    def _todos_from_message(self, message: str) -> list[TodoItem]:
+        items = []
+        pattern = re.compile(
+            r"(?:^|[；;。\\n])\\s*(?:\\d+|[一二三四五六七八九十]+)(?:[\\.、\\)]|\\s+)\\s*([^；;。\\n]+)",
+            flags=re.MULTILINE,
+        )
+        for index, match in enumerate(pattern.finditer(message or ""), start=1):
+            content = match.group(1).strip()
+            if not content:
+                continue
+            items.append(
+                TodoItem(
+                    content=content,
+                    task_type=self._infer_task_type(content),
+                    status="pending",
+                    priority=index,
+                )
+            )
+        if items and all(item.task_type != "answer" for item in items):
+            items[-1] = items[-1].model_copy(update={"task_type": "answer"})
+        return self._enforce_single_in_progress(items)
+
     def _normalize_todo(self, index: int, raw_todo: dict) -> TodoItem | None:
+        if isinstance(raw_todo, str):
+            raw_todo = {"content": raw_todo}
+        if not isinstance(raw_todo, dict):
+            return None
         content = str(
             raw_todo.get("content")
             or raw_todo.get("task")

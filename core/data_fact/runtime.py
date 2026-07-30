@@ -161,10 +161,17 @@ def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]
     sorted_rows = sorted(rows, key=lambda row: str(row.get(time_key) or "")) if time_key else rows
     request_names = {request.name: request for request in requests}
     default_requests = [
+        DataFactRequest(name="record_count", fact_type="count", requirements={"count_target": "rows"}),
+        DataFactRequest(name="start_time", fact_type="time_boundary", requirements={"time_position": "start"}),
+        DataFactRequest(name="end_time", fact_type="time_boundary", requirements={"time_position": "end"}),
         DataFactRequest(name="start_value", fact_type="point_value", requirements={"time_position": "start"}),
         DataFactRequest(name="end_value", fact_type="point_value", requirements={"time_position": "end"}),
         DataFactRequest(name="highest_value", fact_type="extreme", requirements={"operator": "max"}),
         DataFactRequest(name="lowest_value", fact_type="extreme", requirements={"operator": "min"}),
+        DataFactRequest(name="max_value", fact_type="extreme", requirements={"operator": "max"}),
+        DataFactRequest(name="min_value", fact_type="extreme", requirements={"operator": "min"}),
+        DataFactRequest(name="max_time", fact_type="extreme_time", requirements={"operator": "max"}),
+        DataFactRequest(name="min_time", fact_type="extreme_time", requirements={"operator": "min"}),
     ]
     for request in [*requests, *[item for item in default_requests if item.name not in request_names]]:
         fact = _database_fact_for_request(request, sorted_rows, value_key, time_key, evidence_ref)
@@ -183,6 +190,39 @@ def _database_fact_for_request(
     name = request.name
     fact_type = request.fact_type
     requirements = request.requirements or {}
+    normalized_name = str(name or "").strip().lower()
+    if fact_type in {"count", "record_count", "row_count"} or normalized_name in {"record_count", "row_count", "count"}:
+        value = len(rows)
+        return DataFact(
+            fact_id=_fact_id(evidence_ref.source_id, name, value),
+            name=name,
+            fact_type="count",
+            statement=f"{name} is {value}.",
+            value=value,
+            subject=request.subject,
+            time_range=request.time_range,
+            method="sql_query",
+            evidence_refs=[evidence_ref],
+            calculation_trace={"source": "normalized_database_evidence", "count_target": requirements.get("count_target") or "rows"},
+        )
+    if fact_type in {"time_boundary", "boundary_time"} or normalized_name in {"start_time", "end_time", "first_time", "last_time"}:
+        if not time_key:
+            return None
+        position = requirements.get("time_position") or ("end" if normalized_name in {"end_time", "last_time"} else "start")
+        row = rows[-1] if position == "end" else rows[0]
+        value = row.get(time_key)
+        return DataFact(
+            fact_id=_fact_id(evidence_ref.source_id, name, value),
+            name=name,
+            fact_type="time_boundary",
+            statement=f"{name} is {value}.",
+            value=value,
+            subject=request.subject,
+            time_range=request.time_range,
+            method="sql_query",
+            evidence_refs=[evidence_ref],
+            calculation_trace={"row": row, "time_key": time_key, "position": position},
+        )
     if fact_type == "point_value" or name in {"start_value", "end_value"}:
         position = requirements.get("time_position") or ("end" if "end" in name else "start")
         row = rows[-1] if position == "end" else rows[0]
@@ -200,7 +240,7 @@ def _database_fact_for_request(
             evidence_refs=[evidence_ref],
             calculation_trace={"row": row, "value_key": value_key, "time_key": time_key, "position": position},
         )
-    if fact_type in {"extreme", "extrema"} or name in {"highest_value", "lowest_value", "max_value", "min_value"}:
+    if fact_type in {"extreme", "extrema", "extreme_time"} or name in {"highest_value", "lowest_value", "max_value", "min_value", "max_time", "min_time"}:
         operator = requirements.get("operator") or ("min" if "low" in name or "min" in name else "max")
         numeric_rows = [row for row in rows if _number(row.get(value_key)) is not None]
         if not numeric_rows:
@@ -208,12 +248,17 @@ def _database_fact_for_request(
         row = min(numeric_rows, key=lambda item: _number(item.get(value_key)) or 0) if operator == "min" else max(numeric_rows, key=lambda item: _number(item.get(value_key)) or 0)
         value = row.get(value_key)
         timestamp = row.get(time_key) if time_key else None
+        fact_value = timestamp if fact_type == "extreme_time" or name in {"max_time", "min_time"} else value
         return DataFact(
-            fact_id=_fact_id(evidence_ref.source_id, name, value),
+            fact_id=_fact_id(evidence_ref.source_id, name, fact_value),
             name=name,
-            fact_type="extreme",
-            statement=f"{name} is {value}" + (f" at {timestamp}." if timestamp else "."),
-            value=value,
+            fact_type="extreme_time" if fact_type == "extreme_time" or name in {"max_time", "min_time"} else "extreme",
+            statement=(
+                f"{name} is {timestamp} for {operator}_value {value}."
+                if fact_type == "extreme_time" or name in {"max_time", "min_time"}
+                else f"{name} is {value}" + (f" at {timestamp}." if timestamp else ".")
+            ),
+            value=fact_value,
             subject=request.subject,
             time_range=request.time_range,
             method="sql_query",
@@ -247,6 +292,7 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
         if fact is not None:
             facts.append(fact)
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    requested_names = {request.name for request in requests}
     for request in requests:
         if request.name in metrics:
             value = metrics[request.name]
@@ -264,6 +310,21 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
                     calculation_trace={"metric_key": request.name, "code_hash": payload.get("code_hash")},
                 )
             )
+    for name, value in metrics.items():
+        if name in requested_names or not isinstance(value, (int, float, str, bool)) or isinstance(value, bool):
+            continue
+        facts.append(
+            DataFact(
+                fact_id=_fact_id(analysis_id, name, value),
+                name=str(name),
+                fact_type="analysis_metric",
+                statement=f"{name} is {value}.",
+                value=value,
+                method="code_interpreter",
+                evidence_refs=evidence_refs,
+                calculation_trace={"metric_key": name, "code_hash": payload.get("code_hash")},
+            )
+        )
     return facts
 
 
@@ -338,6 +399,8 @@ def _merge_fact_state(request_state, tool_name: str, produced: list[DataFact], r
     fact_set.facts = list(existing.values())
     fact_set.coverage = coverage
     request_state.fact_coverage = coverage
+    if hasattr(request_state, "verified_facts"):
+        request_state.verified_facts = [fact for fact in fact_set.facts if fact.status == "verified"]
     request_state.fact_events.append(
         FactEvent(
             iteration=request_state.iteration,

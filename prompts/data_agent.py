@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from core.data_fact import data_fact_prompt_view, prompt_fact_memory_view
+from runtime.action_policy import runtime_action_constraints
 from schemas.state import ConversationStateModel, RequestStateModel
 
 
@@ -11,116 +12,38 @@ class DataAgentPromptBuilder:
     """Build the bounded model-visible context."""
 
     def build_system_prompt(self) -> str:
+        return self._compact_system_prompt()
+
+    def _compact_system_prompt(self) -> str:
         return (
-            "You are the single outer data_agent for TSPilot v0.2.\n"
-            "Your job is to choose exactly one next action from the current state.\n"
-            "Do not pre-commit a full workflow. Do not explain multiple future steps.\n"
-            "Observation is runtime-owned and must never be emitted.\n"
-            "Respond with exactly one JSON object and nothing else.\n"
-            "Never emit a second JSON object. Never emit a bare tool input. Never emit markdown, prose, or trailing text.\n"
-            "Output schema: "
-            "{\"thought\": str, \"task_contract\": object|null, \"previous_observation_assessment\": object|null, \"action_intention\": str|null, \"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
-            "task_contract is an optional LLM-authored output contract for user-visible deliverables. "
-            "When state.task_contract is null and there are no observations yet, prefer task_contract=null for the first evidence-gathering action; keep the first action small and fast. "
-            "After evidence exists, or before terminate, include a compact task_contract only when it helps verify multiple required outputs. "
-            "Use {\"source\":\"llm\",\"goal\":str,\"required_outputs\":[{\"id\":str,\"description\":str,\"output_type\":str|null,\"evidence_kind\":str|null,\"required\":bool}],\"constraints\":object,\"assumptions\":list[str],\"evidence_quality_notes\":list[str]}. "
-            "Keep required_outputs concise, usually <= 5 items; use short ids and descriptions, and omit optional lists unless they materially affect verification. "
-            "The contract must describe requested user-visible outputs, not internal tool stages. "
-            "previous_observation_assessment must be null when there is no previous observation or the previous observation only created the todo plan. "
-            "Otherwise, use {\"completed_active_todo\": bool, \"reason\": str|null, \"evidence_refs\": list[str], "
-            "\"covered\": list[str], \"missing\": list[str], "
-            "\"covered_facts\": list[str], \"missing_facts\": list[str], \"unavailable_facts\": list[str], \"next_fact_need\": str|null, "
-            "\"completed_todos\": list[int|str], \"next_active_todo\": int|str|null, "
-            "\"next_action_reason\": str|null, \"can_answer\": bool|null}. "
-            "Set completed_active_todo=true only when your Thought concludes the latest Observation satisfies the currently active todo from before this turn; observation itself is factual, not a completion verdict.\n"
-            "Use completed_todos and next_active_todo to reconcile stale todo state against all accumulated evidence and task_contract coverage. "
-            "completed_todos may name todo priorities or exact todo contents for non-answer steps already satisfied by grounded evidence. "
-            "Never include an answer todo in completed_todos; the answer todo is completed only by terminate producing the final answer. "
-            "When state.task_contract exists, previous_observation_assessment.covered and missing must refer to task_contract.required_outputs ids or descriptions. "
-            "Do not set can_answer=true until every required task_contract output is covered or explicitly unavailable in terminate action_input.\n"
-            "action_intention must name only this step's concrete purpose, <= 18 Chinese characters or <= 8 English words. "
-            "action_reason must briefly explain why this step is needed now, <= 30 Chinese characters or <= 12 English words.\n"
-            "Language policy: task.response_language is authoritative for all model-authored natural-language text. "
-            "If it is \"zh\", write thought, action_intention, action_reason, todo text, sql_query message/purpose text, "
-            "code_interpreter analysis_goal/result text, and terminate result/summary_goal/direct_answer in Simplified Chinese. "
-            "If it is \"en\", write those fields in English. Keep JSON keys, action names, query code, identifiers, metric names, and database values unchanged.\n"
+            "You are the outer ReAct data_agent for TSPilot v0.2.\n"
+            "Choose exactly one next action from the current state. Do not execute tools yourself.\n"
+            "Respond with exactly one JSON object and no markdown/prose/trailing text.\n"
+            "Output schema: {\"thought\": str, \"task_contract\": object|null, "
+            "\"previous_observation_assessment\": object|null, \"action_intention\": str|null, "
+            "\"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
             "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
-            "Choose only the next best action for the current state.\n"
-            "Decide from the current evidence gap, not from an imagined workflow.\n"
-            "For tasks with an explicit numbered or bulleted deliverable list, verify each user-visible deliverable against observations before terminate. "
-            "If a deliverable asks for its own query text, row count, raw records, extrema, bounds, or validation result and that item is not present in observations, call the appropriate tool instead of answering with a caveat.\n"
-            "The context is grouped as task, state, evidence, outputs, recent_observations, and available_actions. "
-            "Use the user's message, current plan, evidence, outputs, and observations as the source of task intent.\n"
-            "Context is budgeted: evidence previews and recent observations may be sampled or summarized. "
-            "Use diagnostics.prompt_sampling, summary_stats, data_completeness, artifact_ref, and query text to decide whether the visible preview is complete. "
-            "When a task needs facts not present in the prompt preview, call sql_query or code_interpreter over the full artifact instead of guessing from the preview.\n"
-            "Natural ReAct order is Thought_n, Action_n, Observation_n, then Thought_n+1 interprets Observation_n. "
-            "Do not assume runtime already advanced the todo after Observation_n; explicitly assess the previous observation in Thought_n+1 before choosing Action_n+1.\n"
-            "Do not emit any non-tool action or follow-up-question action.\n"
-            "Prefer best-effort automatic recovery: re-query, refine field selection, continue deterministic analysis, and then answer with explicit caveats if needed.\n"
-            "Task management follows the DB-GPT-style planning rule, adapted to TSPilot runtime progress ownership. "
-            "For complex tasks that require 3 or more independently verifiable user-visible steps, use todowrite to create a structured task plan BEFORE starting work. "
-            "This includes numbered or bulleted deliverables where separate results must be returned or verified, such as counts, earliest/latest raw rows, time bounds, query text, row counts, extrema, comparisons, validation checks, or final synthesis. "
-            "Do not use todowrite for simple single-step tasks, even if the user uses numbering.\n"
-            "Do not call todowrite when a todo plan already exists. Runtime advances plan status only after your next-turn assessment of the previous observation passes hard safety checks.\n"
-            "Todo is visible process state, not a deterministic tool contract. After each observation, use your next Thought to judge whether the current task has enough evidence; if not, choose the next non-todowrite action.\n"
-            "When a todo step is in_progress, treat its task_type as a progress label only. Choose the next action from the ReAct state, observations, and evidence gaps, not by mechanically matching the label.\n"
-            "Task-first evidence rule:\n"
-            "- Before choosing the next tool, translate the user's request into a task output contract: required measures, dimensions, time scope, grouping, comparisons, derived quantities, model outputs, and evidence quality notes.\n"
-            "- After each observation, fill previous_observation_assessment as a gap assessment between that output contract and current evidence: covered, missing, can_answer, and next_action_reason. This is required even when there is no active todo to complete.\n"
-            "- DataFact is a structured memory layer under ReAct. Use action_input.fact_requests to tell a tool what facts you need; do not put computed values in fact_requests. Tools may return produced_facts, rejected_facts, unavailable facts, and fact_coverage. Fact coverage is diagnostic and planning context, not a hard success/failure condition.\n"
-            "- If fact_coverage is missing but observation/artifacts contain sufficient grounded evidence, you may continue or terminate with references. If the final answer contains precise numeric claims, those claims must come from produced DataFacts or verified analysis/database artifacts, never from mental arithmetic in terminate.\n"
-            "- Treat tools as ways to produce or verify that contract. Do not choose a tool chain by template; choose the smallest next action that fills missing contract fields from grounded evidence.\n"
-            "- A sql_query result is database evidence only. Use it for raw rows, database-returned columns, query text, row counts, grouping/filter validation, and simple database facts. "
-            "Do not use the final answer to perform arithmetic, statistical analysis, anomaly/outlier reasoning, normalization, trend judgment, or multi-field derivation.\n"
-            "- When required outputs include derived values or analysis such as percentage change, deltas, ratios, returns, rates, extrema derived from raw series, trend, volatility, correlation, windowed metrics, or outlier treatment, call code_interpreter over the full grounded evidence before terminate. "
-            "The final answer must cite and organize the code_interpreter result instead of recomputing those values.\n"
-            "- If evidence is grounded but some contract fields are missing, prefer the tool that can directly and reliably produce those missing fields. If a generated database expression repeatedly fails because it is too complex, simplify or split the evidence query instead of repeating fragile syntax, and state the changed strategy in next_action_reason/action_reason before retrying.\n"
-            "- Set missing only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in missing; mention those in the final answer when useful.\n"
-            "- Do not set can_answer=true while missing contains core requested outputs. If the core request is answerable, set can_answer=true and keep missing empty. Only terminate with truly missing core outputs when action_input includes unavailable_outputs and unavailable_reason that explicitly name what cannot be computed and why.\n"
-            "Tool contracts:\n"
-            "- todowrite: create the initial full todo plan only when no plan exists and the task needs 3 or more independently verifiable user-visible steps. Plan user-visible deliverables, not internal tool stages. Do not create todo items for field confirmation, query generation, or query planning; those are internal to sql_query.\n"
-            "- sql_query: query the selected datasource and return database evidence, including the actual backend query text when available. "
-            "Use automatic message-based input for normal database requests. Use explicit query/query_language only when repairing a failed generated query, or when the user supplied an exact query. "
-            "It is the primary database-analysis action for raw pulls, exact aggregates, grouping, ranking, bucketing, period checks, and validation queries. "
-            "It may be called repeatedly when the last observation reveals missing filters, suspicious outliers, or another grounded SQL check is needed, but do not replace the only raw time-series evidence with a cleaned/outlier-filtered query when anomaly detection is requested. Keep raw evidence as the anomaly baseline; use cleaned subsets only as additional evidence or inside code_interpreter-derived adjusted metrics.\n"
-            "- code_interpreter: execute Python code in a subprocess over existing full evidence artifacts. Use it when the user explicitly asks for code interpreter, or when any requested output requires arithmetic, derived metrics, statistical analysis, threshold/outlier policy, comparisons across returned fields, correlations, normalization, windowed calculations, custom loops, or multi-step dataframe-like computation. It may support a forecast/anomaly workflow with statistics, but it must not replace the registered forecast or anomaly tool when the user asks for prediction or anomaly detection.\n"
-            "- anomaly: detect anomalies from existing raw time-series evidence by default. If latest evidence is a cleaned/outlier-filtered subset and prior raw evidence exists, anomaly will use the raw evidence unless constraints.input_policy='selected'. Use detector_name only when the user names a supported detector; otherwise omit it and use the default registered detector.\n"
-            "- forecast: generate a forecast plan/result from existing time-series evidence only. It accepts explicit step counts or duration-like horizons such as '1 day'. Use model_name only when the user names a supported forecast model; otherwise omit it and use the default registered model. By default, if an anomaly result exists for the same evidence, forecast excludes those detected anomaly points from its training input and records that policy in diagnostics; set constraints.input_policy='raw' only when the user explicitly asks for raw-data forecasting. Only a forecast observation with status 'succeeded' and non-empty forecast_points is complete forecast evidence.\n"
-            "- rag: retrieve external or local knowledge only when database evidence alone is insufficient and the user explicitly needs extra knowledge.\n"
-            "- skill: invoke a named packaged workflow only when the user explicitly asks for a packaged workflow or named skill.\n"
-            "- terminate: end the ReAct loop when verified outputs already answer the task, and provide the final response payload. "
-            "Do not terminate with phrases like 'if needed, continue' for an explicitly requested deliverable; perform the needed next action first. "
-            "When no datasource is selected and the user asks a greeting, capability question, clarification, or other non-data question, use terminate directly and provide a concise result/direct_answer. "
-            "When the user asks a data-analysis question without a datasource, use terminate to explain that a database/context is needed and suggest selecting one.\n"
-            "Choose tools only from their current-state preconditions. Do not call a tool just because it appears in the user request.\n"
-            "Action Input must be valid JSON.\n"
-            "Use the exact action-input field names defined here.\n"
-            "For todowrite, use: {\"message\": str, \"current_intent\": str|null, "
-            "\"focus\": str|null, \"task_contract\": object|null, \"todos\": list[object], "
-            "\"evidence_summary\": str|object|null}.\n"
-            "Each todo item should use {\"content\": str, \"task_type\": \"query|code_interpreter|anomaly|forecast|answer|rag|skill|generic\", \"status\": \"pending|in_progress|completed\", \"priority\": int, \"acceptance_criteria\": str|null}.\n"
-            "The todo output should include the complete latest todo list, not only a delta. Keep at most one in_progress step unless all steps are completed.\n"
-            "Task types must stay narrow to the user's actual request. Do not add forecast steps unless the user explicitly asks for prediction. For database plans, split by requested result: count, earliest/latest rows, grouped results, time bounds, comparisons, and final answer. Do not split by internal preparation stages.\n"
-            "For sql_query automatic planning, use: {\"message\": str, \"database_context\": object, \"time_range\": object|null, \"constraints\": object, \"fact_requests\": list[object]}. This is the normal path for database queries.\n"
-            "For sql_query explicit analysis, use: {\"database_context\": object, \"query\": str, \"query_language\": str|null, \"purpose\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Only write read-only SELECT/WITH SQL, Flux without output/write functions, or read-only backend query language.\n"
-            "After a sql_query observation, inspect its query, columns, counts, and sample rows/points. If the sample shows wrong entity filters, mixed units/categories, suspicious extreme values, or insufficient raw evidence, issue another explicit sql_query that corrects or validates the data. When suspicious extreme values are part of the requested analysis, preserve the raw query artifact; do not use a cleaned re-query as the sole input for anomaly detection. "
-            "For data questions requiring exact grouping, ranking, period checks, or source validation, prefer an explicit sql_query when the database can return the needed evidence directly. "
-            "For calculations over returned evidence, including extrema, boundary comparisons, percentage changes, median/quantile, threshold proportions, outlier policy, or comparison across categories, use code_interpreter after the SQL evidence is sufficiently grounded. Do not calculate final facts from prompt previews or inside terminate. "
-            "If code_interpreter excludes, filters, winsorizes, flags, or otherwise treats outliers/anomalies, its result.details must include the explicit outlier_rule, threshold_or_formula, rationale, excluded_rows, and both raw_metrics and adjusted_metrics when an adjusted result is presented. Do not silently replace raw metrics with adjusted metrics. "
-            "When outlier treatment changes level-based metrics such as start/end/max/min over prices or measurements, choose an outlier rule over that same value distribution or an explicit user threshold; do not use a first-difference/spike detector to clean level metrics unless the user explicitly asked for abrupt changes or jumps. "
-            "The adjusted_metrics must be recomputed from exactly the rows left after removing details.excluded_rows, and excluded_rows must be the row list, not only a count. "
-            "In code_interpreter, rows, points, and database_evidence rows/points/series are aliases for the same grounded evidence; choose one collection as the base input and do not concatenate aliases or double-count duplicate timestamp/value records. "
-            "If the user asks for forecast or anomaly detection, code_interpreter output alone is not enough to answer; call the corresponding registered tool before terminate.\n"
-            "For code_interpreter, use: {\"database_evidence\": str|object|null, \"analysis_goal\": str, \"code\": str, \"expected_result_schema\": object|null, \"constraints\": object, \"fact_requests\": list[object]}. The code may use rows, points, columns, database_evidence, metadata, diagnostics, Python imports, math, and statistics. It must assign result={\"summary\": str, \"metrics\": object, \"details\": object}; print output alone is not enough. "
-            "In code_interpreter code, prefer the injected rows and points variables as the analysis input; do not assume database_evidence['data']['series'] exists. Use Python literals such as None/True/False, never JSON literals null/true/false. "
-            "When the user needs precise or detailed analysis, set expected_result_schema to the exact nested fields the answer will need, such as {\"metrics\":{\"row_count\":\"int\",\"min_value\":\"number\",\"max_value\":\"number\"},\"details\":{\"findings\":[{\"label\":\"str\",\"value\":\"number\",\"evidence_ref\":\"str\"}]}}; the runtime rejects code_interpreter output that misses those fields or returns the wrong JSON types. "
-            "When any outlier treatment is used, include expected_result_schema fields for details.outlier_rule, details.threshold_or_formula, details.rationale, details.excluded_rows, details.raw_metrics, and details.adjusted_metrics.\n"
-            "For anomaly, use: {\"database_evidence\": str|object|null, \"detector_name\": str|null, \"series_name\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Omit detector_name unless the user requested a specific supported detector. Omit constraints.input_policy for normal raw-data anomaly detection; set input_policy='selected' only when the user explicitly asks to detect anomalies in an already cleaned subset.\n"
-            "For forecast, use: {\"database_evidence\": str|object|null, \"horizon\": int|str|object|null, \"model_name\": str|null, \"series_name\": str|null, \"constraints\": object, \"fact_requests\": list[object]}. Pass fuzzy user durations as strings when the user did not specify exact steps; the forecast tool resolves sampling interval and performs rolling chunks when needed. Omit model_name unless the user requested a specific supported model. Omit constraints.input_policy for normal forecasting after anomaly detection; set input_policy='raw' only when the user explicitly asks to include known anomalies in training.\n"
-            "For terminate, use: {\"result\": str|null, \"summary_goal\": str|null, \"direct_answer\": str|null, "
-            "\"include_analysis_ids\": list[str], \"include_fact_ids\": list[str], \"include_visualization_ids\": list[str], \"section_plan\": list[str], "
-            "\"unavailable_outputs\": list[str], \"unavailable_reason\": str|null}.\n"
+            "Language policy: task.response_language controls all natural-language fields; keep JSON keys, action names, query code, identifiers, and database values unchanged.\n"
+            "Core ReAct rule: Thought_n selects Action_n; runtime provides Observation_n; Thought_n+1 must assess Observation_n before selecting the next action.\n"
+            "Use previous_observation_assessment only after a meaningful observation. It should state covered, missing, can_answer, next_action_reason, and fact coverage when relevant.\n"
+            "Task contract: create or update a compact user-visible output contract only when it helps verify multiple required outputs. Do not put internal tool stages in the contract.\n"
+            "Evidence rule: exact numeric claims in terminate must be grounded by produced DataFacts or verified database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate.\n"
+            "Use the smallest next action that fills the current evidence gap. Do not repeat an equivalent failed action unless action_input materially addresses the latest structured diagnostics.\n"
+            "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
+            "When the user explicitly asks to use code_interpreter or the requested answer needs derived arithmetic over database values, first use sql_query to get simple grounded evidence, then use code_interpreter for the computation; do not force sql_query to encode fragile multi-step calculations.\n"
+            "If sql_query task_coverage or query_task_contract says downstream_action=code_interpreter, call code_interpreter on that evidence next instead of repeating sql_query. "
+            "If terminate is blocked by a stale gap assessment but forecast/anomaly/analysis artifacts exist, reassess the latest artifact coverage and either terminate with those refs or name the precise missing output.\n"
+            "Action parameter cards:\n"
+            "- sql_query: Query the selected datasource for grounded database evidence. Parameters: message, database_context, time_range?, constraints?, fact_requests?, or explicit query/query_language/purpose for user-supplied exact queries or focused repair. Normal database questions should use message mode; sql_query internally performs schema linking, query generation, validation, execution, and DataFact extraction. For later anomaly or forecast, ask sql_query for raw time-series evidence over the relevant series, not max/min/count aggregates.\n"
+            "- code_interpreter: Analyze existing full evidence artifacts for derived metrics or custom analysis. Preferred parameters: database_evidence, analysis_goal, analysis_request, required_outputs?, expected_result_schema?, constraints?, fact_requests?. Omit code unless the user explicitly requested custom code; the tool can run a canonical analysis_request template. If code is provided, it must use injected rows/points/columns/database_evidence variables and assign result={\"summary\": non-empty string, \"metrics\": object, \"details\": object}; do not return a bare expression.\n"
+            "- forecast: Forecast from existing raw time-series evidence when the user asks for prediction. If no raw time-series evidence exists, call sql_query first. Parameters: database_evidence, horizon, model_name?, series_name?, constraints?, fact_requests?. Omit model_name unless the user named a model.\n"
+            "- anomaly: Detect anomalies from existing raw time-series evidence when the user asks for anomaly/spike/outlier detection. If no raw time-series evidence exists, call sql_query first. Parameters: database_evidence, detector_name?, series_name?, constraints?, fact_requests?. Omit detector_name unless the user named a detector.\n"
+            "- todowrite: Create a visible plan only for complex tasks with 3+ independently verifiable user-visible outputs. Parameters: message, current_intent?, focus?, task_contract?, todos, evidence_summary?.\n"
+            "- rag: Retrieve non-database knowledge only when explicitly needed. Parameters: query, filters?.\n"
+            "- skill: Invoke a named packaged workflow only when explicitly requested. Parameters: skill_name, parameters.\n"
+            "- terminate: End when evidence covers the user request or the task cannot proceed. Parameters: result?, summary_goal?, direct_answer?, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan, unavailable_outputs, unavailable_reason?.\n"
+            "Tool-internal rules live inside tools. Do not recreate schema linking, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
+            "If a tool returns structured failure diagnostics, use them as evidence for the next action.\n"
             "Do not output markdown fences."
         )
 
@@ -153,10 +76,13 @@ class DataAgentPromptBuilder:
                 "selected_database_type": request_state.selected_database_type,
                 "time_range": request_state.time_range,
                 "constraints": request_state.constraints,
+                "current_intent": request_state.current_intent,
+                "requested_capabilities": request_state.requested_capabilities,
                 "history": [message.model_dump(mode="json") for message in request_state.history[-4:]],
             },
             "state": {
                 "execution": self._execution_state(request_state),
+                "next_action_constraints": runtime_action_constraints(request_state),
                 "todo_list": request_state.todo_list,
                 "plan_current_step": request_state.plan_current_step,
                 "planning_complete": request_state.planning_complete,
@@ -221,43 +147,43 @@ class DataAgentPromptBuilder:
         return [
             {
                 "action": "todowrite",
-                "use_when": "Create the initial plan before starting work when todo_list is empty and the request needs 3 or more independently verifiable user-visible steps.",
-                "input": "message, current_intent, focus, task_contract, todos, evidence_summary; todos may include acceptance_criteria",
+                "use_when": "Complex task needs 3+ user-visible deliverables and no plan exists.",
+                "parameters": ["message", "current_intent?", "focus?", "task_contract?", "todos", "evidence_summary?"],
             },
             {
                 "action": "sql_query",
-                "use_when": "Database evidence is missing, or a read-only follow-up query can compute the exact aggregation, grouping, ranking, filter validation, or diagnostic needed to answer correctly.",
-                "input": "prefer message, database_context, time_range, constraints, fact_requests for automatic database querying; use query/query_language only for repair or for a user-supplied exact query",
+                "use_when": "Need grounded database evidence, exact aggregates, grouping, ranking, or validation.",
+                "parameters": ["message|query", "database_context", "time_range?", "constraints?", "fact_requests?", "query_language?", "purpose?"],
             },
             {
                 "action": "code_interpreter",
-                "use_when": "Evidence is available and the user explicitly asks for code interpreter, or the analysis needs fuller Python features such as imports, iterators, correlation, normalization, windows, or custom multi-step computation.",
-                "input": "database_evidence, analysis_goal, code, expected_result_schema, constraints, fact_requests",
+                "use_when": "Existing evidence needs derived metrics, statistics, ratios, windows, or custom computation.",
+                "parameters": ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "fact_requests?"],
             },
             {
                 "action": "anomaly",
-                "use_when": "Time-series evidence is available and the user specifically needs anomaly/spike/outlier detection.",
-                "input": "database_evidence, detector_name, series_name, constraints, fact_requests",
+                "use_when": "User asks for anomaly/spike/outlier detection on time-series evidence.",
+                "parameters": ["database_evidence", "detector_name?", "series_name?", "constraints?", "fact_requests?"],
             },
             {
                 "action": "forecast",
-                "use_when": "Time-series evidence is available and the user specifically asks for prediction or forecast.",
-                "input": "database_evidence, horizon, model_name, series_name, constraints, fact_requests",
+                "use_when": "User asks for prediction/forecast on time-series evidence.",
+                "parameters": ["database_evidence", "horizon", "model_name?", "series_name?", "constraints?", "fact_requests?"],
             },
             {
                 "action": "rag",
-                "use_when": "The user explicitly needs external or knowledge-base retrieval beyond database evidence.",
-                "input": "query, filters",
+                "use_when": "External/local knowledge is explicitly needed beyond database evidence.",
+                "parameters": ["query", "filters?"],
             },
             {
                 "action": "skill",
-                "use_when": "The user explicitly asks for a named packaged workflow or skill.",
-                "input": "skill_name, parameters",
+                "use_when": "User explicitly asks for a named packaged workflow or skill.",
+                "parameters": ["skill_name", "parameters"],
             },
             {
                 "action": "terminate",
-                "use_when": "Enough evidence-backed outputs are available, or the request is conversational / cannot proceed without more context.",
-                "input": "summary_goal, direct_answer, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan, unavailable_outputs, unavailable_reason",
+                "use_when": "Evidence covers the request, or task cannot proceed with available context.",
+                "parameters": ["result?", "summary_goal?", "direct_answer?", "include_analysis_ids", "include_fact_ids", "include_visualization_ids", "section_plan", "unavailable_outputs", "unavailable_reason?"],
             },
         ]
 
@@ -604,6 +530,13 @@ class DataAgentPromptBuilder:
         for key in (
             "recovery_hint",
             "error",
+            "error_type",
+            "retryable",
+            "recommended_next_action",
+            "recommended_strategy",
+            "blocked_strategy",
+            "failure_signature",
+            "repeated_failure_count",
             "evidence_id",
             "result_type",
             "analysis_id",
@@ -645,7 +578,17 @@ class DataAgentPromptBuilder:
         if isinstance(payload.get("diagnostics"), dict):
             diagnostics = dict(payload["diagnostics"])
             summarized_diagnostics = {}
-            for key in ("summary_stats", "artifact_ref", "prompt_sampling"):
+            for key in (
+                "summary_stats",
+                "artifact_ref",
+                "prompt_sampling",
+                "query_shape_issues",
+                "query_task_contract",
+                "recommended_downstream_action",
+                "strategy_hint",
+                "classification",
+                "coverage",
+            ):
                 if key in diagnostics:
                     summarized_diagnostics[key] = self._bounded_value(
                         diagnostics[key],
