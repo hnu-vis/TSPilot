@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from pydantic import field_validator
 
+from core.database.dialects import dialect_for_database
 from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.forecast_registry import default_forecast_model_name, get_forecast_model
 from core.timeseries.normalization import normalize_timeseries_evidence
@@ -146,6 +147,16 @@ class ForecastTool(BaseTool):
                 "horizon": horizon,
                 "forecast_plan": forecast_plan.model_dump(mode="json"),
                 "input_quality": quality,
+                "coverage": {
+                    "input_evidence_refs": [database_evidence.evidence_id],
+                    "covered_outputs": ["forecast_points", "forecast_horizon", "input_database_evidence"],
+                    "missing_outputs": [],
+                    "row_count_semantics": "forecast_points",
+                    "training_point_count": len(series.points),
+                    "forecast_point_count": len(forecast_points),
+                    "horizon": horizon,
+                    "can_answer": bool(forecast_points and len(forecast_points) >= horizon),
+                },
                 **input_policy_diagnostics,
             },
             visualizations=[visualization],
@@ -526,8 +537,10 @@ def _validate_forecast_evidence_quality(
     request_state,
     constraints: dict,
 ) -> dict:
-    query = (evidence.query or "").lower()
-    raw_limit = "limit(" in query and "aggregatewindow" not in query
+    raw_limit = dialect_for_database(evidence.query_language).raw_limit_without_downsampling(
+        evidence.query,
+        evidence.query_language,
+    )
     coverage_start = series.points[0].timestamp
     coverage_end = series.points[-1].timestamp
     sampling_interval = _infer_sampling_interval_seconds(series)

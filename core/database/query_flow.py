@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core.time_range import normalize_time_value, parse_time_to_utc
+from core.time_range import parse_time_to_utc
 from schemas.database import DatabaseEvidence
 
 from .connector import DatabaseSchema, QueryResult
@@ -33,9 +33,9 @@ from .contracts import (
     ValidationIssue,
     ValueDomainProbe,
 )
+from .dialects import DatabaseDialect, dialect_for_database
 from .engine import infer_evidence_family, normalize_query_result
-from .query_compiler import QueryCompiler
-from .query_plan import DatabaseQueryPlan, TimeRangePlan
+from .query_plan import DatabaseQueryPlan
 from .schema_linking import SchemaLinkingPipeline
 
 
@@ -223,11 +223,8 @@ class DefaultLogicalQueryPlanner(LogicalQueryPlanner):
 class CompositeDialectRenderer(DialectRenderer):
     """Render logical plans into SQL, Flux, or PromQL."""
 
-    _SQL_DIALECTS = {"timescaledb", "postgresql", "questdb", "clickhouse", "sql"}
-
     def __init__(self, config: dict[str, Any]):
         self._config = config
-        self._compiler = QueryCompiler()
 
     def render(
         self,
@@ -235,100 +232,14 @@ class CompositeDialectRenderer(DialectRenderer):
         context: QueryRequestContext,
         plan: DatabaseQueryPlan,
     ) -> RenderedQuery:
-        db_type = context.database_type.lower()
-        if db_type in self._SQL_DIALECTS:
-            compiled = self._compiler.compile(plan, db_type=db_type, dialect=db_type)
-            return RenderedQuery(
-                query_text=compiled.query,
-                query_language=compiled.language,
-                warnings=list(compiled.warnings),
-            )
-        if db_type == "influxdb":
-            return self._render_flux(plan, context)
-        if db_type == "prometheus":
-            return self._render_promql(plan, context)
-        compiled = self._compiler.compile(plan, db_type=db_type, dialect=db_type)
-        return RenderedQuery(
-            query_text=compiled.query,
-            query_language=compiled.language,
-            warnings=list(compiled.warnings),
-        )
-
-    def _render_flux(self, plan: DatabaseQueryPlan, context: QueryRequestContext) -> RenderedQuery:
-        bucket = str(self._config.get("bucket") or self._config.get("database") or "")
-        source = plan.sources[0] if plan.sources else None
-        measurement = source.name if source else ""
-        field_projection = next((item for item in plan.projections if item.alias == "value"), None)
-        field_name = field_projection.column if field_projection else (source.value_columns[0] if source and source.value_columns else "_value")
-        range_clause = self._flux_range(plan.time_range)
-        lines = [f'from(bucket: "{bucket}")', f"  |> {range_clause}"]
-        if measurement:
-            lines.append(f'  |> filter(fn: (r) => r._measurement == "{measurement}")')
-        if field_name:
-            lines.append(f'  |> filter(fn: (r) => r._field == "{field_name}")')
-        for item in plan.filters:
-            if item.column in {"_measurement", "_field", "_time", "time", "timestamp"}:
-                continue
-            lines.append(
-                f'  |> filter(fn: (r) => r.{item.column} {self._flux_operator(item.operator)} "{self._escape_flux_string(item.value)}")'
-            )
-        aggregation = next((item.aggregation for item in plan.projections if item.aggregation), None)
-        if aggregation:
-            flux_fn = {"avg": "mean", "mean": "mean", "max": "max", "min": "min", "sum": "sum", "count": "count"}.get(aggregation, aggregation)
-            lines.append("  |> group()")
-            lines.append(f"  |> {flux_fn}()")
-        return RenderedQuery(query_text="\n".join(lines), query_language="flux")
-
-    def _render_promql(self, plan: DatabaseQueryPlan, context: QueryRequestContext) -> RenderedQuery:
-        source = plan.sources[0] if plan.sources else None
-        metric_name = source.name if source else ""
-        label_filters = [
-            item for item in plan.filters
-            if item.column not in {"timestamp", "time", "_time"}
-        ]
-        matcher_text = ""
-        if label_filters:
-            matcher_text = "{" + ",".join(f'{item.column}="{item.value}"' for item in label_filters) + "}"
-        query_text = f"{metric_name}{matcher_text}".strip()
-        return RenderedQuery(query_text=query_text, query_language="promql")
-
-    def _flux_range(self, time_range: TimeRangePlan) -> str:
-        if time_range.start and time_range.end:
-            return f'range(start: {self._flux_time(time_range.start)}, stop: {self._flux_time(time_range.end)})'
-        if time_range.start:
-            return f'range(start: {self._flux_time(time_range.start)})'
-        if time_range.lookback:
-            return f"range(start: -{time_range.lookback})"
-        default_range = self._default_flux_time_range()
-        if default_range.get("start") and default_range.get("end"):
-            return f'range(start: {self._flux_time(default_range["start"])}, stop: {self._flux_time(default_range["end"])})'
-        if default_range.get("start"):
-            return f'range(start: {self._flux_time(default_range["start"])})'
-        return "range(start: 1970-01-01T00:00:00Z)"
-
-    def _default_flux_time_range(self) -> dict[str, Any]:
-        configured = self._config.get("default_query_time_range") or self._config.get("default_time_range")
-        if isinstance(configured, dict):
-            return normalize_time_range(configured) or {}
-        reference_dataset = self._config.get("reference_dataset")
-        if isinstance(reference_dataset, dict):
-            configured = reference_dataset.get("time_range")
-            if isinstance(configured, dict):
-                return normalize_time_range(configured) or {}
-        return {"start": "1970-01-01T00:00:00Z"}
-
-    def _flux_time(self, value: str) -> str:
-        return normalize_time_value(value)
-
-    def _flux_operator(self, operator: str) -> str:
-        return "==" if operator == "=" else operator
-
-    def _escape_flux_string(self, value: Any) -> str:
-        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return dialect_for_database(context.database_type).render_plan(context=context, plan=plan, config=self._config)
 
 
 class DefaultQueryValidator(QueryValidator):
     """Validate that rendering preserved key plan semantics."""
+
+    def __init__(self, dialect: DatabaseDialect | None = None):
+        self._dialect = dialect
 
     def validate(
         self,
@@ -340,6 +251,7 @@ class DefaultQueryValidator(QueryValidator):
     ) -> QueryValidationReport:
         issues: list[ValidationIssue] = []
         text = rendered_query.query_text.lower()
+        dialect = self._dialect or dialect_for_database(context.database_type)
         if context.time_range and rendered_query.query_language in {"sql", "timescaledb", "postgresql", "questdb", "clickhouse", "flux"}:
             start = str(context.time_range.get("start") or "").lower()
             end = str(context.time_range.get("end") or "").lower()
@@ -355,7 +267,7 @@ class DefaultQueryValidator(QueryValidator):
         for item in plan.filters:
             if item.column in {"_time", "time", "timestamp"}:
                 continue
-            if not self._has_rendered_filter(rendered_query, item):
+            if not dialect.has_rendered_filter(rendered_query, item):
                 issues.append(
                     ValidationIssue(
                         code="required_filter_missing",
@@ -367,16 +279,6 @@ class DefaultQueryValidator(QueryValidator):
             for issue in issues
         )
         return QueryValidationReport(valid=not any(issue.severity == "error" for issue in issues), issues=issues, safe_to_repair=safe_to_repair)
-
-    def _has_rendered_filter(self, rendered_query: RenderedQuery, item: QueryFilter) -> bool:
-        text = rendered_query.query_text.lower()
-        column = str(item.column).lower()
-        value = str(item.value).lower()
-        if rendered_query.query_language == "flux":
-            return f"r.{column}" in text and f'"{value}"' in text
-        if rendered_query.query_language == "promql":
-            return column in text and f'"{value}"' in text
-        return column in text and value in text
 
 
 class DefaultQueryRepairPolicy(QueryRepairPolicy):
@@ -658,14 +560,16 @@ class DatabaseQueryFlow:
         return schema, field_mappings, plan
 
     async def _execute(self, *, context: QueryRequestContext, intent: QueryIntent, rendered_query: RenderedQuery, execute_range_query_fn=None) -> QueryResult:
+        dialect = dialect_for_database(context.database_type)
         if (
-            context.database_type.lower() == "prometheus"
-            and context.time_range
-            and intent.query_shape == "raw_timeseries"
-            and hasattr(self._connector, "get_range")
+            dialect.supports_range_query(context=context, intent_query_shape=intent.query_shape, connector=self._connector)
             and execute_range_query_fn is not None
         ):
-            step = self._prometheus_step(context.time_range, context.constraints)
+            step = dialect.range_step(
+                time_range=context.time_range or {},
+                constraints=context.constraints,
+                parse_time=self._parse_time,
+            )
             return await execute_range_query_fn(
                 self._connector,
                 rendered_query.query_text,
@@ -674,17 +578,6 @@ class DatabaseQueryFlow:
                 step=step,
             )
         return await self._connector.execute(rendered_query.query_text)
-
-    def _prometheus_step(self, time_range: dict[str, Any], constraints: dict[str, Any]) -> str:
-        from datetime import datetime
-        import math
-
-        max_points = int(constraints.get("max_points", 240))
-        start = self._parse_time(time_range["start"])
-        end = self._parse_time(time_range["end"])
-        total_seconds = max(1, int((end - start).total_seconds()))
-        step_seconds = max(1, math.ceil(total_seconds / max_points))
-        return f"{step_seconds}s"
 
     def _parse_time(self, value: str):
         from datetime import datetime

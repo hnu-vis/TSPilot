@@ -2,24 +2,20 @@
 from __future__ import annotations
 
 import csv
-import math
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from app.settings import Settings
 from core.time_range import format_utc_rfc3339, parse_time_to_utc
+from core.database.dialects import query_language_for_database_type
 from core.database import (
     DatabaseFactory,
-    DatabaseSchema,
     build_reference_dataset_statistics_evidence,
     build_reference_dataset_timeseries_evidence,
-    execute_query,
     execute_range_query,
     infer_evidence_family,
-    infer_prometheus_metric,
     metric_list_preview,
-    normalize_query_result,
     schema_preview,
 )
 from core.database.query_flow import DatabaseQueryFlow
@@ -61,9 +57,6 @@ class QueryDatabaseTool(BaseTool):
                 return self._reference_dataset_statistics(validated_input, config_path, config, reference_dataset)
             return self._reference_dataset_timeseries(validated_input, config_path, config, reference_dataset)
 
-        if db_type == "prometheus":
-            return await self._prometheus_timeseries(validated_input, config, request_state=request_state)
-
         return await self._connector_query_evidence(validated_input, config, evidence_family, request_state=request_state)
 
     async def _load_database_config(self, database_id: str) -> tuple[Path, dict]:
@@ -88,7 +81,7 @@ class QueryDatabaseTool(BaseTool):
             evidence_id=f"evi_{validated_input.database_context.database_id}_metrics",
             result_type="metric_list",
             database=validated_input.database_context.database_id,
-            query_language=str(config.get("type", validated_input.database_context.database_type)),
+            query_language=query_language_for_database_type(config.get("type", validated_input.database_context.database_type)),
             query=None,
             summary=f"Loaded {len(metric_names)} available metrics.",
             data={"metrics": metric_names},
@@ -107,7 +100,7 @@ class QueryDatabaseTool(BaseTool):
             evidence_id=f"evi_{validated_input.database_context.database_id}_schema",
             result_type="schema",
             database=validated_input.database_context.database_id,
-            query_language=str(config.get("type", validated_input.database_context.database_type)),
+            query_language=query_language_for_database_type(config.get("type", validated_input.database_context.database_type)),
             query=None,
             summary=f"Loaded schema preview with {len(preview['tables_or_measurements'])} tables or metrics.",
             data={k: v for k, v in preview.items() if k != "metadata"},
@@ -218,22 +211,6 @@ class QueryDatabaseTool(BaseTool):
         )
         return evidence.model_dump(mode="json")
 
-    async def _prometheus_timeseries(self, validated_input: QueryDatabaseInput, config: dict, *, request_state=None) -> dict:
-        connector = await DatabaseFactory.create_connector(**config)
-        async with connector:
-            flow = DatabaseQueryFlow(
-                connector=connector,
-                config={
-                    **config,
-                    "snapshot_dir": str(self._query_snapshot_dir(request_state)),
-                },
-            )
-            evidence = await flow.run(
-                context=self._build_query_context(validated_input, config),
-                execute_range_query_fn=execute_range_query,
-            )
-        return evidence.model_dump(mode="json")
-
     async def _connector_query_evidence(
         self,
         validated_input: QueryDatabaseInput,
@@ -275,41 +252,6 @@ class QueryDatabaseTool(BaseTool):
             history=validated_input.history,
             intent_profile=validated_input.intent_profile,
         )
-
-    def _prometheus_step(self, time_range: dict, constraints: dict) -> str:
-        max_points = int(constraints.get("max_points", 240))
-        start = self._parse_time(time_range["start"])
-        end = self._parse_time(time_range["end"])
-        total_seconds = max(1, int((end - start).total_seconds()))
-        step_seconds = max(1, math.ceil(total_seconds / max_points))
-        return f"{step_seconds}s"
-
-    def _draft_generic_query(self, message: str, schema, config: dict, evidence_family: str) -> str:
-        db_type = str(config.get("type", "")).lower()
-        first_table = schema.tables[0].name if schema.tables else ""
-        normalized = message.lower()
-        if db_type == "influxdb":
-            measurement = first_table or config.get("database") or "measurement"
-            value_field = self._guess_field_from_message(normalized, schema) or "_value"
-            if evidence_family == "statistics":
-                return (
-                    f'from(bucket: "{config.get("bucket", config.get("database", ""))}") '
-                    f'|> range(start: -7d) |> filter(fn: (r) => r._measurement == "{measurement}") '
-                    f'|> filter(fn: (r) => r._field == "{value_field}") |> mean()'
-                )
-            return (
-                f'from(bucket: "{config.get("bucket", config.get("database", ""))}") '
-                f'|> range(start: -7d) |> filter(fn: (r) => r._measurement == "{measurement}") '
-                f'|> filter(fn: (r) => r._field == "{value_field}")'
-            )
-        return first_table or message
-
-    def _guess_field_from_message(self, normalized_message: str, schema) -> str | None:
-        for table in schema.tables:
-            for column in table.columns:
-                if column.name.lower() in normalized_message:
-                    return column.name
-        return None
 
     def _resolve_dataset_path(self, dataset_path: str, config_path: Path) -> Path:
         path = Path(dataset_path)

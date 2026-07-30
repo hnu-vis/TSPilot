@@ -1,8 +1,13 @@
-"""Deterministic query repair helpers."""
+"""Query repair helpers.
+
+Dialect-specific repairs live in core.database.dialects.  This module keeps a
+small compatibility entrypoint for callers and common error classification.
+"""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+
+from .dialects import dialect_for_database
 
 
 @dataclass(frozen=True)
@@ -59,59 +64,25 @@ def repair_read_only_query(
     """
 
     repaired = query.strip()
-    language = str(query_language or "").lower()
-    looks_like_flux = language == "flux" or "|>" in repaired or repaired.startswith("from(")
-    error_text = str(error or "").lower()
-
-    if looks_like_flux:
-        date_result = _repair_flux_date_import(repaired, error_text)
-        if date_result.changed:
-            return date_result
-        yield_result = _repair_flux_duplicate_default_result(repaired, error_text)
-        if yield_result.changed:
-            return yield_result
+    dialect = dialect_for_database(_database_type_from_language(query_language, repaired))
+    dialect_result = dialect.repair_query(
+        query=repaired,
+        query_language=query_language,
+        error=error,
+    )
+    if dialect_result.changed or dialect_result.hint:
+        return dialect_result
 
     if repaired != query:
         return QueryRepairResult(query=repaired, changed=True, reason="trim_query_whitespace")
     return QueryRepairResult(query=query)
 
 
-def _repair_flux_date_import(query: str, error_text: str) -> QueryRepairResult:
-    if "date." not in query:
-        return QueryRepairResult(query=query)
-    if 'import "date"' in query or "import 'date'" in query:
-        return QueryRepairResult(query=query)
-    if error_text and "undefined identifier date" not in error_text:
-        return QueryRepairResult(query=query)
-    return QueryRepairResult(
-        query='import "date"\n' + query,
-        changed=True,
-        reason="add_flux_date_import",
-        hint='Added Flux import "date" because the query uses date.* functions.',
-    )
-
-
-def _repair_flux_duplicate_default_result(query: str, error_text: str) -> QueryRepairResult:
-    if "tried to produce more than one result" not in error_text:
-        return QueryRepairResult(query=query)
-    if "yield(" in query:
-        return QueryRepairResult(
-            query=query,
-            hint="Flux produced multiple default results; split the query or give each result a unique yield(name).",
-        )
-    parts = [part.strip() for part in re.split(r"\n\s*\n(?=from\s*\()", query) if part.strip()]
-    if len(parts) < 2:
-        return QueryRepairResult(
-            query=query,
-            hint="Flux produced multiple default results; split the query or give each result a unique yield(name).",
-        )
-    repaired_parts = [
-        f'{part}\n  |> yield(name: "result_{index}")'
-        for index, part in enumerate(parts, start=1)
-    ]
-    return QueryRepairResult(
-        query="\n\n".join(repaired_parts),
-        changed=True,
-        reason="name_flux_results",
-        hint="Added unique yield names to multiple Flux result streams.",
-    )
+def _database_type_from_language(query_language: str | None, query: str | None = None) -> str:
+    language = str(query_language or "").strip().lower()
+    query_text = str(query or "").strip()
+    if language == "flux" or "|>" in query_text or query_text.startswith("from("):
+        return "influxdb"
+    if language == "promql":
+        return "prometheus"
+    return language or "sql"

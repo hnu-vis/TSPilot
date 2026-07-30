@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from core.database.dialects import dialect_for_database
 from core.report.composer import (
     build_anomaly_section,
     build_forecast_section,
@@ -103,6 +104,7 @@ class FormatAnswerTool(BaseTool):
         legacy_facts = [
             fact
             for fact in request_state.verified_facts
+            if hasattr(fact, "evidence")
             if not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids
         ]
         analyses = self._selected_analyses(request_state, validated_input.include_analysis_ids)
@@ -464,6 +466,7 @@ class FormatAnswerTool(BaseTool):
         if not include_fact_ids:
             return False
         available = {fact.fact_id for fact in request_state.verified_facts}
+        available.update(fact.fact_id for fact in request_state.fact_set.facts if fact.status == "verified")
         return all(fact_id in available for fact_id in include_fact_ids)
 
     def _has_requested_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]) -> bool:
@@ -856,19 +859,9 @@ class FormatAnswerTool(BaseTool):
         return language == "reference_dataset" or query.startswith("reference_dataset:")
 
     def _markdown_language(self, query_language: str | None) -> str | None:
-        normalized = str(query_language or "").strip().lower()
-        if not normalized:
+        if not str(query_language or "").strip():
             return None
-        aliases = {
-            "postgres": "sql",
-            "postgresql": "sql",
-            "timescaledb": "sql",
-            "questdb": "sql",
-            "clickhouse": "sql",
-            "influxdb": "flux",
-            "prometheus": "promql",
-        }
-        return aliases.get(normalized, normalized)
+        return dialect_for_database(query_language).markdown_language(query_language)
 
     def _language(self, request_state: RequestStateModel | None) -> str:
         return "zh" if getattr(request_state, "response_language", "en") == "zh" else "en"
