@@ -120,6 +120,19 @@ class SandboxAnalysisLLM:
             return query_response
         context = _context_from_prompt(user_prompt)
 
+        if _analysis_count(context) > 0:
+            return _turn(
+                "The code interpreter result is available, so I can assemble the final answer.",
+                "terminate",
+                {
+                    "summary_goal": context["message"],
+                    "include_analysis_ids": _analysis_ids(context),
+                    "include_fact_ids": [],
+                    "include_visualization_ids": [],
+                    "section_plan": ["summary", "analysis"],
+                },
+            )
+
         if context.get("latest_database_evidence") is None:
             return _turn(
                 "I need grounded database rows before running the code interpreter.",
@@ -206,6 +219,77 @@ class CasualLLM:
                 "include_fact_ids": [],
                 "include_visualization_ids": [],
                 "section_plan": ["summary"],
+            },
+        )
+
+
+class CodeRequiredRepairLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        user_prompt = messages[-1][1]
+        query_response = _query_generation_response(user_prompt)
+        if query_response is not None:
+            return query_response
+        context = _context_from_prompt(user_prompt)
+
+        if _analysis_count(context) > 0:
+            return _turn(
+                "The financial metrics are available.",
+                "terminate",
+                {
+                    "summary_goal": context["message"],
+                    "include_analysis_ids": _analysis_ids(context),
+                    "include_fact_ids": [],
+                    "section_plan": ["summary", "analysis"],
+                },
+            )
+
+        latest_code_failure = _latest_failed_observation(context, "code_interpreter")
+        if latest_code_failure is not None or _requires_code_repair(context):
+            return _turn(
+                "The template cannot compute these metrics, so I need generated code.",
+                "code_interpreter",
+                {
+                    "database_evidence": "latest",
+                    "analysis_goal": "compute total return volatility and max drawdown",
+                    "required_outputs": ["total_return", "volatility", "max_drawdown"],
+                    "code": _financial_metrics_code(),
+                    "expected_result_schema": {
+                        "summary": "str",
+                        "metrics": {
+                            "total_return": "float",
+                            "volatility": "float",
+                            "max_drawdown": "float",
+                        },
+                        "details": "dict",
+                    },
+                    "constraints": {"timeout_seconds": 5},
+                },
+            )
+
+        if context.get("latest_database_evidence") is None:
+            return _turn(
+                "I need rows before computing financial metrics.",
+                "sql_query",
+                {
+                    "message": context["message"],
+                    "database_context": context["database_context"],
+                    "time_range": context.get("time_range"),
+                    "constraints": context.get("constraints", {}),
+                },
+            )
+
+        return _turn(
+            "I will first ask for the requested metrics through the analysis request.",
+            "code_interpreter",
+            {
+                "database_evidence": "latest",
+                "analysis_goal": "compute total return volatility and max drawdown",
+                "analysis_request": {"required_outputs": ["returns_volatility_max_drawdown"]},
+                "required_outputs": ["returns_volatility_max_drawdown"],
             },
         )
 
@@ -800,12 +884,6 @@ def _todo_list_from_progress(progress) -> list[dict]:
 
 def _observation_summaries(context: dict) -> list[dict]:
     observations = []
-    latest = context.get("last_observation")
-    if isinstance(latest, dict):
-        normalized = dict(latest)
-        if "tool_name" not in normalized and normalized.get("tool"):
-            normalized["tool_name"] = normalized.get("tool")
-        observations.append(normalized)
     for item in context.get("recent_trajectory") or []:
         if not isinstance(item, dict):
             continue
@@ -817,7 +895,40 @@ def _observation_summaries(context: dict) -> list[dict]:
                 normalized["tool_name"] = normalized.get("tool")
             normalized.setdefault("success", item.get("status") != "failed")
             observations.append(normalized)
+    latest = context.get("last_observation")
+    if isinstance(latest, dict):
+        normalized = dict(latest)
+        if "tool_name" not in normalized and normalized.get("tool"):
+            normalized["tool_name"] = normalized.get("tool")
+        observations.append(normalized)
     return observations
+
+
+def _latest_failed_observation(context: dict, tool_name: str) -> dict | None:
+    for observation in reversed(context.get("latest_observation_summaries") or []):
+        if not isinstance(observation, dict):
+            continue
+        if observation.get("success") is False and observation.get("tool_name") == tool_name:
+            return observation
+    return None
+
+
+def _requires_code_repair(context: dict) -> bool:
+    constraints = context.get("next_action_constraints")
+    if not isinstance(constraints, dict):
+        constraints = {}
+    for item in constraints.get("required_actions") or []:
+        if not isinstance(item, dict) or item.get("action") != "code_interpreter":
+            continue
+        guidance = item.get("input_guidance") if isinstance(item.get("input_guidance"), dict) else {}
+        repair_contract = guidance.get("repair_contract") if isinstance(guidance.get("repair_contract"), dict) else {}
+        if guidance.get("requires_code") is True or repair_contract.get("mode") in {
+            "generated_code_required",
+            "code_execution_repair",
+            "analysis_artifact_repair",
+        }:
+            return True
+    return False
 
 
 def _ref_payloads(refs: dict, prefix: str) -> list[dict]:
@@ -893,3 +1004,46 @@ def _analysis_action_input(evidence, goal: str) -> dict:
         ),
         "expected_result_schema": {"summary": "str", "metrics": "dict", "details": "dict"},
     }
+
+
+def _financial_metrics_code() -> str:
+    return (
+        "import statistics\n"
+        "values = []\n"
+        "value_columns = [column for column in columns if column != 'timestamp']\n"
+        "for row in rows:\n"
+        "    raw = None\n"
+        "    for key in ['value', '_value', 'price'] + value_columns:\n"
+        "        if row.get(key) is not None:\n"
+        "            raw = row.get(key)\n"
+        "            break\n"
+        "    try:\n"
+        "        values.append(float(raw))\n"
+        "    except (TypeError, ValueError):\n"
+        "        continue\n"
+        "returns = [(right / left) - 1 for left, right in zip(values, values[1:]) if left != 0]\n"
+        "total_return = (values[-1] / values[0] - 1) if len(values) >= 2 and values[0] != 0 else None\n"
+        "volatility = statistics.stdev(returns) if len(returns) > 1 else 0.0\n"
+        "peak = values[0] if values else 0.0\n"
+        "max_drawdown = 0.0\n"
+        "for value in values:\n"
+        "    peak = max(peak, value)\n"
+        "    if peak:\n"
+        "        max_drawdown = min(max_drawdown, value / peak - 1)\n"
+        "result = {\n"
+        "    'summary': 'Computed total return, volatility, and max drawdown.',\n"
+        "    'metrics': {\n"
+        "        'total_return': float(total_return) if total_return is not None else None,\n"
+        "        'volatility': float(volatility),\n"
+        "        'max_drawdown': float(max_drawdown),\n"
+        "    },\n"
+        "    'details': {\n"
+        "        'formula': {\n"
+        "            'period_return': 'price_t / price_t_minus_1 - 1',\n"
+        "            'volatility': 'sample standard deviation of period returns',\n"
+        "            'max_drawdown': 'min(price_t / running_peak - 1)',\n"
+        "        },\n"
+        "        'return_count': len(returns),\n"
+        "    },\n"
+        "}\n"
+    )

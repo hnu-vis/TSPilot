@@ -109,6 +109,105 @@ async def test_analysis_request_returns_only_requested_metrics():
 
 
 @pytest.mark.asyncio
+async def test_analysis_request_requires_code_for_uncovered_metrics():
+    evidence = _evidence()
+    request_state = RequestStateModel(
+        request_id="req_code_required_metrics",
+        message="计算收益率、波动率和最大回撤",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        await CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence="latest",
+                analysis_goal="计算收益率、波动率和最大回撤",
+                analysis_request={"required_outputs": ["returns_volatility_max_drawdown"]},
+            ),
+            request_state=request_state,
+        )
+
+    exc = exc_info.value
+    assert getattr(exc, "error_type", None) == "code_required_for_metrics"
+    payload = exc.to_observation_payload()
+    missing = payload["diagnostics"]["missing_metrics"]
+    assert missing == ["total_return", "volatility", "max_drawdown"]
+    assert payload["recommended_next_action"] == "code_interpreter"
+    assert payload["validation_failure"]["repair_contract"]["mode"] == "generated_code_required"
+
+
+@pytest.mark.asyncio
+async def test_generated_code_computes_uncovered_metrics():
+    evidence = _evidence()
+    request_state = RequestStateModel(
+        request_id="req_generated_code_metrics",
+        message="计算收益率、波动率和最大回撤",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+
+    result = await CodeInterpreterTool().execute(
+        CodeInterpreterInput(
+            database_evidence="latest",
+            analysis_goal="计算收益率、波动率和最大回撤",
+            required_outputs=["total_return", "volatility", "max_drawdown"],
+            code=(
+                "import statistics\n"
+                "values = [float(row.get('value')) for row in rows if row.get('value') is not None]\n"
+                "returns = [(right / left) - 1 for left, right in zip(values, values[1:]) if left != 0]\n"
+                "peak = values[0]\n"
+                "max_drawdown = 0.0\n"
+                "for value in values:\n"
+                "    peak = max(peak, value)\n"
+                "    if peak:\n"
+                "        max_drawdown = min(max_drawdown, value / peak - 1)\n"
+                "result = {\n"
+                "    'summary': 'computed financial metrics',\n"
+                "    'metrics': {\n"
+                "        'total_return': values[-1] / values[0] - 1,\n"
+                "        'volatility': statistics.stdev(returns) if len(returns) > 1 else 0.0,\n"
+                "        'max_drawdown': max_drawdown,\n"
+                "    },\n"
+                "    'details': {'return_count': len(returns)},\n"
+                "}\n"
+            ),
+        ),
+        request_state=request_state,
+    )
+
+    assert result["code_type"] == "code_interpreter_v1"
+    assert set(result["result"]["metrics"]) == {"total_return", "volatility", "max_drawdown"}
+    assert result["result"]["details"]["return_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_generated_code_execution_error_has_repair_contract():
+    evidence = _evidence()
+    with pytest.raises(Exception) as exc_info:
+        await CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence=evidence,
+                analysis_goal="计算收益率、波动率和最大回撤",
+                required_outputs=["total_return", "volatility", "max_drawdown"],
+                code="df['returns'] = df['price'].pct_change()\nresult = {}",
+            )
+        )
+
+    exc = exc_info.value
+    assert getattr(exc, "error_type", None) == "analysis_code_execution_failed"
+    validation_failure = getattr(exc, "validation_failure", {})
+    repair_contract = validation_failure["repair_contract"]
+    assert repair_contract["mode"] == "code_execution_repair"
+    assert repair_contract["available_inputs"]["rows"] == "list[dict]"
+    assert repair_contract["available_inputs"]["points"] == "list[dict]"
+    assert "columns" in repair_contract["available_inputs"]
+    assert "df, data" in repair_contract["instruction"]
+
+
+@pytest.mark.asyncio
 async def test_forecast_and_anomaly_tools_use_registered_models_from_input():
     evidence = _evidence()
     request_state = RequestStateModel(

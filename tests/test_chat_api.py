@@ -14,6 +14,7 @@ from schemas.api import ChatRequest
 from tests.fakes import ( 
     BitcoinMultiQueryLLM,
     CasualLLM,
+    CodeRequiredRepairLLM,
     ComplexReActLLM,
     FakeLLM,
     RepeatingTodoLLM,
@@ -123,6 +124,50 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
     finally:
         settings.conversation_log_dir = old_log_dir
         settings.conversation_log_enabled = old_enabled
+
+
+def test_code_required_metrics_repair_generates_code():
+    client = _build_client(CodeRequiredRepairLLM(), max_iterations=6)
+    response = client.post(
+        "/api/v1/chat",
+        json={
+            "message": "计算收益率、波动率和最大回撤。",
+            "database_context": {
+                "database_id": "influxdb2-energydata",
+                "database_type": "influxdb",
+            },
+            "time_range": {
+                "start": "2016-01-11T17:00:00",
+                "end": "2016-01-12T23:00:00",
+            },
+            "constraints": {"max_points": 24},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["used_tools"].count("code_interpreter") == 2
+    failures = [
+        event
+        for event in payload["trace"]
+        if event["event_type"] == "tool_result"
+        and event["payload"].get("tool") == "code_interpreter"
+        and event["payload"].get("success") is False
+    ]
+    assert failures
+    assert failures[-1]["payload"]["payload_preview"]["error_type"] == "code_required_for_metrics"
+    successful_code = [
+        event["payload"]["payload_preview"]
+        for event in payload["trace"]
+        if event["event_type"] == "tool_result"
+        and event["payload"].get("tool") == "code_interpreter"
+        and event["payload"].get("success") is True
+    ][-1]
+    assert successful_code["code_type"] == "code_interpreter_v1"
+    assert successful_code["code_preview"]
+    metrics = successful_code["metrics_preview"]
+    assert set(metrics) == {"total_return", "volatility", "max_drawdown"}
 
 
 def test_first_visible_action_does_not_wait_for_separate_intent_llm_call():
