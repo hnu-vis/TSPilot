@@ -740,6 +740,19 @@ def _compat_context(context: dict) -> dict:
     if not analyses:
         analyses = _analysis_refs(refs)
     analysis_count = len(analyses) or int(inventory.get("analysis_count") or 0)
+    latest_anomaly = outputs.get("latest_anomaly") or _latest_ref_payload(refs, "anomaly")
+    if not latest_anomaly and latest_observation.get("tool_name") == "anomaly" and latest_observation.get("success") is not False:
+        latest_anomaly = latest_observation_payload
+    if not latest_anomaly and inventory.get("has_anomaly"):
+        latest_anomaly = {"anomaly_id": "latest"}
+    latest_forecast = outputs.get("latest_forecast") or _latest_ref_payload(refs, "forecast")
+    if not latest_forecast and latest_observation.get("tool_name") == "forecast" and latest_observation.get("success") is not False:
+        latest_forecast = latest_observation_payload
+    if not latest_forecast and inventory.get("has_forecast"):
+        latest_forecast = {"forecast_id": "latest"}
+    todo_list = state.get("todo_list")
+    if not todo_list:
+        todo_list = _todo_list_from_progress(state.get("todo_progress"))
     return {
         **context,
         "message": task.get("message"),
@@ -750,7 +763,7 @@ def _compat_context(context: dict) -> dict:
         "constraints": task.get("constraints") or {},
         "history": task.get("history") or [],
         "execution_state": execution,
-        "todo_list": state.get("todo_list"),
+        "todo_list": todo_list,
         "plan_current_step": state.get("plan_current_step"),
         "planning_complete": state.get("planning_complete"),
         "requested_capabilities": state.get("requested_capabilities"),
@@ -762,14 +775,27 @@ def _compat_context(context: dict) -> dict:
             "analysis_count": analysis_count,
             "analyses": analyses,
         },
-        "latest_forecast": outputs.get("latest_forecast"),
-        "latest_anomaly": outputs.get("latest_anomaly"),
+        "latest_forecast": latest_forecast,
+        "latest_anomaly": latest_anomaly,
         "latest_rag": outputs.get("latest_rag"),
         "latest_skill": outputs.get("latest_skill"),
         "visualizations": outputs.get("visualizations") or [],
         "latest_observation_summaries": observations,
         "available_actions": context.get("available_actions") or [],
     }
+
+
+def _todo_list_from_progress(progress) -> list[dict]:
+    if not isinstance(progress, dict) or int(progress.get("total") or 0) <= 0:
+        return []
+    result = []
+    current = progress.get("current")
+    if isinstance(current, dict):
+        result.append(dict(current))
+    pending = progress.get("pending_preview")
+    if isinstance(pending, list):
+        result.extend(dict(item) for item in pending if isinstance(item, dict))
+    return result or [{}]
 
 
 def _observation_summaries(context: dict) -> list[dict]:

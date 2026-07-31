@@ -195,7 +195,11 @@ function latestTodoList(steps: TraceStep[]): TodoItem[] {
   const hasTerminalError = steps.some((step) => step.status === 'error');
   for (let index = steps.length - 1; index >= 0; index -= 1) {
     const preview = asRecord(steps[index].toolResult?.payload_preview);
-    const todos = preview && Array.isArray(preview.todos) ? preview.todos : null;
+    const todos = preview && Array.isArray(preview.todos)
+      ? preview.todos
+      : preview && Array.isArray(preview.todos_preview)
+        ? preview.todos_preview
+        : null;
     if (!todos) continue;
     return todos
       .filter((todo): todo is Record<string, unknown> => Boolean(todo && typeof todo === 'object'))

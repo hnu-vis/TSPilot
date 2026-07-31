@@ -61,6 +61,10 @@ class TodoWriteInput(BaseModel):
                 "status": "pending",
                 "priority": index,
             }
+        if isinstance(todo, dict):
+            normalized = dict(todo)
+            normalized.setdefault("priority", index)
+            return normalized
         return todo
 
 
@@ -181,6 +185,7 @@ class TodoWriteTool(BaseTool):
             return None
         content = str(
             raw_todo.get("content")
+            or raw_todo.get("description")
             or raw_todo.get("task")
             or raw_todo.get("title")
             or raw_todo.get("id")

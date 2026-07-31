@@ -210,6 +210,15 @@ def _anomaly_payload_view(payload: dict) -> dict:
 
 def _todo_payload_view(payload: dict) -> dict:
     todos = payload.get("todos") if isinstance(payload.get("todos"), list) else []
+    public_todos = [
+        {
+            key: _strip_query_code(todo.get(key))
+            for key in ("content", "task_type", "status", "priority", "acceptance_criteria", "result_ref", "completion_reason")
+            if isinstance(todo, dict) and todo.get(key) not in (None, "", [], {})
+        }
+        for todo in todos[:8]
+        if isinstance(todo, dict)
+    ]
     return _drop_empty(
         {
             "current_step": payload.get("current_step"),
@@ -217,15 +226,8 @@ def _todo_payload_view(payload: dict) -> dict:
             "todo_total": len(todos),
             "completed_count": payload.get("completed_count"),
             "pending_count": payload.get("pending_count"),
-            "todos_preview": [
-                {
-                    key: _strip_query_code(todo.get(key))
-                    for key in ("content", "task_type", "status", "priority", "acceptance_criteria")
-                    if isinstance(todo, dict) and todo.get(key) not in (None, "", [], {})
-                }
-                for todo in todos[:8]
-                if isinstance(todo, dict)
-            ],
+            "todos": public_todos,
+            "todos_preview": public_todos,
         }
     )
 

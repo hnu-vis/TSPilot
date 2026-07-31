@@ -1360,6 +1360,32 @@ async def test_todowrite_accepts_string_todo_items():
 
 
 @pytest.mark.asyncio
+async def test_todowrite_accepts_description_todo_items():
+    result = await TodoWriteTool().execute(
+        TodoWriteInput(
+            message="请做完整分析。",
+            task_contract={
+                "required_outputs": [
+                    {"evidence_kind": "query"},
+                    {"evidence_kind": "analysis"},
+                    {"evidence_kind": "answer"},
+                ]
+            },
+            todos=[
+                {"id": "1", "description": "查询历史价格"},
+                {"id": "2", "description": "计算收益率和波动率"},
+                {"id": "3", "description": "给出综合结论"},
+            ],
+        )
+    )
+
+    todos = result["todos"]
+    assert [todo["content"] for todo in todos] == ["查询历史价格", "计算收益率和波动率", "给出综合结论"]
+    assert [todo["task_type"] for todo in todos] == ["query", "code_interpreter", "answer"]
+    assert [todo["status"] for todo in todos] == ["in_progress", "pending", "pending"]
+
+
+@pytest.mark.asyncio
 async def test_todowrite_infers_task_types_without_contract():
     result = await TodoWriteTool().execute(
         TodoWriteInput(

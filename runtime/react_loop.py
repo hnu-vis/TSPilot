@@ -436,6 +436,7 @@ class ReActLoop:
             )
             execution_result.observation = transition_result.observation
             self._attach_action_output_timing(execution_result.action_output, tool_timing)
+            self._attach_todo_snapshot(execution_result.action_output, request_state)
             self._store_action_output(request_state, execution_result.action_output)
             append_react_transcript_step(
                 request_state,
@@ -569,6 +570,49 @@ class ReActLoop:
             if value is not None:
                 meta[key] = value
         action_output.meta = meta
+
+    def _attach_todo_snapshot(self, action_output, request_state: RequestStateModel) -> None:
+        if not request_state.todo_list:
+            return
+        todos = [
+            {
+                key: todo.get(key)
+                for key in ("content", "task_type", "status", "priority", "acceptance_criteria", "result_ref", "completion_reason")
+                if isinstance(todo, dict) and todo.get(key) not in (None, "", [], {})
+            }
+            for todo in request_state.todo_list[:8]
+            if isinstance(todo, dict)
+        ]
+        completed = sum(1 for todo in request_state.todo_list if isinstance(todo, dict) and todo.get("status") == "completed")
+        in_progress = next(
+            (
+                str(todo.get("content") or "")
+                for todo in request_state.todo_list
+                if isinstance(todo, dict) and todo.get("status") == "in_progress"
+            ),
+            None,
+        )
+        snapshot = {
+            "current_step": request_state.plan_current_step,
+            "planning_complete": request_state.planning_complete,
+            "todo_total": len(request_state.todo_list),
+            "completed_count": completed,
+            "pending_count": len(request_state.todo_list) - completed,
+            "todos": todos,
+            "todo_progress": {
+                "total": len(request_state.todo_list),
+                "completed": completed,
+                "in_progress": in_progress,
+            },
+        }
+        view = dict(action_output.view or {})
+        payload = dict(view.get("payload") or view)
+        payload.update(snapshot)
+        if isinstance(action_output.view, dict) and "payload" in action_output.view:
+            view["payload"] = payload
+        else:
+            view = payload
+        action_output.view = view
 
     async def _heartbeat_until_done(
         self,

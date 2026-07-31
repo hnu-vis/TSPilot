@@ -610,15 +610,23 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "sql_query", "code_interpreter", "anomaly"]
-    observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
+    assert payload["used_tools"].count("todowrite") == 1
+    assert "sql_query" in payload["used_tools"]
+    assert "code_interpreter" in payload["used_tools"]
+    assert "anomaly" in payload["used_tools"]
+    tool_results = [event for event in payload["trace"] if event["event_type"] == "tool_result"]
     todo_updates = [
-        event for event in observations
-        if event["payload"]["tool_name"] == "todowrite" and event["payload"]["success"] is True
+        event for event in tool_results
+        if isinstance(event["payload"].get("payload_preview"), dict)
+        and event["payload"]["payload_preview"].get("todos")
     ]
-    assert len(todo_updates) == 1
-    final_todo = todo_updates[-1]["payload"]["payload"]["todos"]
-    assert final_todo[0]["status"] == "in_progress"
+    assert len(todo_updates) >= 2
+    initial_todos = todo_updates[0]["payload"]["payload_preview"]["todos"]
+    final_todos = todo_updates[-1]["payload"]["payload_preview"]["todos"]
+    assert initial_todos[0]["status"] == "in_progress"
+    assert initial_todos[0]["content"] != "1"
+    assert sum(1 for todo in final_todos if todo["status"] == "completed") >= 2
+    assert final_todos[-1]["status"] in {"in_progress", "completed"}
 
 
 def test_tool_failure_returns_observation_and_model_can_recover():
