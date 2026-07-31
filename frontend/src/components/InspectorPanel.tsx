@@ -421,14 +421,12 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
         )}
       </div>
 
-      {detail.code && (
-        <ToolCodeBlock
-          title="Python code"
-          language="python"
-          code={detail.code}
-          copyLabel="Copy code"
-        />
-      )}
+      <ToolCodeBlock
+        title="Python code"
+        language="python"
+        code={detail.code}
+        copyLabel="Copy code"
+      />
 
       <StructuredResult
         title="Result"

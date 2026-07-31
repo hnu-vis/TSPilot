@@ -36,6 +36,8 @@ export function FinalAnswer({
     && section.section_type !== 'summary'
     && section.section_type !== 'conclusion'
   ));
+  const referenceQueryItems = queryResultItemsFromReferences(answer.references);
+  const sectionHasQueryResults = sections.some((section) => section.section_type === 'query_results');
   const references = answer.references || [];
 
   return (
@@ -81,6 +83,16 @@ export function FinalAnswer({
               <StructuredSection section={section} />
             </section>
           ))}
+        </div>
+      )}
+
+      {!sectionHasQueryResults && referenceQueryItems.length > 0 && (
+        <div className="answer-sections">
+          <section className="answer-section">
+            <span className="answer-section-type">Database Evidence</span>
+            <h3>Query Results</h3>
+            <QueryResultsView items={referenceQueryItems} fallbackContent="" />
+          </section>
         </div>
       )}
     </div>
@@ -347,6 +359,42 @@ function queryResultItems(payload: Record<string, unknown> | null | undefined): 
       rows_preview: asRecordArray(record.rows_preview),
       sampled_for_prompt: typeof record.sampled_for_prompt === 'boolean' ? record.sampled_for_prompt : false,
       artifact_ref: asString(record.artifact_ref),
+    });
+  }
+  return normalized;
+}
+
+function queryResultItemsFromReferences(references: FinalAnswerType['references'] | undefined): QueryResultItem[] {
+  const normalized: QueryResultItem[] = [];
+  const seen = new Set<string>();
+  for (const reference of references || []) {
+    if (reference.source_type !== 'query') continue;
+    const evidence = asRecord(reference.evidence);
+    if (!evidence) continue;
+    const query = asString(evidence.query);
+    const rowsPreview = asRecordArray(evidence.rows_preview);
+    const hasVisibleEvidence = Boolean(
+      query
+      || rowsPreview.length > 0
+      || typeof evidence.row_count === 'number'
+      || asString(evidence.summary)
+      || asString(evidence.artifact_ref)
+    );
+    if (!hasVisibleEvidence) continue;
+    const key = asString(reference.source_id) || asString(evidence.evidence_id) || query || `${normalized.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      evidence_id: asString(reference.source_id) || asString(evidence.evidence_id),
+      purpose: asString(reference.label),
+      summary: asString(evidence.summary),
+      query_language: asString(evidence.query_language),
+      query,
+      row_count: typeof evidence.row_count === 'number' ? evidence.row_count : null,
+      columns: asStringArray(evidence.columns),
+      rows_preview: rowsPreview,
+      sampled_for_prompt: typeof evidence.sampled_for_prompt === 'boolean' ? evidence.sampled_for_prompt : false,
+      artifact_ref: asString(evidence.artifact_ref),
     });
   }
   return normalized;

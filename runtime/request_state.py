@@ -106,8 +106,6 @@ def build_request_state(request: ChatRequest, settings: Settings) -> RequestStat
         anomaly_artifacts={},
         latest_rag=None,
         latest_skill=None,
-        verified_facts=[],
-        rejected_facts=[],
         final_answer_draft=None,
         visualizations=[],
         tool_history=[],
@@ -455,7 +453,10 @@ def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
             section.model_copy(
                 update={
                     "content": _strip_public_query_text(section.content),
-                    "structured_payload": _sanitize_public_value(section.structured_payload),
+                    "structured_payload": _sanitize_public_value(
+                        section.structured_payload,
+                        allow_query_fields=section.section_type in {"query", "query_results"},
+                    ),
                 }
             )
             for section in answer.sections
@@ -464,7 +465,10 @@ def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
             reference.model_copy(
                 update={
                     "label": _strip_public_query_text(reference.label),
-                    "evidence": _sanitize_public_value(reference.evidence),
+                    "evidence": _sanitize_public_value(
+                        reference.evidence,
+                        allow_query_fields=reference.source_type == "query",
+                    ),
                 }
             )
             for reference in answer.references
@@ -545,10 +549,8 @@ def _sanitize_public_trace_payload(payload: dict) -> dict:
     return sanitized
 
 
-def _sanitize_public_value(value):
+def _sanitize_public_value(value, *, allow_query_fields: bool = False, key_name: str | None = None):
     internal_keys = {
-        "query",
-        "query_language",
         "query_trace",
         "schema_linking",
         "schema_linking_generation",
@@ -562,13 +564,17 @@ def _sanitize_public_value(value):
         "repair_contract",
         "raw_rule_diagnostics",
     }
+    if not allow_query_fields:
+        internal_keys.update({"query", "query_language"})
     if isinstance(value, str):
+        if allow_query_fields and key_name == "query":
+            return value
         return _strip_public_query_text(value)
     if isinstance(value, list):
-        return [_sanitize_public_value(item) for item in value]
+        return [_sanitize_public_value(item, allow_query_fields=allow_query_fields) for item in value]
     if isinstance(value, dict):
         return {
-            key: _sanitize_public_value(item)
+            key: _sanitize_public_value(item, allow_query_fields=allow_query_fields, key_name=str(key))
             for key, item in value.items()
             if str(key) not in internal_keys
         }

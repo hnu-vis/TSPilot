@@ -127,6 +127,9 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
         "data_preview": {},
         "diagnostics": _diagnostics_view(diagnostics),
     }
+    if consumer == "public":
+        view["query_language"] = payload.get("query_language")
+        view["query"] = _truncate_text(str(payload.get("query") or ""), 5000) if payload.get("query") else None
     preview = view["data_preview"]
     if rows:
         preview["rows"] = [_public_row(row) for row in rows[:5]]
@@ -233,7 +236,6 @@ def _terminate_payload_view(payload: dict) -> dict:
         {
             "title": answer.get("title") if answer else payload.get("title"),
             "summary": _strip_query_code(answer.get("summary") if answer else payload.get("summary")),
-            "verified_fact_count": len(payload.get("verified_facts", [])) if isinstance(payload.get("verified_facts"), list) else None,
             "section_count": len(answer.get("sections", [])) if isinstance(answer.get("sections"), list) else None,
         }
     )

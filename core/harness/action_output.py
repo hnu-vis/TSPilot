@@ -40,7 +40,7 @@ class ActionOutputBuilder:
         public_view = public_observation_view(raw_observation) or model_view
         resource_ref = self._resource_ref(model_view, public_view, item)
         observations = self._observation_payload(model_view, resource_ref)
-        view = self._public_payload(public_view, resource_ref)
+        view = self._public_payload(public_view, resource_ref, item)
         memory_fragment = self._memory_fragment(item, observations, resource_ref)
         return ActionOutput(
             tool_name=item.tool_name,
@@ -113,12 +113,29 @@ class ActionOutputBuilder:
             result["error"] = model_view.get("error")
         return _drop_empty(result)
 
-    def _public_payload(self, public_view: dict, resource_ref: str | None) -> dict:
+    def _public_payload(self, public_view: dict, resource_ref: str | None, item: ActionOutputBuildInput) -> dict:
         result = dict(public_view)
+        if item.tool_name == "code_interpreter":
+            code_preview = self._code_input_preview(item.action_input)
+            if code_preview:
+                payload = dict(result.get("payload") or {})
+                payload.update(code_preview)
+                result["payload"] = payload
         if resource_ref:
             result["resource_ref"] = resource_ref
         result.pop("payload_ref", None)
         return _drop_empty(result)
+
+    def _code_input_preview(self, action_input: dict) -> dict:
+        if not isinstance(action_input, dict):
+            return {}
+        code = str(action_input.get("analysis_code") or action_input.get("code") or "")
+        if not code:
+            return {}
+        return {
+            "code_preview": _truncate_text(code, 8000),
+            "analysis_code_chars": len(code),
+        }
 
     def _memory_fragment(self, item: ActionOutputBuildInput, observations: dict, resource_ref: str | None) -> dict:
         action_input = self._action_input_memory(item.tool_name, item.action_input)
@@ -232,6 +249,12 @@ def _bounded_value(
             )
         return _drop_empty(result)
     return value
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
 
 
 def _drop_empty(payload: dict) -> dict:

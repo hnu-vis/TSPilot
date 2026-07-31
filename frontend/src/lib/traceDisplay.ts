@@ -73,7 +73,7 @@ export type PlanDetail = {
 
 export type CodeInterpreterDetail = {
   analysisGoal: string | null;
-  code: string | null;
+  code: string;
   codeHash: string | null;
   codeType: string | null;
   inputEvidenceId: string | null;
@@ -453,11 +453,25 @@ function artifactRefsFor(preview: Record<string, unknown> | null, result: Record
 function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): SqlDetail | null {
   if (tool !== 'sql_query' && tool !== 'query_database') return null;
   if (!preview) return null;
-  const sampleRows = recordsFrom(preview.sample_rows);
-  const samplePoints = recordsFrom(preview.sample_points);
+  const dataPreview = asRecord(preview.data_preview);
+  const sampleRows = recordsFrom(preview.sample_rows).length > 0
+    ? recordsFrom(preview.sample_rows)
+    : recordsFrom(dataPreview?.rows);
+  const samplePoints = recordsFrom(preview.sample_points).length > 0
+    ? recordsFrom(preview.sample_points)
+    : recordsFrom(dataPreview?.points);
   const columns = stringsFrom(preview.columns);
   const query = stringFrom(preview.query);
-  if (!query && columns.length === 0 && sampleRows.length === 0 && samplePoints.length === 0) return null;
+  if (
+    !query
+    && columns.length === 0
+    && sampleRows.length === 0
+    && samplePoints.length === 0
+    && numberFrom(preview.row_count) === null
+    && numberFrom(preview.point_count) === null
+  ) {
+    return null;
+  }
   return {
     queryLanguage: stringFrom(preview.query_language),
     query,
@@ -479,10 +493,20 @@ function codeInterpreterDetailFor(
   if (tool !== 'code_interpreter') return null;
   const inputPreview = asRecord(call?.input_preview);
   const actionInput = asRecord(step.actionInput) || asRecord(call?.action_input);
-  const code = stringFrom(inputPreview?.code_preview) || stringFrom(actionInput?.code);
+  const code = stringFrom(inputPreview?.code_preview)
+    || stringFrom(preview?.code_preview)
+    || stringFrom(actionInput?.code)
+    || stringFrom(actionInput?.analysis_code)
+    || '';
   const result = asRecord(preview?.analysis_result) || asRecord(preview?.result_preview);
-  const metrics = asRecord(preview?.analysis_metrics) || asRecord(result?.metrics) || {};
-  const details = asRecord(preview?.analysis_details) || asRecord(result?.details) || {};
+  const metrics = asRecord(preview?.analysis_metrics)
+    || asRecord(preview?.metrics_preview)
+    || asRecord(result?.metrics)
+    || {};
+  const details = asRecord(preview?.analysis_details)
+    || asRecord(preview?.details_preview)
+    || asRecord(result?.details)
+    || {};
   if (!code && !result && !preview) return null;
   return {
     analysisGoal: stringFrom(preview?.analysis_goal) || stringFrom(inputPreview?.analysis_goal) || stringFrom(actionInput?.analysis_goal),
