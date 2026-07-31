@@ -250,7 +250,7 @@ def _execute_analysis_request(
     last = sorted_points[-1]
     max_point = max(sorted_points, key=lambda item: float(item["value"]))
     min_point = min(sorted_points, key=lambda item: float(item["value"]))
-    metrics = {
+    all_metrics = {
         "record_count": len(sorted_points),
         "start_value": first["value"],
         "end_value": last["value"],
@@ -263,18 +263,25 @@ def _execute_analysis_request(
         "start_end_change": float(last["value"]) - float(first["value"]),
         "change": float(last["value"]) - float(first["value"]),
     }
-    details = {
-        "start_time": first.get("timestamp"),
-        "end_time": last.get("timestamp"),
-        "max_time": max_point.get("timestamp"),
-        "min_time": min_point.get("timestamp"),
-        "first_point": first,
-        "last_point": last,
-        "max_point": max_point,
-        "min_point": min_point,
-        "columns": columns,
-        "requested_outputs": _string_list(required_outputs or (analysis_request or {}).get("required_outputs")),
-    }
+    requested_outputs = _string_list(required_outputs or (analysis_request or {}).get("required_outputs"))
+    selected_metric_keys = _requested_metric_keys(requested_outputs, all_metrics)
+    goal_metric_keys = _metric_keys_implied_by_text(goal, all_metrics)
+    if goal_metric_keys:
+        selected_metric_keys = [
+            key for key in selected_metric_keys if key in goal_metric_keys
+        ] or goal_metric_keys
+    metrics = {key: all_metrics[key] for key in selected_metric_keys}
+    if not metrics and not requested_outputs:
+        metrics = dict(all_metrics)
+    details = _selected_analysis_details(
+        selected_metric_keys=list(metrics),
+        requested_outputs=requested_outputs,
+        first=first,
+        last=last,
+        max_point=max_point,
+        min_point=min_point,
+        columns=columns,
+    )
     if _analysis_context_indicates_outlier_treatment(goal, analysis_request, constraints):
         details.update(
             {
@@ -285,7 +292,7 @@ def _execute_analysis_request(
                     "This template reports transparent raw and adjusted metrics; no rows are excluded unless a detector explicitly supplies excluded_rows."
                 ),
                 "excluded_rows": [],
-                "raw_metrics": dict(metrics),
+                "raw_metrics": {key: all_metrics[key] for key in metrics},
                 "adjusted_metrics": dict(metrics),
             }
         )
@@ -463,14 +470,135 @@ def _number(value) -> float | None:
 
 
 def _analysis_request_summary(goal: str, metrics: dict, details: dict) -> str:
-    return (
-        f"{goal}: record_count={metrics['record_count']}, "
-        f"start_value={metrics['start_value']} at {details.get('start_time')}, "
-        f"end_value={metrics['end_value']} at {details.get('end_time')}, "
-        f"max_value={metrics['max_value']} at {details.get('max_time')}, "
-        f"min_value={metrics['min_value']} at {details.get('min_time')}, "
-        f"difference={metrics['difference']}."
-    )
+    if not metrics:
+        return goal
+    parts = []
+    for key, value in metrics.items():
+        if key in {"max_value", "highest_value"}:
+            parts.append(f"{key}={value} at {details.get('max_time')}")
+        elif key in {"min_value", "lowest_value"}:
+            parts.append(f"{key}={value} at {details.get('min_time')}")
+        elif key == "start_value":
+            parts.append(f"{key}={value} at {details.get('start_time')}")
+        elif key == "end_value":
+            parts.append(f"{key}={value} at {details.get('end_time')}")
+        else:
+            parts.append(f"{key}={value}")
+    return f"{goal}: " + ", ".join(parts) + "."
+
+
+def _requested_metric_keys(requested_outputs: list[str], available_metrics: dict) -> list[str]:
+    if not requested_outputs:
+        return []
+    selected: list[str] = []
+    for output in requested_outputs:
+        text = str(output or "").strip().lower()
+        compact = text.replace("_", "").replace("-", "").replace(" ", "")
+        candidates: list[str] = []
+        if output in available_metrics:
+            candidates.append(output)
+        if "difference" in text or "差" in text or "差异" in text:
+            candidates.extend(["max_min_difference", "difference"])
+        if "highest" in text or "maximum" in text or "max" in text or "最大" in text or "最高" in text:
+            if "time" in text or "时间" in text:
+                continue
+            candidates.extend(["max_value", "highest_value"])
+        if "lowest" in text or "minimum" in text or "min" in text or "最小" in text or "最低" in text:
+            if "time" in text or "时间" in text:
+                continue
+            candidates.extend(["min_value", "lowest_value"])
+        if "start" in text or "first" in text or "起始" in text or "开始" in text:
+            candidates.append("start_value")
+        if "end" in text or "last" in text or "结束" in text or "最终" in text or "最后" in text:
+            candidates.append("end_value")
+        if "count" in text or "record" in text or "数量" in text or "条数" in text:
+            candidates.append("record_count")
+        for key in available_metrics:
+            key_compact = key.replace("_", "")
+            if compact and (compact == key_compact or compact in key_compact or key_compact in compact):
+                candidates.append(key)
+        for key in candidates:
+            if key in available_metrics and key not in selected:
+                selected.append(key)
+                break
+    return selected
+
+
+def _metric_keys_implied_by_text(text: str, available_metrics: dict) -> list[str]:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return []
+    result: list[str] = []
+    asks_difference = any(marker in lowered for marker in ("difference", "差异", "差值", "相差", "之差"))
+    asks_change = any(marker in lowered for marker in ("change", "变化", "涨跌", "增减", "percentage", "百分比"))
+    if asks_difference:
+        for candidates in (("max_value", "highest_value"), ("min_value", "lowest_value"), ("max_min_difference", "difference")):
+            for key in candidates:
+                if key in available_metrics and key not in result:
+                    result.append(key)
+                    break
+        return result
+    for markers, candidates in (
+        (("highest", "maximum", "max", "最大", "最高"), ("max_value", "highest_value")),
+        (("lowest", "minimum", "min", "最小", "最低"), ("min_value", "lowest_value")),
+        (("start", "first", "起始", "开始", "首个"), ("start_value",)),
+        (("end", "last", "结束", "最终", "最后", "最晚"), ("end_value",)),
+        (("count", "record", "数量", "条数", "多少条"), ("record_count",)),
+    ):
+        if any(marker in lowered for marker in markers):
+            for key in candidates:
+                if key in available_metrics and key not in result:
+                    result.append(key)
+                    break
+    if asks_change:
+        for key in ("percentage_change", "start_end_change", "change"):
+            if key in available_metrics and key not in result:
+                result.append(key)
+                break
+    return result
+
+
+def _selected_analysis_details(
+    *,
+    selected_metric_keys: list[str],
+    requested_outputs: list[str],
+    first: dict,
+    last: dict,
+    max_point: dict,
+    min_point: dict,
+    columns: list[str],
+) -> dict:
+    if not selected_metric_keys and not requested_outputs:
+        return {
+            "start_time": first.get("timestamp"),
+            "end_time": last.get("timestamp"),
+            "max_time": max_point.get("timestamp"),
+            "min_time": min_point.get("timestamp"),
+            "first_point": first,
+            "last_point": last,
+            "max_point": max_point,
+            "min_point": min_point,
+            "columns": columns,
+            "requested_outputs": requested_outputs,
+        }
+    details: dict = {
+        "columns": columns,
+        "requested_outputs": requested_outputs,
+    }
+    selected = set(selected_metric_keys)
+    if selected & {"max_value", "highest_value", "max_min_difference", "difference"}:
+        details["max_time"] = max_point.get("timestamp")
+        details["max_point"] = max_point
+    if selected & {"min_value", "lowest_value", "max_min_difference", "difference"}:
+        details["min_time"] = min_point.get("timestamp")
+        details["min_point"] = min_point
+    if selected & {"start_value", "start_end_change", "change"}:
+        details["start_time"] = first.get("timestamp")
+        details["first_point"] = first
+    if selected & {"end_value", "start_end_change", "change"}:
+        details["end_time"] = last.get("timestamp")
+        details["last_point"] = last
+    return details
 
 
 def _string_list(value) -> list[str]:

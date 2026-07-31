@@ -436,10 +436,13 @@ def _latest_query_requests_downstream_analysis(request_state: RequestStateModel)
     if str(contract.get("downstream_action") or "").strip().lower() != "code_interpreter":
         return None
     missing = task_coverage.get("missing") if isinstance(task_coverage.get("missing"), list) else []
+    required_outputs = missing
+    if not required_outputs:
+        required_outputs = task_coverage.get("missing_or_uncertain") if isinstance(task_coverage.get("missing_or_uncertain"), list) else []
     return {
         "goal": request_state.message,
         "query_task_contract": contract,
-        "required_outputs": contract.get("required_outputs") or missing,
+        "required_outputs": required_outputs,
         "missing": missing,
     }
 

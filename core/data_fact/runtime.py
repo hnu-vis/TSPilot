@@ -22,7 +22,7 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
     """
 
     action_input = _latest_action_input(request_state, tool_name)
-    requests = _fact_requests(action_input)
+    requests = _request_relevant_fact_requests(getattr(request_state, "message", ""), _fact_requests(action_input))
     produced: list[DataFact] = []
     rejected: list[DataFact] = []
 
@@ -112,6 +112,54 @@ def _fact_requests(action_input: dict) -> list[DataFactRequest]:
     return requests
 
 
+def _request_relevant_fact_requests(message: str, requests: list[DataFactRequest]) -> list[DataFactRequest]:
+    relevant_names = _fact_names_implied_by_text(message)
+    if not relevant_names:
+        return requests
+    return [
+        request
+        for request in requests
+        if _canonical_fact_name(request.name, request.fact_type) in relevant_names
+    ]
+
+
+def _fact_names_implied_by_text(text: str) -> set[str]:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return set()
+    result: set[str] = set()
+    asks_difference = any(marker in lowered for marker in ("difference", "差异", "差值", "相差", "之差"))
+    asks_change = any(marker in lowered for marker in ("change", "变化", "涨跌", "增减", "percentage", "百分比"))
+    if asks_difference:
+        result.update({"max_min_difference", "difference", "max_value", "highest_value", "min_value", "lowest_value"})
+        return result
+    if any(marker in lowered for marker in ("highest", "maximum", "max", "最大", "最高")):
+        result.update({"max_value", "highest_value"})
+    if any(marker in lowered for marker in ("lowest", "minimum", "min", "最小", "最低")):
+        result.update({"min_value", "lowest_value"})
+    if any(marker in lowered for marker in ("start", "first", "起始", "开始", "首个")):
+        result.update({"start_value", "start_time"})
+    if any(marker in lowered for marker in ("end", "last", "结束", "最终", "最后", "最晚")):
+        result.update({"end_value", "end_time"})
+    if asks_change:
+        result.update({"change", "start_end_change", "percentage_change"})
+    if any(marker in lowered for marker in ("count", "record", "数量", "条数", "多少条")):
+        result.update({"record_count", "row_count", "count"})
+    return result
+
+
+def _canonical_fact_name(name: str, fact_type: str | None = None) -> str:
+    normalized = str(name or "").strip().lower()
+    type_text = str(fact_type or "").strip().lower()
+    if normalized in {"highest_value", "max_value"} or (type_text == "extreme" and "min" not in normalized and "low" not in normalized):
+        return "max_value" if normalized == "max_value" else "highest_value"
+    if normalized in {"lowest_value", "min_value"}:
+        return "min_value" if normalized == "min_value" else "lowest_value"
+    if normalized in {"max_min_difference", "difference"}:
+        return "max_min_difference" if normalized == "max_min_difference" else "difference"
+    return normalized
+
+
 def _validate_fact(raw_fact: Any, *, default_method: str, default_status: str = "verified") -> DataFact | None:
     if not isinstance(raw_fact, dict):
         return None
@@ -134,19 +182,9 @@ def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]
         return []
     rows = _rows_from_evidence(payload)
     evidence_ref = FactEvidenceRef(source_type="query", source_id=evidence_id, label=payload.get("summary"))
-    facts: list[DataFact] = [
-        DataFact(
-            fact_id=_fact_id(evidence_id, "data_coverage", len(rows)),
-            name="data_coverage",
-            fact_type="data_coverage",
-            statement=f"Query returned {len(rows)} row-like records.",
-            value={"row_count": len(rows)},
-            method="sql_query",
-            evidence_refs=[evidence_ref],
-            calculation_trace={"source": "normalized_database_evidence"},
-            status="verified",
-        )
-    ]
+    facts: list[DataFact] = []
+    if not requests:
+        return facts
     if not rows:
         facts.extend(
             _unavailable_fact(request, evidence_ref, "Query returned no row-like records.")
@@ -159,21 +197,7 @@ def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]
     if not value_key:
         return facts
     sorted_rows = sorted(rows, key=lambda row: str(row.get(time_key) or "")) if time_key else rows
-    request_names = {request.name: request for request in requests}
-    default_requests = [
-        DataFactRequest(name="record_count", fact_type="count", requirements={"count_target": "rows"}),
-        DataFactRequest(name="start_time", fact_type="time_boundary", requirements={"time_position": "start"}),
-        DataFactRequest(name="end_time", fact_type="time_boundary", requirements={"time_position": "end"}),
-        DataFactRequest(name="start_value", fact_type="point_value", requirements={"time_position": "start"}),
-        DataFactRequest(name="end_value", fact_type="point_value", requirements={"time_position": "end"}),
-        DataFactRequest(name="highest_value", fact_type="extreme", requirements={"operator": "max"}),
-        DataFactRequest(name="lowest_value", fact_type="extreme", requirements={"operator": "min"}),
-        DataFactRequest(name="max_value", fact_type="extreme", requirements={"operator": "max"}),
-        DataFactRequest(name="min_value", fact_type="extreme", requirements={"operator": "min"}),
-        DataFactRequest(name="max_time", fact_type="extreme_time", requirements={"operator": "max"}),
-        DataFactRequest(name="min_time", fact_type="extreme_time", requirements={"operator": "min"}),
-    ]
-    for request in [*requests, *[item for item in default_requests if item.name not in request_names]]:
+    for request in requests:
         fact = _database_fact_for_request(request, sorted_rows, value_key, time_key, evidence_ref)
         if fact is not None:
             facts.append(fact)
@@ -278,8 +302,11 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
     if input_evidence_id:
         evidence_refs.append(FactEvidenceRef(source_type="query", source_id=str(input_evidence_id)))
     facts: list[DataFact] = []
+    requested_names = {request.name for request in requests}
     for raw in result.get("facts") or []:
         if not isinstance(raw, dict):
+            continue
+        if requested_names and raw.get("name") not in requested_names:
             continue
         fact = _validate_fact(
             {
@@ -292,7 +319,6 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
         if fact is not None:
             facts.append(fact)
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
-    requested_names = {request.name for request in requests}
     for request in requests:
         if request.name in metrics:
             value = metrics[request.name]
@@ -310,21 +336,6 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
                     calculation_trace={"metric_key": request.name, "code_hash": payload.get("code_hash")},
                 )
             )
-    for name, value in metrics.items():
-        if name in requested_names or not isinstance(value, (int, float, str, bool)) or isinstance(value, bool):
-            continue
-        facts.append(
-            DataFact(
-                fact_id=_fact_id(analysis_id, name, value),
-                name=str(name),
-                fact_type="analysis_metric",
-                statement=f"{name} is {value}.",
-                value=value,
-                method="code_interpreter",
-                evidence_refs=evidence_refs,
-                calculation_trace={"metric_key": name, "code_hash": payload.get("code_hash")},
-            )
-        )
     return facts
 
 
@@ -399,8 +410,6 @@ def _merge_fact_state(request_state, tool_name: str, produced: list[DataFact], r
     fact_set.facts = list(existing.values())
     fact_set.coverage = coverage
     request_state.fact_coverage = coverage
-    if hasattr(request_state, "verified_facts"):
-        request_state.verified_facts = [fact for fact in fact_set.facts if fact.status == "verified"]
     request_state.fact_events.append(
         FactEvent(
             iteration=request_state.iteration,

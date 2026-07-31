@@ -42,7 +42,7 @@ class FormatAnswerTool(BaseTool):
     _LABELS = {
         "zh": {
             "summary": "摘要",
-            "verified_facts": "已验证事实",
+            "facts": "计算依据",
             "analysis": "分析",
             "plan": "计划",
             "knowledge_context": "知识上下文",
@@ -60,7 +60,7 @@ class FormatAnswerTool(BaseTool):
         },
         "en": {
             "summary": "Summary",
-            "verified_facts": "Verified Facts",
+            "facts": "Evidence",
             "analysis": "Analysis",
             "plan": "Plan",
             "knowledge_context": "Knowledge Context",
@@ -85,12 +85,13 @@ class FormatAnswerTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
+        selected_fact_ids = set(validated_input.include_fact_ids)
         data_facts = [
             fact
             for fact in request_state.fact_set.facts
             if (
                 fact.status == "verified"
-                and (not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids)
+                and fact.fact_id in selected_fact_ids
             )
         ]
         unavailable_facts = [
@@ -98,14 +99,8 @@ class FormatAnswerTool(BaseTool):
             for fact in request_state.fact_set.facts
             if (
                 fact.status == "unavailable"
-                and (not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids)
+                and fact.fact_id in selected_fact_ids
             )
-        ]
-        legacy_facts = [
-            fact
-            for fact in request_state.verified_facts
-            if hasattr(fact, "evidence")
-            if not validated_input.include_fact_ids or fact.fact_id in validated_input.include_fact_ids
         ]
         analyses = self._selected_analyses(request_state, validated_input.include_analysis_ids)
         fallback_summary = self._fallback_summary(
@@ -120,7 +115,7 @@ class FormatAnswerTool(BaseTool):
             analysis_summary = " ".join(analysis.summary.strip() for analysis in analyses if analysis.summary.strip())
             summary = build_summary(
                 request_state,
-                legacy_facts,
+                [],
                 analysis_summary or fallback_summary,
                 prefer_fallback=bool(analysis_summary),
             )
@@ -129,7 +124,7 @@ class FormatAnswerTool(BaseTool):
         else:
             summary = build_summary(
                 request_state,
-                legacy_facts,
+                [],
                 fallback_summary,
             )
         if request_state.database_context is None and direct_answer:
@@ -152,19 +147,12 @@ class FormatAnswerTool(BaseTool):
         if data_facts or unavailable_facts:
             sections_by_type["facts"] = AnswerSection(
                 section_type="facts",
-                heading=self._label(request_state, "verified_facts"),
+                heading=self._label(request_state, "facts"),
                 content=self._render_data_fact_section(data_facts, unavailable_facts),
                 structured_payload={
                     "fact_ids": [fact.fact_id for fact in data_facts],
                     "unavailable_fact_ids": [fact.fact_id for fact in unavailable_facts],
                 },
-            )
-        elif legacy_facts:
-            sections_by_type["facts"] = AnswerSection(
-                section_type="facts",
-                heading=self._label(request_state, "verified_facts"),
-                content="\n".join(f"- {fact.statement}" for fact in legacy_facts),
-                structured_payload={"fact_ids": [fact.fact_id for fact in legacy_facts]},
             )
         if analyses:
             sections_by_type["analysis"] = AnswerSection(
@@ -184,7 +172,6 @@ class FormatAnswerTool(BaseTool):
             len(database_evidence) <= 1
             and request_state.latest_database_evidence is not None
             and not data_facts
-            and not legacy_facts
         ):
             evidence = request_state.latest_database_evidence
             for section in self._evidence_sections(evidence, request_state):
@@ -222,7 +209,7 @@ class FormatAnswerTool(BaseTool):
             heading=self._label(request_state, "conclusion"),
             content=summary,
             structured_payload={
-                "has_facts": bool(data_facts or legacy_facts),
+                "has_facts": bool(data_facts),
                 "has_analysis": bool(analyses),
                 "has_anomaly": request_state.latest_anomaly is not None,
                 "has_forecast": request_state.latest_forecast is not None,
@@ -239,7 +226,7 @@ class FormatAnswerTool(BaseTool):
                     evidence=self._database_reference_payload(evidence),
                 )
             )
-        if validated_input.include_fact_ids:
+        if selected_fact_ids:
             references.extend(
                 AnswerReference(
                     source_type="fact",
@@ -248,15 +235,6 @@ class FormatAnswerTool(BaseTool):
                     evidence=self._data_fact_reference_payload(fact),
                 )
                 for fact in [*data_facts, *unavailable_facts]
-            )
-            references.extend(
-                AnswerReference(
-                    source_type="fact",
-                    source_id=fact.fact_id,
-                    label=fact.fact_type,
-                    evidence=fact.evidence,
-                )
-                for fact in legacy_facts
             )
         references.extend(
             AnswerReference(
@@ -466,8 +444,7 @@ class FormatAnswerTool(BaseTool):
     def _has_requested_facts(self, request_state: RequestStateModel, include_fact_ids: list[str]) -> bool:
         if not include_fact_ids:
             return False
-        available = {fact.fact_id for fact in request_state.verified_facts}
-        available.update(fact.fact_id for fact in request_state.fact_set.facts if fact.status == "verified")
+        available = {fact.fact_id for fact in request_state.fact_set.facts if fact.status == "verified"}
         return all(fact_id in available for fact_id in include_fact_ids)
 
     def _has_requested_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]) -> bool:
@@ -832,6 +809,8 @@ class FormatAnswerTool(BaseTool):
             "query_language": evidence.query_language,
             "query": evidence.query,
             "row_count": summary.get("row_count"),
+            "columns": summary.get("columns"),
+            "rows_preview": summary.get("rows_preview"),
             "sampled_for_prompt": summary.get("sampled_for_prompt"),
             "artifact_ref": summary.get("artifact_ref"),
         }

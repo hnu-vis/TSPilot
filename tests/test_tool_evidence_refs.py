@@ -75,6 +75,40 @@ async def test_analysis_tools_resolve_lightweight_evidence_refs_from_state():
 
 
 @pytest.mark.asyncio
+async def test_analysis_request_returns_only_requested_metrics():
+    evidence = _evidence()
+    request_state = RequestStateModel(
+        request_id="req_requested_metrics",
+        message="最大值和最小值的差异是多少？",
+        status="running",
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+
+    result = await CodeInterpreterTool().execute(
+        CodeInterpreterInput(
+            database_evidence="latest",
+            analysis_goal="最大值和最小值的差异是多少？",
+            analysis_request={
+                "required_outputs": ["最大值", "最小值", "最大值和最小值的差异"],
+            },
+        ),
+        request_state=request_state,
+    )
+
+    metrics = result["result"]["metrics"]
+    assert metrics == {
+        "max_value": 51.0,
+        "min_value": 1.0,
+        "max_min_difference": 50.0,
+    }
+    details = result["result"]["details"]
+    assert set(details) == {"columns", "requested_outputs", "max_time", "max_point", "min_time", "min_point"}
+    assert "record_count" not in result["summary"]
+    assert "start_end_change" not in metrics
+
+
+@pytest.mark.asyncio
 async def test_forecast_and_anomaly_tools_use_registered_models_from_input():
     evidence = _evidence()
     request_state = RequestStateModel(

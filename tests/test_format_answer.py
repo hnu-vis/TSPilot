@@ -7,7 +7,7 @@ from runtime.request_state import build_request_state
 from schemas.api import ChatRequest
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
-from schemas.insight import VerifiedFact
+from schemas.data_fact import DataFact, FactCoverage, FactEvent, FactEvidenceRef
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesPoint
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
@@ -17,15 +17,16 @@ def test_format_answer_allows_explicit_included_fact_without_unrelated_missing_r
         ChatRequest(message="请把价格分成高位、低位和中间区间"),
         get_settings(),
     )
-    fact = VerifiedFact(
+    fact = DataFact(
         fact_id="fact_bucket",
+        name="price_bucket",
         fact_type="categorization",
         statement="低位 <= 10，中间区间 10 到 20，高位 >= 20。",
-        confidence=0.9,
-        evidence={"low_max": 10, "high_min": 20},
-        verification_rule="deterministic_quartile_bucket_from_points",
+        value={"low_max": 10, "high_min": 20},
+        method="code_interpreter",
+        evidence_refs=[FactEvidenceRef(source_type="analysis", source_id="ana_bucket")],
     )
-    request_state.verified_facts = [fact]
+    request_state.fact_set.facts = [fact]
 
     result = asyncio.run(
         FormatAnswerTool().execute(
@@ -40,6 +41,49 @@ def test_format_answer_allows_explicit_included_fact_without_unrelated_missing_r
 
     assert result["summary"] == fact.statement
     assert result["sections"][0]["section_type"] == "facts"
+
+
+def test_format_answer_does_not_infer_fact_selection_from_process_events():
+    request_state = build_request_state(
+        ChatRequest(message="bitcoin usd的历史最大值和最小值的差异是多少？"),
+        get_settings(),
+    )
+    current_fact = DataFact(
+        fact_id="fact_difference",
+        name="max_min_difference",
+        fact_type="difference",
+        statement="max_min_difference is 50.0.",
+        value=50.0,
+        method="code_interpreter",
+        evidence_refs=[FactEvidenceRef(source_type="analysis", source_id="ana_current")],
+    )
+    stale_fact = DataFact(
+        fact_id="fact_record_count",
+        name="record_count",
+        fact_type="count",
+        statement="record_count is 2679.",
+        value=2679,
+        method="sql_query",
+        evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_old")],
+    )
+    request_state.fact_set.facts = [stale_fact, current_fact]
+    request_state.fact_events.append(
+        FactEvent(
+            iteration=2,
+            tool_name="code_interpreter",
+            produced_fact_ids=[current_fact.fact_id],
+            coverage=FactCoverage(requested=["max_min_difference"], verified=["max_min_difference"]),
+        )
+    )
+
+    result = asyncio.run(
+        FormatAnswerTool().execute(
+            FormatAnswerInput(summary_goal="回答差异", section_plan=["facts"]),
+            request_state=request_state,
+        )
+    )
+
+    assert "facts" not in [section["section_type"] for section in result["sections"]]
 
 
 def test_format_answer_allows_statistics_evidence_for_count_direct_answer():

@@ -62,12 +62,23 @@ class TerminateTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
+        include_fact_ids = validated_input.include_fact_ids or self._process_fact_ids(request_state)
         formatter_input = FormatAnswerInput(
             summary_goal=validated_input.summary_goal,
             direct_answer=validated_input.direct_answer,
             include_analysis_ids=validated_input.include_analysis_ids,
-            include_fact_ids=validated_input.include_fact_ids,
+            include_fact_ids=include_fact_ids,
             include_visualization_ids=validated_input.include_visualization_ids,
             section_plan=validated_input.section_plan,
         )
         return await self._formatter.execute(formatter_input, request_state=request_state, **kwargs)
+
+    def _process_fact_ids(self, request_state: RequestStateModel) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for event in request_state.fact_events:
+            for fact_id in [*event.produced_fact_ids, *event.unavailable_fact_ids]:
+                if fact_id not in seen:
+                    selected.append(fact_id)
+                    seen.add(fact_id)
+        return selected
