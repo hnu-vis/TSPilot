@@ -107,6 +107,8 @@ def execute_python_rows_v1(
 
     code, imported_names = _prepare_code(code)
     _validate_code(code)
+    safe_metadata = _safe_mapping(metadata)
+    safe_diagnostics = _safe_mapping(diagnostics)
     globals_dict = {
         "__builtins__": _SAFE_BUILTINS,
         "math": math,
@@ -125,11 +127,11 @@ def execute_python_rows_v1(
                 "series": [{"points": [dict(point) for point in points]}] if points else [],
             },
             "columns": list(columns),
-            "metadata": dict(metadata),
-            "diagnostics": dict(diagnostics),
+            "metadata": safe_metadata,
+            "diagnostics": safe_diagnostics,
         },
-        "metadata": dict(metadata),
-        "diagnostics": dict(diagnostics),
+        "metadata": safe_metadata,
+        "diagnostics": safe_diagnostics,
         "mean": statistics.mean,
         "median": statistics.median,
         "stdev": statistics.stdev,
@@ -150,6 +152,14 @@ def execute_python_rows_v1(
     runtime_ms = int((time.perf_counter() - started) * 1000)
     result = validate_analysis_result_payload(locals_dict.get("result"))
     return ExecutionOutput(result=result, runtime_ms=runtime_ms)
+
+
+def _safe_mapping(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if value in (None, "", [], ()):
+        return {}
+    return {"value": value}
 
 
 def validate_analysis_result_payload(result) -> dict:

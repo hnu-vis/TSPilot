@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from core.harness import ActionOutputBuildInput, ActionOutputBuilder, default_capability_registry
+from schemas.action_output import ActionOutput
 from schemas.state import ConversationStateModel, RequestStateModel
 from schemas.tool import ToolCall, ToolObservation
 from runtime.action_policy import runtime_action_constraints
@@ -17,6 +19,7 @@ class ExecutionResult:
     tool_spec: ToolSpec
     observation: ToolObservation
     full_payload: dict
+    action_output: ActionOutput
 
 
 class ToolExecutor:
@@ -24,6 +27,8 @@ class ToolExecutor:
 
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
+        self._capability_registry = default_capability_registry()
+        self._action_output_builder = ActionOutputBuilder()
 
     async def execute(
         self,
@@ -59,24 +64,32 @@ class ToolExecutor:
             )
 
         full_payload = tool_spec.output_model.model_validate(raw_result).model_dump(mode="json")
-        visible_payload, truncated = self._truncate_payload(full_payload, request_state)
-        observation = ToolObservation(
-            tool_name=action_name,
-            success=True,
-            summary=tool_spec.tool.summarize(full_payload),
-            payload=visible_payload,
-            error=None,
-            payload_truncated=truncated,
-            payload_ref=(
-                f"obs:{request_state.request_id}:{request_state.iteration}:{action_name}"
-                if truncated
-                else None
-            ),
+        summary = tool_spec.tool.summarize(full_payload)
+        action_output = self._action_output_builder.build(
+            ActionOutputBuildInput(
+                tool_name=action_name,
+                success=True,
+                summary=summary,
+                full_payload=full_payload,
+                result_target=tool_spec.result_target,
+                action_input=validated.model_dump(mode="json"),
+                iteration=request_state.iteration,
+                request_id=request_state.request_id,
+                produces_terminal_payload=tool_spec.produces_terminal_payload,
+            )
         )
-        return ExecutionResult(tool_spec=tool_spec, observation=observation, full_payload=full_payload)
+        observation = self._action_output_builder.to_tool_observation(action_output)
+        return ExecutionResult(
+            tool_spec=tool_spec,
+            observation=observation,
+            full_payload=full_payload,
+            action_output=action_output,
+        )
 
     def _normalize_action_input(self, action_name: str, action_input: dict, request_state: RequestStateModel) -> dict:
         normalized = dict(action_input or {})
+        if normalized.get("constraints") in (None, "", False):
+            normalized["constraints"] = {}
         if action_name == "terminate":
             for key in (
                 "include_analysis_ids",
@@ -97,24 +110,25 @@ class ToolExecutor:
         normalized["fact_requests"] = self._normalize_fact_requests(normalized.get("fact_requests"), normalized)
         normalized = self._apply_runtime_input_guidance(action_name, normalized, request_state)
         if action_name == "anomaly":
-            if str(normalized.get("detector_name") or "").strip().lower() in {"default", "auto", "none", "null"}:
-                normalized.pop("detector_name", None)
+            self._drop_unselected_optional_choice(normalized, "detector_name")
         if action_name == "forecast":
-            if str(normalized.get("model_name") or "").strip().lower() in {"default", "auto", "none", "null"}:
-                normalized.pop("model_name", None)
+            self._drop_unselected_optional_choice(normalized, "model_name")
         if action_name == "code_interpreter" and not str(normalized.get("code") or "").strip():
-            normalized.setdefault("database_evidence", "latest")
+            for key, value in self._capability_registry.default_input_for_action(action_name).items():
+                normalized.setdefault(key, value)
             normalized.setdefault("analysis_goal", request_state.message)
-            normalized.setdefault(
-                "analysis_request",
-                {
-                    "goal": request_state.message,
-                    "required_outputs": self._contract_required_outputs(request_state),
-                    "mode": "canonical_timeseries_metrics",
-                },
-            )
+            analysis_request = self._normalize_analysis_request(normalized.get("analysis_request"))
+            analysis_request.setdefault("goal", request_state.message)
+            analysis_request.setdefault("required_outputs", self._contract_required_outputs(request_state))
+            analysis_request.setdefault("mode", "canonical_timeseries_metrics")
+            normalized["analysis_request"] = analysis_request
             if not normalized.get("required_outputs"):
                 normalized["required_outputs"] = self._contract_required_outputs(request_state)
+        if action_name == "todowrite":
+            normalized.setdefault("message", request_state.message)
+            normalized.setdefault("focus", request_state.focus or request_state.message)
+            if not normalized.get("requested_capabilities"):
+                normalized["requested_capabilities"] = list(request_state.requested_capabilities or [])
         state_database_context = request_state.database_context
         if state_database_context is not None:
             state_payload = state_database_context.model_dump(mode="json")
@@ -135,6 +149,30 @@ class ToolExecutor:
             if not isinstance(item, dict) or item.get("action") != action_name:
                 continue
             guidance = item.get("input_guidance") if isinstance(item.get("input_guidance"), dict) else {}
+            for key, value in guidance.items():
+                if key in {"mode", "repair_contract", "validation_failure", "constraints", "analysis_request"}:
+                    continue
+                if value not in (None, "", [], {}) and normalized.get(key) in (None, "", [], {}):
+                    normalized[key] = value
+            if isinstance(guidance.get("repair_contract"), dict):
+                normalized["mode"] = guidance.get("mode") or "repair"
+                normalized["repair_contract"] = guidance["repair_contract"]
+                merged_constraints = dict(normalized.get("constraints") or {})
+                merged_constraints["_repair_contract"] = guidance["repair_contract"]
+                if isinstance(guidance.get("validation_failure"), dict):
+                    merged_constraints["_validation_failure"] = guidance["validation_failure"]
+                normalized["constraints"] = merged_constraints
+                if action_name == "sql_query":
+                    normalized.pop("query", None)
+                if action_name == "code_interpreter":
+                    normalized.setdefault("database_evidence", guidance["repair_contract"].get("input_evidence") or "latest")
+                    normalized.setdefault("analysis_goal", guidance["repair_contract"].get("analysis_goal") or request_state.message)
+                    analysis_request = self._normalize_analysis_request(normalized.get("analysis_request"))
+                    analysis_request.setdefault("goal", normalized.get("analysis_goal") or request_state.message)
+                    analysis_request.setdefault("mode", guidance["repair_contract"].get("mode") or "analysis_artifact_repair")
+                    if isinstance(guidance["repair_contract"].get("required_details_fields"), list):
+                        analysis_request.setdefault("required_details_fields", guidance["repair_contract"]["required_details_fields"])
+                    normalized["analysis_request"] = analysis_request
             guidance_constraints = guidance.get("constraints") if isinstance(guidance.get("constraints"), dict) else {}
             if guidance_constraints:
                 merged_constraints = dict(normalized.get("constraints") or {})
@@ -147,10 +185,18 @@ class ToolExecutor:
                 required_outputs = guidance["analysis_request"].get("required_outputs")
                 if isinstance(required_outputs, list) and not normalized.get("required_outputs"):
                     normalized["required_outputs"] = required_outputs
-                if not self._user_explicitly_requested_custom_code(request_state):
-                    normalized.pop("code", None)
             break
         if action_name == "sql_query":
+            if not isinstance(normalized.get("intent_profile"), dict) or not normalized.get("intent_profile"):
+                normalized["intent_profile"] = (
+                    dict(request_state.intent_profile)
+                    if isinstance(request_state.intent_profile, dict)
+                    else {}
+                )
+            if not normalized.get("selected_database") and request_state.selected_database:
+                normalized["selected_database"] = request_state.selected_database
+            if not normalized.get("selected_database_type") and request_state.selected_database_type:
+                normalized["selected_database_type"] = request_state.selected_database_type
             merged_constraints = dict(normalized.get("constraints") or {})
             if self._latest_sql_shape_requested_raw(request_state):
                 merged_constraints["evidence_shape"] = "raw_timeseries"
@@ -159,9 +205,19 @@ class ToolExecutor:
                 normalized["constraints"] = merged_constraints
         return normalized
 
-    def _user_explicitly_requested_custom_code(self, request_state: RequestStateModel) -> bool:
-        text = str(request_state.message or "").lower()
-        return any(token in text for token in ("python", "代码", "code", "script", "脚本"))
+    def _normalize_analysis_request(self, value) -> dict:
+        if value in (None, "", [], {}, False):
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return {"required_outputs": [str(item).strip() for item in value if str(item).strip()]}
+        return {"goal": str(value).strip()}
+
+    def _drop_unselected_optional_choice(self, normalized: dict, key: str) -> None:
+        value = str(normalized.get(key) or "").strip().lower()
+        if value in {"default", "auto", "none", "null"}:
+            normalized.pop(key, None)
 
     def _latest_sql_shape_requested_raw(self, request_state: RequestStateModel) -> bool:
         latest = request_state.observations[-1] if request_state.observations else None

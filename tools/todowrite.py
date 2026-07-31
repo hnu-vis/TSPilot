@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
 from core.completion import normalize_todo_for_completion
+from core.harness import default_capability_registry
 from tools.base import BaseTool
 
 
@@ -26,7 +28,7 @@ class TodoWriteInput(BaseModel):
     requested_capabilities: list[str] = Field(default_factory=list)
     focus: str | None = None
     task_contract: dict | None = None
-    todos: list[dict] = Field(default_factory=list)
+    todos: list[dict | str] = Field(default_factory=list)
     evidence_summary: dict | str | None = None
 
     @model_validator(mode="before")
@@ -37,6 +39,11 @@ class TodoWriteInput(BaseModel):
         normalized = dict(data)
         if normalized.get("todo_list") and not normalized.get("todos"):
             normalized["todos"] = normalized["todo_list"]
+        if isinstance(normalized.get("todos"), list):
+            normalized["todos"] = [
+                cls._normalize_raw_todo_item(index, todo)
+                for index, todo in enumerate(normalized["todos"], start=1)
+            ]
         if not normalized.get("message"):
             normalized["message"] = (
                 normalized.get("focus")
@@ -45,6 +52,16 @@ class TodoWriteInput(BaseModel):
                 or "Create a todo plan."
             )
         return normalized
+
+    @staticmethod
+    def _normalize_raw_todo_item(index: int, todo: Any) -> dict | str:
+        if isinstance(todo, str):
+            return {
+                "content": todo,
+                "status": "pending",
+                "priority": index,
+            }
+        return todo
 
 
 class TodoWriteResult(BaseModel):
@@ -60,13 +77,24 @@ class TodoWriteResult(BaseModel):
 
 class TodoWriteTool(BaseTool):
     async def execute(self, validated_input: TodoWriteInput, **kwargs) -> dict:
+        total_todos = len(validated_input.todos)
         todos = [
             normalized
             for index, todo in enumerate(validated_input.todos, start=1)
-            if (normalized := self._normalize_todo(index, todo)) is not None
+            if (normalized := self._normalize_todo(index, todo, validated_input, total_todos=total_todos)) is not None
         ]
-        if self._looks_like_placeholder_plan(todos):
-            todos = self._todos_from_message(validated_input.message or validated_input.focus or "")
+        source_text = validated_input.message or validated_input.focus or ""
+        if not todos:
+            todos = self._todos_from_text(source_text, validated_input)
+        elif self._looks_like_placeholder_plan(todos):
+            todos = self._todos_from_text(source_text, validated_input)
+        elif self._looks_like_collapsed_multistep_plan(todos):
+            source_text = todos[0].content
+            if validated_input.message and validated_input.message != source_text:
+                source_text = f"{validated_input.message}\n{source_text}"
+            expanded = self._todos_from_text(source_text, validated_input)
+            if expanded:
+                todos = expanded
         if not todos:
             todos = [
                 TodoItem(
@@ -100,20 +128,20 @@ class TodoWriteTool(BaseTool):
         placeholder_count = sum(1 for todo in todos if re.fullmatch(r"step_\d+", str(todo.content or "")))
         return placeholder_count == len(todos)
 
-    def _todos_from_message(self, message: str) -> list[TodoItem]:
+    def _looks_like_collapsed_multistep_plan(self, todos: list[TodoItem]) -> bool:
+        if len(todos) != 1:
+            return False
+        return len(self._extract_numbered_items(todos[0].content)) >= 2
+
+    def _todos_from_text(self, text: str, validated_input: TodoWriteInput | None = None) -> list[TodoItem]:
         items = []
-        pattern = re.compile(
-            r"(?:^|[；;。\\n])\\s*(?:\\d+|[一二三四五六七八九十]+)(?:[\\.、\\)]|\\s+)\\s*([^；;。\\n]+)",
-            flags=re.MULTILINE,
-        )
-        for index, match in enumerate(pattern.finditer(message or ""), start=1):
-            content = match.group(1).strip()
+        for index, content in enumerate(self._extract_numbered_items(text), start=1):
             if not content:
                 continue
             items.append(
                 TodoItem(
                     content=content,
-                    task_type=self._infer_task_type(content),
+                    task_type=self._todo_task_type(index, content, len(self._extract_numbered_items(text)), validated_input),
                     status="pending",
                     priority=index,
                 )
@@ -122,7 +150,31 @@ class TodoWriteTool(BaseTool):
             items[-1] = items[-1].model_copy(update={"task_type": "answer"})
         return self._enforce_single_in_progress(items)
 
-    def _normalize_todo(self, index: int, raw_todo: dict) -> TodoItem | None:
+    def _extract_numbered_items(self, text: str) -> list[str]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return []
+        marker = r"(?:\d+|[一二三四五六七八九十]+)\s*(?:[\.、\)]|）)"
+        pattern = re.compile(
+            rf"(?:^|[\n\r；;。:：])\s*{marker}\s*(.*?)"
+            rf"(?=(?:[\n\r；;。]\s*{marker})|\Z)",
+            flags=re.DOTALL,
+        )
+        items = []
+        for match in pattern.finditer(normalized_text):
+            content = re.sub(r"\s+", " ", match.group(1)).strip(" \t\r\n；;。")
+            if content:
+                items.append(content)
+        return items
+
+    def _normalize_todo(
+        self,
+        index: int,
+        raw_todo: dict | str,
+        validated_input: TodoWriteInput | None = None,
+        *,
+        total_todos: int = 0,
+    ) -> TodoItem | None:
         if isinstance(raw_todo, str):
             raw_todo = {"content": raw_todo}
         if not isinstance(raw_todo, dict):
@@ -134,12 +186,13 @@ class TodoWriteTool(BaseTool):
             or raw_todo.get("id")
             or f"step_{index}"
         ).strip()
-        task_type = str(
+        explicit_task_type = str(
             raw_todo.get("task_type")
             or raw_todo.get("todo_type")
             or raw_todo.get("kind")
-            or self._infer_task_type(content)
+            or ""
         ).strip().lower()
+        task_type = explicit_task_type or self._todo_task_type(index, content, total_todos, validated_input)
         if task_type == "plan" or self._is_internal_query_preparation(content):
             return None
         status = str(raw_todo.get("status") or "pending").strip().lower()
@@ -189,22 +242,57 @@ class TodoWriteTool(BaseTool):
             )
         return f"Todo plan updated with {len(todos)} steps. Completed {completed_count}, remaining {pending_count}."
 
-    def _infer_task_type(self, content: str) -> str:
-        normalized = content.lower()
-        if self._is_internal_query_preparation(content):
-            return "query"
-        if any(token in normalized for token in ["查询", "查库", "取数", "query", "retrieve evidence"]):
-            return "query"
-        if any(token in normalized for token in ["洞察", "事实", "趋势", "周期", "seasonality", "trend", "code interpreter"]):
-            return "code_interpreter"
-        if any(token in normalized for token in ["异常", "anomaly", "outlier"]):
-            return "anomaly"
-        if any(token in normalized for token in ["预测", "forecast", "predict"]):
-            return "forecast"
-        if any(token in normalized for token in ["总结", "回答", "汇总", "answer", "format"]):
+    def _contract_task_type(self, index: int, validated_input: TodoWriteInput | None) -> str:
+        if validated_input is None:
+            return "generic"
+        task_contract = validated_input.task_contract if isinstance(validated_input.task_contract, dict) else {}
+        outputs = task_contract.get("required_outputs") if isinstance(task_contract.get("required_outputs"), list) else []
+        output = outputs[index - 1] if 0 <= index - 1 < len(outputs) and isinstance(outputs[index - 1], dict) else {}
+        raw_kind = output.get("evidence_kind") or output.get("output_type")
+        kind = default_capability_registry().normalize_id(str(raw_kind or ""))
+        if kind:
+            task_type = default_capability_registry().task_type_for_capability(kind)
+            if task_type in {"sql_query", "terminate"}:
+                return "query" if task_type == "sql_query" else "answer"
+            return task_type
+        return "generic"
+
+    def _todo_task_type(
+        self,
+        index: int,
+        content: str,
+        total_todos: int,
+        validated_input: TodoWriteInput | None,
+    ) -> str:
+        contract_type = self._contract_task_type(index, validated_input)
+        if contract_type and contract_type != "generic":
+            return contract_type
+        inferred = self._infer_task_type_from_content(content)
+        if inferred != "generic":
+            return inferred
+        if total_todos > 1 and index == total_todos:
             return "answer"
-        if any(token in normalized for token in ["规划", "计划", "todo", "plan"]):
-            return "plan"
+        return "generic"
+
+    def _infer_task_type_from_content(self, content: str) -> str:
+        text = str(content or "").strip().lower()
+        if not text:
+            return "generic"
+        if re.search(r"异常|异常检测|离群|突增|突降|anomal|outlier|spike", text, flags=re.IGNORECASE):
+            return "anomaly"
+        if re.search(r"预测|预估|未来|forecast|predict|projection", text, flags=re.IGNORECASE):
+            return "forecast"
+        if re.search(
+            r"计算|统计|平均|均值|最大|最小|最新|标准差|波动|回撤|指标|变化率|差值|分析|"
+            r"calculate|compute|statistic|average|mean|max|min|std|volatility|drawdown|analysis",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return "code_interpreter"
+        if re.search(r"结论|解释|回答|总结|汇总|中文|conclusion|answer|explain|summari[sz]e", text, flags=re.IGNORECASE):
+            return "answer"
+        if re.search(r"查询|获取|读取|加载|数据|序列|记录|query|fetch|load|retrieve|data|series|record", text, flags=re.IGNORECASE):
+            return "query"
         return "generic"
 
     def _is_internal_query_preparation(self, content: str) -> bool:

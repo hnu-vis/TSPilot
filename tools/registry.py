@@ -78,7 +78,10 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
         ),
         ToolSpec(
             tool_name="sql_query",
-            description="Unified read-only database query tool. Use natural-language message for automatic planning or explicit query for SQL/Flux/PromQL analysis.",
+            description=(
+                "Unified read-only database evidence tool. The outer agent should describe the needed evidence "
+                "in natural language; schema linking, query generation, dialect handling, and validation are internal."
+            ),
             input_model=SqlQueryInput,
             output_model=DatabaseEvidence,
             tool=SqlQueryTool(settings, llm=llm),

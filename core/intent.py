@@ -1,17 +1,18 @@
 """Structured request capability profile helpers."""
 from __future__ import annotations
 
-import re
 from typing import Any
 
+from core.harness import default_capability_registry
 
-CAPABILITY_ORDER = ("query", "analysis", "forecast", "anomaly")
+
+CAPABILITY_ORDER = ("query", "analysis", "forecast", "anomaly", "external_knowledge", "skill")
 
 
 def build_intent_profile_fallback(message: str) -> dict[str, Any]:
-    """Build a minimal capability profile without modeling user-visible facts."""
+    """Build a minimal safe profile when no structured LLM intent is available."""
 
-    capabilities = _infer_requested_capabilities(message)
+    capabilities = ["query"]
     return {
         "source": "fallback",
         "primary_goal": message,
@@ -46,46 +47,6 @@ def apply_intent_profile_to_state(request_state, profile: dict[str, Any]) -> Non
     request_state.requested_capabilities = capabilities
 
 
-def _infer_requested_capabilities(message: str) -> list[str]:
-    normalized = message.lower()
-    capabilities = ["query"]
-    if any(token in normalized for token in ("预测", "预估", "forecast", "predict", "prediction")):
-        capabilities.append("forecast")
-    if any(token in normalized for token in ("异常", "离群", "尖峰", "异常点", "outlier", "anomaly", "spike", "dip")):
-        capabilities.append("anomaly")
-    if _looks_analytical(normalized) and "analysis" not in capabilities:
-        capabilities.append("analysis")
-    return _normalize_capabilities(capabilities)
-
-
-def _looks_analytical(message: str) -> bool:
-    if any(
-        token in message
-        for token in (
-            "分析",
-            "统计",
-            "计算",
-            "比较",
-            "趋势",
-            "走势",
-            "涨跌",
-            "变化",
-            "最高",
-            "最低",
-            "最大",
-            "最小",
-            "analysis",
-            "analyze",
-            "calculate",
-            "compare",
-            "trend",
-            "change",
-        )
-    ):
-        return True
-    return bool(re.search(r"(?<![A-Za-z0-9_])(max|min)(?![A-Za-z0-9_])", message))
-
-
 def _answer_requirements_from_capabilities(capabilities: list[str]) -> list[str]:
     requirements = ["conclusion"]
     requirements.extend(item for item in capabilities if item != "query")
@@ -93,19 +54,16 @@ def _answer_requirements_from_capabilities(capabilities: list[str]) -> list[str]
 
 
 def _normalize_capabilities(values: list[str], *, allow_conclusion: bool = False) -> list[str]:
-    aliases = {
-        "outlier": "anomaly",
-        "prediction": "forecast",
-        "predict": "forecast",
-        "statistics": "analysis",
-        "statistical_summary": "analysis",
-    }
+    registry = default_capability_registry()
     allowed = set(CAPABILITY_ORDER)
     if allow_conclusion:
         allowed.add("conclusion")
+        allowed.add("answer")
     normalized = []
     for value in values:
-        item = aliases.get(str(value).strip().lower(), str(value).strip().lower())
+        item = registry.normalize_id(value)
+        if item == "answer" and allow_conclusion:
+            item = "conclusion"
         if item in allowed:
             normalized.append(item)
     return _dedupe(normalized)

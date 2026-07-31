@@ -21,7 +21,15 @@ type MarkdownBlock =
   | { type: 'numberedList'; items: string[]; start: number }
   | { type: 'code'; language: string | null; content: string };
 
-export function FinalAnswer({ answer, tokenUsage }: { answer: FinalAnswerType; tokenUsage?: TokenUsage | null }) {
+export function FinalAnswer({
+  answer,
+  tokenUsage,
+  elapsedSeconds,
+}: {
+  answer: FinalAnswerType;
+  tokenUsage?: TokenUsage | null;
+  elapsedSeconds?: number | null;
+}) {
   const summary = answer.summary?.trim() || '我没有生成可展示的回答。';
   const sections = (answer.sections || []).filter((section) => (
     section.content?.trim()
@@ -38,6 +46,11 @@ export function FinalAnswer({ answer, tokenUsage }: { answer: FinalAnswerType; t
           <span>Answer</span>
         </div>
         <div className="answer-header-meta">
+          {typeof elapsedSeconds === 'number' && Number.isFinite(elapsedSeconds) ? (
+            <span className="answer-reference-count">
+              {elapsedSeconds.toFixed(1)}s
+            </span>
+          ) : null}
           {tokenUsage?.totals?.total_tokens ? (
             <span className="answer-reference-count">
               {tokenUsage.totals.total_tokens.toLocaleString()} tokens

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from schemas.agent_turn import PreviousObservationAssessment
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
+from core.harness import default_capability_registry
 
 
 @dataclass
@@ -196,7 +197,10 @@ def _requires_specialized_capability(
 def _requires_code_analysis(request_state: RequestStateModel) -> bool:
     contract = request_state.task_contract
     if contract is None:
-        return False
+        return any(
+            str(item).strip().lower() == "analysis"
+            for item in (request_state.requested_capabilities or [])
+        )
     for output in contract.required_outputs:
         if not output.required:
             continue
@@ -395,35 +399,30 @@ def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None
     required = [
         output
         for output in contract.required_outputs
-        if output.required
+        if output.required and not _contract_output_is_terminal_answer(output)
     ]
     if not required:
         return []
+    state_missing = [
+        output.id
+        for output in required
+        if not _contract_output_is_covered_by_state(request_state, output)
+    ]
+    if not state_missing:
+        return []
     if gap is None:
-        return [
-            output.id
-            for output in required
-            if not _contract_output_is_covered_by_state(request_state, output)
-        ]
+        return state_missing
     if gap.get("can_answer") is not True:
         gap_missing = set(_gap_blocking_items(gap))
         if gap_missing:
             uncovered_gap_missing = [
                 output.id
                 for output in required
-                if (output.id in gap_missing or output.description in gap_missing)
+                if _contract_output_matches_gap_item(output, gap_missing)
                 and not _contract_output_is_covered_by_state(request_state, output)
             ]
-            return uncovered_gap_missing or (
-                []
-                if all(_contract_output_is_covered_by_state(request_state, output) for output in required)
-                else sorted(gap_missing)
-            )
-        return [
-            output.id
-            for output in required
-            if not _contract_output_is_covered_by_state(request_state, output)
-        ]
+            return uncovered_gap_missing or state_missing
+        return state_missing
     covered = {
         str(item).strip()
         for item in gap.get("covered", [])
@@ -451,6 +450,20 @@ def _contract_output_is_covered_by_state(request_state: RequestStateModel, outpu
     if _contract_output_is_covered_by_verified_fact(request_state, output):
         return True
     evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+    if _contract_output_is_terminal_answer(output):
+        return request_state.final_answer_draft is not None
+    if not evidence_kind:
+        inferred = _contract_output_inferred_capabilities(output)
+        if "forecast" in inferred and _latest_forecast_is_usable(request_state):
+            return True
+        if "anomaly" in inferred and request_state.latest_anomaly is not None:
+            return True
+        if "analysis" in inferred and request_state.latest_analysis_id is not None:
+            return True
+        if "query" in inferred and request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state):
+            return True
+        if not inferred:
+            return bool(_all_answer_refs(request_state))
     if evidence_kind in {"query", "database", "database_evidence", "sql", "raw"}:
         return request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state)
     if evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
@@ -460,6 +473,61 @@ def _contract_output_is_covered_by_state(request_state: RequestStateModel, outpu
     if evidence_kind == "anomaly":
         return request_state.latest_anomaly is not None
     return False
+
+
+def _contract_output_inferred_capabilities(output) -> set[str]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(output, "id", None),
+            getattr(output, "description", None),
+            getattr(output, "output_type", None),
+            " ".join(str(item) for item in getattr(output, "measures", []) or []),
+            " ".join(str(item) for item in getattr(output, "dimensions", []) or []),
+            getattr(output, "success_criteria", None),
+        )
+    ).strip().lower()
+    if not text:
+        return set()
+    inferred: set[str] = set()
+    capability_terms = {
+        "forecast": ("forecast", "prediction", "predict", "未来", "预测"),
+        "anomaly": ("anomaly", "outlier", "spike", "异常", "离群"),
+        "analysis": ("analysis", "metric", "statistics", "statistical", "计算", "指标", "统计", "分析"),
+        "query": ("query", "evidence", "data", "rows", "points", "查询", "数据"),
+    }
+    for capability, terms in capability_terms.items():
+        if any(term in text for term in terms):
+            inferred.add(capability)
+    return inferred
+
+
+def _contract_output_matches_gap_item(output, gap_items: set[str]) -> bool:
+    normalized_gap = {
+        str(item or "").strip().lower()
+        for item in gap_items
+        if str(item or "").strip()
+    }
+    keys = {
+        str(getattr(output, "id", "") or "").strip().lower(),
+        str(getattr(output, "description", "") or "").strip().lower(),
+        str(getattr(output, "evidence_kind", "") or "").strip().lower(),
+        str(getattr(output, "output_type", "") or "").strip().lower(),
+    }
+    keys.update(str(item or "").strip().lower() for item in getattr(output, "measures", []) or [])
+    keys.update(str(item or "").strip().lower() for item in getattr(output, "dimensions", []) or [])
+    keys = {key for key in keys if key}
+    return bool(keys & normalized_gap)
+
+
+def _contract_output_is_terminal_answer(output) -> bool:
+    evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+    output_type = str(getattr(output, "output_type", "") or "").strip().lower()
+    return evidence_kind in {"conclusion", "answer", "final_answer"} or output_type in {
+        "conclusion",
+        "answer",
+        "final_answer",
+    }
 
 
 def _next_action_for_missing_required(missing: list[str]) -> str:
@@ -591,6 +659,15 @@ def _gap_missing_is_covered_by_artifacts(request_state: RequestStateModel, missi
     }
     if not missing_keys:
         return False
+    contract = request_state.task_contract
+    outputs = getattr(contract, "required_outputs", []) if contract is not None else []
+    matched_outputs = [
+        output
+        for output in outputs or []
+        if _contract_output_matches_gap_item(output, missing_keys)
+    ]
+    if matched_outputs:
+        return all(_contract_output_is_covered_by_state(request_state, output) for output in matched_outputs)
     structured_coverage = {
         "forecast": _latest_forecast_is_usable(request_state),
         "anomaly": request_state.latest_anomaly is not None,
@@ -985,13 +1062,7 @@ def _assessment_state(
 
 
 def _action_matches_task_type(tool_name: str, task_type: str) -> bool:
-    if not task_type:
-        return True
-    if task_type == "query":
-        return tool_name == "sql_query"
-    if task_type == "answer":
-        return tool_name == "terminate"
-    return tool_name == task_type
+    return default_capability_registry().action_matches_task_type(tool_name, task_type)
 
 
 def _action_is_prerequisite_repair(
@@ -1001,17 +1072,7 @@ def _action_is_prerequisite_repair(
 ) -> bool:
     if previous_observation is None or not previous_observation.success:
         return False
-    if task_type == "code_interpreter" and tool_name == "sql_query":
-        return True
-    if task_type in {"anomaly", "forecast"} and tool_name == "sql_query":
-        return True
-    if task_type in {"anomaly", "forecast", "answer"} and tool_name == "code_interpreter":
-        return True
-    if task_type in {"forecast", "answer"} and tool_name == "anomaly":
-        return True
-    if task_type == "answer" and tool_name in {"sql_query", "forecast"}:
-        return True
-    return False
+    return default_capability_registry().action_is_prerequisite(tool_name, task_type)
 
 
 def _task_coverage(payload: dict) -> dict:
@@ -1101,15 +1162,7 @@ def _assessment_accepts_empty_result(assessment: PreviousObservationAssessment) 
 
 
 def _hint_for_task_type(task_type: str) -> str | None:
-    return {
-        "query": "Call sql_query with the missing filters, fields, aggregation, or time range.",
-        "code_interpreter": "Run code_interpreter over the full evidence artifact.",
-        "anomaly": "Run anomaly after time-series evidence is available.",
-        "forecast": "Run forecast after time-series evidence is available.",
-        "rag": "Call rag only if external knowledge is required.",
-        "skill": "Invoke the requested packaged skill.",
-        "answer": "Terminate only after final answer verification can pass.",
-    }.get(task_type or "")
+    return default_capability_registry().hint_for_task_type(task_type)
 
 
 def _string_items(value) -> list[str]:
@@ -1163,6 +1216,8 @@ def _latest_forecast_is_usable(request_state: RequestStateModel) -> bool:
 
 
 def _analysis_quality_gaps(request_state: RequestStateModel, analysis_ids: set[str] | None = None) -> list[str]:
+    if not _contract_requires_outlier_treatment(request_state):
+        return []
     gaps: list[str] = []
     for analysis_id, analysis in request_state.analysis_artifacts.items():
         if analysis_ids is not None and analysis_id not in analysis_ids:
@@ -1170,6 +1225,35 @@ def _analysis_quality_gaps(request_state: RequestStateModel, analysis_ids: set[s
         if _analysis_conflicts_with_detected_anomalies(request_state, analysis):
             gaps.append(f"analysis:{analysis_id}:requires_outlier_transparency")
     return gaps
+
+
+def _contract_requires_outlier_treatment(request_state: RequestStateModel) -> bool:
+    contract = request_state.task_contract
+    outputs = getattr(contract, "required_outputs", []) if contract is not None else []
+    for output in outputs or []:
+        text = " ".join(
+            str(value or "")
+            for value in (
+                getattr(output, "id", None),
+                getattr(output, "description", None),
+                getattr(output, "success_criteria", None),
+                getattr(output, "evidence_kind", None),
+                getattr(output, "output_type", None),
+            )
+        ).lower()
+        if any(
+            token in text
+            for token in (
+                "outlier_treatment",
+                "adjusted_metrics",
+                "excluded_rows",
+                "异常值处理",
+                "异常处理",
+                "剔除",
+            )
+        ):
+            return True
+    return False
 
 
 def _analysis_conflicts_with_detected_anomalies(request_state: RequestStateModel, analysis) -> bool:
@@ -1225,5 +1309,9 @@ def _forecast_payload_is_usable(payload: dict) -> bool:
         return False
     horizon = payload.get("horizon")
     if isinstance(horizon, int) and horizon > 0:
+        diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+        full_count = diagnostics.get("forecast_point_count")
+        if isinstance(full_count, int) and full_count > 0:
+            return full_count >= horizon
         return len(forecast_points) >= horizon
     return True

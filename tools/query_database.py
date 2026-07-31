@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.settings import Settings
 from core.time_range import format_utc_rfc3339, parse_time_to_utc
-from core.database.dialects import query_language_for_database_type
+from core.database.dialects import dialect_for_database, query_language_for_database_type
 from core.database import (
     DatabaseFactory,
     build_reference_dataset_statistics_evidence,
@@ -95,7 +95,8 @@ class QueryDatabaseTool(BaseTool):
         connector = await DatabaseFactory.create_connector(**config)
         async with connector:
             schema = await connector.get_schema()
-        preview = schema_preview(schema)
+        dialect = dialect_for_database(str(config.get("type", validated_input.database_context.database_type)))
+        preview = schema_preview(schema, dialect=dialect)
         evidence = DatabaseEvidence(
             evidence_id=f"evi_{validated_input.database_context.database_id}_schema",
             result_type="schema",

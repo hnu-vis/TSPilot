@@ -287,9 +287,10 @@ export default function App() {
         phase: 'tool_result',
         status: success ? 'complete' : 'error',
         summary: observation ? stringFrom(observation.summary, success ? 'Step completed.' : 'Step failed.') : success ? 'Step completed.' : 'Step failed.',
-        tool: observation ? stringFrom(observation.tool_name, '') : undefined,
+        tool: observation ? stringFrom(observation.tool_name, '') || stringFrom(observation.tool, '') : undefined,
         observation: observation || undefined,
-        completedAt: timestamp,
+        startedAt: stringFrom(event.data.started_at) || undefined,
+        completedAt: stringFrom(event.data.completed_at) || timestamp,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
         updatedAt: timestamp,
       };
@@ -375,7 +376,8 @@ export default function App() {
         tool: stringFrom(event.data.tool, 'tool'),
         toolResult: event.data,
         observation: asRecord(event.data.observation) || event.data,
-        completedAt: timestamp,
+        startedAt: stringFrom(event.data.started_at) || undefined,
+        completedAt: stringFrom(event.data.completed_at) || timestamp,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
         updatedAt: timestamp,
       };

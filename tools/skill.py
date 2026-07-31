@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from core.skill import execute_skill
-from tools.base import BaseTool
+from core.skill import execute_skill, list_skills
+from tools.base import BaseTool, StructuredToolError
 
 
 class SkillInput(BaseModel):
@@ -15,6 +15,15 @@ class SkillInput(BaseModel):
 
 class SkillTool(BaseTool):
     async def execute(self, validated_input: SkillInput, *, request_state=None, **kwargs) -> dict:
+        available = set(list_skills())
+        if validated_input.skill_name not in available:
+            raise StructuredToolError(
+                f"Unknown skill '{validated_input.skill_name}'.",
+                error_type="unknown_skill",
+                retryable=False,
+                diagnostics={"available_skills": sorted(available)},
+                recommended_next_action="terminate",
+            )
         task_context = dict(validated_input.task_context)
         if request_state is not None and not task_context:
             task_context = {

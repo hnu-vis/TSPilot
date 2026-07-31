@@ -14,10 +14,12 @@ from sandbox import execute_python_sandbox_v1
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
-from tools.base import BaseTool
+from tools.base import BaseTool, StructuredToolError
 
 
 class CodeInterpreterInput(BaseModel):
+    mode: str | None = None
+    repair_contract: dict | None = None
     database_evidence: DatabaseEvidence | dict | str | None = None
     analysis_goal: str | None = None
     code: str | None = None
@@ -30,9 +32,18 @@ class CodeInterpreterInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_code_aliases(cls, data):
-        if isinstance(data, dict) and not data.get("code") and data.get("analysis_code"):
+        if isinstance(data, dict):
             data = dict(data)
-            data["code"] = data["analysis_code"]
+            if not data.get("code") and data.get("analysis_code"):
+                data["code"] = data["analysis_code"]
+            data["analysis_request"] = _normalize_analysis_request(data.get("analysis_request"))
+            data["required_outputs"] = _normalize_required_outputs(data.get("required_outputs"))
+            if not isinstance(data.get("constraints"), dict):
+                data["constraints"] = (
+                    {"value": data.get("constraints")}
+                    if data.get("constraints") not in (None, "", [], {})
+                    else {}
+                )
         return data
 
 
@@ -83,9 +94,17 @@ class CodeInterpreterTool(BaseTool):
             runtime_ms = sandbox_output.runtime_ms
         requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
         result_payload = output["result"]
-        _validate_expected_result_schema(result_payload, validated_input.expected_result_schema or {})
-        _validate_outlier_treatment_transparency(result_payload)
-        _validate_result_has_numeric_analysis(result_payload, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
+        try:
+            _validate_expected_result_schema(result_payload, validated_input.expected_result_schema or {})
+            _validate_outlier_treatment_transparency(result_payload)
+            _validate_result_has_numeric_analysis(result_payload, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
+        except AnalysisCodeError as exc:
+            raise _structured_analysis_validation_error(
+                exc,
+                goal=goal,
+                database_evidence=database_evidence,
+                result_payload=result_payload,
+            ) from exc
         result = AnalysisResult(
             analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
             analysis_goal=goal,
@@ -133,6 +152,38 @@ def _resolve_database_evidence(database_evidence, request_state):
             return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
         return DatabaseEvidence.model_validate(database_evidence)
     return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)
+
+
+def _normalize_analysis_request(value) -> dict | None:
+    if value in (None, "", [], {}):
+        return None
+    if isinstance(value, dict):
+        normalized = dict(value)
+        if "required_outputs" in normalized:
+            normalized["required_outputs"] = _normalize_required_outputs(normalized.get("required_outputs"))
+        return normalized
+    if isinstance(value, list):
+        return {"required_outputs": _normalize_required_outputs(value)}
+    return {"goal": str(value)}
+
+
+def _normalize_required_outputs(value) -> list[str]:
+    if value in (None, "", False):
+        return []
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                label = item.get("id") or item.get("description") or item.get("output_type") or item.get("evidence_kind")
+            else:
+                label = item
+            if str(label or "").strip():
+                result.append(str(label).strip())
+        return result
+    if isinstance(value, dict):
+        label = value.get("id") or value.get("description") or value.get("output_type") or value.get("evidence_kind")
+        return [str(label).strip()] if str(label or "").strip() else []
+    return [str(value).strip()] if str(value).strip() else []
 
 
 def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict], list[str]]:
@@ -224,6 +275,20 @@ def _execute_analysis_request(
         "columns": columns,
         "requested_outputs": _string_list(required_outputs or (analysis_request or {}).get("required_outputs")),
     }
+    if _analysis_context_indicates_outlier_treatment(goal, analysis_request, constraints):
+        details.update(
+            {
+                "outlier_rule": "canonical_transparency_template_no_exclusion",
+                "threshold_or_formula": "No exclusion threshold was applied by the canonical metrics template.",
+                "rationale": (
+                    "The analysis goal requested anomaly/outlier handling. "
+                    "This template reports transparent raw and adjusted metrics; no rows are excluded unless a detector explicitly supplies excluded_rows."
+                ),
+                "excluded_rows": [],
+                "raw_metrics": dict(metrics),
+                "adjusted_metrics": dict(metrics),
+            }
+        )
     summary = _analysis_request_summary(goal, metrics, details)
     return {
         "result": {
@@ -238,6 +303,114 @@ def _execute_analysis_request(
             "input_point_count": len(sorted_points),
         },
     }
+
+
+def _analysis_context_indicates_outlier_treatment(goal: str, analysis_request: dict | None, constraints: dict | None) -> bool:
+    repair_contract = None
+    if isinstance(constraints, dict):
+        repair_contract = constraints.get("_repair_contract")
+    text = " ".join(
+        [
+            goal or "",
+            _flatten_text(analysis_request or {}),
+            _flatten_text(repair_contract or {}),
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "outlier",
+            "anomaly",
+            "anomalous",
+            "excluded",
+            "异常",
+            "离群",
+            "剔除",
+            "排除",
+        )
+    )
+
+
+def _structured_analysis_validation_error(
+    exc: AnalysisCodeError,
+    *,
+    goal: str,
+    database_evidence: DatabaseEvidence,
+    result_payload: dict,
+) -> StructuredToolError:
+    message = str(exc)
+    required_fields = [
+        "outlier_rule",
+        "threshold_or_formula",
+        "rationale",
+        "excluded_rows",
+        "raw_metrics",
+        "adjusted_metrics",
+    ]
+    if "transparent details fields" in message or "outlier treatment" in message:
+        error_code = "analysis_transparency_missing"
+        repair_contract = {
+            "mode": "analysis_artifact_repair",
+            "input_evidence": database_evidence.evidence_id,
+            "analysis_goal": goal,
+            "required_details_fields": required_fields,
+            "previous_result_summary": result_payload.get("summary") if isinstance(result_payload, dict) else None,
+            "expected_result_shape": {"summary": "string", "metrics": "object", "details": "object"},
+        }
+        validation_failure = {
+            "scope": "artifact_output",
+            "capability": "analysis",
+            "tool": "code_interpreter",
+            "error_code": error_code,
+            "message": message,
+            "failed_artifact": {
+                "input_evidence_id": database_evidence.evidence_id,
+                "result_summary": result_payload.get("summary") if isinstance(result_payload, dict) else None,
+            },
+            "required_contract": {"required_details_fields": required_fields},
+            "repair_contract": repair_contract,
+            "retry_policy": {
+                "required_action": "code_interpreter",
+                "max_equivalent_retries": 2,
+                "allow_same_action": True,
+                "terminal_after_exhausted": True,
+            },
+        }
+        return StructuredToolError(
+            message,
+            error_type=error_code,
+            retryable=True,
+            recommended_next_action="code_interpreter",
+            diagnostics={"repair_contract": repair_contract, "required_details_fields": required_fields},
+            validation_failure=validation_failure,
+        )
+    return StructuredToolError(
+        message,
+        error_type="analysis_validation_failed",
+        retryable=True,
+        recommended_next_action="code_interpreter",
+        diagnostics={},
+        validation_failure={
+            "scope": "artifact_output",
+            "capability": "analysis",
+            "tool": "code_interpreter",
+            "error_code": "analysis_validation_failed",
+            "message": message,
+            "failed_artifact": {"input_evidence_id": database_evidence.evidence_id},
+            "required_contract": {},
+            "repair_contract": {
+                "mode": "analysis_artifact_repair",
+                "input_evidence": database_evidence.evidence_id,
+                "analysis_goal": goal,
+            },
+            "retry_policy": {
+                "required_action": "code_interpreter",
+                "max_equivalent_retries": 2,
+                "allow_same_action": True,
+                "terminal_after_exhausted": True,
+            },
+        },
+    )
 
 
 def _canonical_numeric_points(*, rows: list[dict], points: list[dict]) -> list[dict]:

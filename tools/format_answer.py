@@ -239,24 +239,25 @@ class FormatAnswerTool(BaseTool):
                     evidence=self._database_reference_payload(evidence),
                 )
             )
-        references.extend(
-            AnswerReference(
-                source_type="fact",
-                source_id=fact.fact_id,
-                label=fact.fact_type,
-                evidence=self._data_fact_reference_payload(fact),
+        if validated_input.include_fact_ids:
+            references.extend(
+                AnswerReference(
+                    source_type="fact",
+                    source_id=fact.fact_id,
+                    label=fact.fact_type,
+                    evidence=self._data_fact_reference_payload(fact),
+                )
+                for fact in [*data_facts, *unavailable_facts]
             )
-            for fact in [*data_facts, *unavailable_facts]
-        )
-        references.extend(
-            AnswerReference(
-                source_type="fact",
-                source_id=fact.fact_id,
-                label=fact.fact_type,
-                evidence=fact.evidence,
+            references.extend(
+                AnswerReference(
+                    source_type="fact",
+                    source_id=fact.fact_id,
+                    label=fact.fact_type,
+                    evidence=fact.evidence,
+                )
+                for fact in legacy_facts
             )
-            for fact in legacy_facts
-        )
         references.extend(
             AnswerReference(
                 source_type="analysis",

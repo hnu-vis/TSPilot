@@ -3,20 +3,11 @@ from __future__ import annotations
 
 import re
 
-from core.completion import evaluate_goal_completion, latest_gap_assessment
+from core.completion import latest_gap_assessment
+from core.harness import build_action_space, build_observation_frame
+from core.harness.action_space import VALID_ACTIONS
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
-
-VALID_ACTIONS = {
-    "todowrite",
-    "sql_query",
-    "code_interpreter",
-    "forecast",
-    "anomaly",
-    "rag",
-    "skill",
-    "terminate",
-}
 
 TERMINAL_ACTIONS = {"terminate"}
 
@@ -30,17 +21,43 @@ def validate_action(
 ) -> tuple[bool, str | None]:
     if action_name not in VALID_ACTIONS:
         return False, f"Action '{action_name}' is not part of the runtime contract."
-    capabilities = {
-        str(item).strip().lower()
-        for item in (request_state.requested_capabilities or [])
-        if str(item).strip()
-    }
-    if action_name == "rag" and request_state.database_context is not None and "rag" not in capabilities:
+    capabilities = _effective_capabilities(request_state)
+    if action_name == "rag" and request_state.database_context is not None and not ({"rag", "external_knowledge"} & capabilities):
         return (
             False,
             "RAG is not required by the structured intent profile for this database task. "
             "Use database evidence, analysis, anomaly, forecast, or terminate with grounded caveats.",
         )
+    if action_name == "skill" and "skill" not in capabilities:
+        return (
+            False,
+            "Skill is not required by the structured task contract or capability profile. "
+            "Use database evidence, analysis, anomaly, forecast, or terminate with grounded caveats.",
+        )
+    if action_name == "sql_query":
+        boundary_reason = _outer_sql_query_boundary_violation(request_state, action_input)
+        if boundary_reason:
+            return False, boundary_reason
+    if action_name == "todowrite":
+        boundary_reason = _outer_todo_boundary_violation(action_input)
+        if boundary_reason:
+            return False, boundary_reason
+        if request_state.todo_list:
+            return (
+                False,
+                "A todo plan already exists. Runtime advances plan status after successful actions; choose the next analysis action or terminate.",
+            )
+        contract_reason = _initial_todo_contract_violation(request_state, action_input)
+        if contract_reason:
+            return False, contract_reason
+        if _is_initial_todowrite_action(request_state):
+            return True, None
+        if request_state.tool_history or request_state.observations:
+            return (
+                False,
+                "todowrite is only valid before evidence or analysis work starts. "
+                "Continue with the current evidence gap or terminate if the answer is covered.",
+            )
     constraints = runtime_action_constraints(request_state)
     required_actions = {
         str(item.get("action") or "").strip()
@@ -52,19 +69,17 @@ def validate_action(
         for item in constraints.get("prohibited_actions", [])
         if str(item).strip()
     }
-    if action_name in prohibited_actions:
+    if action_name in prohibited_actions and action_name not in TERMINAL_ACTIONS:
         return False, constraints.get("reason") or f"Action '{action_name}' is not allowed in the current state."
-    if required_actions and action_name not in required_actions:
+    if required_actions and action_name not in required_actions and action_name not in TERMINAL_ACTIONS:
         return (
             False,
             (constraints.get("reason") or "The current state requires a different next action.")
             + f" Required actions: {sorted(required_actions)}.",
         )
-    if action_name == "todowrite" and request_state.todo_list:
-        return (
-            False,
-            "A todo plan already exists. Runtime advances plan status after successful actions; choose the next analysis action or terminate.",
-        )
+    covered_repeat_reason = _covered_action_repeat_reason(request_state, action_name, required_actions)
+    if covered_repeat_reason:
+        return False, covered_repeat_reason
     if action_name != "todowrite" and _requires_initial_todo_plan(request_state):
         return (
             False,
@@ -78,72 +93,116 @@ def validate_action(
     if repeat_failure_reason:
         return False, repeat_failure_reason
     if action_name in TERMINAL_ACTIONS:
-        evaluation = evaluate_goal_completion(request_state)
-        request_state.completion_state["latest_goal"] = evaluation.model_dump()
-        goal_covered_despite_todos = _terminal_goal_covered_despite_todos(request_state, evaluation)
-        unavailable_outputs_explained = (
-            not _missing_specialized_tool_output(evaluation.missing_evidence)
-            and _terminal_input_explains_unavailable_outputs(request_state, action_input)
-        )
-        active_todo = next((todo for todo in request_state.todo_list if todo.get("status") == "in_progress"), None)
-        if active_todo is not None:
-            active_type = str(active_todo.get("task_type") or "").strip().lower()
-            if active_type != "answer" and not goal_covered_despite_todos and not unavailable_outputs_explained:
-                return (
-                    False,
-                    "Final answer is blocked because the active todo is not an answer step. "
-                    "Assess the previous observation and complete the active todo before terminating.",
-                )
-        pending_non_answer = [
-            todo for todo in request_state.todo_list
-            if todo.get("status") != "completed"
-            and str(todo.get("task_type") or "").strip().lower() != "answer"
-        ]
-        if pending_non_answer and not goal_covered_despite_todos and not unavailable_outputs_explained:
-            return (
-                False,
-                "Final answer is blocked because non-answer todo steps are still incomplete.",
-            )
-        if not evaluation.can_answer:
-            if _missing_specialized_tool_output(evaluation.missing_evidence):
-                return (
-                    False,
-                    "Final answer is blocked because the current goal is not complete: "
-                    + evaluation.reason,
-                )
-            if unavailable_outputs_explained:
-                return True, None
-            return (
-                False,
-                "Final answer is blocked because the current goal is not complete: "
-                + evaluation.reason,
-            )
+        terminal_reason = _terminal_boundary_violation(request_state)
+        if terminal_reason:
+            return False, terminal_reason
+        return True, None
     return True, None
 
 
-def _terminal_goal_covered_despite_todos(
+def _outer_sql_query_boundary_violation(
     request_state: RequestStateModel,
-    evaluation,
-) -> bool:
-    if not evaluation.can_answer:
-        return False
-    if not evaluation.answerable_from:
-        return False
-    gap = latest_gap_assessment(request_state)
-    if not gap:
-        return False
-    if gap.get("can_answer") is not True:
-        return False
-    return not _gap_blocking_items(gap)
+    action_input: dict | None,
+) -> str | None:
+    if not isinstance(action_input, dict):
+        return None
+    constraints = request_state.constraints if isinstance(request_state.constraints, dict) else {}
+    if constraints.get("allow_outer_explicit_query") is True:
+        return None
+    exposed_query_fields = [
+        key for key in ("query", "message|query", "query_language")
+        if key in action_input and action_input.get(key) not in (None, "", [], {})
+    ]
+    if not exposed_query_fields:
+        return None
+    return (
+        "Outer ReAct SQL boundary violation: data_agent must not write SQL/Flux/PromQL or pass query-language fields. "
+        "Call sql_query with natural-language action_input.message and optional purpose only; "
+        "schema linking, query generation, dialect handling, and repair are internal to sql_query. "
+        f"Remove fields: {exposed_query_fields}."
+    )
 
 
-def _missing_specialized_tool_output(missing_evidence: list[str]) -> bool:
-    missing = {
-        str(item).strip().lower()
-        for item in missing_evidence
-        if str(item).strip()
-    }
-    return bool(missing & {"analysis", "forecast", "anomaly"})
+def _outer_todo_boundary_violation(action_input: dict | None) -> str | None:
+    if not isinstance(action_input, dict):
+        return None
+    if not _contains_database_query_code(action_input):
+        return None
+    return (
+        "Outer ReAct boundary violation: todowrite must describe user-facing plan steps in natural language. "
+        "Do not place database query code, dialect syntax, schema-linking details, or repair instructions inside todo content."
+    )
+
+
+def _initial_todo_contract_violation(
+    request_state: RequestStateModel,
+    action_input: dict | None,
+) -> str | None:
+    return None
+
+
+def _contains_database_query_code(value) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_database_query_code(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_database_query_code(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    patterns = (
+        r"\bselect\s+.+\bfrom\b",
+        r"\bwith\s+\w+\s+as\s*\(",
+        r"\bfrom\s*\(",
+        r"\|\s*>",
+        r"\brange\s*\(",
+        r"\bfilter\s*\(",
+        r"\baggregatewindow\s*\(",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns)
+
+
+def _terminal_boundary_violation(request_state: RequestStateModel) -> str | None:
+    """Return a minimal DB-GPT-style terminal guard violation.
+
+    Terminate should end the ReAct loop once useful tool observations exist. It
+    should not prove full semantic coverage of every model-authored contract
+    output; that made finalization brittle. The hard boundary here is only:
+    database-backed answers need at least one evidence/artifact, and explicitly
+    required specialized capabilities need their corresponding artifact.
+    """
+
+    if request_state.database_context is None:
+        return None
+    missing = _missing_explicit_terminal_capabilities(request_state)
+    if missing:
+        return (
+            "Final answer is blocked because an explicitly requested tool output is missing: "
+            + ", ".join(missing)
+            + "."
+        )
+    if not _available_artifact_refs(request_state):
+        return (
+            "Final answer is blocked because no database-backed observation or artifact is available yet. "
+            "Call sql_query or another evidence-producing tool first."
+        )
+    return None
+
+
+def _missing_explicit_terminal_capabilities(request_state: RequestStateModel) -> list[str]:
+    capabilities = _effective_capabilities(request_state)
+    missing: list[str] = []
+    if "forecast" in capabilities and not _latest_forecast_is_usable(request_state):
+        missing.append("forecast")
+    if "anomaly" in capabilities and request_state.latest_anomaly is None:
+        missing.append("anomaly")
+    if "analysis" in capabilities and request_state.latest_analysis_id is None:
+        missing.append("analysis")
+    if "query" in capabilities or "database_evidence" in capabilities or "database" in capabilities:
+        if request_state.latest_database_evidence is None or _latest_database_evidence_is_empty(request_state):
+            missing.append("database_evidence")
+    return missing
 
 
 def _repeated_failed_action_without_strategy_change(
@@ -176,6 +235,40 @@ def _repeated_failed_action_without_strategy_change(
     return (
         f"Action '{action_name}' has failed repeatedly. "
         "Assess the latest failure and provide a changed next_action_reason/action_reason before retrying the same tool."
+    )
+
+
+def _covered_action_repeat_reason(
+    request_state: RequestStateModel,
+    action_name: str,
+    required_actions: set[str],
+) -> str | None:
+    if action_name in TERMINAL_ACTIONS or action_name in required_actions:
+        return None
+    latest = request_state.observations[-1] if request_state.observations else None
+    if latest is not None and not latest.success:
+        return None
+    refs = _available_artifact_refs(request_state)
+    if action_name in {"sql_query", "query_database"} and any(ref.startswith("evidence:") for ref in refs):
+        if _has_successful_action(request_state, action_name):
+            return (
+                "Equivalent query evidence already exists. Reuse the available evidence artifact "
+                "and choose the next missing capability action, or terminate if the request is covered."
+            )
+    if action_name == "code_interpreter" and any(ref.startswith("analysis:") for ref in refs):
+        if _has_successful_action(request_state, action_name):
+            return "Analysis artifact already exists. Reuse it or choose the next missing capability action."
+    if action_name == "forecast" and any(ref.startswith("forecast:") for ref in refs):
+        return "Forecast artifact already exists. Reuse it or terminate if the request is covered."
+    if action_name == "anomaly" and any(ref.startswith("anomaly:") for ref in refs):
+        return "Anomaly artifact already exists. Reuse it or choose the next missing capability action."
+    return None
+
+
+def _has_successful_action(request_state: RequestStateModel, action_name: str) -> bool:
+    return any(
+        observation.tool_name == action_name and observation.success
+        for observation in request_state.observations
     )
 
 
@@ -258,108 +351,74 @@ def _requires_initial_todo_plan(request_state: RequestStateModel) -> bool:
     if profile.get("needs_plan") is True:
         return True
     message = str(request_state.message or "")
-    numbered_items = re.findall(r"(?<!\d)(?:\d+|[一二三四五六七八九十]+)(?:[\.\、\)]|\s+)\s*\S", message)
+    if _explicitly_requests_todo_plan(message):
+        return True
+    numbered_items = re.findall(
+        r"(?:^|[\n；;。])\s*(?:\d+|[一二三四五六七八九十]+)(?:[\.\、\)]|\s+)\s*\S",
+        message,
+    )
     bullet_items = re.findall(r"(?:^|\n)\s*[-*]\s+\S", message)
     return len(numbered_items) + len(bullet_items) >= 3
+
+
+def _is_initial_todowrite_action(request_state: RequestStateModel) -> bool:
+    return (
+        not request_state.todo_list
+        and not request_state.tool_history
+        and not request_state.observations
+        and _requires_initial_todo_plan(request_state)
+    )
+
+
+def _explicitly_requests_todo_plan(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for pattern in (
+            r"\btodo(?:\s+list)?\b",
+            r"待办",
+            r"任务列表",
+            r"先\s*(?:写|制定|列|创建|生成|做)\s*(?:一个)?\s*(?:todo|计划|任务)",
+            r"先.*(?:todo|计划|任务列表)",
+            r"按(?:照)?(?:这个|该)?计划执行",
+        )
+    )
 
 
 def runtime_action_constraints(request_state: RequestStateModel) -> dict:
     """Return runtime-owned next-action constraints derived from structured state."""
 
-    if _requires_initial_todo_plan(request_state):
-        return {
-            "required_actions": [
-                {
-                    "action": "todowrite",
-                    "reason": "The user requested a multi-step deliverable and no todo plan exists.",
-                }
-            ],
-            "prohibited_actions": sorted(VALID_ACTIONS - {"todowrite"}),
-            "missing_outputs": ["todo_plan"],
-            "reason": "Create the initial todo plan before querying or answering.",
-        }
-
-    capabilities = {
-        str(item).strip().lower()
-        for item in (request_state.requested_capabilities or [])
-        if str(item).strip()
-    }
-    has_database_evidence = not _latest_database_evidence_is_empty(request_state) and request_state.latest_database_evidence is not None
-    required: list[dict] = []
-    missing: list[str] = []
-
-    if "anomaly" in capabilities and request_state.latest_anomaly is None:
-        missing.append("anomaly")
-        required.append(
-            {
-                "action": "anomaly" if has_database_evidence else "sql_query",
-                "reason": "Anomaly output is required by the structured intent profile.",
-                "input_guidance": {"database_evidence": "latest"} if has_database_evidence else {"constraints": {"evidence_shape": "raw_timeseries"}},
-            }
-        )
-    elif "forecast" in capabilities and not _latest_forecast_is_usable(request_state):
-        missing.append("forecast")
-        required.append(
-            {
-                "action": "forecast" if has_database_evidence else "sql_query",
-                "reason": "Forecast output is required by the structured intent profile.",
-                "input_guidance": {"database_evidence": "latest", "horizon": "derive from user request"} if has_database_evidence else {"constraints": {"evidence_shape": "raw_timeseries"}},
-            }
-        )
-
     downstream_analysis = None
+    capabilities = _effective_capabilities(request_state)
     specialized_covered = (
         ("anomaly" in capabilities and request_state.latest_anomaly is not None)
         or ("forecast" in capabilities and _latest_forecast_is_usable(request_state))
     )
     if not specialized_covered:
         downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
-    if downstream_analysis and request_state.latest_analysis_id is None:
-        required.append(
-            {
-                "action": "code_interpreter",
-                "reason": "Latest database evidence declares uncovered derived outputs for downstream analysis.",
-                "input_guidance": {
-                    "database_evidence": "latest",
-                    "analysis_request": downstream_analysis,
-                },
-            }
-        )
-        missing.append("analysis")
+    frame = build_observation_frame(
+        request_state,
+        requires_initial_todo_plan=_requires_initial_todo_plan(request_state),
+        latest_database_evidence_empty=_latest_database_evidence_is_empty(request_state),
+        downstream_analysis_request=downstream_analysis,
+        shape_recovery_request=_latest_query_shape_recovery(request_state),
+        completion_missing_outputs=[],
+        completion_reason=None,
+    )
+    return build_action_space(frame).model_view()
 
-    shape_recovery = _latest_query_shape_recovery(request_state)
-    if shape_recovery:
-        action = "sql_query"
-        if has_database_evidence and shape_recovery.get("recommended_downstream_action") == "code_interpreter":
-            action = "code_interpreter"
-        required.append(
-            {
-                "action": action,
-                "reason": "The previous sql_query failed dialect/query-task shape validation.",
-                "input_guidance": shape_recovery,
-            }
-        )
-        missing.append("query_shape_recovery")
 
-    if not required:
-        prohibited = []
-        if request_state.database_context is not None and "rag" not in capabilities:
-            prohibited.append("rag")
-        return {
-            "required_actions": [],
-            "prohibited_actions": prohibited,
-            "missing_outputs": [],
-            "reason": "No runtime-enforced action constraint is active.",
-        }
-    prohibited = ["terminate"]
-    if request_state.database_context is not None and "rag" not in capabilities:
-        prohibited.append("rag")
-    return {
-        "required_actions": required[:1],
-        "prohibited_actions": prohibited,
-        "missing_outputs": missing,
-        "reason": required[0]["reason"],
+def _effective_capabilities(request_state: RequestStateModel) -> set[str]:
+    values = {
+        str(item).strip().lower()
+        for item in (request_state.requested_capabilities or [])
+        if str(item).strip()
     }
+    if "rag" in values:
+        values.add("external_knowledge")
+    return values
 
 
 def _latest_query_requests_downstream_analysis(request_state: RequestStateModel) -> dict | None:
@@ -426,21 +485,63 @@ def build_policy_observation(
     action_name: str,
     reason: str,
 ) -> ToolObservation:
+    next_constraints = runtime_action_constraints(request_state)
+    prohibited = {
+        str(item).strip()
+        for item in next_constraints.get("prohibited_actions", [])
+        if str(item).strip()
+    }
+    required = [
+        str(item.get("action") or "").strip()
+        for item in next_constraints.get("required_actions", [])
+        if isinstance(item, dict) and str(item.get("action") or "").strip()
+    ]
+    allowed_next_actions = required or sorted(VALID_ACTIONS - prohibited)
+    latest_goal = request_state.completion_state.get("latest_goal")
+    missing_capabilities = []
+    if isinstance(latest_goal, dict):
+        missing_capabilities = [
+            str(item).strip()
+            for item in latest_goal.get("missing_evidence", [])
+            if str(item).strip()
+        ]
     return ToolObservation(
         tool_name=action_name,
         success=False,
         summary=reason,
         payload={
-            "valid_actions": sorted(VALID_ACTIONS),
-            "completion_state": request_state.completion_state,
+            "rejected_action": action_name,
+            "allowed_next_actions": allowed_next_actions,
+            "next_action_constraints": next_constraints,
+            "missing_capabilities": missing_capabilities or next_constraints.get("missing_outputs", []),
+            "available_artifacts": _available_artifact_refs(request_state),
+            "recommended_next_action": allowed_next_actions[0] if allowed_next_actions else None,
             "recovery_hint": (
                 "Choose exactly one allowed next action and return one JSON object. "
+                "The field next_action_constraints is authoritative: do not choose prohibited_actions, and choose required_actions when present. "
                 "Do not call todowrite again when a plan already exists. "
-                "Use the latest observation, bounded evidence previews, and artifact refs to decide whether to query, analyze, or terminate with the final answer. "
-                "Todo state is progress context; it does not replace the ReAct Thought/Action/Observation loop."
+                "Use available_artifacts and missing_capabilities to decide whether to query, analyze, run a specialized tool, or terminate."
             ),
         },
         error=reason,
         payload_truncated=False,
         payload_ref=None,
     )
+
+
+def _available_artifact_refs(request_state: RequestStateModel) -> list[str]:
+    refs: list[str] = []
+    if request_state.latest_database_evidence is not None:
+        refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
+    if request_state.latest_analysis_id:
+        refs.append(f"analysis:{request_state.latest_analysis_id}")
+    if request_state.latest_anomaly is not None:
+        refs.append(f"anomaly:{request_state.latest_anomaly.anomaly_id}")
+    if request_state.latest_forecast is not None:
+        refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
+    if request_state.latest_rag is not None:
+        refs.append("rag:latest")
+    if request_state.latest_skill is not None:
+        skill_name = request_state.latest_skill.get("skill_name") if isinstance(request_state.latest_skill, dict) else None
+        refs.append(f"skill:{skill_name}" if skill_name else "skill:latest")
+    return refs

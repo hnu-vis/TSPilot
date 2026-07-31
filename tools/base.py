@@ -15,12 +15,14 @@ class StructuredToolError(Exception):
         retryable: bool = True,
         diagnostics: dict | None = None,
         recommended_next_action: str | None = None,
+        validation_failure: dict | None = None,
     ):
         super().__init__(message)
         self.error_type = error_type
         self.retryable = retryable
         self.diagnostics = diagnostics or {}
         self.recommended_next_action = recommended_next_action
+        self.validation_failure = validation_failure or {}
 
     def to_observation_payload(self) -> dict:
         payload = {
@@ -31,6 +33,8 @@ class StructuredToolError(Exception):
         }
         if self.recommended_next_action:
             payload["recommended_next_action"] = self.recommended_next_action
+        if self.validation_failure:
+            payload["validation_failure"] = self.validation_failure
         return payload
 
 

@@ -12,7 +12,7 @@ from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
 from schemas.timeseries import AnomalyResult
 from schemas.visualization import VisualizationPayload
-from tools.base import BaseTool
+from tools.base import BaseTool, StructuredToolError
 
 
 class AnomalyInput(BaseModel):
@@ -38,11 +38,18 @@ class AnomalyTool(BaseTool):
             constraints,
         )
         preferred_series = validated_input.series_name or constraints.get("series_name")
-        series = normalize_timeseries_evidence(
-            database_evidence,
-            series_name=preferred_series,
-            value_field=preferred_series,
-        )
+        try:
+            series = normalize_timeseries_evidence(
+                database_evidence,
+                series_name=preferred_series,
+                value_field=preferred_series,
+            )
+        except ValueError as exc:
+            raise _insufficient_timeseries_evidence_error(
+                message=str(exc),
+                tool_name="anomaly",
+                evidence=database_evidence,
+            ) from exc
         detector_name = validated_input.detector_name or constraints.get("detector_name") or default_anomaly_detector_name()
         detector = get_anomaly_detector(detector_name)
         detector_output = detector.detect(series, params=constraints)
@@ -124,6 +131,46 @@ def _latest_raw_timeseries_candidate(selected: DatabaseEvidence, request_state) 
             continue
         candidates.append(evidence)
     return candidates[-1] if candidates else None
+
+
+def _insufficient_timeseries_evidence_error(
+    *,
+    message: str,
+    tool_name: str,
+    evidence: DatabaseEvidence,
+) -> StructuredToolError:
+    repair_contract = {
+        "mode": "timeseries_input_repair",
+        "failed_tool": tool_name,
+        "input_evidence": evidence.evidence_id,
+        "required_evidence_shape": "raw_timeseries",
+        "required_min_points": 2,
+        "constraints": {
+            "evidence_shape": "raw_timeseries",
+            "dialect_complexity_policy": "simple_raw_evidence",
+        },
+    }
+    return StructuredToolError(
+        message,
+        error_type="insufficient_timeseries_evidence",
+        retryable=True,
+        diagnostics={
+            "input_evidence_id": evidence.evidence_id,
+            "result_type": evidence.result_type,
+            "required_min_points": 2,
+            "required_evidence_shape": "raw_timeseries",
+        },
+        recommended_next_action="sql_query",
+        validation_failure={
+            "tool": "sql_query",
+            "repair_contract": repair_contract,
+            "retry_policy": {
+                "required_action": "sql_query",
+                "max_equivalent_retries": 2,
+                "terminal_after_exhausted": False,
+            },
+        },
+    )
 
 
 def _evidence_looks_outlier_filtered(evidence: DatabaseEvidence) -> bool:

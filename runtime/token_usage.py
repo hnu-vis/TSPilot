@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 import tiktoken
+
+_TIKTOKEN_OFFLINE_LOCK = threading.Lock()
 
 
 def record_llm_token_usage(
@@ -18,13 +22,23 @@ def record_llm_token_usage(
     tool_name: str | None = None,
     duration_ms: int | None = None,
 ) -> dict | None:
-    """Estimate LLM token usage with tiktoken and retain provider usage when present."""
+    """Retain provider usage and estimate tokens only when it cannot block the request path."""
 
     if request_state is None:
         return None
     provider_usage = extract_provider_token_usage(response)
     response_text = output_text if output_text is not None else _response_text(response)
-    estimated_usage = estimate_token_usage(messages or [], response_text, model=model or _response_model(response))
+    estimated_usage = None
+    accounting_status = {
+        "estimated_usage_status": "skipped_provider_usage_available"
+        if provider_usage is not None
+        else "not_attempted"
+    }
+    if provider_usage is None:
+        estimated_usage = estimate_token_usage(messages or [], response_text, model=model or _response_model(response))
+        accounting_status["estimated_usage_status"] = (
+            "estimated_offline" if estimated_usage is not None else "unavailable_offline"
+        )
     if estimated_usage is None and provider_usage is None:
         return None
     token_state = request_state.completion_state.setdefault("token_usage", _empty_usage())
@@ -33,6 +47,7 @@ def record_llm_token_usage(
         "tool_name": _tool_name_for_usage(source=source, output_text=response_text, tool_name=tool_name),
         "estimated": estimated_usage,
         "provider": provider_usage,
+        "accounting": accounting_status,
     }
     if duration_ms is not None:
         entry["duration_ms"] = int(duration_ms)
@@ -157,12 +172,38 @@ def _json_object(text: str | None) -> dict | None:
 
 
 def _encoding_for_model(model: str | None):
-    if model:
+    with _tiktoken_offline_only():
+        if model:
+            try:
+                return tiktoken.encoding_for_model(model)
+            except KeyError:
+                pass
+        return tiktoken.get_encoding("cl100k_base")
+
+
+@contextmanager
+def _tiktoken_offline_only():
+    """Prevent tiktoken from synchronously downloading encodings during request handling."""
+
+    with _TIKTOKEN_OFFLINE_LOCK:
         try:
-            return tiktoken.encoding_for_model(model)
-        except KeyError:
-            pass
-    return tiktoken.get_encoding("cl100k_base")
+            from tiktoken import load as tiktoken_load
+        except Exception:
+            yield
+            return
+
+        original_read_file = tiktoken_load.read_file
+
+        def offline_read_file(blobpath: str) -> bytes:
+            if "://" in str(blobpath):
+                raise RuntimeError(f"tiktoken encoding is not available in local cache: {blobpath}")
+            return original_read_file(blobpath)
+
+        tiktoken_load.read_file = offline_read_file
+        try:
+            yield
+        finally:
+            tiktoken_load.read_file = original_read_file
 
 
 def _count_messages(messages: list, encoding) -> int:

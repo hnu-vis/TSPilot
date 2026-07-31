@@ -1,10 +1,12 @@
 """Deterministic schema and catalog inspection helpers."""
 from __future__ import annotations
 
+from typing import Any
+
 from .connector import DatabaseSchema
 
 
-def schema_preview(schema: DatabaseSchema) -> dict:
+def schema_preview(schema: DatabaseSchema, *, dialect: Any | None = None) -> dict:
     metadata = schema.metadata or {}
     value_domains = metadata.get("value_domains") if isinstance(metadata.get("value_domains"), dict) else {}
     reference_dataset = (
@@ -52,13 +54,20 @@ def schema_preview(schema: DatabaseSchema) -> dict:
                         "values": list(values)[:20] if isinstance(values, list) else [],
                     }
                 )
-    return {
+    preview = {
         "tables_or_measurements": tables,
         "fields": fields,
         "labels_or_tags": labels_or_tags,
         "time_columns": time_columns,
         "metadata": metadata,
     }
+    if dialect is not None:
+        extension_builder = getattr(dialect, "schema_preview_extensions", None)
+        if callable(extension_builder):
+            extensions = extension_builder(schema=schema, preview=preview)
+            if isinstance(extensions, dict):
+                preview.update(extensions)
+    return preview
 
 
 def metric_list_preview(schema: DatabaseSchema) -> dict:

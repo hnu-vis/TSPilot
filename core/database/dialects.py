@@ -54,6 +54,9 @@ class DatabaseDialect:
     def query_shape_issues(self, *, query: str, query_language: str | None = None, query_task_contract: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return []
 
+    def schema_preview_extensions(self, *, schema: Any, preview: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
     def repair_query(self, *, query: str, query_language: str | None = None, error: Exception | str | None = None):
         from .repair import QueryRepairResult
 
@@ -173,6 +176,53 @@ class InfluxDBFluxDialect(DatabaseDialect):
             return
         super().validate_read_only(query, query_language)
 
+    def schema_preview_extensions(self, *, schema: Any, preview: dict[str, Any]) -> dict[str, Any]:
+        value_domains = getattr(schema, "metadata", {}).get("value_domains")
+        if not isinstance(value_domains, dict):
+            return {}
+        tables = preview.get("tables_or_measurements") if isinstance(preview.get("tables_or_measurements"), list) else []
+        measure_mappings = []
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            table_name = table.get("name")
+            field_values = table.get("field_values") if isinstance(table.get("field_values"), list) else []
+            if field_values:
+                table["field_value_semantics"] = {
+                    "logical_measure_source": "_field",
+                    "physical_value_column": "_value",
+                    "aggregate_column": "_value",
+                    "rule": "Filter _field to select a logical measure; aggregate/read numeric values from _value.",
+                }
+            for field_value in field_values:
+                if field_value in (None, ""):
+                    continue
+                measure_mappings.append(
+                    {
+                        "source": table_name,
+                        "logical_measure": str(field_value),
+                        "selector_column": "_field",
+                        "selector_value": str(field_value),
+                        "physical_value_column": "_value",
+                        "aggregate_column": "_value",
+                        "time_column": "_time",
+                    }
+                )
+        if not measure_mappings:
+            return {}
+        return {
+            "physical_model": {
+                "dialect": "influxdb_flux_long_form",
+                "value_storage": "logical measures are selected via _field; numeric samples are stored in _value",
+                "measure_mappings": measure_mappings[:200],
+                "query_generation_constraints": [
+                    "Filter r[\"_field\"] to select logical_measure.",
+                    "Use _value for aggregate functions such as max/min/mean/sum/count unless a pivoted physical column is explicitly proven.",
+                    "Do not aggregate field values directly when the field is listed as logical_measure.",
+                ],
+            }
+        }
+
     def query_shape_issues(self, *, query: str, query_language: str | None = None, query_task_contract: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         normalized = str(query or "").lower()
         issues: list[dict[str, Any]] = []
@@ -236,7 +286,86 @@ class InfluxDBFluxDialect(DatabaseDialect):
                         "recommended_shape": "Keep _value for long-form Flux aggregates, or filter _field and return raw _time/_value evidence.",
                     }
                 )
+        issues.extend(self._logical_field_aggregate_issues(query=query, query_task_contract=contract))
         return issues
+
+    def _logical_field_aggregate_issues(self, *, query: str | None, query_task_contract: dict[str, Any]) -> list[dict[str, Any]]:
+        text = str(query or "")
+        if not text.strip():
+            return []
+        mappings = self._measure_mappings_from_contract(query_task_contract)
+        if not mappings:
+            return []
+        issues: list[dict[str, Any]] = []
+        aggregate_pattern = re.compile(
+            r"\|\>\s*(?P<fn>max|min|mean|sum|count)\s*\(\s*column\s*:\s*[\"'](?P<column>[^\"']+)[\"']",
+            flags=re.IGNORECASE,
+        )
+        for match in aggregate_pattern.finditer(text):
+            physical_column = match.group("column")
+            mapping = next(
+                (
+                    item for item in mappings
+                    if str(item.get("logical_measure") or item.get("selector_value") or "").lower() == physical_column.lower()
+                    and str(item.get("physical_value_column") or item.get("aggregate_column") or "").lower() != physical_column.lower()
+                ),
+                None,
+            )
+            if not mapping:
+                continue
+            issues.append(
+                {
+                    "code": "flux_logical_field_used_as_physical_aggregate_column",
+                    "message": (
+                        f"Flux query aggregates logical field value {physical_column!r} as a physical column. "
+                        "Long-form Influx data must filter the field selector and aggregate the physical value column."
+                    ),
+                    "failed_physical_column": physical_column,
+                    "logical_measure": mapping.get("logical_measure") or mapping.get("selector_value"),
+                    "required_field_filter": {
+                        "column": mapping.get("selector_column") or "_field",
+                        "operator": "=",
+                        "value": mapping.get("selector_value") or mapping.get("logical_measure"),
+                    },
+                    "physical_value_column": mapping.get("physical_value_column") or "_value",
+                    "aggregate_column": mapping.get("aggregate_column") or mapping.get("physical_value_column") or "_value",
+                    "recommended_shape": "schema_grounded_flux_aggregate",
+                }
+            )
+        return issues
+
+    def _measure_mappings_from_contract(self, contract: dict[str, Any]) -> list[dict[str, Any]]:
+        candidates: list[Any] = []
+        for key in ("measures", "aggregate_targets"):
+            value = contract.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+        diagnostics = contract.get("_schema_linking_diagnostics")
+        if isinstance(diagnostics, dict):
+            for key in ("measure_mappings", "measures", "aggregate_targets"):
+                value = diagnostics.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+            raw_rule = diagnostics.get("raw_rule_diagnostics")
+            if isinstance(raw_rule, dict):
+                value = raw_rule.get("measure_mappings")
+                if isinstance(value, list):
+                    candidates.extend(value)
+        mappings = []
+        seen = set()
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            logical = item.get("logical_measure") or item.get("selector_value")
+            physical = item.get("physical_value_column") or item.get("aggregate_column")
+            if not logical or not physical:
+                continue
+            key = (str(logical).lower(), str(physical).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            mappings.append(item)
+        return mappings
 
     def repair_query(self, *, query: str, query_language: str | None = None, error: Exception | str | None = None):
         from .repair import QueryRepairResult

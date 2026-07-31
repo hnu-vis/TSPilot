@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from core.database.dialects import dialect_for_database
 from runtime.language import detect_response_language
@@ -51,13 +51,45 @@ class LLMSchemaLinkingContract(BaseModel):
     """LLM-selected schema/query grounding contract."""
 
     sources: list[dict[str, Any]] = Field(default_factory=list)
+    measures: list[dict[str, Any]] = Field(default_factory=list)
     value_columns: list[dict[str, Any]] = Field(default_factory=list)
+    aggregate_targets: list[dict[str, Any]] = Field(default_factory=list)
     dimension_columns: list[dict[str, Any]] = Field(default_factory=list)
     required_filters: list[dict[str, Any]] = Field(default_factory=list)
     candidate_filters: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_terms: list[str] = Field(default_factory=list)
     confidence: str = "low"
     evidence: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "sources",
+        "measures",
+        "value_columns",
+        "aggregate_targets",
+        "dimension_columns",
+        "required_filters",
+        "candidate_filters",
+        mode="before",
+    )
+    @classmethod
+    def normalize_object_lists(cls, value, info):
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        for item in value:
+            if isinstance(item, dict):
+                normalized.append(item)
+                continue
+            if isinstance(item, str) and item.strip():
+                key = "name"
+                if info.field_name in {"required_filters", "candidate_filters"}:
+                    key = "column"
+                elif info.field_name in {"measures", "aggregate_targets"}:
+                    key = "logical_measure"
+                normalized.append({key: item.strip()})
+        return normalized
 
 
 @dataclass
@@ -211,6 +243,10 @@ class LLMQueryGenerator:
             "The query must be read-only and grounded only in the provided schema.\n"
             f"Dialect/query-language rules for this datasource ({database_type}, {dialect.query_language}): {dialect.generation_rules}\n"
             "Treat schema_preview.schema_linking as the first-stage grounding result.\n"
+            "If schema_preview.schema_linking.measures or aggregate_targets is present, treat it as authoritative: "
+            "use selector_column/selector_value to filter logical measures and aggregate/read physical_value_column or aggregate_column. "
+            "Never aggregate a logical_measure name directly when a separate physical_value_column is provided.\n"
+            "If schema_preview.physical_model is present, follow its query_generation_constraints before all generic column-name heuristics.\n"
             "Preserve every schema_linking.required_filters item in the generated query unless it is impossible in the dialect.\n"
             "Use schema_linking.candidate_filters and labels_or_tags as auxiliary value-domain evidence. "
             "Map user-mentioned entities, abbreviations, ticker symbols, and multilingual aliases to those domain values before writing filters.\n"
@@ -267,6 +303,9 @@ class LLMQueryGenerator:
             "Use only schema_preview and rule_schema_linking as evidence.\n"
             "Select the minimal physical sources, value columns, dimension columns, and filters needed for the user request.\n"
             f"Dialect-specific grounding rules for this datasource ({database_type}): {dialect.schema_linking_rules}\n"
+            "If schema_preview.physical_model or rule_schema_linking.measure_mappings is present, use it as authoritative physical-column evidence. "
+            "For each requested measure, preserve logical_measure, selector_column/selector_value, physical_value_column, and aggregate_column in measures/aggregate_targets. "
+            "Do not put a logical field value into value_columns as if it were a physical aggregate column unless physical_model proves that column exists after pivoting. "
             "Treat rule_schema_linking.candidate_filters as value-domain evidence. "
             "When the user mentions an entity, unit, ticker, symbol, code, label, or multilingual alias that matches a candidate value, include it in required_filters. "
             "required_filters must contain every source/dimension value that is necessary for the query to answer the specific user request, not optional filters.\n"
@@ -274,7 +313,9 @@ class LLMQueryGenerator:
             "For each filter use {\"source\": string|null, \"column\": string, \"operator\": \"=\", \"value\": string|number|boolean}.\n"
             "JSON schema: {"
             "\"sources\": object[], "
+            "\"measures\": object[], "
             "\"value_columns\": object[], "
+            "\"aggregate_targets\": object[], "
             "\"dimension_columns\": object[], "
             "\"required_filters\": object[], "
             "\"candidate_filters\": object[], "
@@ -334,10 +375,15 @@ class LLMQueryGenerator:
         required_filters: list[Any] = []
         candidate_filters: list[Any] = []
         sources: list[Any] = []
+        measures: list[Any] = []
+        aggregate_targets: list[Any] = []
         if isinstance(schema_linking, dict):
             required_filters = schema_linking.get("required_filters") if isinstance(schema_linking.get("required_filters"), list) else []
             candidate_filters = schema_linking.get("candidate_filters") if isinstance(schema_linking.get("candidate_filters"), list) else []
             sources = schema_linking.get("sources") if isinstance(schema_linking.get("sources"), list) else []
+            measures = schema_linking.get("measures") if isinstance(schema_linking.get("measures"), list) else []
+            aggregate_targets = schema_linking.get("aggregate_targets") if isinstance(schema_linking.get("aggregate_targets"), list) else []
+        physical_model = schema_preview.get("physical_model") if isinstance(schema_preview.get("physical_model"), dict) else None
         return {
             "goal": (
                 "Return a corrected read-only query that satisfies the user request and addresses the validation/execution error. "
@@ -351,4 +397,7 @@ class LLMQueryGenerator:
             "required_filters": required_filters,
             "candidate_filters": candidate_filters,
             "grounded_sources": sources,
+            "measures": measures,
+            "aggregate_targets": aggregate_targets,
+            "physical_model": physical_model,
         }

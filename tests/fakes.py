@@ -632,6 +632,29 @@ def _evidence_refs_from_payload(payload: dict) -> list[str]:
 
 
 def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
+    if "LLM Schema Linking JSON:" in user_prompt:
+        payload = json.loads(user_prompt.split("LLM Schema Linking JSON:\n", 1)[1])
+        schema_preview = payload.get("schema_preview") or {}
+        tables = schema_preview.get("tables_or_measurements") or []
+        table = tables[0] if tables and isinstance(tables[0], dict) else {}
+        table_name = table.get("name") or "measurement"
+        fields = table.get("field_columns") or []
+        field = fields[0] if fields else "value"
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "sources": [{"name": table_name, "source_type": "measurement"}],
+                    "value_columns": [{"name": field, "source": table_name}],
+                    "dimension_columns": [],
+                    "required_filters": [],
+                    "candidate_filters": [],
+                    "unresolved_terms": [],
+                    "confidence": "high",
+                    "evidence": ["fake schema linking selected the first schema source and value column"],
+                },
+                ensure_ascii=False,
+            )
+        )
     if "LLM SQL Query Generation JSON:" not in user_prompt:
         return None
     payload = json.loads(user_prompt.split("LLM SQL Query Generation JSON:\n", 1)[1])
@@ -734,11 +757,21 @@ def _analysis_action_input(evidence, goal: str) -> dict:
         "analysis_goal": goal,
         "code_type": "python_rows_v1",
         "analysis_code": (
-            "values = [float(row.get('value')) for row in rows if row.get('value') is not None]\n"
+            "value_keys = ('value', '_value', 'price', 'appliances_energy_wh')\n"
+            "values = []\n"
+            "for row in rows:\n"
+            "    for key in value_keys:\n"
+            "        if row.get(key) is None:\n"
+            "            continue\n"
+            "        try:\n"
+            "            values.append(float(row.get(key)))\n"
+            "            break\n"
+            "        except (TypeError, ValueError):\n"
+            "            continue\n"
             "summary = f'Analyzed {len(rows)} rows.'\n"
             "if values:\n"
             "    summary = f'Analyzed {len(rows)} rows; first={values[0]:.2f}, last={values[-1]:.2f}.'\n"
-            "result = {'summary': summary, 'metrics': {'row_count': len(rows)}, 'details': {}}\n"
+            "result = {'summary': summary, 'metrics': {'row_count': len(rows), 'first_value': values[0] if values else None, 'last_value': values[-1] if values else None}, 'details': {}}\n"
         ),
         "expected_result_schema": {"summary": "str", "metrics": "dict", "details": "dict"},
     }

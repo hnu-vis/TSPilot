@@ -22,6 +22,7 @@ class SchemaLinkingPipelineResult:
     plan: DatabaseQueryPlan
     required_filters: list[QueryFilter]
     candidate_filters: list[dict[str, Any]] = field(default_factory=list)
+    measure_mappings: list[dict[str, Any]] = field(default_factory=list)
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -47,6 +48,7 @@ class SchemaLinkingPipelineResult:
                 for item in self.required_filters
             ],
             "candidate_filters": self.candidate_filters or [],
+            **({"measure_mappings": self.measure_mappings} if self.measure_mappings else {}),
         }
 
 
@@ -96,12 +98,14 @@ class SchemaLinkingPipeline:
         )
         required_filters = self.required_filters(plan)
         candidate_filters = self.candidate_filters(schema=schema, plan=plan)
+        measure_mappings = self.measure_mappings(schema=schema, linking=linking)
         return SchemaLinkingPipelineResult(
             linking=linking,
             field_mappings=field_mappings,
             plan=plan,
             required_filters=required_filters,
             candidate_filters=candidate_filters,
+            measure_mappings=measure_mappings,
         )
 
     def map_fields(
@@ -257,6 +261,36 @@ class SchemaLinkingPipeline:
                     }
                 )
         return candidates
+
+    def measure_mappings(self, *, schema: DatabaseSchema, linking: SchemaLinkingResult) -> list[dict[str, Any]]:
+        value_domains = schema.metadata.get("value_domains")
+        if not isinstance(value_domains, dict):
+            return []
+        mappings: list[dict[str, Any]] = []
+        linked_source_names = {source.name for source in linking.sources}
+        for source_name, domains in value_domains.items():
+            if linked_source_names and source_name not in linked_source_names:
+                continue
+            if not isinstance(domains, dict):
+                continue
+            field_values = domains.get("_field")
+            if not isinstance(field_values, list) or not field_values:
+                continue
+            for logical_measure in field_values:
+                if logical_measure in (None, ""):
+                    continue
+                mappings.append(
+                    {
+                        "source": source_name,
+                        "logical_measure": str(logical_measure),
+                        "selector_column": "_field",
+                        "selector_value": str(logical_measure),
+                        "physical_value_column": "_value",
+                        "aggregate_column": "_value",
+                        "time_column": "_time",
+                    }
+                )
+        return mappings
 
     def _apply_time_range(self, plan: DatabaseQueryPlan, time_range: dict[str, Any] | None) -> None:
         if not time_range:

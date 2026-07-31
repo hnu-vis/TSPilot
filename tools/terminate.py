@@ -30,7 +30,19 @@ class TerminateInput(BaseModel):
             normalized["direct_answer"] = result
         if not normalized.get("summary_goal"):
             normalized["summary_goal"] = normalized.get("message") or result or "Assemble the final answer."
+        for key in ("include_analysis_ids", "include_fact_ids", "include_visualization_ids", "section_plan", "unavailable_outputs"):
+            normalized[key] = cls._normalize_listish(normalized.get(key))
         return normalized
+
+    @staticmethod
+    def _normalize_listish(value):
+        if value in (None, "", False, True):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [value]
+        return []
 
 
 class TerminateTool(BaseTool):

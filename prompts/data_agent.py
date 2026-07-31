@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 
-from core.data_fact import data_fact_prompt_view, prompt_fact_memory_view
+from core.harness import default_capability_registry
+from core.harness.observation_view import model_observation_view
 from runtime.action_policy import runtime_action_constraints
 from schemas.state import ConversationStateModel, RequestStateModel
 
@@ -16,34 +17,23 @@ class DataAgentPromptBuilder:
 
     def _compact_system_prompt(self) -> str:
         return (
-            "You are the outer ReAct data_agent for TSPilot v0.2.\n"
-            "Choose exactly one next action from the current state. Do not execute tools yourself.\n"
+            "You are the outer ReAct tool-calling data_agent for TSPilot v0.2.\n"
+            "Your only job is to choose exactly one next tool action from the current state. Do not execute tools yourself.\n"
             "Respond with exactly one JSON object and no markdown/prose/trailing text.\n"
             "Output schema: {\"thought\": str, \"task_contract\": object|null, "
             "\"previous_observation_assessment\": object|null, \"action_intention\": str|null, "
             "\"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
             "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
-            "Language policy: task.response_language controls all natural-language fields; keep JSON keys, action names, query code, identifiers, and database values unchanged.\n"
-            "Core ReAct rule: Thought_n selects Action_n; runtime provides Observation_n; Thought_n+1 must assess Observation_n before selecting the next action.\n"
-            "Use previous_observation_assessment only after a meaningful observation. It should state covered, missing, can_answer, next_action_reason, and fact coverage when relevant.\n"
-            "Task contract: create or update a compact user-visible output contract only when it helps verify multiple required outputs. Do not put internal tool stages in the contract.\n"
-            "Evidence rule: exact numeric claims in terminate must be grounded by produced DataFacts or verified database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate.\n"
-            "Use the smallest next action that fills the current evidence gap. Do not repeat an equivalent failed action unless action_input materially addresses the latest structured diagnostics.\n"
+            "Language policy: task.response_language controls all natural-language fields; keep JSON keys, action names, identifiers, and database values unchanged.\n"
+            "Core ReAct rule: Thought_n selects Action_n; runtime provides Observation_n; Thought_n+1 must use Observation_n and progress_summary before choosing the next action.\n"
+            "Do not repeat actions listed as completed in progress_summary unless last_observation says the existing artifact is insufficient.\n"
             "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
-            "When the user explicitly asks to use code_interpreter or the requested answer needs derived arithmetic over database values, first use sql_query to get simple grounded evidence, then use code_interpreter for the computation; do not force sql_query to encode fragile multi-step calculations.\n"
-            "If sql_query task_coverage or query_task_contract says downstream_action=code_interpreter, call code_interpreter on that evidence next instead of repeating sql_query. "
-            "If terminate is blocked by a stale gap assessment but forecast/anomaly/analysis artifacts exist, reassess the latest artifact coverage and either terminate with those refs or name the precise missing output.\n"
-            "Action parameter cards:\n"
-            "- sql_query: Query the selected datasource for grounded database evidence. Parameters: message, database_context, time_range?, constraints?, fact_requests?, or explicit query/query_language/purpose for user-supplied exact queries or focused repair. Normal database questions should use message mode; sql_query internally performs schema linking, query generation, validation, execution, and DataFact extraction. For later anomaly or forecast, ask sql_query for raw time-series evidence over the relevant series, not max/min/count aggregates.\n"
-            "- code_interpreter: Analyze existing full evidence artifacts for derived metrics or custom analysis. Preferred parameters: database_evidence, analysis_goal, analysis_request, required_outputs?, expected_result_schema?, constraints?, fact_requests?. Omit code unless the user explicitly requested custom code; the tool can run a canonical analysis_request template. If code is provided, it must use injected rows/points/columns/database_evidence variables and assign result={\"summary\": non-empty string, \"metrics\": object, \"details\": object}; do not return a bare expression.\n"
-            "- forecast: Forecast from existing raw time-series evidence when the user asks for prediction. If no raw time-series evidence exists, call sql_query first. Parameters: database_evidence, horizon, model_name?, series_name?, constraints?, fact_requests?. Omit model_name unless the user named a model.\n"
-            "- anomaly: Detect anomalies from existing raw time-series evidence when the user asks for anomaly/spike/outlier detection. If no raw time-series evidence exists, call sql_query first. Parameters: database_evidence, detector_name?, series_name?, constraints?, fact_requests?. Omit detector_name unless the user named a detector.\n"
-            "- todowrite: Create a visible plan only for complex tasks with 3+ independently verifiable user-visible outputs. Parameters: message, current_intent?, focus?, task_contract?, todos, evidence_summary?.\n"
-            "- rag: Retrieve non-database knowledge only when explicitly needed. Parameters: query, filters?.\n"
-            "- skill: Invoke a named packaged workflow only when explicitly requested. Parameters: skill_name, parameters.\n"
-            "- terminate: End when evidence covers the user request or the task cannot proceed. Parameters: result?, summary_goal?, direct_answer?, include_analysis_ids, include_fact_ids, include_visualization_ids, section_plan, unavailable_outputs, unavailable_reason?.\n"
-            "Tool-internal rules live inside tools. Do not recreate schema linking, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
-            "If a tool returns structured failure diagnostics, use them as evidence for the next action.\n"
+            "Use the smallest next action that fills the current missing capability. When all requested capabilities are covered, call terminate.\n"
+            "Exact numeric claims in terminate must be grounded by database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate.\n"
+            "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
+            "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
+            "Tool-internal rules live inside tools. Do not recreate schema linking, query generation, validation, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
+            "If a tool returns structured failure diagnostics, choose the recommended next action or a materially different action that addresses the diagnostics.\n"
             "Do not output markdown fences."
         )
 
@@ -52,163 +42,100 @@ class DataAgentPromptBuilder:
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> dict:
-        latest_evidence = (
-            self._summarize_database_evidence(request_state.latest_database_evidence)
-            if request_state.latest_database_evidence
-            else None
-        )
-        latest_evidence_id = latest_evidence.get("evidence_id") if isinstance(latest_evidence, dict) else None
-        prior_queries = [
-            item
-            for item in self._summarize_query_history(request_state)
-            if item.get("evidence_id") != latest_evidence_id
-        ]
+        return self._outer_react_view(request_state, conversation_state)
+
+    def _outer_react_view(
+        self,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+    ) -> dict:
+        action_space = runtime_action_constraints(request_state)
         return {
-            "task": {
-                "message": request_state.message,
-                "response_language": request_state.response_language,
-                "database_context": (
-                    request_state.database_context.model_dump(mode="json")
-                    if request_state.database_context
-                    else None
-                ),
-                "selected_database": request_state.selected_database,
-                "selected_database_type": request_state.selected_database_type,
-                "time_range": request_state.time_range,
-                "constraints": request_state.constraints,
-                "current_intent": request_state.current_intent,
-                "requested_capabilities": request_state.requested_capabilities,
-                "history": [message.model_dump(mode="json") for message in request_state.history[-4:]],
-            },
+            "task": self._task_context(request_state),
+            "tools": self._available_actions(),
             "state": {
                 "execution": self._execution_state(request_state),
-                "next_action_constraints": runtime_action_constraints(request_state),
-                "todo_list": request_state.todo_list,
-                "plan_current_step": request_state.plan_current_step,
-                "planning_complete": request_state.planning_complete,
-                "focus": request_state.focus,
-                "recent_todo_summary": conversation_state.recent_todo_summary,
-                "prompt_context_summary": request_state.prompt_context_summary,
-                "task_contract": (
-                    request_state.task_contract.model_dump(mode="json")
-                    if request_state.task_contract
-                    else None
-                ),
-                "data_fact_context": data_fact_prompt_view(request_state),
-                "long_term_fact_memory": prompt_fact_memory_view(self._database_id_for_fact_memory(request_state)),
-                "conversation_fact_memory": self._conversation_fact_memory(conversation_state),
+                "next_action_constraints": action_space,
+                "progress_summary": self._progress_summary(request_state, conversation_state),
+                "todo_progress": self._todo_progress_context(request_state, conversation_state),
+                "artifact_inventory": self._artifact_inventory(request_state),
             },
-            "evidence": {
-                "latest": latest_evidence,
-                "prior_queries": prior_queries[-5:],
+            "artifacts": {
+                "refs": self._artifact_ref_index(request_state),
             },
-            "outputs": {
-                "analysis_workspace": self._analysis_workspace(request_state),
-                "latest_forecast": (
-                    self._summarize_forecast_status(request_state.latest_forecast)
-                    if request_state.latest_forecast
-                    else None
-                ),
-                "latest_anomaly": (
-                    self._summarize_anomaly_status(request_state.latest_anomaly)
-                    if request_state.latest_anomaly
-                    else None
-                ),
-                "latest_rag": request_state.latest_rag,
-                "latest_skill": request_state.latest_skill,
-                "verified_facts": [
-                    fact.model_dump(mode="json")
-                    for fact in request_state.verified_facts
-                ],
-                "data_facts": data_fact_prompt_view(request_state),
-                "visualizations": [
-                    self._summarize_visualization(visualization)
-                    for visualization in request_state.visualizations
-                ],
-            },
-            "recent_observations": [
-                {
-                    "tool_name": observation.tool_name,
-                    "success": observation.success,
-                    "summary": observation.summary,
-                    "error": observation.error,
-                    "payload": self._summarize_observation_payload(observation.payload),
-                }
-                for observation in request_state.observations[-4:]
-            ],
-            "recent_react_transcript": [
-                self._react_step_context(step)
-                for step in request_state.react_transcript[-6:]
-            ],
-            "available_actions": self._available_actions(),
+            "last_observation": (
+                self._action_output_observation_context(request_state.latest_action_output)
+                if request_state.latest_action_output
+                else None
+            ),
+            "recent_trajectory": self._recent_memory_context(request_state),
         }
 
     def _available_actions(self) -> list[dict]:
-        return [
-            {
-                "action": "todowrite",
-                "use_when": "Complex task needs 3+ user-visible deliverables and no plan exists.",
-                "parameters": ["message", "current_intent?", "focus?", "task_contract?", "todos", "evidence_summary?"],
-            },
-            {
-                "action": "sql_query",
-                "use_when": "Need grounded database evidence, exact aggregates, grouping, ranking, or validation.",
-                "parameters": ["message|query", "database_context", "time_range?", "constraints?", "fact_requests?", "query_language?", "purpose?"],
-            },
-            {
-                "action": "code_interpreter",
-                "use_when": "Existing evidence needs derived metrics, statistics, ratios, windows, or custom computation.",
-                "parameters": ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "fact_requests?"],
-            },
-            {
-                "action": "anomaly",
-                "use_when": "User asks for anomaly/spike/outlier detection on time-series evidence.",
-                "parameters": ["database_evidence", "detector_name?", "series_name?", "constraints?", "fact_requests?"],
-            },
-            {
-                "action": "forecast",
-                "use_when": "User asks for prediction/forecast on time-series evidence.",
-                "parameters": ["database_evidence", "horizon", "model_name?", "series_name?", "constraints?", "fact_requests?"],
-            },
-            {
-                "action": "rag",
-                "use_when": "External/local knowledge is explicitly needed beyond database evidence.",
-                "parameters": ["query", "filters?"],
-            },
-            {
-                "action": "skill",
-                "use_when": "User explicitly asks for a named packaged workflow or skill.",
-                "parameters": ["skill_name", "parameters"],
-            },
-            {
-                "action": "terminate",
-                "use_when": "Evidence covers the request, or task cannot proceed with available context.",
-                "parameters": ["result?", "summary_goal?", "direct_answer?", "include_analysis_ids", "include_fact_ids", "include_visualization_ids", "section_plan", "unavailable_outputs", "unavailable_reason?"],
-            },
-        ]
+        cards = []
+        for card in default_capability_registry().action_cards():
+            item = {
+                "action": card.get("action"),
+                "use_when": card.get("use_when"),
+                "parameters": self._minimal_parameters(card.get("action"), card.get("parameters") or []),
+            }
+            cards.append({key: value for key, value in item.items() if value not in (None, "", [], {})})
+        return cards
 
-    def _conversation_fact_memory(self, conversation_state: ConversationStateModel) -> dict:
-        facts = list(conversation_state.recent_fact_memory or [])[-12:]
+    def _minimal_parameters(self, action: str | None, parameters: list[str]) -> list[str]:
+        if action == "sql_query":
+            return ["message", "purpose?"]
+        if action == "todowrite":
+            return ["message", "todos", "task_contract?"]
+        if action == "code_interpreter":
+            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?"]
+        if action in {"forecast", "anomaly"}:
+            return ["database_evidence", "constraints?"]
+        if action == "terminate":
+            return ["result", "summary_goal?", "include_analysis_ids?", "include_fact_ids?"]
+        return list(parameters)[:4]
+
+    def _task_context(self, request_state: RequestStateModel) -> dict:
+        payload = {
+            "message": request_state.message,
+            "response_language": request_state.response_language,
+            "database_context": self._outer_database_context(request_state),
+            "time_range": request_state.time_range,
+            "constraints": request_state.constraints,
+            "history": [message.model_dump(mode="json") for message in request_state.history[-4:]],
+        }
+        focus = str(request_state.focus or "").strip()
+        if focus and focus != str(request_state.message or "").strip():
+            payload["focus"] = focus
+        capabilities = self._requested_capabilities_context(request_state)
+        if capabilities:
+            payload["requested_capabilities"] = capabilities
         return {
-            "summary": conversation_state.fact_memory_summary,
-            "recent": [
-                {
-                    "fact_id": fact.fact_id,
-                    "name": fact.name,
-                    "fact_type": fact.fact_type,
-                    "status": fact.status,
-                    "statement": fact.statement,
-                }
-                for fact in facts
-            ],
+            key: value
+            for key, value in payload.items()
+            if value not in (None, "", [], {})
         }
 
-    def _database_id_for_fact_memory(self, request_state: RequestStateModel) -> str | None:
-        if request_state.selected_database:
-            return request_state.selected_database
-        if request_state.database_context is not None:
-            return request_state.database_context.database_id
-        return None
+    def _outer_database_context(self, request_state: RequestStateModel) -> dict | None:
+        context = request_state.database_context
+        if context is None:
+            return None
+        payload = context.model_dump(mode="json")
+        return {
+            "database_id": payload.get("database_id"),
+            "database_type": payload.get("database_type"),
+            "display_name": payload.get("display_name"),
+        }
+
+    def _requested_capabilities_context(self, request_state: RequestStateModel) -> list[str]:
+        capabilities = [
+            str(item).strip()
+            for item in (request_state.requested_capabilities or [])
+            if str(item).strip()
+        ]
+        if not capabilities or capabilities == ["query"]:
+            return []
+        return capabilities
 
     def _execution_state(self, request_state: RequestStateModel) -> dict:
         last_success = next((item for item in reversed(request_state.observations) if item.success), None)
@@ -218,9 +145,8 @@ class DataAgentPromptBuilder:
         return {
             "iteration": request_state.iteration,
             "max_iterations": request_state.max_iterations,
-            "tool_sequence": [call.tool_name for call in request_state.tool_history],
+            "tool_sequence": [call.tool_name for call in request_state.tool_history[-8:]],
             "last_tool": last_tool,
-            "last_action_reason": last_call.reason if last_call else None,
             "last_successful_tool": last_success.tool_name if last_success else None,
             "last_failure": (
                 {
@@ -231,17 +157,216 @@ class DataAgentPromptBuilder:
                 if last_failure
                 else None
             ),
-            "artifacts": {
-                "has_database_evidence": request_state.latest_database_evidence is not None,
-                "has_analysis": bool(request_state.analysis_artifacts),
-                "has_forecast": request_state.latest_forecast is not None,
-                "has_anomaly": request_state.latest_anomaly is not None,
-                "has_final_answer": request_state.final_answer_draft is not None,
-                "verified_fact_count": len(request_state.verified_facts),
-                "visualization_count": len(request_state.visualizations),
-                "analysis_count": len(request_state.analysis_artifacts),
-            },
-            "plan_progress_owner": "runtime" if request_state.todo_list else "none",
+        }
+
+    def _progress_summary(
+        self,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+    ) -> list[dict]:
+        progress = []
+        outputs = [output for output in request_state.action_outputs if output.tool_name != "terminate"]
+        for output in outputs[-8:]:
+            if not output.success:
+                continue
+            iteration = output.meta.get("iteration") if isinstance(output.meta, dict) else None
+            progress.append(
+                {
+                    "status": "completed",
+                    "step": iteration,
+                    "action": output.tool_name,
+                    "resource_ref": output.resource_ref,
+                    "covers": self._covered_capability(output.tool_name),
+                    "summary": self._truncate_text(output.content, 240),
+                }
+            )
+        if conversation_state.recent_todo_summary:
+            progress.append({"status": "context", "summary": conversation_state.recent_todo_summary})
+        return [
+            {key: value for key, value in item.items() if value not in (None, "", [], {})}
+            for item in progress
+        ]
+
+    def _covered_capability(self, tool_name: str) -> str | None:
+        return {
+            "todowrite": "todo_plan",
+            "sql_query": "query",
+            "query_database": "query",
+            "code_interpreter": "analysis",
+            "forecast": "forecast",
+            "anomaly": "anomaly",
+            "rag": "external_knowledge",
+            "skill": "skill",
+        }.get(str(tool_name or "").strip())
+
+    def _todo_progress_context(
+        self,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+    ) -> dict:
+        todos = [todo for todo in request_state.todo_list if isinstance(todo, dict)]
+        by_status: dict[str, int] = {}
+        for todo in todos:
+            status = str(todo.get("status") or "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+        current = next((todo for todo in todos if todo.get("status") == "in_progress"), None)
+        pending = [todo for todo in todos if todo.get("status") not in {"completed", "in_progress"}]
+        return {
+            "planning_complete": request_state.planning_complete,
+            "current_step": request_state.plan_current_step,
+            "total": len(todos),
+            "by_status": by_status,
+            "current": self._todo_item_context(current),
+            "pending_preview": [self._todo_item_context(todo) for todo in pending[:6]],
+            "recent_summary": conversation_state.recent_todo_summary,
+        }
+
+    def _todo_item_context(self, todo: dict | None) -> dict | None:
+        if not isinstance(todo, dict):
+            return None
+        return {
+            key: self._bounded_value(todo.get(key), max_string_chars=500, max_list_items=4, max_dict_items=6)
+            for key in ("content", "task_type", "status", "priority", "acceptance_criteria")
+            if todo.get(key) not in (None, "", [], {})
+        }
+
+    def _task_contract_context(self, request_state: RequestStateModel) -> dict | None:
+        if request_state.task_contract is None:
+            return None
+        payload = request_state.task_contract.model_dump(mode="json")
+        return self._bounded_value(payload, max_string_chars=700, max_list_items=8, max_dict_items=14)
+
+    def _final_answer_context(
+        self,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+    ) -> dict:
+        memory = []
+        for fact in list(conversation_state.recent_fact_memory or [])[-6:]:
+            memory.append(
+                {
+                    "fact_id": fact.fact_id,
+                    "name": fact.name,
+                    "fact_type": fact.fact_type,
+                    "status": fact.status,
+                    "statement": self._truncate_text(fact.statement, 500),
+                }
+            )
+        return {"artifact_refs": self._artifact_ref_index(request_state)}
+
+    def _facts_from_action_outputs(self, request_state: RequestStateModel) -> list[dict]:
+        facts: list[dict] = []
+        for action_output in request_state.action_outputs[-6:]:
+            observation = action_output.observations
+            if not isinstance(observation, dict):
+                continue
+            for key in ("facts", "produced_facts_preview"):
+                raw_facts = observation.get(key)
+                if not isinstance(raw_facts, list):
+                    continue
+                for fact in raw_facts:
+                    if not isinstance(fact, dict):
+                        continue
+                    facts.append(
+                        {
+                            item_key: self._bounded_value(fact.get(item_key), max_string_chars=500, max_list_items=4, max_dict_items=6)
+                            for item_key in ("fact_id", "name", "fact_type", "statement", "value", "status")
+                            if fact.get(item_key) not in (None, "", [], {})
+                        }
+                    )
+        return facts[-12:]
+
+    def _artifact_inventory(self, request_state: RequestStateModel) -> dict:
+        return {
+            "database_evidence_count": len(request_state.database_evidence_artifacts),
+            "analysis_count": len(request_state.analysis_artifacts),
+            "has_forecast": request_state.latest_forecast is not None,
+            "has_anomaly": request_state.latest_anomaly is not None,
+            "verified_fact_count": len(request_state.verified_facts),
+            "visualization_count": len(request_state.visualizations),
+        }
+
+    def _resource_index_context(self, request_state: RequestStateModel) -> dict:
+        resources = (request_state.resource_index or {}).get("resources")
+        if not isinstance(resources, dict):
+            resources = {}
+        items = []
+        for ref, payload in list(resources.items())[-12:]:
+            item = {"resource_ref": ref}
+            if isinstance(payload, dict):
+                item.update(
+                    {
+                        "tool_name": payload.get("tool_name"),
+                        "resource_type": payload.get("resource_type"),
+                        "iteration": payload.get("iteration"),
+                        "status": payload.get("status"),
+                    }
+                )
+            items.append({key: value for key, value in item.items() if value not in (None, "", [], {})})
+        return {"resources": items}
+
+    def _action_output_observation_context(self, action_output) -> dict | str | None:
+        if action_output is None:
+            return None
+        observation = action_output.observations
+        return self._bounded_value(observation, max_string_chars=900, max_list_items=8, max_dict_items=24)
+
+    def _recent_memory_context(self, request_state: RequestStateModel) -> list[dict]:
+        fragments = request_state.memory_fragments
+        latest_iteration = None
+        if request_state.latest_action_output is not None and isinstance(request_state.latest_action_output.meta, dict):
+            latest_iteration = request_state.latest_action_output.meta.get("iteration")
+        if latest_iteration is not None:
+            fragments = [
+                fragment for fragment in fragments
+                if not isinstance(fragment, dict) or fragment.get("iteration") != latest_iteration
+            ]
+        fragments = fragments[-3:]
+        if fragments:
+            return [
+                self._bounded_value(fragment, max_string_chars=900, max_list_items=8, max_dict_items=24)
+                for fragment in fragments
+                if isinstance(fragment, dict)
+            ]
+        outputs = request_state.action_outputs
+        if latest_iteration is not None:
+            outputs = [
+                output for output in outputs
+                if not isinstance(output.meta, dict) or output.meta.get("iteration") != latest_iteration
+            ]
+        return [
+            {
+                "iteration": output.meta.get("iteration") if isinstance(output.meta, dict) else None,
+                "action": output.tool_name,
+                "observation": self._action_output_observation_context(output),
+                "resource_ref": output.resource_ref,
+                "status": "succeeded" if output.success else "failed",
+            }
+            for output in outputs[-3:]
+        ]
+
+    def _artifact_ref_index(self, request_state: RequestStateModel) -> dict:
+        evidence_refs = [f"evidence:{item}" for item in list(request_state.database_evidence_artifacts.keys())[-8:]]
+        analysis_refs = [f"analysis:{item}" for item in list(request_state.analysis_artifacts.keys())[-8:]]
+        return {
+            "database_evidence": evidence_refs,
+            "analysis": analysis_refs,
+            "latest_database_evidence": (
+                f"evidence:{request_state.latest_database_evidence.evidence_id}"
+                if request_state.latest_database_evidence
+                else None
+            ),
+            "latest_analysis": f"analysis:{request_state.latest_analysis_id}" if request_state.latest_analysis_id else None,
+            "latest_forecast": (
+                f"forecast:{request_state.latest_forecast.forecast_id}"
+                if request_state.latest_forecast
+                else None
+            ),
+            "latest_anomaly": (
+                f"anomaly:{request_state.latest_anomaly.anomaly_id}"
+                if request_state.latest_anomaly
+                else None
+            ),
         }
 
     def build_user_prompt(
@@ -256,13 +381,19 @@ class DataAgentPromptBuilder:
                 json.dumps(context["task"], ensure_ascii=False, indent=2),
                 "",
                 "Available Tools:",
-                json.dumps(context["available_actions"], ensure_ascii=False, indent=2),
+                json.dumps(context["tools"], ensure_ascii=False, indent=2),
                 "",
-                "Previous Thought/Action/Observation:",
-                self._react_transcript(request_state),
-                "",
-                "Runtime State JSON:",
-                json.dumps(context, ensure_ascii=False, indent=2),
+                "Outer ReAct State:",
+                json.dumps(
+                    {
+                        "state": context["state"],
+                        "artifacts": context["artifacts"],
+                        "last_observation": context["last_observation"],
+                        "recent_trajectory": context["recent_trajectory"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
             ]
         )
 
@@ -283,7 +414,7 @@ class DataAgentPromptBuilder:
                 lines.append(f"Action: {step.action}")
                 lines.append(
                     "Action Input: "
-                    + self._truncate_text(json.dumps(step.action_input, ensure_ascii=False), 2000)
+                    + self._truncate_text(json.dumps(self._action_input_context(step.action, step.action_input), ensure_ascii=False), 2000)
                 )
                 if step.observation is not None:
                     lines.append(
@@ -314,7 +445,7 @@ class DataAgentPromptBuilder:
                 lines.append(f"Action: {call.tool_name}")
                 lines.append(
                     "Action Input: "
-                    + self._truncate_text(json.dumps(call.tool_input, ensure_ascii=False), 2000)
+                    + self._truncate_text(json.dumps(self._action_input_context(call.tool_name, call.tool_input), ensure_ascii=False), 2000)
                 )
             for observation in observations_by_iteration.get(iteration, []):
                 lines.append(
@@ -324,7 +455,7 @@ class DataAgentPromptBuilder:
                             {
                                 "tool_name": observation.tool_name,
                                 "success": observation.success,
-                                "summary": observation.summary,
+                    "summary": self._observation_summary_context(observation),
                                 "error": observation.error,
                                 "payload": self._summarize_observation_payload(observation.payload),
                             },
@@ -345,7 +476,7 @@ class DataAgentPromptBuilder:
             "action_reason": self._truncate_text(step.action_reason, 500),
             "action": step.action,
             "action_input": self._bounded_value(
-                step.action_input,
+                self._action_input_context(step.action, step.action_input),
                 max_string_chars=1200,
                 max_list_items=8,
                 max_dict_items=16,
@@ -358,19 +489,37 @@ class DataAgentPromptBuilder:
         }
 
     def _observation_context(self, observation) -> dict:
-        context = {
-            "tool_name": observation.tool_name,
-            "success": observation.success,
-            "summary": observation.summary,
-            "payload": self._summarize_observation_payload(observation.payload),
+        return model_observation_view(observation) or {}
+
+    def _action_input_context(self, action_name: str, action_input: dict | None) -> dict:
+        if not isinstance(action_input, dict):
+            return {}
+        if action_name != "sql_query":
+            return action_input
+        sanitized = {
+            key: value
+            for key, value in action_input.items()
+            if key not in {"query", "message|query", "query_language"}
         }
-        if observation.error:
-            context["error"] = observation.error
-        if observation.payload_truncated:
-            context["payload_truncated"] = True
-        if observation.payload_ref:
-            context["payload_ref"] = observation.payload_ref
-        return context
+        if any(key in action_input for key in ("query", "message|query", "query_language")):
+            sanitized["omitted_internal_query_fields"] = True
+            sanitized["sql_boundary_hint"] = "Outer agent must call sql_query with natural-language message/purpose only."
+        return sanitized
+
+    def _observation_summary_context(self, observation) -> str | None:
+        summary = getattr(observation, "summary", None)
+        if getattr(observation, "tool_name", None) == "sql_query":
+            return self._strip_query_code(summary)
+        return summary
+
+    def _strip_query_code(self, value):
+        if not isinstance(value, str):
+            return value
+        text = value
+        for marker in (" for query '", " for query `", " Query statement:", "\nQuery statement:"):
+            if marker in text:
+                text = text.split(marker, 1)[0]
+        return text
 
     def _observation_iteration(self, observation, calls_by_iteration: dict[int, object]) -> int:
         for iteration in sorted(calls_by_iteration, reverse=True):
@@ -383,10 +532,11 @@ class DataAgentPromptBuilder:
         data = dict(payload.get("data") or {})
         diagnostics = dict(payload.get("diagnostics") or {})
         summary_stats = diagnostics.get("summary_stats") or {}
+        query_was_available = bool(payload.get("query"))
         if isinstance(data.get("points"), list):
             data["points"] = data["points"][:8]
         if isinstance(data.get("rows"), list):
-            data["rows"] = data["rows"][:4]
+            data["rows"] = [self._outer_row_preview(row) for row in data["rows"][:4]]
         if isinstance(data.get("series"), list):
             series_preview = []
             for item in data["series"][:3]:
@@ -394,30 +544,59 @@ class DataAgentPromptBuilder:
                     series_preview.append(self._summarize_series_preview(item, point_limit=4))
             data["series"] = series_preview
         payload["data"] = data
-        payload["query"] = self._truncate_text(payload.get("query"), 4000)
-        payload["summary"] = self._truncate_text(payload.get("summary"), 1200)
-        payload["metadata"] = self._bounded_value(payload.get("metadata") or {}, max_string_chars=600, max_list_items=8, max_dict_items=16)
+        if query_was_available:
+            payload["query_available_in_artifact"] = True
+        payload.pop("query", None)
+        payload.pop("query_language", None)
+        payload["summary"] = self._truncate_text(self._strip_query_code(payload.get("summary")), 1200)
+        payload["metadata"] = self._outer_evidence_metadata(payload.get("metadata") or {})
+        if isinstance(payload.get("columns"), list):
+            payload["columns"] = [self._outer_column_name(column) for column in payload["columns"]]
         visible_diagnostics = {
             key: value
             for key, value in diagnostics.items()
-            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "query_trace", "series_count"}
+            if key in {"artifact_kind", "artifact_ref", "summary_stats", "prompt_sampling", "series_count"}
         }
         visible_diagnostics["prompt_sampling"] = self._prompt_sampling(
             full_counts=summary_stats,
             data=data,
             fallback=visible_diagnostics.get("prompt_sampling") if isinstance(visible_diagnostics.get("prompt_sampling"), dict) else None,
         )
-        if "query_trace" in visible_diagnostics:
-            visible_diagnostics["query_trace"] = self._bounded_value(
-                visible_diagnostics["query_trace"],
-                max_string_chars=1200,
-                max_list_items=6,
-                max_dict_items=16,
-            )
         payload["diagnostics"] = visible_diagnostics
         if summary_stats:
             payload["summary_stats"] = summary_stats
         return payload
+
+    def _outer_evidence_metadata(self, metadata: dict) -> dict:
+        if not isinstance(metadata, dict):
+            return {}
+        visible = {}
+        for key in ("unit", "units", "currency", "symbol", "source", "time_range", "aggregation", "granularity"):
+            if metadata.get(key) not in (None, "", [], {}):
+                visible[key] = metadata.get(key)
+        return self._bounded_value(visible, max_string_chars=400, max_list_items=4, max_dict_items=8)
+
+    def _outer_column_name(self, column) -> str:
+        text = str(column or "").strip()
+        if text.startswith("_"):
+            text = text.lstrip("_")
+        return text or "column"
+
+    def _outer_row_preview(self, row):
+        if not isinstance(row, dict):
+            return self._bounded_value(row, max_string_chars=400, max_list_items=6, max_dict_items=8)
+        normalized = {}
+        for key, value in row.items():
+            name = self._outer_column_name(key)
+            if name in normalized:
+                suffix = 2
+                candidate = f"{name}_{suffix}"
+                while candidate in normalized:
+                    suffix += 1
+                    candidate = f"{name}_{suffix}"
+                name = candidate
+            normalized[name] = self._bounded_value(value, max_string_chars=400, max_list_items=6, max_dict_items=8)
+        return normalized
 
     def _summarize_query_history(self, request_state: RequestStateModel) -> list[dict]:
         """Expose prior database queries as stable model-visible context."""
@@ -452,11 +631,10 @@ class DataAgentPromptBuilder:
                 {
                     "evidence_id": item.get("evidence_id"),
                     "database": item.get("database"),
-                    "query_language": item.get("query_language"),
-                    "query": self._truncate_text(item.get("query"), 2500),
-                    "summary": self._truncate_text(item.get("summary"), 800),
+                    "query_available_in_artifact": bool(item.get("query_available_in_artifact")),
+                    "summary": self._truncate_text(self._strip_query_code(item.get("summary")), 800),
                     "result_type": item.get("result_type"),
-                    "columns": (item.get("columns") or [])[:20],
+                    "columns": [self._outer_column_name(column) for column in (item.get("columns") or [])[:20]],
                     "row_count": row_count,
                     "point_count": point_count,
                     "series_count": series_count,
@@ -547,17 +725,18 @@ class DataAgentPromptBuilder:
             "anomaly_id",
             "current_step",
             "planning_complete",
-            "query",
-            "query_language",
             "columns",
             "task_contract",
         ):
             if key in payload:
-                summarized[key] = self._bounded_value(payload[key], max_string_chars=1200, max_list_items=12, max_dict_items=16)
+                value = payload[key]
+                if key == "columns" and isinstance(value, list):
+                    value = [self._outer_column_name(column) for column in value]
+                summarized[key] = self._bounded_value(value, max_string_chars=1200, max_list_items=12, max_dict_items=16)
         if isinstance(payload.get("data"), dict):
             data = dict(payload["data"])
             if isinstance(data.get("rows"), list):
-                preview["rows"] = data["rows"][:3]
+                preview["rows"] = [self._outer_row_preview(row) for row in data["rows"][:3]]
             if isinstance(data.get("points"), list):
                 preview["points"] = data["points"][:4]
             if isinstance(data.get("series"), list):
@@ -582,11 +761,8 @@ class DataAgentPromptBuilder:
                 "summary_stats",
                 "artifact_ref",
                 "prompt_sampling",
-                "query_shape_issues",
-                "query_task_contract",
                 "recommended_downstream_action",
                 "strategy_hint",
-                "classification",
                 "coverage",
             ):
                 if key in diagnostics:
@@ -596,13 +772,6 @@ class DataAgentPromptBuilder:
                         max_list_items=8,
                         max_dict_items=16,
                     )
-            if payload.get("error") and isinstance(diagnostics.get("query_trace"), dict):
-                summarized_diagnostics["query_trace"] = self._bounded_value(
-                    diagnostics["query_trace"],
-                    max_string_chars=1000,
-                    max_list_items=8,
-                    max_dict_items=16,
-                )
             summary_stats = diagnostics.get("summary_stats") if isinstance(diagnostics.get("summary_stats"), dict) else {}
             summarized_diagnostics["prompt_sampling"] = self._prompt_sampling(
                 full_counts=summary_stats,
@@ -635,19 +804,19 @@ class DataAgentPromptBuilder:
         return summarized
 
     def _summarize_series_preview(self, series: dict, *, point_limit: int) -> dict:
-        item = {
-            key: self._bounded_value(value, max_string_chars=400, max_list_items=6, max_dict_items=8)
-            for key, value in series.items()
-            if key not in {"points", "rows"}
-        }
+        item = {}
+        for key, value in series.items():
+            if key in {"points", "rows"}:
+                continue
+            item[self._outer_column_name(key)] = self._bounded_value(value, max_string_chars=400, max_list_items=6, max_dict_items=8)
         points = series.get("points")
         if isinstance(points, list):
             item["points_count"] = series.get("points_count") or len(points)
-            item["points"] = self._sample_edges(points, limit=point_limit)
+            item["points"] = [self._outer_row_preview(point) for point in self._sample_edges(points, limit=point_limit)]
         rows = series.get("rows")
         if isinstance(rows, list):
             item["rows_count"] = series.get("rows_count") or len(rows)
-            item["rows"] = self._sample_edges(rows, limit=point_limit)
+            item["rows"] = [self._outer_row_preview(row) for row in self._sample_edges(rows, limit=point_limit)]
         return item
 
     def _prompt_sampling(self, *, full_counts: dict, data: dict, fallback: dict | None = None) -> dict:

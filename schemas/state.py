@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from schemas.action_output import ActionOutput
 from schemas.analysis import AnalysisResult
 from schemas.api import Message
 from schemas.database import DatabaseEvidence
@@ -70,6 +71,10 @@ class RequestStateModel(BaseModel):
     tool_history: list[ToolCall] = Field(default_factory=list)
     observations: list[ToolObservation] = Field(default_factory=list)
     react_transcript: list[ReActTranscriptStep] = Field(default_factory=list)
+    action_outputs: list[ActionOutput] = Field(default_factory=list)
+    latest_action_output: ActionOutput | None = None
+    memory_fragments: list[dict] = Field(default_factory=list)
+    resource_index: dict = Field(default_factory=dict)
     errors: list[dict] = Field(default_factory=list)
     prompt_context_summary: str | None = None
 

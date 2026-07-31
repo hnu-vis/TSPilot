@@ -16,6 +16,7 @@ from core.completion import (
 )
 from core.intent import build_intent_profile_fallback
 from core.database.dialects import query_language_for_database_type
+from core.harness.observation_view import public_observation_view
 from core.time_range import normalize_time_range
 from runtime.artifacts import persist_json_artifact
 from runtime.language import detect_response_language
@@ -25,7 +26,8 @@ from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
 from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
-from core.data_fact import data_fact_prompt_view, register_data_facts_from_payload
+from core.data_fact import register_data_facts_from_payload
+from core.harness import default_capability_registry
 from schemas.task_contract import TaskContract
 from schemas.tool import ReActTranscriptStep, ToolObservation
 
@@ -315,14 +317,70 @@ def append_trace(request_state: RequestStateModel, event_type: str, payload: dic
 
 
 def apply_task_contract(request_state: RequestStateModel, raw_contract) -> TaskContract | None:
-    """Persist an LLM-authored task output contract when present."""
+    """Persist an LLM-authored task output contract when present.
+
+    Once a user-visible output contract exists, later model turns may refine or
+    append outputs, but must not silently drop previously required deliverables.
+    This keeps the runtime completion gate monotonic across ReAct turns.
+    """
 
     if raw_contract is None:
         return None
     contract = raw_contract if isinstance(raw_contract, TaskContract) else TaskContract.model_validate(raw_contract)
+    if request_state.task_contract is not None:
+        contract = _merge_task_contract(request_state.task_contract, contract)
     request_state.task_contract = contract
     request_state.completion_state["task_contract"] = contract.model_dump(mode="json")
     return contract
+
+
+def _merge_task_contract(existing: TaskContract, update: TaskContract) -> TaskContract:
+    existing_outputs = list(existing.required_outputs or [])
+    merged_outputs = list(existing_outputs)
+    index_by_key = {
+        _task_contract_output_key(output): index
+        for index, output in enumerate(merged_outputs)
+        if _task_contract_output_key(output)
+    }
+    for output in update.required_outputs or []:
+        key = _task_contract_output_key(output)
+        if key and key in index_by_key:
+            merged_outputs[index_by_key[key]] = output
+        else:
+            merged_outputs.append(output)
+            if key:
+                index_by_key[key] = len(merged_outputs) - 1
+    return TaskContract(
+        source=existing.source,
+        goal=update.goal or existing.goal,
+        required_outputs=merged_outputs,
+        constraints={**(existing.constraints or {}), **(update.constraints or {})},
+        assumptions=_dedupe_strings([*(existing.assumptions or []), *(update.assumptions or [])]),
+        evidence_quality_notes=_dedupe_strings(
+            [*(existing.evidence_quality_notes or []), *(update.evidence_quality_notes or [])]
+        ),
+    )
+
+
+def _task_contract_output_key(output) -> str:
+    output_id = str(getattr(output, "id", "") or "").strip().lower()
+    if output_id:
+        return f"id:{output_id}"
+    description = str(getattr(output, "description", "") or "").strip().lower()
+    if description:
+        return f"description:{description}"
+    return ""
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
 
 
 def append_react_transcript_step(
@@ -355,15 +413,17 @@ def append_react_transcript_step(
 
 
 def build_final_response(request_state: RequestStateModel, trace_events: list[TraceEventModel]) -> ChatResponse:
+    public_trace = _public_response_trace(trace_events)
     if request_state.final_answer_draft is not None:
+        public_answer = public_final_answer(request_state.final_answer_draft)
         return ChatResponse(
             conversation_id=request_state.conversation_id or "",
             request_id=request_state.request_id,
             status="completed",
             response_kind="final_answer",
             used_tools=_visible_used_tools(request_state),
-            answer=request_state.final_answer_draft,
-            trace=trace_events,
+            answer=public_answer,
+            trace=public_trace,
             token_usage=token_usage_summary(request_state),
             error=None,
         )
@@ -375,10 +435,157 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
         response_kind="error",
         used_tools=_visible_used_tools(request_state),
         answer=None,
-        trace=trace_events,
+        trace=public_trace,
         token_usage=token_usage_summary(request_state),
         error="Request did not reach a final answer.",
     )
+
+
+def public_final_answer_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    return public_final_answer(FinalAnswer.model_validate(payload)).model_dump(mode="json")
+
+
+def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
+    return FinalAnswer(
+        title=answer.title,
+        summary=_strip_public_query_text(answer.summary),
+        sections=[
+            section.model_copy(
+                update={
+                    "content": _strip_public_query_text(section.content),
+                    "structured_payload": _sanitize_public_value(section.structured_payload),
+                }
+            )
+            for section in answer.sections
+        ],
+        references=[
+            reference.model_copy(
+                update={
+                    "label": _strip_public_query_text(reference.label),
+                    "evidence": _sanitize_public_value(reference.evidence),
+                }
+            )
+            for reference in answer.references
+        ],
+        visualizations=answer.visualizations,
+    )
+
+
+def _public_response_trace(trace_events: list[TraceEventModel]) -> list[TraceEventModel]:
+    public_events: list[TraceEventModel] = []
+    for event in trace_events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.event_type == "action_output":
+            view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
+            timing = _timing_from_action_output_payload(payload)
+            public_events.append(
+                TraceEventModel(
+                    event_type="tool_result",
+                    payload={
+                        "tool": payload.get("tool_name"),
+                        "success": payload.get("success", False),
+                        "summary": payload.get("content"),
+                        "payload_preview": view.get("payload") if isinstance(view.get("payload"), dict) else view,
+                        "resource_ref": payload.get("resource_ref"),
+                        **timing,
+                    },
+                    timestamp=event.timestamp,
+                )
+            )
+            continue
+        if event.event_type == "observation":
+            public_view = public_observation_view(payload) or {}
+            public_events.append(
+                TraceEventModel(
+                    event_type="tool_result",
+                    payload={
+                        "tool": public_view.get("tool_name") or payload.get("tool_name"),
+                        "success": public_view.get("success", False),
+                        "summary": public_view.get("summary"),
+                        "payload_preview": public_view.get("payload") or {},
+                        "artifact_ref": public_view.get("artifact_ref"),
+                        "payload_ref": public_view.get("payload_ref") or payload.get("payload_ref"),
+                    },
+                    timestamp=event.timestamp,
+                )
+            )
+            continue
+        public_events.append(
+            TraceEventModel(
+                event_type=event.event_type,
+                payload=(
+                    public_final_answer_payload(payload)
+                    if event.event_type == "final_answer"
+                    else _sanitize_public_trace_payload(payload)
+                ),
+                timestamp=event.timestamp,
+            )
+        )
+    return public_events
+
+
+def _timing_from_action_output_payload(payload: dict) -> dict:
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return {
+        key: meta[key]
+        for key in ("started_at", "completed_at", "duration_ms", "elapsed_seconds")
+        if key in meta and meta[key] is not None
+    }
+
+
+def _sanitize_public_trace_payload(payload: dict) -> dict:
+    sanitized = dict(payload or {})
+    observation = sanitized.get("observation")
+    if isinstance(observation, dict):
+        sanitized["observation"] = public_observation_view(observation) or {}
+    if "answer" in sanitized and isinstance(sanitized.get("answer"), dict):
+        sanitized["answer"] = public_final_answer_payload(sanitized["answer"])
+    return sanitized
+
+
+def _sanitize_public_value(value):
+    internal_keys = {
+        "query",
+        "query_language",
+        "query_trace",
+        "schema_linking",
+        "schema_linking_generation",
+        "llm_query_generation",
+        "query_generation",
+        "query_task_contract",
+        "executed_query",
+        "generated_query",
+        "repaired_from_query",
+        "previous_error",
+        "repair_contract",
+        "raw_rule_diagnostics",
+    }
+    if isinstance(value, str):
+        return _strip_public_query_text(value)
+    if isinstance(value, list):
+        return [_sanitize_public_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_public_value(item)
+            for key, item in value.items()
+            if str(key) not in internal_keys
+        }
+    return value
+
+
+def _strip_public_query_text(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return value
+    text = value
+    for marker in ("Query statement:", "\nQuery statement:", " for query '", " for query `"):
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip()
+    text = re.sub(r"```(?:flux|sql|promql)?\s+.*?```", "[query omitted]", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"from\s*\([^)]*\)(?:\s*\|>.*?)(?=(?:['`\"。；;]|\n\n|$))", "[query omitted]", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\bselect\b\s+.*?\bfrom\b\s+.*?(?=(?:['`\"。；;]|\n\n|$))", "[query omitted]", text, flags=re.IGNORECASE | re.DOTALL)
+    return text
 
 
 def _visible_used_tools(request_state: RequestStateModel) -> list[str]:
@@ -398,28 +605,14 @@ def apply_observation(
     thought: str | None = None,
     action_reason: str | None = None,
 ) -> ToolObservation:
-    if not observation.success:
-        safe_observation = _build_prompt_safe_failure_observation(observation)
-        request_state.observations.append(safe_observation)
-        return safe_observation
+    from core.harness import StateTransitionEngine
 
-    if tool_spec.result_target == "todo":
-        _apply_todo_payload(request_state, full_payload)
-    elif tool_spec.result_target == "evidence":
-        _apply_evidence_payload(request_state, full_payload)
-    elif tool_spec.result_target == "analysis":
-        _apply_analysis_payload(request_state, full_payload)
-    elif tool_spec.result_target == "presentation":
-        _apply_presentation_payload(request_state, full_payload)
-        _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
-
-    if tool_spec.result_target in {"evidence", "analysis"}:
-        register_data_facts_from_payload(request_state, observation.tool_name, full_payload)
-        _advance_todo_after_artifact(request_state, observation.tool_name, full_payload, tool_spec.result_target)
-
-    safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
-    request_state.observations.append(safe_observation)
-    return safe_observation
+    return StateTransitionEngine().apply(
+        request_state,
+        observation,
+        full_payload,
+        tool_spec,
+    ).observation
 
 
 async def apply_observation_async(
@@ -431,28 +624,16 @@ async def apply_observation_async(
     thought: str | None = None,
     action_reason: str | None = None,
 ) -> ToolObservation:
-    if not observation.success:
-        safe_observation = _build_prompt_safe_failure_observation(observation)
-        request_state.observations.append(safe_observation)
-        return safe_observation
+    from core.harness import StateTransitionEngine
 
-    if tool_spec.result_target == "todo":
-        _apply_todo_payload(request_state, full_payload)
-    elif tool_spec.result_target == "evidence":
-        _apply_evidence_payload(request_state, full_payload)
-    elif tool_spec.result_target == "analysis":
-        _apply_analysis_payload(request_state, full_payload)
-    elif tool_spec.result_target == "presentation":
-        _apply_presentation_payload(request_state, full_payload)
-        _complete_answer_todo_after_terminal(request_state, observation.tool_name, full_payload)
-
-    if tool_spec.result_target in {"evidence", "analysis"}:
-        register_data_facts_from_payload(request_state, observation.tool_name, full_payload)
-        _advance_todo_after_artifact(request_state, observation.tool_name, full_payload, tool_spec.result_target)
-
-    safe_observation = enrich_observation_payload(request_state, observation, full_payload, tool_spec)
-    request_state.observations.append(safe_observation)
-    return safe_observation
+    return (
+        await StateTransitionEngine().apply_async(
+            request_state,
+            observation,
+            full_payload,
+            tool_spec,
+        )
+    ).observation
 
 
 def enrich_observation_payload(
@@ -481,17 +662,6 @@ def enrich_observation_payload(
         payload = request_state.final_answer_draft.model_dump(mode="json")
 
     payload = _deduplicate_observation_payload(observation, payload)
-    if tool_spec.result_target in {"evidence", "analysis"} and isinstance(payload, dict):
-        payload = {
-            **payload,
-            "data_fact_context": data_fact_prompt_view(request_state),
-            "fact_coverage": request_state.fact_coverage.model_dump(mode="json"),
-            "produced_facts": [
-                fact.model_dump(mode="json")
-                for fact in request_state.fact_set.facts[-8:]
-            ],
-        }
-
     return observation.model_copy(
         update={
             "payload": payload,
@@ -582,7 +752,15 @@ def _is_large_value(value) -> bool:
 
 def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) -> None:
     if isinstance(full_payload.get("task_contract"), dict):
-        apply_task_contract(request_state, full_payload["task_contract"])
+        try:
+            apply_task_contract(request_state, full_payload["task_contract"])
+        except Exception as exc:
+            request_state.completion_state.setdefault("todo_warnings", []).append(
+                {
+                    "type": "invalid_todowrite_task_contract",
+                    "message": str(exc),
+                }
+            )
     request_state.todo_list = [
         normalize_todo_for_completion(todo)
         for todo in list(full_payload.get("todos", []))
@@ -590,6 +768,7 @@ def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) ->
     ]
     request_state.plan_current_step = int(full_payload.get("current_step") or 0)
     request_state.planning_complete = bool(full_payload.get("planning_complete", False))
+    _activate_next_todo(request_state)
     if request_state.todo_list:
         request_state.max_iterations = max(
             request_state.max_iterations,
@@ -637,25 +816,18 @@ def _complete_answer_todo_after_terminal(
         }
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
-    current_todo["status"] = "completed"
-    current_todo["result_ref"] = "final_answer:latest"
-    current_todo["completion_reason"] = f"Tool '{tool_name}' produced the final answer."
-    request_state.todo_list[current_index] = current_todo
-    next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
-    if next_index is not None:
-        next_todo = dict(request_state.todo_list[next_index])
-        next_todo["status"] = "in_progress"
-        request_state.todo_list[next_index] = next_todo
-        request_state.plan_current_step = next_index + 1
-        request_state.planning_complete = False
-    else:
-        request_state.plan_current_step = len(request_state.todo_list)
-        request_state.planning_complete = True
+    ref = "final_answer:latest"
+    current_todo = _complete_todo_at_index(
+        request_state,
+        current_index,
+        result_ref=ref,
+        reason=f"Tool '{tool_name}' produced the final answer.",
+    )
     request_state.completion_state["latest_step"] = {
         "completed": True,
         "reason": current_todo["completion_reason"],
         "missing_evidence": [],
-        "evidence_refs": ["final_answer:latest"],
+        "evidence_refs": [ref],
         "next_action_hint": None,
         "tool_name": tool_name,
         "todo_index": current_index,
@@ -673,6 +845,10 @@ def _advance_todo_after_artifact(
     if not request_state.todo_list:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
+    synchronized = _sync_todos_from_artifact_state(request_state)
+    if synchronized:
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
     if current_index is None:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
@@ -683,20 +859,25 @@ def _advance_todo_after_artifact(
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     ref = _artifact_ref_for_tool(tool_name, full_payload)
-    current["status"] = "completed"
-    current["result_ref"] = ref
-    current["completion_reason"] = f"Tool '{tool_name}' produced artifact {ref}."
-    request_state.todo_list[current_index] = current
-    next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
-    if next_index is not None:
-        next_todo = dict(request_state.todo_list[next_index])
-        next_todo["status"] = "in_progress"
-        request_state.todo_list[next_index] = next_todo
-        request_state.plan_current_step = next_index + 1
-        request_state.planning_complete = False
-    else:
-        request_state.plan_current_step = len(request_state.todo_list)
-        request_state.planning_complete = True
+    if not ref:
+        request_state.completion_state["latest_step"] = {
+            "completed": False,
+            "reason": f"Tool '{tool_name}' succeeded but did not produce a usable artifact ref.",
+            "missing_evidence": [f"{tool_name}_artifact"],
+            "evidence_refs": [],
+            "next_action_hint": default_capability_registry().hint_for_task_type(task_type),
+            "tool_name": tool_name,
+            "todo_index": current_index,
+            "todo": current,
+        }
+        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
+        return
+    current = _complete_todo_at_index(
+        request_state,
+        current_index,
+        result_ref=ref,
+        reason=f"Tool '{tool_name}' produced artifact {ref}.",
+    )
     request_state.completion_state["latest_step"] = {
         "completed": True,
         "reason": current["completion_reason"],
@@ -710,36 +891,116 @@ def _advance_todo_after_artifact(
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
+def _sync_todos_from_artifact_state(request_state: RequestStateModel) -> bool:
+    """Complete any non-answer todos already covered by structured artifacts."""
+
+    changed = False
+    for index, todo in enumerate(list(request_state.todo_list)):
+        if not isinstance(todo, dict) or todo.get("status") == "completed":
+            continue
+        task_type = str(todo.get("task_type") or "").strip().lower()
+        if task_type in {"answer", "plan", "generic", ""}:
+            continue
+        ref = _state_ref_for_todo_type(request_state, task_type)
+        if not ref:
+            continue
+        completed = normalize_todo_for_completion(dict(todo))
+        completed["status"] = "completed"
+        completed["result_ref"] = ref
+        completed["completion_reason"] = f"Structured artifact state covers todo type '{task_type}'."
+        request_state.todo_list[index] = completed
+        changed = True
+    if changed:
+        _activate_next_todo(request_state)
+    return changed
+
+
+def _state_ref_for_todo_type(request_state: RequestStateModel, task_type: str) -> str | None:
+    capability = default_capability_registry().normalize_id(task_type)
+    if capability in {"query", "database", "database_evidence"} and request_state.latest_database_evidence is not None:
+        return f"evidence:{request_state.latest_database_evidence.evidence_id}"
+    if capability == "analysis" and request_state.latest_analysis_id:
+        return f"analysis:{request_state.latest_analysis_id}"
+    if capability == "anomaly" and request_state.latest_anomaly is not None:
+        return f"anomaly:{request_state.latest_anomaly.anomaly_id}"
+    if capability == "forecast" and request_state.latest_forecast is not None:
+        points = getattr(request_state.latest_forecast, "forecast_points", None)
+        if not isinstance(points, list) or not points:
+            return None
+        return f"forecast:{request_state.latest_forecast.forecast_id}"
+    if capability == "external_knowledge" and request_state.latest_rag:
+        return "rag:latest"
+    if capability == "skill" and request_state.latest_skill:
+        skill_name = request_state.latest_skill.get("skill_name") or "latest"
+        return f"skill:{skill_name}"
+    if capability in {"generic", ""}:
+        if request_state.latest_analysis_id:
+            return f"analysis:{request_state.latest_analysis_id}"
+        if request_state.latest_database_evidence is not None:
+            return f"evidence:{request_state.latest_database_evidence.evidence_id}"
+    return None
+
+
+def _complete_todo_at_index(
+    request_state: RequestStateModel,
+    index: int,
+    *,
+    result_ref: str,
+    reason: str,
+) -> dict:
+    completed = normalize_todo_for_completion(dict(request_state.todo_list[index]))
+    completed["status"] = "completed"
+    completed["result_ref"] = result_ref
+    completed["completion_reason"] = reason
+    request_state.todo_list[index] = completed
+    _activate_next_todo(request_state)
+    return completed
+
+
+def _activate_next_todo(request_state: RequestStateModel) -> None:
+    active_indices = [
+        index
+        for index, todo in enumerate(request_state.todo_list)
+        if isinstance(todo, dict) and todo.get("status") == "in_progress"
+    ]
+    if active_indices:
+        first_active = active_indices[0]
+        for index in active_indices[1:]:
+            updated = dict(request_state.todo_list[index])
+            updated["status"] = "pending"
+            request_state.todo_list[index] = updated
+        request_state.plan_current_step = first_active + 1
+        request_state.planning_complete = False
+        return
+    next_index = next(
+        (
+            index
+            for index, todo in enumerate(request_state.todo_list)
+            if isinstance(todo, dict) and todo.get("status") == "pending"
+        ),
+        None,
+    )
+    if next_index is not None:
+        next_todo = dict(request_state.todo_list[next_index])
+        next_todo["status"] = "in_progress"
+        request_state.todo_list[next_index] = next_todo
+        request_state.plan_current_step = next_index + 1
+        request_state.planning_complete = False
+    else:
+        request_state.plan_current_step = len(request_state.todo_list)
+        request_state.planning_complete = True
+
+
 def _tool_covers_todo_type(tool_name: str, result_target: str, task_type: str) -> bool:
     if task_type in {"answer", "plan"}:
         return False
     if task_type in {"generic", ""}:
         return result_target in {"evidence", "analysis"}
-    if task_type in {"query", "database", "database_evidence", "sql"}:
-        return result_target == "evidence" or tool_name in {"sql_query", "query_database"}
-    if task_type in {"analysis", "code_interpreter", "derived", "statistical", "statistics"}:
-        return tool_name == "code_interpreter"
-    if task_type == "anomaly":
-        return tool_name == "anomaly"
-    if task_type == "forecast":
-        return tool_name == "forecast"
-    if task_type in {"rag", "knowledge"}:
-        return tool_name == "rag"
-    return result_target in {"evidence", "analysis"}
+    return default_capability_registry().action_matches_task_type(tool_name, task_type)
 
 
 def _artifact_ref_for_tool(tool_name: str, payload: dict) -> str | None:
-    if tool_name in {"sql_query", "query_database"} and payload.get("evidence_id"):
-        return f"evidence:{payload['evidence_id']}"
-    if tool_name == "code_interpreter" and payload.get("analysis_id"):
-        return f"analysis:{payload['analysis_id']}"
-    if tool_name == "forecast" and payload.get("forecast_id"):
-        return f"forecast:{payload['forecast_id']}"
-    if tool_name == "anomaly" and payload.get("anomaly_id"):
-        return f"anomaly:{payload['anomaly_id']}"
-    if tool_name == "rag":
-        return "rag:latest"
-    return None
+    return default_capability_registry().artifact_ref_for_payload(tool_name, payload)
 
 
 def _apply_evidence_payload(request_state: RequestStateModel, full_payload: dict) -> None:

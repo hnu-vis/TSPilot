@@ -1165,6 +1165,31 @@ def test_policy_requires_todowrite_for_explicit_multi_deliverable_list():
     assert validate_action(request_state, "todowrite") == (True, None)
 
 
+def test_policy_allows_explicit_initial_todowrite_before_required_evidence():
+    request_state = RequestStateModel(
+        request_id="req-policy-explicit-todo-first",
+        message="请先制定一个todo list：1 查询 bitcoin USD 价格数据；2 计算最大值；3 给出中文结论。",
+        database_context=DatabaseContext(
+            database_id="influxdb2-bitcoin-sample",
+            database_type="influxdb",
+        ),
+        requested_capabilities=["query", "analysis"],
+        status="running",
+    )
+
+    allowed, reason = validate_action(request_state, "sql_query", {"message": "查询价格"})
+
+    assert allowed is False
+    assert "initial todo plan" in (reason or "")
+    assert validate_action(
+        request_state,
+        "todowrite",
+        {
+            "todos": ["查询 bitcoin USD 价格数据", "计算最大值", "给出中文结论"],
+        },
+    ) == (True, None)
+
+
 def test_policy_rejects_repeated_todowrite_but_allows_next_action():
     request_state = RequestStateModel(
         request_id="req-policy-todo",
@@ -1310,6 +1335,53 @@ async def test_todowrite_drops_internal_plan_steps():
     assert todos[0]["status"] == "in_progress"
     assert all(todo["task_type"] != "plan" for todo in todos)
     assert all("evidence_needed" not in todo for todo in todos)
+
+
+@pytest.mark.asyncio
+async def test_todowrite_accepts_string_todo_items():
+    result = await TodoWriteTool().execute(
+        TodoWriteInput(
+            message="请先制定 todo 后执行。",
+            task_contract={
+                "required_outputs": [
+                    {"evidence_kind": "query"},
+                    {"evidence_kind": "analysis"},
+                    {"evidence_kind": "answer"},
+                ]
+            },
+            todos=["查询 bitcoin USD 价格数据", "计算最大值", "给出中文结论"],
+        )
+    )
+
+    todos = result["todos"]
+    assert [todo["content"] for todo in todos] == ["查询 bitcoin USD 价格数据", "计算最大值", "给出中文结论"]
+    assert [todo["task_type"] for todo in todos] == ["query", "code_interpreter", "answer"]
+    assert [todo["status"] for todo in todos] == ["in_progress", "pending", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_todowrite_infers_task_types_without_contract():
+    result = await TodoWriteTool().execute(
+        TodoWriteInput(
+            message="请先写 todo 后执行。",
+            todos=[
+                "查询比特币USD价格数据",
+                "计算最大值、最小值、平均值和最新值",
+                "进行异常检测",
+                "预测未来5个点",
+                "用中文解释关键结论",
+            ],
+        )
+    )
+
+    todos = result["todos"]
+    assert [todo["task_type"] for todo in todos] == [
+        "query",
+        "code_interpreter",
+        "anomaly",
+        "forecast",
+        "answer",
+    ]
 
 
 def test_todo_plan_expands_iteration_budget_for_multistep_workflow():
