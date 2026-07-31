@@ -162,6 +162,7 @@ class LLMQueryGenerator:
         time_range: dict | None,
         constraints: dict,
         history: list[dict],
+        fact_requests: list[Any] | None = None,
         previous_query: str | None = None,
         error: Exception | str | None = None,
         request_state=None,
@@ -180,6 +181,7 @@ class LLMQueryGenerator:
             time_range=time_range,
             constraints=constraints,
             history=history,
+            fact_requests=fact_requests or [],
             previous_query=previous_query,
             error=error,
         )
@@ -275,6 +277,9 @@ class LLMQueryGenerator:
             "do not aggregate, rank, pivot, join, or reshape away the native value/time columns. "
             "For Flux, do not invent helper functions such as summarize() and do not use custom record-property syntax for dynamic aggregates; when multi-aggregate Flux is uncertain, return raw _time/_value evidence and put the derived output in task_coverage.missing with next_action_hint=\"code_interpreter\".\n"
             "Before returning, self-check whether this single query covers the whole user request. "
+            "If request.fact_requests is non-empty, treat it as current-tool fact output guidance. "
+            "When requested facts can be produced directly by this query, return columns or rows that make those facts verifiable from current evidence. "
+            "When a requested fact requires downstream calculation, preserve the necessary raw/current evidence and list that fact in task_coverage.missing with the downstream action. "
             "Use request.response_language for all natural-language JSON values you generate, including purpose, assumptions, "
             "task_coverage.satisfied, task_coverage.missing, and task_coverage.next_action_hint. "
             "Use Simplified Chinese for \"zh\" and English for \"en\". Keep query code, identifiers, and data values unchanged.\n"
@@ -336,6 +341,7 @@ class LLMQueryGenerator:
         time_range: dict | None,
         constraints: dict,
         history: list[dict],
+        fact_requests: list[Any],
         previous_query: str | None,
         error: Exception | str | None,
     ) -> str:
@@ -347,6 +353,7 @@ class LLMQueryGenerator:
             "schema_preview": schema_preview,
             "time_range": time_range,
             "constraints": constraints,
+            "fact_requests": fact_requests,
             "history": history[-6:],
             "previous_query": previous_query,
             "error": str(error) if error is not None else None,
