@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 
 from core.harness import ActionOutputBuildInput, ActionOutputBuilder, default_capability_registry
@@ -40,6 +41,7 @@ class ToolExecutor:
     ) -> ExecutionResult:
         tool_spec = self._registry.resolve(action_name)
         normalized_input = self._normalize_action_input(action_name, action_input, request_state)
+        normalized_input = await self._apply_fact_memory(action_name, normalized_input, request_state)
         validated = tool_spec.input_model.model_validate(normalized_input)
         request_state.tool_history.append(
             ToolCall(
@@ -291,6 +293,73 @@ class ToolExecutor:
                 if isinstance(existing, list):
                     existing.extend(hints)
         return normalized
+
+    async def _apply_fact_memory(
+        self,
+        action_name: str,
+        normalized_input: dict,
+        request_state: RequestStateModel,
+    ) -> dict:
+        if action_name not in {"sql_query", "code_interpreter", "forecast", "anomaly"}:
+            return normalized_input
+        memory_context = request_state.completion_state.get("memory_context")
+        if not isinstance(memory_context, dict):
+            return normalized_input
+        merged = dict(normalized_input)
+        explicit = self._normalize_fact_requests(merged.get("fact_requests"), merged)
+        raw_requests = memory_context.get("fact_requests") if isinstance(memory_context.get("fact_requests"), list) else []
+        selected_card_ids = memory_context.get("selected_card_ids") if isinstance(memory_context.get("selected_card_ids"), list) else []
+        memory_requests = [self._memory_fact_request_payload(item, selected_card_ids) for item in raw_requests]
+        merged["fact_requests"] = self._dedupe_fact_requests([*explicit, *memory_requests])
+        diagnostics = dict(memory_context.get("diagnostics") or {})
+        diagnostics["source"] = "request_memory_context"
+        diagnostics["selected_card_ids"] = selected_card_ids
+        diagnostics["fact_request_count"] = len(memory_requests)
+        constraints = merged.setdefault("constraints", {})
+        if isinstance(constraints, dict) and diagnostics:
+            constraints["memory_diagnostics"] = diagnostics
+        used_by_tools = memory_context.setdefault("used_by_tools", {})
+        if isinstance(used_by_tools, dict):
+            used_by_tools[action_name] = int(used_by_tools.get(action_name) or 0) + 1
+        return merged
+
+    def _memory_fact_request_payload(self, request, selected_card_ids: list) -> dict:
+        payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
+        requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
+        payload["requirements"] = {
+            **requirements,
+            "source": "memory",
+            "memory_card_ids": selected_card_ids,
+        }
+        return payload
+
+    def _dedupe_fact_requests(self, requests: list) -> list:
+        result: list = []
+        seen: set[str] = set()
+        for item in requests:
+            if hasattr(item, "model_dump"):
+                payload = item.model_dump(mode="json", exclude_none=True)
+            elif isinstance(item, dict):
+                payload = dict(item)
+            else:
+                continue
+            if not payload.get("name") or not payload.get("fact_type"):
+                continue
+            key = json.dumps(
+                {
+                    "name": payload.get("name"),
+                    "fact_type": payload.get("fact_type"),
+                    "requirements": payload.get("requirements") or {},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if key in seen:
+                continue
+            result.append(payload)
+            seen.add(key)
+        return result
 
     def _truncate_payload(self, payload: dict, request_state: RequestStateModel) -> tuple[dict, bool]:
         max_chars = int(request_state.context_budget.get("max_observation_chars", 1600))

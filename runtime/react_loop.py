@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from app.settings import Settings
+from core.data_fact.retriever import EmbeddingFactMemoryRetriever, MemoryRetrievalResult
 from core.database.dialects import dialect_for_database
 from core.harness import ActionOutputBuilder, StateTransitionEngine
 from core.harness.observation_view import public_observation_view
@@ -43,10 +44,17 @@ def _truncate_text(value: str, max_chars: int) -> str:
 class ReActLoop:
     """Execute the strict outer loop."""
 
-    def __init__(self, data_agent: DataAgent, tool_executor: ToolExecutor, settings: Settings):
+    def __init__(
+        self,
+        data_agent: DataAgent,
+        tool_executor: ToolExecutor,
+        settings: Settings,
+        memory_retriever: EmbeddingFactMemoryRetriever | None = None,
+    ):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
+        self._memory_retriever = memory_retriever
         self._trace_logger = ConversationTraceLogger(settings)
         self._transition_engine = StateTransitionEngine()
         self._action_output_builder = ActionOutputBuilder()
@@ -134,6 +142,7 @@ class ReActLoop:
         *,
         emit_heartbeats: bool = False,
     ) -> AsyncIterator[TraceEventModel]:
+        await self._initialize_memory_context(request_state)
         while request_state.iteration < request_state.max_iterations:
             request_state.iteration += 1
             try:
@@ -213,6 +222,7 @@ class ReActLoop:
                 )
                 sync_from_request(request_state, conversation_state)
                 continue
+
             yield append_trace(
                 request_state,
                 "action",
@@ -466,6 +476,29 @@ class ReActLoop:
             "error",
             {"message": "Maximum iterations reached before a terminal payload was produced."},
         )
+
+    async def _initialize_memory_context(self, request_state: RequestStateModel) -> None:
+        if "memory_context" in request_state.completion_state:
+            return
+        if self._memory_retriever is None:
+            request_state.completion_state["memory_context"] = {
+                "hits": [],
+                "fact_requests": [],
+                "selected_card_ids": [],
+                "diagnostics": {"memory_enabled": False, "reason": "No memory retriever configured."},
+                "used_by_tools": {},
+            }
+            return
+        result = await self._memory_retriever.retrieve_once(request_state=request_state)
+        if not isinstance(result, MemoryRetrievalResult):
+            result = MemoryRetrievalResult.model_validate(result)
+        request_state.completion_state["memory_context"] = {
+            "hits": [hit.model_dump(mode="json") for hit in result.hits],
+            "fact_requests": [item.model_dump(mode="json", exclude_none=True) for item in result.fact_requests],
+            "selected_card_ids": [hit.card_id for hit in result.hits],
+            "diagnostics": result.diagnostics,
+            "used_by_tools": {},
+        }
 
     def _store_observation_action_output(
         self,
