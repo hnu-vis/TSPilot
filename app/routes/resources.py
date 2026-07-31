@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.settings import get_settings
 from core.database import DatabaseFactory, metric_list_preview, schema_preview
-from core.data_fact.memory import prompt_fact_memory_view, read_fact_memory
+from core.data_fact.memory import memory_cards_view, memory_detail, prompt_fact_memory_view, read_fact_memory
 
 router = APIRouter(prefix="/api/v1/resources", tags=["resources"])
 
@@ -201,25 +201,59 @@ async def preview_database_resource(database_id: str, refresh: bool = Query(defa
 
 @router.get("/fact-memory")
 async def get_global_fact_memory() -> dict:
-    """Return long-term fact definition and recipe memory."""
+    """Return prompt-safe fact memory cards."""
     memory = read_fact_memory(None)
+    view = memory_cards_view(None)
     return {
-        "memory": memory.model_dump(mode="json"),
-        "prompt_view": prompt_fact_memory_view(None),
+        "memory": {
+            "cards": view.get("cards", []),
+            "storage_path": memory.storage_path,
+            "updated_at": memory.updated_at,
+        },
+        "prompt_view": view,
     }
+
+
+@router.get("/fact-memory/{memory_id}")
+async def get_global_fact_memory_detail(memory_id: str) -> dict:
+    """Return one on-demand fact memory detail."""
+    detail = memory_detail(None, memory_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Fact memory '{memory_id}' was not found.")
+    return {"detail": detail.model_dump(mode="json")}
 
 
 @router.get("/databases/{database_id}/fact-memory")
 async def get_database_fact_memory(database_id: str) -> dict:
-    """Return fact definition and recipe memory scoped to one database."""
+    """Return prompt-safe fact memory cards scoped to one database."""
     config = await DatabaseFactory.get_database(database_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
     memory = read_fact_memory(database_id)
+    view = memory_cards_view(database_id)
     return {
         "database": _public_database_config(database_id, config),
-        "memory": memory.model_dump(mode="json"),
-        "prompt_view": prompt_fact_memory_view(database_id),
+        "memory": {
+            "cards": view.get("cards", []),
+            "storage_path": memory.storage_path,
+            "updated_at": memory.updated_at,
+        },
+        "prompt_view": view,
+    }
+
+
+@router.get("/databases/{database_id}/fact-memory/{memory_id}")
+async def get_database_fact_memory_detail(database_id: str, memory_id: str) -> dict:
+    """Return one on-demand fact memory detail scoped to one database."""
+    config = await DatabaseFactory.get_database(database_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
+    detail = memory_detail(database_id, memory_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Fact memory '{memory_id}' was not found.")
+    return {
+        "database": _public_database_config(database_id, config),
+        "detail": detail.model_dump(mode="json"),
     }
 
 

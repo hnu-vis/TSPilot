@@ -3,6 +3,7 @@ import type {
   DatabaseConnectionTest,
   DatabasePreviewResponse,
   DatabaseResource,
+  FactMemoryDetailResponse,
   FactMemoryResponse,
   FinalAnswer,
   KnowledgeResource,
@@ -45,6 +46,16 @@ export async function fetchFactMemory(databaseId?: string | null): Promise<FactM
     : '/resources/fact-memory';
   const response = await fetch(`${API_BASE}${path}`);
   if (!response.ok) throw new Error(`Failed to load fact memory: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchFactMemoryDetail(memoryId: string, databaseId?: string | null): Promise<FactMemoryDetailResponse> {
+  const encodedId = encodeURIComponent(memoryId);
+  const path = databaseId
+    ? `/resources/databases/${encodeURIComponent(databaseId)}/fact-memory/${encodedId}`
+    : `/resources/fact-memory/${encodedId}`;
+  const response = await fetch(`${API_BASE}${path}`);
+  if (!response.ok) throw new Error(`Failed to load fact memory detail: ${response.status}`);
   return response.json();
 }
 

@@ -98,8 +98,31 @@ class FactRecipe(BaseModel):
     updated_at: str | None = None
 
 
+class MemoryCard(BaseModel):
+    """Prompt-safe memory summary used for retrieval and UI lists."""
+
+    id: str
+    kind: str
+    title: str
+    description: str
+    tags: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
+class MemoryDetail(BaseModel):
+    """On-demand memory payload used after a card is selected."""
+
+    id: str
+    card: MemoryCard
+    fact_request: DataFactRequest | None = None
+    guidance: str | None = None
+    examples: list[str] = Field(default_factory=list)
+
+
 class FactMemory(BaseModel):
     definitions: list[FactDefinition] = Field(default_factory=list)
     recipes: list[FactRecipe] = Field(default_factory=list)
+    cards: list[MemoryCard] = Field(default_factory=list)
+    details: list[MemoryDetail] = Field(default_factory=list)
     storage_path: str | None = None
     updated_at: str | None = None

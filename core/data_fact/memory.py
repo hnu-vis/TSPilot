@@ -11,7 +11,15 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from schemas.data_fact import DataFact, DataFactRequest, FactDefinition, FactMemory, FactRecipe
+from schemas.data_fact import (
+    DataFact,
+    DataFactRequest,
+    FactDefinition,
+    FactMemory,
+    FactRecipe,
+    MemoryCard,
+    MemoryDetail,
+)
 
 
 def utc_now_iso() -> str:
@@ -36,11 +44,13 @@ def read_fact_memory(database_id: str | None = None) -> FactMemory:
         {
             "definitions": [*default_fact_definitions(), *(payload.get("definitions") or [])],
             "recipes": [*default_fact_recipes(), *(payload.get("recipes") or [])],
+            "cards": payload.get("cards") or [],
+            "details": payload.get("details") or [],
             "storage_path": str(path),
             "updated_at": payload.get("updated_at"),
         }
     )
-    return _dedupe_memory(memory)
+    return _materialize_card_memory(_dedupe_memory(memory))
 
 
 def write_fact_memory(memory: FactMemory, database_id: str | None = None) -> Path:
@@ -57,44 +67,58 @@ def write_fact_memory(memory: FactMemory, database_id: str | None = None) -> Pat
 
 
 def prompt_fact_memory_view(database_id: str | None = None) -> dict:
+    return memory_cards_view(database_id)
+
+
+def memory_cards_view(database_id: str | None = None) -> dict:
     global_memory = read_fact_memory(None)
     scoped_memory = read_fact_memory(database_id) if database_id else FactMemory()
-    memory = _dedupe_memory(
+    memory = _materialize_card_memory(_dedupe_memory(
         FactMemory(
             definitions=[*global_memory.definitions, *scoped_memory.definitions],
             recipes=[*global_memory.recipes, *scoped_memory.recipes],
+            cards=[*global_memory.cards, *scoped_memory.cards],
+            details=[*global_memory.details, *scoped_memory.details],
             storage_path=scoped_memory.storage_path or global_memory.storage_path,
             updated_at=scoped_memory.updated_at or global_memory.updated_at,
         )
-    )
-    definitions = memory.definitions[:12]
-    recipes = memory.recipes[:8]
+    ))
+    cards = memory.cards[:24]
     return {
         "summary": {
             "definition_count": len(memory.definitions),
             "recipe_count": len(memory.recipes),
-            "available_fact_types": [item.fact_type for item in definitions],
-            "available_recipes": [item.name for item in recipes],
+            "card_count": len(memory.cards),
+            "available_titles": [item.title for item in cards[:12]],
         },
-        "definitions": [
-            {
-                "fact_type": item.fact_type,
-                "preferred_tool": item.preferred_tool,
-                "scope": item.scope,
-            }
-            for item in definitions
-        ],
-        "recipes": [
-            {
-                "fact_type": item.fact_type,
-                "name": item.name,
-                "preferred_tool": item.preferred_tool,
-                "scope": item.scope,
-            }
-            for item in recipes
-        ],
+        "cards": [card.model_dump(mode="json") for card in cards],
         "updated_at": memory.updated_at,
     }
+
+
+def memory_detail(database_id: str | None, memory_id: str) -> MemoryDetail | None:
+    normalized_id = _safe_id(memory_id)
+    memory = read_fact_memory(database_id)
+    for detail in memory.details:
+        if _safe_id(detail.id) == normalized_id:
+            return detail
+    if database_id:
+        global_detail = memory_detail(None, memory_id)
+        if global_detail is not None:
+            return global_detail
+    return None
+
+
+def memory_details(database_id: str | None, memory_ids: Iterable[str]) -> list[MemoryDetail]:
+    result: list[MemoryDetail] = []
+    seen: set[str] = set()
+    for memory_id in memory_ids:
+        detail = memory_detail(database_id, memory_id)
+        if detail is None or detail.id in seen:
+            continue
+        result.append(detail)
+        seen.add(detail.id)
+    return result
 
 
 def observe_fact_usage(
@@ -160,12 +184,12 @@ def observe_fact_usage(
                 updated_at=now,
             ),
         )
-    next_memory = FactMemory(
+    next_memory = _materialize_card_memory(FactMemory(
         definitions=list(definitions.values()),
         recipes=list(recipes.values()),
         storage_path=str(fact_memory_path(database_id)),
         updated_at=now,
-    )
+    ))
     write_fact_memory(next_memory, database_id)
     return next_memory
 
@@ -230,6 +254,46 @@ def default_fact_definitions() -> list[dict]:
 def default_fact_recipes() -> list[dict]:
     return [
         {
+            "recipe_id": "recipe_extreme_max_value",
+            "fact_type": "extreme",
+            "name": "max_value",
+            "preferred_tool": "sql_query",
+            "fact_request_template": {"name": "max_value", "fact_type": "extreme", "requirements": {"operator": "max"}},
+            "expected_result_schema": {"facts": [{"name": "max_value", "fact_type": "extreme"}]},
+            "verification_notes": _default_verification_requirements(),
+            "updated_at": None,
+        },
+        {
+            "recipe_id": "recipe_extreme_min_value",
+            "fact_type": "extreme",
+            "name": "min_value",
+            "preferred_tool": "sql_query",
+            "fact_request_template": {"name": "min_value", "fact_type": "extreme", "requirements": {"operator": "min"}},
+            "expected_result_schema": {"facts": [{"name": "min_value", "fact_type": "extreme"}]},
+            "verification_notes": _default_verification_requirements(),
+            "updated_at": None,
+        },
+        {
+            "recipe_id": "recipe_extreme_max_time",
+            "fact_type": "extreme_time",
+            "name": "max_time",
+            "preferred_tool": "sql_query",
+            "fact_request_template": {"name": "max_time", "fact_type": "extreme_time", "requirements": {"operator": "max"}},
+            "expected_result_schema": {"facts": [{"name": "max_time", "fact_type": "extreme_time"}]},
+            "verification_notes": _default_verification_requirements(),
+            "updated_at": None,
+        },
+        {
+            "recipe_id": "recipe_extreme_min_time",
+            "fact_type": "extreme_time",
+            "name": "min_time",
+            "preferred_tool": "sql_query",
+            "fact_request_template": {"name": "min_time", "fact_type": "extreme_time", "requirements": {"operator": "min"}},
+            "expected_result_schema": {"facts": [{"name": "min_time", "fact_type": "extreme_time"}]},
+            "verification_notes": _default_verification_requirements(),
+            "updated_at": None,
+        },
+        {
             "recipe_id": "recipe_range_change",
             "fact_type": "change",
             "name": "range_change",
@@ -248,12 +312,95 @@ def default_fact_recipes() -> list[dict]:
 def _dedupe_memory(memory: FactMemory) -> FactMemory:
     definitions = {item.fact_type: item for item in memory.definitions}
     recipes = {item.recipe_id: item for item in memory.recipes}
+    cards = {item.id: item for item in memory.cards}
+    details = {item.id: item for item in memory.details}
     return memory.model_copy(
         update={
             "definitions": list(definitions.values()),
             "recipes": list(recipes.values()),
+            "cards": list(cards.values()),
+            "details": list(details.values()),
         }
     )
+
+
+def _materialize_card_memory(memory: FactMemory) -> FactMemory:
+    cards = {card.id: card for card in memory.cards}
+    details = {detail.id: detail for detail in memory.details}
+    for definition in memory.definitions:
+        card = _card_from_definition(definition)
+        cards.setdefault(card.id, card)
+        details.setdefault(card.id, _detail_from_definition(definition, card))
+    for recipe in memory.recipes:
+        card = _card_from_recipe(recipe)
+        cards.setdefault(card.id, card)
+        details.setdefault(card.id, _detail_from_recipe(recipe, card))
+    return memory.model_copy(
+        update={
+            "cards": list(cards.values()),
+            "details": list(details.values()),
+        }
+    )
+
+
+def _card_from_definition(definition: FactDefinition) -> MemoryCard:
+    fact_type = _safe_id(definition.fact_type)
+    return MemoryCard(
+        id=f"definition.{fact_type}",
+        kind="fact_definition",
+        title=definition.fact_type,
+        description=definition.description,
+        tags=[item for item in [definition.fact_type, *definition.required_evidence, definition.scope] if item],
+        updated_at=definition.updated_at,
+    )
+
+
+def _detail_from_definition(definition: FactDefinition, card: MemoryCard) -> MemoryDetail:
+    guidance = definition.report_guidance or definition.description
+    return MemoryDetail(
+        id=card.id,
+        card=card,
+        fact_request=None,
+        guidance=guidance,
+        examples=[],
+    )
+
+
+def _card_from_recipe(recipe: FactRecipe) -> MemoryCard:
+    fact_type = _safe_id(recipe.fact_type)
+    name = _safe_id(recipe.name)
+    return MemoryCard(
+        id=f"recipe.{fact_type}.{name}",
+        kind="fact_recipe",
+        title=recipe.name,
+        description=_recipe_description(recipe),
+        tags=[item for item in [recipe.fact_type, recipe.name, recipe.scope] if item],
+        updated_at=recipe.updated_at,
+    )
+
+
+def _detail_from_recipe(recipe: FactRecipe, card: MemoryCard) -> MemoryDetail:
+    fact_request = None
+    if isinstance(recipe.fact_request_template, dict) and recipe.fact_request_template:
+        try:
+            fact_request = DataFactRequest.model_validate(recipe.fact_request_template)
+        except Exception:
+            fact_request = None
+    return MemoryDetail(
+        id=card.id,
+        card=card,
+        fact_request=fact_request,
+        guidance="; ".join(recipe.verification_notes or []) or None,
+        examples=[],
+    )
+
+
+def _recipe_description(recipe: FactRecipe) -> str:
+    name = str(recipe.name or "").replace("_", " ")
+    fact_type = str(recipe.fact_type or "").replace("_", " ")
+    if name and fact_type and name != fact_type:
+        return f"Generate the {name} fact for {fact_type} requests."
+    return f"Generate a {fact_type or name} fact from current evidence."
 
 
 def _read_json(path: Path) -> dict | None:

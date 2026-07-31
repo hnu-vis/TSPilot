@@ -93,35 +93,25 @@ export type FactCoverage = {
   partial?: string[];
 };
 
-export type FactDefinition = {
-  fact_type: string;
+export type MemoryCard = {
+  id: string;
+  kind: string;
+  title: string;
   description: string;
-  required_evidence?: string[];
-  preferred_tool?: string | null;
-  output_schema?: Record<string, unknown>;
-  verification_requirements?: string[];
-  report_guidance?: string | null;
-  scope?: string;
-  source?: string;
+  tags?: string[];
   updated_at?: string | null;
 };
 
-export type FactRecipe = {
-  recipe_id: string;
-  fact_type: string;
-  name: string;
-  preferred_tool: string;
-  fact_request_template?: Record<string, unknown>;
-  expected_result_schema?: Record<string, unknown>;
-  verification_notes?: string[];
-  scope?: string;
-  source?: string;
-  updated_at?: string | null;
+export type MemoryDetail = {
+  id: string;
+  card: MemoryCard;
+  fact_request?: Record<string, unknown> | null;
+  guidance?: string | null;
+  examples?: string[];
 };
 
 export type FactMemory = {
-  definitions: FactDefinition[];
-  recipes: FactRecipe[];
+  cards: MemoryCard[];
   storage_path?: string | null;
   updated_at?: string | null;
 };
@@ -130,6 +120,11 @@ export type FactMemoryResponse = {
   database?: DatabaseResource;
   memory: FactMemory;
   prompt_view?: Record<string, unknown>;
+};
+
+export type FactMemoryDetailResponse = {
+  database?: DatabaseResource;
+  detail: MemoryDetail;
 };
 
 export type TraceStatus = 'running' | 'complete' | 'error';

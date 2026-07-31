@@ -1,7 +1,7 @@
-import { AlertCircle, BrainCircuit, Code2, Database, FileText, RefreshCw } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
-import { fetchFactMemory } from '../services/api';
-import type { DatabaseResource, FactDefinition, FactMemoryResponse, FactRecipe } from '../types';
+import { AlertCircle, BrainCircuit, Database, FileText, RefreshCw } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { fetchFactMemory, fetchFactMemoryDetail } from '../services/api';
+import type { DatabaseResource, FactMemoryResponse, MemoryCard, MemoryDetail } from '../types';
 
 type Props = {
   databases: DatabaseResource[];
@@ -18,6 +18,12 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
   const [scope, setScope] = useState<'global' | 'database'>('global');
   const [reloadToken, setReloadToken] = useState(0);
   const [state, setState] = useState<MemoryState>({ loading: false, error: null, data: null });
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [detailState, setDetailState] = useState<{ loading: boolean; error: string | null; detail: MemoryDetail | null }>({
+    loading: false,
+    error: null,
+    detail: null,
+  });
   const databaseId = scope === 'database' ? selectedDatabaseId : null;
   const activeDatabase = databases.find((database) => database.id === selectedDatabaseId) || null;
 
@@ -42,9 +48,32 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
     };
   }, [databaseId, reloadToken]);
 
-  const definitions = state.data?.memory.definitions || [];
-  const recipes = state.data?.memory.recipes || [];
-  const definitionsBySource = useMemo(() => groupBySource(definitions), [definitions]);
+  const cards = state.data?.memory.cards || [];
+
+  useEffect(() => {
+    if (!selectedCardId) {
+      setDetailState({ loading: false, error: null, detail: null });
+      return;
+    }
+    let cancelled = false;
+    setDetailState((current) => ({ loading: true, error: null, detail: current.detail }));
+    fetchFactMemoryDetail(selectedCardId, databaseId)
+      .then((payload) => {
+        if (!cancelled) setDetailState({ loading: false, error: null, detail: payload.detail });
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setDetailState({
+            loading: false,
+            error: error instanceof Error ? error.message : 'Unable to load memory detail.',
+            detail: null,
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCardId, databaseId]);
 
   return (
     <section className="fact-memory-manager" aria-label="Fact memory">
@@ -52,7 +81,7 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
         <div>
           <span className="database-kicker">Long-term memory</span>
           <h2>Fact Memory</h2>
-          <p>Fact definitions and recipes guide ReAct planning. Concrete numeric facts are regenerated from current evidence.</p>
+          <p>Memory cards summarize reusable fact-generation intent. Concrete numeric facts are regenerated from current evidence.</p>
         </div>
         <div className="fact-memory-actions">
           <div className="segmented-control" aria-label="Fact memory scope">
@@ -92,12 +121,8 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
 
       <div className="fact-memory-meta">
         <div>
-          <strong>{definitions.length.toLocaleString()}</strong>
-          <span>definitions</span>
-        </div>
-        <div>
-          <strong>{recipes.length.toLocaleString()}</strong>
-          <span>recipes</span>
+          <strong>{cards.length.toLocaleString()}</strong>
+          <span>cards</span>
         </div>
         <div>
           <strong>{scope === 'database' ? activeDatabase?.display_name || activeDatabase?.name || 'Database' : 'Global'}</strong>
@@ -111,38 +136,45 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
 
       <div className="fact-memory-grid">
         <section className="database-section">
-          <SectionTitle icon={BrainCircuit} title="Definitions" count={definitions.length} />
-          {definitions.length > 0 ? (
+          <SectionTitle icon={BrainCircuit} title="Memory cards" count={cards.length} />
+          {cards.length > 0 ? (
             <div className="fact-definition-list">
-              {definitions.map((definition) => (
-                <FactDefinitionCard key={`${definition.scope || 'global'}-${definition.fact_type}-${definition.source || 'source'}`} definition={definition} />
+              {cards.map((card) => (
+                <MemoryCardItem
+                  key={card.id}
+                  card={card}
+                  selected={selectedCardId === card.id}
+                  onSelect={() => setSelectedCardId(card.id)}
+                />
               ))}
             </div>
           ) : (
-            <EmptyState label="No fact definitions stored." />
+            <EmptyState label="No memory cards stored." />
           )}
         </section>
 
         <section className="database-section">
-          <SectionTitle icon={Code2} title="Recipes" count={recipes.length} />
-          {recipes.length > 0 ? (
-            <div className="fact-recipe-list">
-              {recipes.map((recipe) => (
-                <FactRecipeCard key={recipe.recipe_id} recipe={recipe} />
-              ))}
-            </div>
+          <SectionTitle icon={FileText} title="Selected detail" count={detailState.detail ? 1 : 0} />
+          {detailState.loading ? (
+            <EmptyState label="Loading memory detail." />
+          ) : detailState.error ? (
+            <EmptyState label={detailState.error} />
+          ) : detailState.detail ? (
+            <MemoryDetailCard detail={detailState.detail} />
           ) : (
-            <EmptyState label="No fact recipes stored." />
+            <EmptyState label="Select a memory card to load its detail." />
           )}
         </section>
       </div>
 
       <section className="database-section fact-memory-source-section">
-        <SectionTitle icon={FileText} title="Sources" count={definitionsBySource.length} />
+        <SectionTitle icon={FileText} title="Storage" count={state.data?.memory.storage_path ? 1 : 0} />
         <div className="chip-list compact">
-          {definitionsBySource.map((item) => (
-            <span key={item.source}>{item.source}: {item.count}</span>
-          ))}
+          {(state.data?.prompt_view?.summary && typeof state.data.prompt_view.summary === 'object')
+            ? Object.entries(state.data.prompt_view.summary as Record<string, unknown>).slice(0, 6).map(([key, value]) => (
+              <span key={key}>{key}: {String(value)}</span>
+            ))
+            : null}
         </div>
         {state.data?.memory.storage_path && <p className="sample-note">{state.data.memory.storage_path}</p>}
       </section>
@@ -159,31 +191,36 @@ function SectionTitle({ icon: Icon, title, count }: { icon: typeof BrainCircuit;
   );
 }
 
-function FactDefinitionCard({ definition }: { definition: FactDefinition }) {
+function MemoryCardItem({ card, selected, onSelect }: { card: MemoryCard; selected: boolean; onSelect: () => void }) {
   return (
-    <article className="fact-memory-card">
+    <button type="button" className={`fact-memory-card ${selected ? 'selected' : ''}`} onClick={onSelect}>
       <div className="fact-memory-card-title">
-        <strong>{definition.fact_type}</strong>
-        <span>{definition.preferred_tool || 'tool'}</span>
+        <strong>{card.title}</strong>
+        <span>{card.kind}</span>
       </div>
-      <p>{definition.description}</p>
+      <p>{card.description}</p>
       <div className="chip-list compact">
-        {(definition.required_evidence || []).map((item) => <span key={item}>{item}</span>)}
+        {(card.tags || []).slice(0, 6).map((item) => <span key={item}>{item}</span>)}
       </div>
-      {definition.report_guidance && <small>{definition.report_guidance}</small>}
-    </article>
+      {card.updated_at && <small>{card.updated_at}</small>}
+    </button>
   );
 }
 
-function FactRecipeCard({ recipe }: { recipe: FactRecipe }) {
+function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
   return (
     <article className="fact-memory-card">
       <div className="fact-memory-card-title">
-        <strong>{recipe.name}</strong>
-        <span>{recipe.preferred_tool}</span>
+        <strong>{detail.card.title}</strong>
+        <span>{detail.card.kind}</span>
       </div>
-      <p>{recipe.fact_type}</p>
-      <pre className="debug-json">{JSON.stringify(recipe.expected_result_schema || {}, null, 2)}</pre>
+      <p>{detail.guidance || detail.card.description}</p>
+      {detail.fact_request && <pre className="debug-json">{JSON.stringify(detail.fact_request, null, 2)}</pre>}
+      {detail.examples && detail.examples.length > 0 && (
+        <div className="chip-list compact">
+          {detail.examples.slice(0, 4).map((item) => <span key={item}>{item}</span>)}
+        </div>
+      )}
     </article>
   );
 }
@@ -195,13 +232,4 @@ function EmptyState({ label }: { label: string }) {
       <span>{label}</span>
     </div>
   );
-}
-
-function groupBySource(definitions: FactDefinition[]) {
-  const counts = new Map<string, number>();
-  definitions.forEach((definition) => {
-    const source = definition.source || 'unknown';
-    counts.set(source, (counts.get(source) || 0) + 1);
-  });
-  return Array.from(counts.entries()).map(([source, count]) => ({ source, count }));
 }
