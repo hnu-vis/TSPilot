@@ -225,7 +225,8 @@ The prompt must explicitly expose these fields to the model:
 - `latest_anomaly`
 - `latest_rag`
 - `latest_skill`
-- `verified_facts`
+- `fact_set`
+- `fact_events`
 - `visualizations`
 - `prompt_context_summary`
 
@@ -293,7 +294,7 @@ The prompt should guide the model with this order:
 - `Observation` is not model output
 - prefer deterministic recovery or a failed observation over guessing when required fields are missing
 - treat `query_database` output as evidence, not as a final answer
-- use only `verified_facts` in final narration
+- use only selected `fact_set` facts from the current request flow in final narration
 - prefer `linechart` for time-indexed or ratio/comparison facts when the evidence supports it
 - do not emit hidden state changes outside the structured block
 - do not emit `Observation`

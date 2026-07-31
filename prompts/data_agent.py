@@ -282,7 +282,9 @@ class DataAgentPromptBuilder:
             "analysis_count": len(request_state.analysis_artifacts),
             "has_forecast": request_state.latest_forecast is not None,
             "has_anomaly": request_state.latest_anomaly is not None,
-            "verified_fact_count": len(request_state.verified_facts),
+            "verified_fact_count": sum(
+                1 for fact in request_state.fact_set.facts if fact.status == "verified"
+            ),
             "visualization_count": len(request_state.visualizations),
         }
 
@@ -788,16 +790,6 @@ class DataAgentPromptBuilder:
                 }
                 for todo in payload["todos"][:8]
                 if isinstance(todo, dict)
-            ]
-        if isinstance(payload.get("verified_facts"), list):
-            summarized["verified_facts"] = [
-                {
-                    "fact_id": fact.get("fact_id"),
-                    "fact_type": fact.get("fact_type"),
-                    "statement": fact.get("statement"),
-                }
-                for fact in payload["verified_facts"][:6]
-                if isinstance(fact, dict)
             ]
         if isinstance(payload.get("valid_actions"), list):
             summarized["valid_actions"] = payload["valid_actions"]

@@ -60,7 +60,7 @@ def _request_state():
     return request_state
 
 
-def test_generated_insight_executes_code_over_full_evidence():
+def test_generated_analysis_executes_code_over_full_evidence():
     request_state = _request_state()
 
     result = asyncio.run(
@@ -85,7 +85,7 @@ def test_generated_insight_executes_code_over_full_evidence():
     assert result["result"]["metrics"]["proportion"] == pytest.approx(2 / 3)
 
 
-def test_multiple_generated_insights_accumulate_in_analysis_workspace():
+def test_multiple_generated_analyses_accumulate_in_analysis_workspace():
     request_state = _request_state()
     first = {
         "analysis_id": "ana_first",
@@ -116,9 +116,9 @@ def test_multiple_generated_insights_accumulate_in_analysis_workspace():
     )
 
     assert set(request_state.analysis_artifacts) == {"ana_first", "ana_second"}
-    workspace = context["outputs"]["analysis_workspace"]
-    assert workspace["analysis_count"] == 2
-    assert [item["analysis_id"] for item in workspace["analyses"]] == ["ana_first", "ana_second"]
+    assert context["state"]["artifact_inventory"]["analysis_count"] == 2
+    assert context["artifacts"]["refs"]["analysis"] == ["analysis:ana_first", "analysis:ana_second"]
+    assert context["artifacts"]["refs"]["latest_analysis"] == "analysis:ana_second"
 
 
 def test_python_rows_runner_allows_safe_imports_and_lambda_sorting():
@@ -224,7 +224,7 @@ def test_python_sandbox_v1_times_out():
         )
 
 
-def test_generated_insight_supports_python_sandbox_v1():
+def test_generated_analysis_supports_python_sandbox_v1():
     request_state = _request_state()
 
     result = asyncio.run(

@@ -90,7 +90,9 @@ def build_observation_frame(
             has_anomaly=request_state.latest_anomaly is not None,
             has_rag=request_state.latest_rag is not None,
             has_skill=request_state.latest_skill is not None,
-            verified_fact_count=len(request_state.verified_facts),
+            verified_fact_count=sum(
+                1 for fact in request_state.fact_set.facts if fact.status == "verified"
+            ),
             visualization_count=len(request_state.visualizations),
             analysis_count=len(request_state.analysis_artifacts),
         ),

@@ -92,18 +92,12 @@
 
 ## Analysis layer
 
-### `tools/insight.py`
+### `tools/code_interpreter.py`
 
-- Inputs: `DatabaseEvidence`, requested fact types, focus, constraints
-- Outputs: `InsightResult` and visualization payloads
-- Can: propose, complete, verify, select facts; build chartable outputs
-- Cannot: query databases directly
-
-### `core/insight/*`
-
-- Purpose: deterministic helper pipeline for proposal/completion/verification/selection
-- Can: contain bounded rules and helper functions
-- Cannot: become a second open-ended agent
+- Inputs: database evidence, analysis goal, optional generated code and constraints
+- Outputs: analysis artifact plus facts produced from requested outputs
+- Can: execute scoped analysis over evidence and register tool-produced facts
+- Cannot: query databases directly or assemble final answers
 
 ### `tools/forecast.py`
 

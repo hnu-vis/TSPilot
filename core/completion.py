@@ -137,20 +137,20 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
     if (
         _requires_specialized_capability(request_state, requirements, "forecast")
         and not _latest_forecast_is_usable(request_state)
-        and not _verified_facts_cover_specialized_capability(request_state, "forecast")
+        and not _data_facts_cover_specialized_capability(request_state, "forecast")
     ):
         missing.append("forecast")
     if (
         _requires_specialized_capability(request_state, requirements, "anomaly")
         and request_state.latest_anomaly is None
-        and not _verified_facts_cover_specialized_capability(request_state, "anomaly")
+        and not _data_facts_cover_specialized_capability(request_state, "anomaly")
     ):
         missing.append("anomaly")
     if (
         _requires_code_analysis(request_state)
         and request_state.latest_analysis_id is None
         and not _latest_database_evidence_is_empty(request_state)
-        and not _verified_facts_cover_required_analysis(request_state)
+        and not _data_facts_cover_required_analysis(request_state)
     ):
         missing.append("analysis")
     return missing
@@ -209,7 +209,7 @@ def _requires_code_analysis(request_state: RequestStateModel) -> bool:
     return False
 
 
-def _verified_facts_cover_required_analysis(request_state: RequestStateModel) -> bool:
+def _data_facts_cover_required_analysis(request_state: RequestStateModel) -> bool:
     """Return whether current verified facts already ground the requested answer.
 
     Specialized tools should be required because the answer contract has an
@@ -219,7 +219,7 @@ def _verified_facts_cover_required_analysis(request_state: RequestStateModel) ->
     """
 
     contract = request_state.task_contract
-    verified = _verified_answer_facts(request_state)
+    verified = _verified_data_facts(request_state)
     if not verified:
         return False
     if contract is None:
@@ -237,12 +237,12 @@ def _verified_facts_cover_required_analysis(request_state: RequestStateModel) ->
     return all(_contract_output_is_covered_by_verified_fact(request_state, output) for output in analysis_outputs)
 
 
-def _verified_facts_cover_specialized_capability(request_state: RequestStateModel, capability: str) -> bool:
+def _data_facts_cover_specialized_capability(request_state: RequestStateModel, capability: str) -> bool:
     allowed_sources = {capability.strip().lower()}
-    return any(_fact_has_allowed_source(fact, allowed_sources) for fact in _verified_answer_facts(request_state))
+    return any(_fact_has_allowed_source(fact, allowed_sources) for fact in _verified_data_facts(request_state))
 
 
-def _verified_answer_facts(request_state: RequestStateModel) -> list:
+def _verified_data_facts(request_state: RequestStateModel) -> list:
     facts = list(getattr(getattr(request_state, "fact_set", None), "facts", []) or [])
     verified = []
     for fact in facts:
@@ -257,7 +257,7 @@ def _verified_answer_facts(request_state: RequestStateModel) -> list:
 
 
 def _contract_output_is_covered_by_verified_fact(request_state: RequestStateModel, output) -> bool:
-    facts = _verified_answer_facts(request_state)
+    facts = _verified_data_facts(request_state)
     if not facts:
         return False
     output_keys = _contract_output_keys(output)
@@ -671,7 +671,7 @@ def _gap_missing_is_covered_by_artifacts(request_state: RequestStateModel, missi
     structured_coverage = {
         "forecast": _latest_forecast_is_usable(request_state),
         "anomaly": request_state.latest_anomaly is not None,
-        "analysis": request_state.latest_analysis_id is not None or _verified_facts_cover_required_analysis(request_state),
+        "analysis": request_state.latest_analysis_id is not None or _data_facts_cover_required_analysis(request_state),
         "database_evidence": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
         "query": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
     }
@@ -1032,7 +1032,7 @@ def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) ->
         valid_refs.add(request_state.latest_forecast.forecast_id)
     if request_state.latest_anomaly is not None:
         valid_refs.add(request_state.latest_anomaly.anomaly_id)
-    valid_refs.update(f"fact:{fact.fact_id}" for fact in _verified_answer_facts(request_state))
+    valid_refs.update(f"fact:{fact.fact_id}" for fact in _verified_data_facts(request_state))
     for observation in request_state.observations:
         if observation.payload_ref:
             valid_refs.add(observation.payload_ref)
@@ -1193,7 +1193,7 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_database_evidence is not None:
         refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
     refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
-    refs.extend(f"fact:{fact.fact_id}" for fact in _verified_answer_facts(request_state))
+    refs.extend(f"fact:{fact.fact_id}" for fact in _verified_data_facts(request_state))
     if _latest_forecast_is_usable(request_state):
         refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
     if request_state.latest_anomaly is not None:

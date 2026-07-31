@@ -32,7 +32,7 @@ TSPilot-v0.2/
 │   ├── registry.py
 │   ├── todowrite.py
 │   ├── query_database.py
-│   ├── insight.py
+│   ├── code_interpreter.py
 │   ├── forecast.py
 │   ├── anomaly.py
 │   ├── rag.py
@@ -45,11 +45,8 @@ TSPilot-v0.2/
 │   │   ├── repair.py
 │   │   ├── schema.py
 │   │   └── SPEC/
-│   ├── insight/
-│   │   ├── proposal.py
-│   │   ├── completion.py
-│   │   ├── verification.py
-│   │   ├── selection.py
+│   ├── analysis/
+│   │   ├── python_runner.py
 │   │   └── SPEC/
 │   ├── timeseries/
 │   │   ├── normalization.py
@@ -69,7 +66,6 @@ TSPilot-v0.2/
     ├── tool.py
     ├── agent_turn.py
     ├── database.py
-    ├── insight.py
     ├── visualization.py
     ├── timeseries.py
     ├── output.py
@@ -103,7 +99,7 @@ TSPilot-v0.2/
 - [registry.py](tools/SPEC/registry_SPEC.md)
 - [todowrite.py](tools/SPEC/todowrite_SPEC.md)
 - [query_database.py](tools/SPEC/query_database_SPEC.md)
-- [insight.py](tools/SPEC/insight_SPEC.md)
+- [code_interpreter.py](tools/SPEC/code_interpreter_SPEC.md)
 - [forecast.py](tools/SPEC/forecast_SPEC.md)
 - [anomaly.py](tools/SPEC/anomaly_SPEC.md)
 - [rag.py](tools/SPEC/rag_SPEC.md)
@@ -117,12 +113,9 @@ TSPilot-v0.2/
 - [schema.py](core/database/SPEC/schema_SPEC.md)
 - [schema linking](core/database/SPEC/schema_linking_SPEC.md)
 
-### core/insight
+### core/analysis
 
-- [proposal.py](core/insight/SPEC/proposal_SPEC.md)
-- [completion.py](core/insight/SPEC/completion_SPEC.md)
-- [verification.py](core/insight/SPEC/verification_SPEC.md)
-- [selection.py](core/insight/SPEC/selection_SPEC.md)
+- [python_runner.py](core/analysis/SPEC/python_runner_SPEC.md)
 
 ### core/timeseries
 
@@ -146,7 +139,6 @@ TSPilot-v0.2/
 - [tool.py](schemas/SPEC/tool_SPEC.md)
 - [agent_turn.py](schemas/SPEC/agent_turn_SPEC.md)
 - [database.py](schemas/SPEC/database_SPEC.md)
-- [insight.py](schemas/SPEC/insight_SPEC.md)
 - [visualization.py](schemas/SPEC/visualization_SPEC.md)
 - [timeseries.py](schemas/SPEC/timeseries_SPEC.md)
 - [output.py](schemas/SPEC/output_SPEC.md)

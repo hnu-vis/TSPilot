@@ -368,12 +368,6 @@ class ToolExecutor:
             return payload, False
 
         visible = dict(payload)
-        if isinstance(visible.get("fact_candidates"), list):
-            visible["fact_candidates"] = visible["fact_candidates"][:8]
-        if isinstance(visible.get("completed_facts"), list):
-            visible["completed_facts"] = visible["completed_facts"][:6]
-        if isinstance(visible.get("verified_facts"), list):
-            visible["verified_facts"] = visible["verified_facts"][:6]
         if isinstance(visible.get("rejected_facts"), list):
             visible["rejected_facts"] = visible["rejected_facts"][:6]
         if isinstance(visible.get("forecast_points"), list):

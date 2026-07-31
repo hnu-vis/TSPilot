@@ -9,10 +9,28 @@ def _context_from_prompt(user_prompt: str) -> dict:
     global _LAST_CONTEXT
     if "Runtime State JSON:\n" in user_prompt:
         context_json = user_prompt.split("Runtime State JSON:\n", 1)[1]
-    else:
+        _LAST_CONTEXT = _compat_context(json.loads(context_json))
+        return _LAST_CONTEXT
+    if "Context JSON:\n" in user_prompt:
         context_json = user_prompt.split("Context JSON:\n", 1)[1]
-    _LAST_CONTEXT = _compat_context(json.loads(context_json))
+        _LAST_CONTEXT = _compat_context(json.loads(context_json))
+        return _LAST_CONTEXT
+    task = _section_json(user_prompt, "User Task:", "Available Tools:")
+    outer_state = _section_json(user_prompt, "Outer ReAct State:", None)
+    _LAST_CONTEXT = _compat_context({"task": task, **outer_state})
     return _LAST_CONTEXT
+
+
+def _section_json(text: str, start_marker: str, end_marker: str | None) -> dict:
+    if start_marker not in text:
+        return {}
+    chunk = text.split(start_marker, 1)[1]
+    if end_marker and end_marker in chunk:
+        chunk = chunk.split(end_marker, 1)[0]
+    chunk = chunk.strip()
+    if not chunk:
+        return {}
+    return json.loads(chunk)
 
 
 class FakeLLM:
@@ -90,7 +108,7 @@ class FakeLLM:
         )
 
 
-class SandboxInsightLLM:
+class SandboxAnalysisLLM:
     def __init__(self):
         self.calls = 0
 
@@ -706,7 +724,22 @@ def _compat_context(context: dict) -> dict:
     state = context.get("state") or {}
     evidence = context.get("evidence") or {}
     outputs = context.get("outputs") or {}
+    artifacts = context.get("artifacts") or {}
+    refs = artifacts.get("refs") if isinstance(artifacts.get("refs"), dict) else {}
     execution = state.get("execution") or {}
+    inventory = state.get("artifact_inventory") if isinstance(state.get("artifact_inventory"), dict) else {}
+    observations = _observation_summaries(context)
+    latest_observation = observations[-1] if observations else {}
+    latest_observation_payload = latest_observation.get("payload") if isinstance(latest_observation.get("payload"), dict) else latest_observation
+    latest_evidence = evidence.get("latest") or _latest_ref_payload(refs, "database_evidence") or _latest_ref_payload(refs, "evidence")
+    if not latest_evidence and latest_observation.get("tool_name") in {"sql_query", "query_database"} and latest_observation.get("success") is not False:
+        latest_evidence = latest_observation_payload
+    analyses = _ref_payloads(refs, "analysis")
+    if latest_observation.get("tool_name") == "code_interpreter" and latest_observation.get("success") is not False:
+        analyses.append(latest_observation_payload)
+    if not analyses:
+        analyses = _analysis_refs(refs)
+    analysis_count = len(analyses) or int(inventory.get("analysis_count") or 0)
     return {
         **context,
         "message": task.get("message"),
@@ -723,18 +756,77 @@ def _compat_context(context: dict) -> dict:
         "requested_capabilities": state.get("requested_capabilities"),
         "task_contract": state.get("task_contract"),
         "focus": state.get("focus"),
-        "latest_database_evidence": evidence.get("latest"),
+        "latest_database_evidence": latest_evidence,
         "query_history": evidence.get("prior_queries") or [],
-        "analysis_workspace": outputs.get("analysis_workspace") or {},
+        "analysis_workspace": outputs.get("analysis_workspace") or {
+            "analysis_count": analysis_count,
+            "analyses": analyses,
+        },
         "latest_forecast": outputs.get("latest_forecast"),
         "latest_anomaly": outputs.get("latest_anomaly"),
         "latest_rag": outputs.get("latest_rag"),
         "latest_skill": outputs.get("latest_skill"),
-        "verified_facts": outputs.get("verified_facts") or [],
         "visualizations": outputs.get("visualizations") or [],
-        "latest_observation_summaries": context.get("recent_observations") or [],
+        "latest_observation_summaries": observations,
         "available_actions": context.get("available_actions") or [],
     }
+
+
+def _observation_summaries(context: dict) -> list[dict]:
+    observations = []
+    latest = context.get("last_observation")
+    if isinstance(latest, dict):
+        normalized = dict(latest)
+        if "tool_name" not in normalized and normalized.get("tool"):
+            normalized["tool_name"] = normalized.get("tool")
+        observations.append(normalized)
+    for item in context.get("recent_trajectory") or []:
+        if not isinstance(item, dict):
+            continue
+        observation = item.get("observation")
+        if isinstance(observation, dict):
+            normalized = dict(observation)
+            normalized.setdefault("tool_name", item.get("action"))
+            if "tool_name" not in normalized and normalized.get("tool"):
+                normalized["tool_name"] = normalized.get("tool")
+            normalized.setdefault("success", item.get("status") != "failed")
+            observations.append(normalized)
+    return observations
+
+
+def _ref_payloads(refs: dict, prefix: str) -> list[dict]:
+    result = []
+    raw = refs.get(prefix)
+    if isinstance(raw, list):
+        result.extend(item for item in raw if isinstance(item, dict))
+    elif isinstance(raw, dict):
+        result.append(raw)
+    marker = f"{prefix}:"
+    for ref, payload in refs.items():
+        if str(ref).startswith(marker) and isinstance(payload, dict):
+            result.append(payload)
+    return result
+
+
+def _latest_ref_payload(refs: dict, prefix: str) -> dict | None:
+    matches = _ref_payloads(refs, prefix)
+    return matches[-1] if matches else None
+
+
+def _analysis_refs(refs: dict) -> list[dict]:
+    raw = refs.get("analysis")
+    values = raw if isinstance(raw, list) else [raw] if raw else []
+    result = []
+    for value in values:
+        text = str(value or "")
+        if text.startswith("analysis:"):
+            result.append({"analysis_id": text.split("analysis:", 1)[1]})
+    latest = str(refs.get("latest_analysis") or "")
+    if latest.startswith("analysis:"):
+        analysis_id = latest.split("analysis:", 1)[1]
+        if not any(item.get("analysis_id") == analysis_id for item in result):
+            result.append({"analysis_id": analysis_id})
+    return result
 
 
 def _analysis_count(context: dict) -> int:

@@ -135,7 +135,7 @@ Existing files already provide partial building blocks:
 
 - split mixed requests into multi-query plans when needed
 - preserve both aggregate evidence and raw-series evidence
-- let downstream `insight` consume raw evidence without losing query-native
+- let downstream analysis consume raw evidence without losing query-native
   facts
 - formalize prompt projection rules so the model sees summaries while tools read
   full artifacts
@@ -144,6 +144,6 @@ Existing files already provide partial building blocks:
 
 - upstream planning modules must not depend on SQL, Flux, or PromQL syntax
 - backend-specific syntax belongs only in renderers or connector adapters
-- `insight` must not query databases directly
+- downstream analysis must not query databases directly
 - answer formatting must consume evidence, not infer backend query semantics
 - full raw results must be storable independently from prompt-visible summaries

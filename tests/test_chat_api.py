@@ -17,7 +17,7 @@ from tests.fakes import (
     ComplexReActLLM,
     FakeLLM,
     RepeatingTodoLLM,
-    SandboxInsightLLM,
+    SandboxAnalysisLLM,
     TodoScopeLLM,
 )
 
@@ -71,7 +71,7 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
     settings.conversation_log_dir = str(tmp_path)
     settings.conversation_log_enabled = True
     try:
-        client = _build_client(SandboxInsightLLM(), max_iterations=5)
+        client = _build_client(SandboxAnalysisLLM(), max_iterations=5)
         response = client.post(
             "/api/v1/chat",
             json={
@@ -96,16 +96,16 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         code_observation = next(
             event
             for event in payload["trace"]
-            if event["event_type"] == "observation"
-            and event["payload"]["tool_name"] == "code_interpreter"
+            if event["event_type"] == "tool_result"
+            and event["payload"]["tool"] == "code_interpreter"
         )
-        code_payload = code_observation["payload"]["payload"]
+        code_payload = code_observation["payload"]["payload_preview"]
         assert code_payload["code_type"] == "code_interpreter_v1"
-        assert code_payload["diagnostics"]["sandbox"] == "subprocess_code_interpreter_v1"
-        assert code_payload["result"]["metrics"]["value_count"] > 1
-        assert code_payload["result"]["metrics"]["delta_count"] == code_payload["result"]["metrics"]["value_count"] - 1
+        assert code_payload["code_preview"]
+        assert code_payload["metrics_preview"]["value_count"] > 1
+        assert code_payload["metrics_preview"]["delta_count"] == code_payload["metrics_preview"]["value_count"] - 1
         assert "Code interpreter computed" in code_observation["payload"]["summary"]
-        assert "Code interpreter computed" in code_payload["result"]["summary"]
+        assert "Code interpreter computed" in code_payload["summary"]
 
         section_types = [section["section_type"] for section in payload["answer"]["sections"]]
         assert "analysis" in section_types
@@ -119,7 +119,7 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         assert len(code_outputs) == 1
         code_output = json.loads(code_outputs[0].read_text(encoding="utf-8"))
         assert code_output["status"] == "succeeded"
-        assert code_output["result"]["metrics"]["delta_count"] == code_payload["result"]["metrics"]["delta_count"]
+        assert code_output["result"]["metrics"]["delta_count"] == code_payload["metrics_preview"]["delta_count"]
     finally:
         settings.conversation_log_dir = old_log_dir
         settings.conversation_log_enabled = old_enabled

@@ -269,7 +269,7 @@ Practical design choices to avoid:
   repair in a single opaque step
 - mixing full raw result transport with model-visible observation text
 - embedding backend-specific assumptions directly into runtime control flow
-- coupling `insight` or answer formatting to one query language
+- coupling downstream analysis or answer formatting to one query language
 - treating SQL generation as the universal path when some backends are not SQL
 
 ## Evidence selection guidance

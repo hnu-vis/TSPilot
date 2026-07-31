@@ -56,8 +56,8 @@ This schema also depends on:
 - `latest_anomaly: AnomalyResult | null`
 - `latest_rag: dict | null`
 - `latest_skill: dict | null`
-- `verified_facts: list[VerifiedFact]`
-- `rejected_facts: list[RejectedFact]`
+- `fact_set: FactSet`
+- `fact_events: list[FactEvent]`
 
 ### Presentation state
 
