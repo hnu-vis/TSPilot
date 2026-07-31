@@ -290,8 +290,29 @@ def _validation_failure_view(validation_failure: dict, *, include_retry: bool) -
     for key in ("tool_name", "error_type", "message", "missing_required_filters", "missing_requirements"):
         if key in validation_failure:
             view[key] = _sanitize_value(validation_failure.get(key), max_string_chars=700)
+    repair_contract = validation_failure.get("repair_contract")
+    if include_retry and isinstance(repair_contract, dict):
+        view["repair_contract"] = _repair_contract_view(repair_contract)
     if include_retry and isinstance(validation_failure.get("retry_policy"), dict):
         view["retry_policy"] = _sanitize_value(validation_failure.get("retry_policy"), max_string_chars=500)
+    return _drop_empty(view)
+
+
+def _repair_contract_view(repair_contract: dict) -> dict:
+    view = {}
+    for key in (
+        "mode",
+        "input_evidence",
+        "analysis_goal",
+        "required_metrics",
+        "missing_metrics",
+        "required_details_fields",
+        "available_inputs",
+        "instruction",
+        "expected_result_shape",
+    ):
+        if key in repair_contract:
+            view[key] = _sanitize_value(repair_contract.get(key), max_string_chars=700)
     return _drop_empty(view)
 
 

@@ -72,7 +72,10 @@ The model must treat anything outside that window as unavailable.
 - After each observation, write `previous_observation_assessment` as the gap between the task output contract and current evidence: `covered`, `missing`, `can_answer`, and `next_action_reason`.
 - Choose tools to produce missing contract fields from grounded evidence; do not hard-code a tool chain for a task phrase.
 - Database-computable work should be satisfied by `sql_query` when returned columns or result shape explicitly cover the contract.
-- Use `code_interpreter` for supporting computation only when SQL evidence is grounded and database queries are impractical, repeatedly fail, or the user explicitly asks for code execution.
+- Use `code_interpreter` after SQL evidence is grounded when requested metrics require custom formulas, sequence/window calculations, or metrics not clearly covered by the simple analysis template.
+- `analysis_request` without `code` is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences.
+- For returns, volatility, drawdown, correlation, rolling/window metrics, or ambiguous unsupported metrics, provide Python `code` in `code_interpreter`.
+- Generated `code_interpreter` Python runs with variables `rows`, `points`, `columns`, `metadata`, and `diagnostics`. It must build any DataFrame/list from those inputs, must not assume `df` or `data` already exists, and must assign a dict named `result` with `summary`, `metrics`, and `details`.
 - `missing` is only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in `missing`.
 - Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`.
 

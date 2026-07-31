@@ -152,7 +152,7 @@ class ToolExecutor:
                 continue
             guidance = item.get("input_guidance") if isinstance(item.get("input_guidance"), dict) else {}
             for key, value in guidance.items():
-                if key in {"mode", "repair_contract", "validation_failure", "constraints", "analysis_request"}:
+                if key in {"mode", "repair_contract", "validation_failure", "constraints", "analysis_request", "requires_code"}:
                     continue
                 if value not in (None, "", [], {}) and normalized.get(key) in (None, "", [], {}):
                     normalized[key] = value
@@ -169,12 +169,27 @@ class ToolExecutor:
                 if action_name == "code_interpreter":
                     normalized.setdefault("database_evidence", guidance["repair_contract"].get("input_evidence") or "latest")
                     normalized.setdefault("analysis_goal", guidance["repair_contract"].get("analysis_goal") or request_state.message)
+                    generated_code_required = (
+                        guidance.get("requires_code") is True
+                        or guidance["repair_contract"].get("mode") == "generated_code_required"
+                    )
+                    if generated_code_required and not normalized.get("code"):
+                        normalized.pop("analysis_request", None)
                     analysis_request = self._normalize_analysis_request(normalized.get("analysis_request"))
                     analysis_request.setdefault("goal", normalized.get("analysis_goal") or request_state.message)
                     analysis_request.setdefault("mode", guidance["repair_contract"].get("mode") or "analysis_artifact_repair")
+                    if isinstance(guidance["repair_contract"].get("required_metrics"), list):
+                        analysis_request.setdefault("required_outputs", guidance["repair_contract"]["required_metrics"])
+                        if not normalized.get("required_outputs"):
+                            normalized["required_outputs"] = guidance["repair_contract"]["required_metrics"]
+                    if isinstance(guidance["repair_contract"].get("missing_metrics"), list):
+                        analysis_request.setdefault("missing_metrics", guidance["repair_contract"]["missing_metrics"])
                     if isinstance(guidance["repair_contract"].get("required_details_fields"), list):
                         analysis_request.setdefault("required_details_fields", guidance["repair_contract"]["required_details_fields"])
-                    normalized["analysis_request"] = analysis_request
+                    if analysis_request and (not generated_code_required or not normalized.get("code")):
+                        normalized["analysis_request"] = analysis_request
+                    elif normalized.get("code"):
+                        normalized.pop("analysis_request", None)
             guidance_constraints = guidance.get("constraints") if isinstance(guidance.get("constraints"), dict) else {}
             if guidance_constraints:
                 merged_constraints = dict(normalized.get("constraints") or {})

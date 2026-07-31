@@ -32,6 +32,11 @@ class DataAgentPromptBuilder:
             "Exact numeric claims in terminate must be grounded by database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate.\n"
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
+            "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
+            "If requested analysis metrics require custom formulas, sequence/window calculations, returns, volatility, drawdown, correlation, or any metric not clearly template-covered, call code_interpreter with Python code.\n"
+            "Code interpreter sandbox contract: generated Python code receives variables rows, points, columns, metadata, and diagnostics. "
+            "Do not assume df, data, or dataframe variables already exist; build them from rows or points. "
+            "The code must assign a dict named result with a non-empty summary string, a metrics dict, and a details dict.\n"
             "Tool-internal rules live inside tools. Do not recreate schema linking, query generation, validation, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
             "If a tool returns structured failure diagnostics, choose the recommended next action or a materially different action that addresses the diagnostics.\n"
             "Do not output markdown fences."
@@ -88,7 +93,7 @@ class DataAgentPromptBuilder:
         if action == "todowrite":
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
-            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?"]
+            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?"]
         if action in {"forecast", "anomaly"}:
             return ["database_evidence", "constraints?"]
         if action == "terminate":

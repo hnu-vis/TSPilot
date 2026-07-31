@@ -182,6 +182,12 @@ class ActionSpaceBuilder:
                 "repair_contract": repair_contract,
                 "validation_failure": validation_failure,
                 **(
+                    {"requires_code": True}
+                    if action == "code_interpreter"
+                    and repair_contract.get("mode") in {"generated_code_required", "code_execution_repair", "analysis_artifact_repair"}
+                    else {}
+                ),
+                **(
                     {"constraints": repair_contract.get("constraints")}
                     if isinstance(repair_contract.get("constraints"), dict)
                     else {}

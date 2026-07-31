@@ -17,6 +17,21 @@ from schemas.data_fact import DataFactRequest
 from tools.base import BaseTool, StructuredToolError
 
 
+TEMPLATE_SUPPORTED_METRICS = {
+    "record_count",
+    "start_value",
+    "end_value",
+    "highest_value",
+    "lowest_value",
+    "max_value",
+    "min_value",
+    "max_min_difference",
+    "difference",
+    "start_end_change",
+    "change",
+}
+
+
 class CodeInterpreterInput(BaseModel):
     mode: str | None = None
     repair_contract: dict | None = None
@@ -59,6 +74,22 @@ class CodeInterpreterTool(BaseTool):
         goal = validated_input.analysis_goal or "Code interpreter analysis"
         constraints = validated_input.constraints or {}
         if not validated_input.code or not validated_input.code.strip():
+            missing_metrics = _missing_template_metrics(
+                goal=goal,
+                required_outputs=validated_input.required_outputs,
+                analysis_request=validated_input.analysis_request,
+            )
+            if missing_metrics:
+                raise _structured_code_required_error(
+                    goal=goal,
+                    database_evidence=database_evidence,
+                    required_metrics=_requested_metric_labels(
+                        goal=goal,
+                        required_outputs=validated_input.required_outputs,
+                        analysis_request=validated_input.analysis_request,
+                    ),
+                    missing_metrics=missing_metrics,
+                )
             output = _execute_analysis_request(
                 rows=rows,
                 points=points,
@@ -79,16 +110,27 @@ class CodeInterpreterTool(BaseTool):
                     "code_interpreter analysis requires numeric time-series values, but the selected evidence "
                     "does not expose a usable timestamp/value pair. Query evidence with a numeric value column first."
                 )
-            sandbox_output = execute_python_sandbox_v1(
-                code=validated_input.code,
-                rows=rows,
-                points=points,
-                columns=columns,
-                metadata=database_evidence.metadata,
-                diagnostics=database_evidence.diagnostics,
-                timeout_seconds=int(constraints.get("timeout_seconds", 5)),
-                work_dir=_code_interpreter_work_dir(request_state, code_hash),
-            )
+            try:
+                sandbox_output = execute_python_sandbox_v1(
+                    code=validated_input.code,
+                    rows=rows,
+                    points=points,
+                    columns=columns,
+                    metadata=database_evidence.metadata,
+                    diagnostics=database_evidence.diagnostics,
+                    timeout_seconds=int(constraints.get("timeout_seconds", 5)),
+                    work_dir=_code_interpreter_work_dir(request_state, code_hash),
+                )
+            except AnalysisCodeError as exc:
+                raise _structured_code_execution_error(
+                    exc,
+                    goal=goal,
+                    database_evidence=database_evidence,
+                    columns=columns,
+                    required_outputs=validated_input.required_outputs,
+                    analysis_request=validated_input.analysis_request,
+                    expected_result_schema=validated_input.expected_result_schema or {},
+                ) from exc
             output = {"result": sandbox_output.result, "diagnostics": {"runtime_ms": sandbox_output.runtime_ms}}
             code_type = "code_interpreter_v1"
             runtime_ms = sandbox_output.runtime_ms
@@ -184,6 +226,132 @@ def _normalize_required_outputs(value) -> list[str]:
         label = value.get("id") or value.get("description") or value.get("output_type") or value.get("evidence_kind")
         return [str(label).strip()] if str(label or "").strip() else []
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _requested_metric_labels(*, goal: str, required_outputs: list[str], analysis_request: dict | None) -> list[str]:
+    labels = _string_list(required_outputs)
+    if isinstance(analysis_request, dict):
+        labels.extend(_string_list(analysis_request.get("required_outputs")))
+    deduped: list[str] = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+    if deduped:
+        return deduped
+    text_labels = []
+    if goal:
+        text_labels.append(goal)
+    if isinstance(analysis_request, dict) and analysis_request.get("goal"):
+        text_labels.append(str(analysis_request.get("goal")))
+    return text_labels
+
+
+def _missing_template_metrics(*, goal: str, required_outputs: list[str], analysis_request: dict | None) -> list[str]:
+    labels = _requested_metric_labels(
+        goal=goal,
+        required_outputs=required_outputs,
+        analysis_request=analysis_request,
+    )
+    missing: list[str] = []
+    for label in labels:
+        coverage = _template_metric_coverage(label)
+        for metric in coverage["missing"]:
+            if metric not in missing:
+                missing.append(metric)
+    return _sort_missing_metrics(missing)
+
+
+def _sort_missing_metrics(metrics: list[str]) -> list[str]:
+    priority = {
+        "total_return": 0,
+        "volatility": 1,
+        "max_drawdown": 2,
+    }
+    return sorted(metrics, key=lambda item: (priority.get(item, 100), item))
+
+
+def _template_metric_coverage(label: str) -> dict[str, list[str]]:
+    text = str(label or "").strip().lower()
+    if not text:
+        return {"covered": [], "missing": []}
+    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
+    missing = _unsupported_metric_names(text, compact)
+    if missing:
+        return {"covered": [], "missing": missing}
+    covered = _supported_metric_names(text, compact)
+    if covered:
+        return {"covered": covered, "missing": []}
+    return {"covered": [], "missing": [str(label).strip()]}
+
+
+def _unsupported_metric_names(text: str, compact: str) -> list[str]:
+    missing: list[str] = []
+    metric_markers = (
+        ("total_return", ("totalreturn", "cumulativereturn", "returnrate", "收益率", "总收益", "累计收益")),
+        ("volatility", ("volatility", "stdreturn", "波动率", "波动")),
+        ("max_drawdown", ("maxdrawdown", "maximumdrawdown", "drawdown", "最大回撤", "回撤")),
+    )
+    for name, markers in metric_markers:
+        if any(marker in compact or marker in text for marker in markers) and name not in missing:
+            missing.append(name)
+    if "returns" in text and "total_return" not in missing:
+        missing.append("total_return")
+    return missing
+
+
+def _supported_metric_names(text: str, compact: str) -> list[str]:
+    exact = {
+        "recordcount": "record_count",
+        "rowcount": "record_count",
+        "count": "record_count",
+        "startvalue": "start_value",
+        "firstvalue": "start_value",
+        "endvalue": "end_value",
+        "lastvalue": "end_value",
+        "highestvalue": "highest_value",
+        "maxvalue": "max_value",
+        "maximumvalue": "max_value",
+        "lowestvalue": "lowest_value",
+        "minvalue": "min_value",
+        "minimumvalue": "min_value",
+        "maxmindifference": "max_min_difference",
+        "difference": "difference",
+        "startendchange": "start_end_change",
+        "change": "change",
+        "最大值": "max_value",
+        "最高值": "highest_value",
+        "最小值": "min_value",
+        "最低值": "lowest_value",
+        "最大值和最小值的差异": "max_min_difference",
+        "最大最小差异": "max_min_difference",
+        "差异": "difference",
+        "差值": "difference",
+        "起始值": "start_value",
+        "开始值": "start_value",
+        "结束值": "end_value",
+        "最终值": "end_value",
+        "记录数": "record_count",
+        "条数": "record_count",
+    }
+    covered: list[str] = []
+    for key, metric in exact.items():
+        normalized_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", key.lower())
+        if compact == normalized_key or normalized_key in compact:
+            if metric not in covered:
+                covered.append(metric)
+    if ("最大" in text or "最高" in text or "max" in text or "maximum" in text) and "max_drawdown" not in compact:
+        metric = "max_value"
+        if metric not in covered:
+            covered.append(metric)
+    if "最小" in text or "最低" in text or "min" in text or "minimum" in text:
+        metric = "min_value"
+        if metric not in covered:
+            covered.append(metric)
+    if any(marker in text for marker in ("差异", "差值", "difference")):
+        metric = "max_min_difference" if (("最大" in text and "最小" in text) or "max" in text and "min" in text) else "difference"
+        if metric not in covered:
+            covered.append(metric)
+    return [metric for metric in covered if metric in TEMPLATE_SUPPORTED_METRICS]
 
 
 def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict], list[str]]:
@@ -335,6 +503,138 @@ def _analysis_context_indicates_outlier_treatment(goal: str, analysis_request: d
             "剔除",
             "排除",
         )
+    )
+
+
+def _structured_code_required_error(
+    *,
+    goal: str,
+    database_evidence: DatabaseEvidence,
+    required_metrics: list[str],
+    missing_metrics: list[str],
+) -> StructuredToolError:
+    repair_contract = {
+        "mode": "generated_code_required",
+        "input_evidence": database_evidence.evidence_id,
+        "analysis_goal": goal,
+        "required_metrics": required_metrics,
+        "missing_metrics": missing_metrics,
+        "instruction": (
+            "Call code_interpreter again with Python code. The code must compute the missing metrics "
+            "from rows/points and return result = {'summary': str, 'metrics': dict, 'details': dict}."
+        ),
+        "expected_result_shape": {
+            "summary": "string",
+            "metrics": {metric: "number_or_null" for metric in missing_metrics},
+            "details": "object",
+        },
+    }
+    message = (
+        "analysis_request_v1 cannot cover requested metrics without generated code: "
+        + ", ".join(missing_metrics)
+    )
+    validation_failure = {
+        "scope": "tool_input",
+        "capability": "analysis",
+        "tool": "code_interpreter",
+        "error_code": "code_required_for_metrics",
+        "message": message,
+        "required_contract": {
+            "template_supported_metrics": sorted(TEMPLATE_SUPPORTED_METRICS),
+            "required_metrics": required_metrics,
+            "missing_metrics": missing_metrics,
+        },
+        "repair_contract": repair_contract,
+        "retry_policy": {
+            "required_action": "code_interpreter",
+            "max_equivalent_retries": 2,
+            "allow_same_action": True,
+            "terminal_after_exhausted": True,
+        },
+    }
+    return StructuredToolError(
+        message,
+        error_type="code_required_for_metrics",
+        retryable=True,
+        recommended_next_action="code_interpreter",
+        diagnostics={
+            "template_supported_metrics": sorted(TEMPLATE_SUPPORTED_METRICS),
+            "required_metrics": required_metrics,
+            "missing_metrics": missing_metrics,
+            "repair_contract": repair_contract,
+        },
+        validation_failure=validation_failure,
+    )
+
+
+def _structured_code_execution_error(
+    exc: AnalysisCodeError,
+    *,
+    goal: str,
+    database_evidence: DatabaseEvidence,
+    columns: list[str],
+    required_outputs: list[str],
+    analysis_request: dict | None,
+    expected_result_schema: dict,
+) -> StructuredToolError:
+    required_metrics = _requested_metric_labels(
+        goal=goal,
+        required_outputs=required_outputs,
+        analysis_request=analysis_request,
+    )
+    repair_contract = {
+        "mode": "code_execution_repair",
+        "input_evidence": database_evidence.evidence_id,
+        "analysis_goal": goal,
+        "required_metrics": required_metrics,
+        "expected_result_shape": expected_result_schema
+        or {"summary": "string", "metrics": "object", "details": "object"},
+        "available_inputs": {
+            "rows": "list[dict]",
+            "points": "list[dict]",
+            "columns": columns,
+            "metadata": "dict",
+            "diagnostics": "dict",
+        },
+        "instruction": (
+            "Call code_interpreter again with corrected Python code. The sandbox provides variables "
+            "rows, points, columns, metadata, and diagnostics. Do not assume df, data, or dataframe "
+            "variables already exist; create them from rows or points if needed. The code must assign "
+            "a dict to result with non-empty result['summary'], result['metrics'], and result['details']."
+        ),
+    }
+    raw_message = str(exc)
+    message = raw_message if raw_message.startswith("analysis_code sandbox failed:") else f"analysis_code sandbox failed: {raw_message}"
+    validation_failure = {
+        "scope": "tool_input",
+        "capability": "analysis",
+        "tool": "code_interpreter",
+        "error_code": "analysis_code_execution_failed",
+        "message": message,
+        "required_contract": {
+            "available_inputs": repair_contract["available_inputs"],
+            "required_metrics": required_metrics,
+            "expected_result_shape": repair_contract["expected_result_shape"],
+        },
+        "repair_contract": repair_contract,
+        "retry_policy": {
+            "required_action": "code_interpreter",
+            "max_equivalent_retries": 2,
+            "allow_same_action": True,
+            "terminal_after_exhausted": True,
+        },
+    }
+    return StructuredToolError(
+        message,
+        error_type="analysis_code_execution_failed",
+        retryable=True,
+        recommended_next_action="code_interpreter",
+        diagnostics={
+            "available_inputs": repair_contract["available_inputs"],
+            "required_metrics": required_metrics,
+            "repair_contract": repair_contract,
+        },
+        validation_failure=validation_failure,
     )
 
 
