@@ -39,6 +39,7 @@ class ObservationFrame:
     has_database_context: bool
     has_todo_plan: bool
     artifacts: ArtifactInventory
+    active_todo_task_type: str | None = None
     latest_failed_tool: str | None = None
     latest_failure_payload: dict = field(default_factory=dict)
     latest_database_evidence_empty: bool = False
@@ -54,6 +55,7 @@ class ObservationFrame:
             "requested_capabilities": list(self.requested_capabilities),
             "has_database_context": self.has_database_context,
             "has_todo_plan": self.has_todo_plan,
+            "active_todo_task_type": self.active_todo_task_type,
             "artifacts": self.artifacts.model_view(),
             "latest_failed_tool": self.latest_failed_tool,
             "latest_failure_payload": self.latest_failure_payload,
@@ -83,6 +85,7 @@ def build_observation_frame(
         requested_capabilities=tuple(requested_capabilities),
         has_database_context=request_state.database_context is not None,
         has_todo_plan=bool(request_state.todo_list),
+        active_todo_task_type=_active_todo_task_type(request_state),
         artifacts=ArtifactInventory(
             has_database_evidence=request_state.latest_database_evidence is not None,
             has_analysis=bool(request_state.analysis_artifacts),
@@ -105,6 +108,14 @@ def build_observation_frame(
         completion_reason=completion_reason,
         requires_initial_todo_plan=requires_initial_todo_plan,
     )
+
+
+def _active_todo_task_type(request_state: RequestStateModel) -> str | None:
+    current = next((todo for todo in request_state.todo_list if todo.get("status") == "in_progress"), None)
+    if not isinstance(current, dict):
+        return None
+    task_type = str(current.get("task_type") or "").strip().lower()
+    return task_type or None
 
 
 def _active_repair_failure(request_state: RequestStateModel):

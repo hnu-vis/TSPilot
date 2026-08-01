@@ -197,7 +197,9 @@ class TodoWriteTool(BaseTool):
             or raw_todo.get("kind")
             or ""
         ).strip().lower()
-        task_type = explicit_task_type or self._todo_task_type(index, content, total_todos, validated_input)
+        task_type = self._normalize_task_type(
+            explicit_task_type or self._todo_task_type(index, content, total_todos, validated_input)
+        )
         if task_type == "plan" or self._is_internal_query_preparation(content):
             return None
         status = str(raw_todo.get("status") or "pending").strip().lower()
@@ -220,6 +222,14 @@ class TodoWriteTool(BaseTool):
             completion_reason=raw_todo.get("completion_reason"),
         )
         return TodoItem.model_validate(normalize_todo_for_completion(normalized.model_dump(mode="json")))
+
+    def _normalize_task_type(self, task_type: str) -> str:
+        normalized = str(task_type or "").strip().lower()
+        if normalized in {"list", "todo_list", "todos", "planning"}:
+            return "plan"
+        if normalized in {"data", "dataset", "timeseries", "time_series", "series", "records"}:
+            return "query"
+        return normalized or "generic"
 
     def _enforce_single_in_progress(self, todos: list[TodoItem]) -> list[TodoItem]:
         seen_in_progress = False

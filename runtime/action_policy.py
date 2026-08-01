@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import re
 
-from core.completion import latest_gap_assessment
-from core.harness import build_action_space, build_observation_frame
+from core.completion import current_todo, latest_gap_assessment
+from core.harness import build_action_space, build_observation_frame, default_capability_registry
 from core.harness.action_space import VALID_ACTIONS
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
@@ -425,6 +425,13 @@ def _latest_query_requests_downstream_analysis(request_state: RequestStateModel)
     evidence = request_state.latest_database_evidence
     if evidence is None:
         return None
+    active_todo = current_todo(request_state)
+    active_todo_content = None
+    if isinstance(active_todo, dict):
+        active_task_type = str(active_todo.get("task_type") or "").strip().lower()
+        if not default_capability_registry().action_matches_task_type("code_interpreter", active_task_type):
+            return None
+        active_todo_content = str(active_todo.get("content") or "").strip()
     diagnostics = evidence.diagnostics if isinstance(evidence.diagnostics, dict) else {}
     task_coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
     contract = task_coverage.get("query_task_contract") if isinstance(task_coverage.get("query_task_contract"), dict) else None
@@ -436,6 +443,8 @@ def _latest_query_requests_downstream_analysis(request_state: RequestStateModel)
     if str(contract.get("downstream_action") or "").strip().lower() != "code_interpreter":
         return None
     missing = task_coverage.get("missing") if isinstance(task_coverage.get("missing"), list) else []
+    if active_todo_content:
+        missing = [active_todo_content]
     required_outputs = missing
     if not required_outputs:
         required_outputs = task_coverage.get("missing_or_uncertain") if isinstance(task_coverage.get("missing_or_uncertain"), list) else []

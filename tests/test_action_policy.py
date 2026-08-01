@@ -4,7 +4,7 @@ import pytest
 
 from core.completion import apply_previous_observation_assessment, normalize_todo_for_completion
 from runtime.react_loop import ReActLoop
-from runtime.action_policy import validate_action
+from runtime.action_policy import runtime_action_constraints, validate_action
 from runtime.request_state import apply_observation, apply_observation_async, enrich_observation_payload
 from schemas.agent_turn import PreviousObservationAssessment, ReActTurn
 from schemas.database import DatabaseEvidence
@@ -119,6 +119,46 @@ def test_terminate_requires_forecast_tool_output_when_forecast_is_requested():
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
     assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
+
+
+def test_downstream_analysis_constraints_follow_active_analysis_todo_only():
+    request_state = RequestStateModel(
+        request_id="req-downstream-analysis-active-todo",
+        message="查询数据，分析趋势，检测异常，预测接下来 6 个点，最后给出结论。",
+        status="running",
+        requested_capabilities=["query", "analysis", "anomaly", "forecast"],
+        todo_list=[
+            {"content": "查询数据", "task_type": "query", "status": "completed", "priority": 1},
+            {"content": "分析趋势", "task_type": "code_interpreter", "status": "in_progress", "priority": 2},
+            {"content": "检测异常", "task_type": "anomaly", "status": "pending", "priority": 3},
+            {"content": "预测接下来 6 个点", "task_type": "forecast", "status": "pending", "priority": 4},
+            {"content": "给出结论", "task_type": "answer", "status": "pending", "priority": 5},
+        ],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_energy",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded rows.",
+            data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+            diagnostics={
+                "task_coverage": {
+                    "missing": ["分析趋势", "检测异常", "预测接下来 6 个点", "给出结论"],
+                    "query_task_contract": {
+                        "downstream_action": "code_interpreter",
+                        "preferred_evidence_shape": "raw_series",
+                    },
+                }
+            },
+        ),
+    )
+
+    constraints = runtime_action_constraints(request_state)
+
+    required = constraints["required_actions"][0]
+    assert required["action"] == "code_interpreter"
+    guidance = required["input_guidance"]
+    assert guidance["analysis_request"]["required_outputs"] == ["分析趋势"]
+    assert guidance["analysis_request"]["missing"] == ["分析趋势"]
 
 
 def test_terminate_rejects_incomplete_forecast_artifact_when_forecast_is_requested():
@@ -1335,6 +1375,34 @@ async def test_todowrite_drops_internal_plan_steps():
     assert todos[0]["status"] == "in_progress"
     assert all(todo["task_type"] != "plan" for todo in todos)
     assert all("evidence_needed" not in todo for todo in todos)
+
+
+@pytest.mark.asyncio
+async def test_todowrite_normalizes_llm_task_type_aliases():
+    result = await TodoWriteTool().execute(
+        TodoWriteInput(
+            message="请先列 todo，然后查询数据，分析趋势，检测异常，预测并总结。",
+            todos=[
+                {"content": "列出待办事项", "task_type": "list", "status": "in_progress", "priority": 1},
+                {"content": "查询 appliances_energy_wh 数据", "task_type": "data", "status": "pending", "priority": 2},
+                {"content": "分析趋势", "task_type": "code_interpreter", "status": "pending", "priority": 3},
+                {"content": "检测异常", "task_type": "anomaly", "status": "pending", "priority": 4},
+                {"content": "预测接下来 6 个点", "task_type": "forecast", "status": "pending", "priority": 5},
+                {"content": "给出结论", "task_type": "answer", "status": "pending", "priority": 6},
+            ],
+        )
+    )
+
+    todos = result["todos"]
+    assert [todo["content"] for todo in todos] == [
+        "查询 appliances_energy_wh 数据",
+        "分析趋势",
+        "检测异常",
+        "预测接下来 6 个点",
+        "给出结论",
+    ]
+    assert [todo["task_type"] for todo in todos] == ["query", "code_interpreter", "anomaly", "forecast", "answer"]
+    assert [todo["status"] for todo in todos] == ["in_progress", "pending", "pending", "pending", "pending"]
 
 
 @pytest.mark.asyncio

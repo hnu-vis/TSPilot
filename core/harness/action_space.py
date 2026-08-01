@@ -77,6 +77,7 @@ class ActionSpaceBuilder:
 
         capabilities = set(self._registry.normalize_many(frame.requested_capabilities, include_query=False))
         has_evidence = frame.artifacts.has_database_evidence and not frame.latest_database_evidence_empty
+        active_task_type = str(frame.active_todo_task_type or "").strip().lower()
         required: list[RequiredAction] = []
         missing: list[str] = []
 
@@ -93,9 +94,11 @@ class ActionSpaceBuilder:
                 break
             if capability_id not in capabilities:
                 continue
+            action = self._registry.actions_for_capability(capability_id)[0]
+            if active_task_type and active_task_type != "answer" and not self._registry.action_matches_task_type(action, active_task_type):
+                continue
             if getattr(frame.artifacts, artifact_attr):
                 continue
-            action = self._registry.actions_for_capability(capability_id)[0]
             required.append(
                 RequiredAction(
                     action=action if has_evidence else "sql_query",

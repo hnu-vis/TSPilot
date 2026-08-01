@@ -48,7 +48,10 @@ def normalize_todo_for_completion(todo: dict) -> dict:
     """Normalize todo shape without turning it into a runtime evidence contract."""
     normalized = dict(todo)
     task_type = str(normalized.get("task_type") or "").strip().lower()
-    if task_type == "plan":
+    if task_type in {"plan", "list", "todo_list", "todos", "planning"}:
+        task_type = "query"
+        normalized["task_type"] = task_type
+    elif task_type in {"data", "dataset", "timeseries", "time_series", "series", "records"}:
         task_type = "query"
         normalized["task_type"] = task_type
     normalized.pop("evidence_needed", None)
