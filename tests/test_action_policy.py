@@ -5,6 +5,7 @@ import pytest
 from core.completion import apply_previous_observation_assessment, normalize_todo_for_completion
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import runtime_action_constraints, validate_action
+from runtime.output_selection import select_outputs_for_action
 from runtime.request_state import apply_observation, apply_observation_async, enrich_observation_payload
 from schemas.agent_turn import PreviousObservationAssessment, ReActTurn
 from schemas.database import DatabaseEvidence
@@ -159,6 +160,66 @@ def test_downstream_analysis_constraints_follow_active_analysis_todo_only():
     guidance = required["input_guidance"]
     assert guidance["analysis_request"]["required_outputs"] == ["分析趋势"]
     assert guidance["analysis_request"]["missing"] == ["分析趋势"]
+
+
+def test_output_selector_filters_task_contract_by_action_capability():
+    request_state = RequestStateModel(
+        request_id="req-output-selector-contract",
+        message="查询数据，计算指标，检测异常，预测并总结。",
+        status="running",
+        task_contract=TaskContract.model_validate(
+            {
+                "source": "llm",
+                "goal": "multi step",
+                "required_outputs": [
+                    {"id": "series", "description": "原始序列", "evidence_kind": "database"},
+                    {"id": "trend", "description": "趋势指标", "evidence_kind": "analysis"},
+                    {"id": "anomalies", "description": "异常点", "evidence_kind": "anomaly"},
+                    {"id": "future", "description": "未来 6 个点", "evidence_kind": "forecast"},
+                    {"id": "conclusion", "description": "综合结论", "evidence_kind": "answer"},
+                ],
+            }
+        ),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded rows.",
+            data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        ),
+    )
+
+    code_outputs = select_outputs_for_action(request_state, "code_interpreter")
+    anomaly_outputs = select_outputs_for_action(request_state, "anomaly")
+    forecast_outputs = select_outputs_for_action(request_state, "forecast")
+
+    assert code_outputs["required_outputs"] == ["趋势指标"]
+    assert anomaly_outputs["required_outputs"] == ["异常点"]
+    assert forecast_outputs["required_outputs"] == ["未来 6 个点"]
+
+
+def test_output_selector_active_todo_overrides_global_missing_outputs():
+    request_state = RequestStateModel(
+        request_id="req-output-selector-active-todo",
+        message="查询数据，分析趋势，检测异常，预测并总结。",
+        status="running",
+        todo_list=[
+            {"content": "查询数据", "task_type": "query", "status": "completed", "priority": 1},
+            {"content": "分析趋势", "task_type": "code_interpreter", "status": "in_progress", "priority": 2},
+            {"content": "检测异常", "task_type": "anomaly", "status": "pending", "priority": 3},
+            {"content": "预测接下来 6 个点", "task_type": "forecast", "status": "pending", "priority": 4},
+            {"content": "给出结论", "task_type": "answer", "status": "pending", "priority": 5},
+        ],
+    )
+
+    selected = select_outputs_for_action(
+        request_state,
+        "code_interpreter",
+        fallback_outputs=["分析趋势", "检测异常", "预测接下来 6 个点", "给出结论"],
+    )
+
+    assert selected["required_outputs"] == ["分析趋势"]
+    assert selected["missing"] == ["分析趋势"]
 
 
 def test_terminate_rejects_incomplete_forecast_artifact_when_forecast_is_requested():

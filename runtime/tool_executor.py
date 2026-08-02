@@ -10,6 +10,7 @@ from schemas.action_output import ActionOutput
 from schemas.state import ConversationStateModel, RequestStateModel
 from schemas.tool import ToolCall, ToolObservation
 from runtime.action_policy import runtime_action_constraints
+from runtime.output_selection import select_outputs_for_action
 from tools.registry import ToolRegistry, ToolSpec
 
 
@@ -121,11 +122,11 @@ class ToolExecutor:
             normalized.setdefault("analysis_goal", request_state.message)
             analysis_request = self._normalize_analysis_request(normalized.get("analysis_request"))
             analysis_request.setdefault("goal", request_state.message)
-            analysis_request.setdefault("required_outputs", self._contract_required_outputs(request_state))
+            analysis_request.setdefault("required_outputs", self._action_required_outputs(request_state, action_name))
             analysis_request.setdefault("mode", "canonical_timeseries_metrics")
             normalized["analysis_request"] = analysis_request
             if not normalized.get("required_outputs"):
-                normalized["required_outputs"] = self._contract_required_outputs(request_state)
+                normalized["required_outputs"] = self._action_required_outputs(request_state, action_name)
         if action_name == "todowrite":
             normalized.setdefault("message", request_state.message)
             normalized.setdefault("focus", request_state.focus or request_state.message)
@@ -262,6 +263,15 @@ class ToolExecutor:
         profile = request_state.intent_profile if isinstance(request_state.intent_profile, dict) else {}
         raw_outputs = profile.get("required_outputs") if isinstance(profile.get("required_outputs"), list) else []
         return [str(item).strip() for item in raw_outputs if str(item).strip()]
+
+    def _action_required_outputs(self, request_state: RequestStateModel, action_name: str) -> list[str]:
+        selected = select_outputs_for_action(
+            request_state,
+            action_name,
+            fallback_outputs=self._contract_required_outputs(request_state),
+        )
+        outputs = selected.get("required_outputs") if isinstance(selected.get("required_outputs"), list) else []
+        return [str(item).strip() for item in outputs if str(item).strip()]
 
     def _normalize_time_range_hint(self, value, normalized_input: dict):
         if value in (None, "", [], {}):
