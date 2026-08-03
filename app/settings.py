@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     max_observation_chars: int = 1600
     max_visible_rows: int = 60
     max_visible_points: int = 240
+    agent_turn_timeout_seconds: float = Field(default=45.0, alias="TSPILOT_AGENT_TURN_TIMEOUT_SECONDS")
+    request_deadline_seconds: float = Field(default=180.0, alias="TSPILOT_REQUEST_DEADLINE_SECONDS")
 
     @property
     def resolved_database_config_dir(self) -> Path:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import app.deps as deps
@@ -23,10 +24,20 @@ from tests.fakes import (
 )
 
 
+class SlowTurnLLM:
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        await asyncio.sleep(1)
+        return "{}"
+
+
 def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     settings = get_settings()
     if max_iterations is not None:
         settings.max_iterations = max_iterations
+    else:
+        settings.max_iterations = 30
+    settings.agent_turn_timeout_seconds = 45.0
+    settings.request_deadline_seconds = 180.0
 
     deps.get_llm = lambda: llm
     deps.get_data_agent_llm = lambda: llm
@@ -63,6 +74,44 @@ def test_chat_json_path_returns_final_answer():
     assert payload["token_usage"]["totals"]["total_tokens"] > 0
     assert payload["token_usage"]["totals"]["call_count"] >= 1
     assert payload["token_usage"]["totals"]["counting_method"] == "tiktoken_estimate"
+
+
+def test_chat_json_path_returns_agent_decision_timeout():
+    settings = get_settings()
+    old_turn_timeout = settings.agent_turn_timeout_seconds
+    old_deadline = settings.request_deadline_seconds
+    try:
+        client = _build_client(SlowTurnLLM(), max_iterations=2)
+        settings.agent_turn_timeout_seconds = 0.01
+        settings.request_deadline_seconds = 5
+        response = client.post(
+            "/api/v1/chat",
+            json={
+                "message": "请分析 appliances_energy_wh 的趋势",
+                "database_context": {
+                    "database_id": "influxdb2-energydata",
+                    "database_type": "influxdb",
+                },
+            },
+        )
+    finally:
+        settings.agent_turn_timeout_seconds = old_turn_timeout
+        settings.request_deadline_seconds = old_deadline
+        deps.get_data_agent.cache_clear()
+        deps.get_tool_registry.cache_clear()
+        deps.get_tool_executor.cache_clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["response_kind"] == "error"
+    timeout_events = [
+        event
+        for event in payload["trace"]
+        if event["event_type"] == "agent_decision_timeout"
+    ]
+    assert timeout_events
+    assert timeout_events[-1]["payload"]["agent_turn_timeout_seconds"] == 0.01
 
 
 def test_chat_json_path_uses_code_interpreter_tool(tmp_path):

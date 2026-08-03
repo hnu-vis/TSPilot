@@ -143,21 +143,45 @@ class ReActLoop:
         emit_heartbeats: bool = False,
     ) -> AsyncIterator[TraceEventModel]:
         await self._initialize_memory_context(request_state)
+        deadline = self._request_deadline()
         while request_state.iteration < request_state.max_iterations:
+            if self._deadline_exceeded(deadline):
+                request_state.status = "failed"
+                request_state.errors.append({"stage": "runtime_deadline", "message": "Request deadline exceeded."})
+                yield append_trace(
+                    request_state,
+                    "runtime_deadline_exceeded",
+                    self._timeout_payload(
+                        request_state,
+                        deadline=deadline,
+                        message="Request deadline exceeded before a terminal payload was produced.",
+                    ),
+                )
+                yield append_trace(
+                    request_state,
+                    "error",
+                    {"message": "Request deadline exceeded before a terminal payload was produced."},
+                )
+                return
             request_state.iteration += 1
             try:
                 turn_task = asyncio.create_task(self._data_agent.next_turn(request_state, conversation_state))
+                turn_wait_task = asyncio.create_task(
+                    asyncio.wait_for(turn_task, timeout=self._remaining_agent_timeout(deadline))
+                )
                 async for heartbeat in self._heartbeat_until_done(
                     request_state,
-                    turn_task,
+                    turn_wait_task,
                     emit_heartbeats=emit_heartbeats,
                     phase="reasoning",
                     message="正在选择下一步工具。",
                     iteration=request_state.iteration,
                 ):
                     yield heartbeat
-                turn = await turn_task
+                turn = await turn_wait_task
             except asyncio.CancelledError:
+                if "turn_wait_task" in locals() and not turn_wait_task.done():
+                    turn_wait_task.cancel()
                 if "turn_task" in locals() and not turn_task.done():
                     turn_task.cancel()
                     try:
@@ -165,6 +189,25 @@ class ReActLoop:
                     except asyncio.CancelledError:
                         pass
                 raise
+            except TimeoutError:
+                if "turn_wait_task" in locals() and not turn_wait_task.done():
+                    turn_wait_task.cancel()
+                if "turn_task" in locals() and not turn_task.done():
+                    turn_task.cancel()
+                request_state.status = "failed"
+                message = "Timed out while waiting for data_agent to choose the next action."
+                request_state.errors.append({"stage": "agent_decision_timeout", "message": message})
+                yield append_trace(
+                    request_state,
+                    "agent_decision_timeout",
+                    self._timeout_payload(
+                        request_state,
+                        deadline=deadline,
+                        message=message,
+                    ),
+                )
+                yield append_trace(request_state, "error", {"message": message})
+                return
             except Exception as exc:
                 request_state.status = "failed"
                 request_state.errors.append({"stage": "agent", "message": str(exc)})
@@ -487,6 +530,43 @@ class ReActLoop:
             {"message": "Maximum iterations reached before a terminal payload was produced."},
         )
 
+    def _request_deadline(self) -> float | None:
+        seconds = float(getattr(self._settings, "request_deadline_seconds", 0) or 0)
+        if seconds <= 0:
+            return None
+        return time.monotonic() + seconds
+
+    def _deadline_exceeded(self, deadline: float | None) -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _remaining_agent_timeout(self, deadline: float | None) -> float:
+        per_turn = float(getattr(self._settings, "agent_turn_timeout_seconds", 45.0) or 45.0)
+        if deadline is None:
+            return max(0.1, per_turn)
+        remaining = max(0.1, deadline - time.monotonic())
+        return max(0.1, min(per_turn, remaining))
+
+    def _timeout_payload(self, request_state: RequestStateModel, *, deadline: float | None, message: str) -> dict:
+        remaining = None if deadline is None else round(max(0.0, deadline - time.monotonic()), 3)
+        latest_goal = request_state.completion_state.get("latest_goal")
+        return {
+            "iteration": request_state.iteration,
+            "message": message,
+            "remaining_deadline_seconds": remaining,
+            "agent_turn_timeout_seconds": float(getattr(self._settings, "agent_turn_timeout_seconds", 45.0) or 45.0),
+            "request_deadline_seconds": float(getattr(self._settings, "request_deadline_seconds", 0) or 0),
+            "available_artifacts": self._artifact_inventory_payload(request_state),
+            "goal_coverage": latest_goal if isinstance(latest_goal, dict) else None,
+        }
+
+    def _artifact_inventory_payload(self, request_state: RequestStateModel) -> dict:
+        return {
+            "database_evidence": list(request_state.database_evidence_artifacts.keys()),
+            "analysis": list(request_state.analysis_artifacts.keys()),
+            "forecast": list(request_state.forecast_artifacts.keys()),
+            "anomaly": list(request_state.anomaly_artifacts.keys()),
+        }
+
     async def _initialize_memory_context(self, request_state: RequestStateModel) -> None:
         if "memory_context" in request_state.completion_state:
             return
@@ -755,7 +835,14 @@ class ReActLoop:
             )
             return
 
-        if event_type in {"artifact_registered", "coverage_updated", "todo_updated", "policy_decision"}:
+        if event_type in {
+            "artifact_registered",
+            "coverage_updated",
+            "todo_updated",
+            "policy_decision",
+            "agent_decision_timeout",
+            "runtime_deadline_exceeded",
+        }:
             yield event
             return
 

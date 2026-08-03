@@ -417,6 +417,35 @@ export default function App() {
       return;
     }
 
+    if (event.event === 'agent_decision_timeout' || event.event === 'runtime_deadline_exceeded') {
+      const iteration = numberFrom(event.data.iteration, 0);
+      const id = `${event.event}-${iteration || Date.now()}`;
+      const timestamp = now();
+      const message = stringFrom(event.data.message, event.event === 'agent_decision_timeout'
+        ? 'Agent decision timed out.'
+        : 'Request deadline exceeded.');
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'runtime',
+        phase: 'reasoning',
+        status: 'error',
+        summary: message,
+        tool: event.event,
+        toolResult: {
+          tool: event.event,
+          success: false,
+          summary: message,
+          payload_preview: event.data,
+        },
+        observation: event.data,
+        completedAt: timestamp,
+        updatedAt: timestamp,
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
     if (event.event === 'final_answer') {
       const answer = extractFinalAnswer(event.data);
       if (!answer) return;
