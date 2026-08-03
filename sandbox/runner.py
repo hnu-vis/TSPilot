@@ -11,6 +11,7 @@ from pathlib import Path
 
 from core.analysis.python_runner import AnalysisCodeError, ExecutionOutput, validate_analysis_result_payload
 
+from .analysis_context import build_canonical_analysis_context
 from .policy import MAX_RESULT_BYTES, MAX_STDIO_CHARS, clamp_timeout
 
 
@@ -47,6 +48,13 @@ def execute_python_sandbox_v1(
         "metadata": dict(metadata),
         "diagnostics": dict(diagnostics),
     }
+    payload["analysis_context"] = build_canonical_analysis_context(
+        rows=payload["rows"],
+        points=payload["points"],
+        columns=payload["columns"],
+        metadata=payload["metadata"],
+        diagnostics=payload["diagnostics"],
+    )
     try:
         try:
             paths.input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

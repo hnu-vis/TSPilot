@@ -1,6 +1,8 @@
 """Subprocess code interpreter tool for grounded data analysis."""
 from __future__ import annotations
 
+import asyncio
+import ast
 import hashlib
 import json
 import re
@@ -11,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.analysis.python_runner import AnalysisCodeError
 from sandbox import execute_python_sandbox_v1
+from sandbox.analysis_context import build_canonical_analysis_context
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
@@ -63,6 +66,9 @@ class CodeInterpreterInput(BaseModel):
 
 
 class CodeInterpreterTool(BaseTool):
+    def __init__(self, llm=None):
+        self._llm = llm
+
     async def execute(self, validated_input: CodeInterpreterInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
         database_evidence = validated_input.database_evidence
@@ -73,67 +79,118 @@ class CodeInterpreterTool(BaseTool):
         rows, points, columns = _analysis_inputs(database_evidence)
         goal = validated_input.analysis_goal or "Code interpreter analysis"
         constraints = validated_input.constraints or {}
-        if not validated_input.code or not validated_input.code.strip():
+        code_text = str(validated_input.code or "").strip()
+        generated_code_preview = None
+        executed_code_preview = None
+        repair_attempts: list[dict] = []
+        canonical_context = build_canonical_analysis_context(
+            rows=rows,
+            points=points,
+            columns=columns,
+            metadata=database_evidence.metadata,
+            diagnostics=database_evidence.diagnostics,
+        )
+        if not code_text:
             missing_metrics = _missing_template_metrics(
                 goal=goal,
                 required_outputs=validated_input.required_outputs,
                 analysis_request=validated_input.analysis_request,
             )
             if missing_metrics:
-                raise _structured_code_required_error(
-                    goal=goal,
-                    database_evidence=database_evidence,
-                    required_metrics=_requested_metric_labels(
+                if self._llm is not None:
+                    try:
+                        code_text = await self._generate_analysis_code(
+                            goal=goal,
+                            required_outputs=validated_input.required_outputs,
+                            required_metrics=_requested_metric_labels(
+                                goal=goal,
+                                required_outputs=validated_input.required_outputs,
+                                analysis_request=validated_input.analysis_request,
+                            ),
+                            canonical_context=canonical_context,
+                        )
+                        generated_code_preview = _failed_code_summary(code_text)
+                    except (AnalysisCodeError, asyncio.TimeoutError):
+                        raise _structured_code_required_error(
+                            goal=goal,
+                            database_evidence=database_evidence,
+                            required_metrics=_requested_metric_labels(
+                                goal=goal,
+                                required_outputs=validated_input.required_outputs,
+                                analysis_request=validated_input.analysis_request,
+                            ),
+                            missing_metrics=missing_metrics,
+                        )
+                else:
+                    raise _structured_code_required_error(
                         goal=goal,
-                        required_outputs=validated_input.required_outputs,
-                        analysis_request=validated_input.analysis_request,
-                    ),
-                    missing_metrics=missing_metrics,
+                        database_evidence=database_evidence,
+                        required_metrics=_requested_metric_labels(
+                            goal=goal,
+                            required_outputs=validated_input.required_outputs,
+                            analysis_request=validated_input.analysis_request,
+                        ),
+                        missing_metrics=missing_metrics,
+                    )
+            if not code_text:
+                output = _execute_analysis_request(
+                    rows=rows,
+                    points=points,
+                    columns=columns,
+                    goal=goal,
+                    required_outputs=validated_input.required_outputs,
+                    analysis_request=validated_input.analysis_request,
+                    constraints=constraints,
                 )
-            output = _execute_analysis_request(
-                rows=rows,
-                points=points,
-                columns=columns,
-                goal=goal,
-                required_outputs=validated_input.required_outputs,
-                analysis_request=validated_input.analysis_request,
-                constraints=constraints,
-            )
-            code_type = "analysis_request_v1"
-            code_hash = _code_hash(json.dumps(output.get("diagnostics", {}), ensure_ascii=False, sort_keys=True, default=str))
-            runtime_ms = 0
-        else:
-            code_hash = _code_hash(validated_input.code)
+                code_type = "analysis_request_v1"
+                code_hash = _code_hash(json.dumps(output.get("diagnostics", {}), ensure_ascii=False, sort_keys=True, default=str))
+                runtime_ms = 0
+        if code_text:
+            code_hash = _code_hash(code_text)
             requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
             if requires_numeric_series and rows and not points:
                 raise AnalysisCodeError(
                     "code_interpreter analysis requires numeric time-series values, but the selected evidence "
                     "does not expose a usable timestamp/value pair. Query evidence with a numeric value column first."
                 )
-            try:
-                sandbox_output = execute_python_sandbox_v1(
-                    code=validated_input.code,
-                    rows=rows,
-                    points=points,
-                    columns=columns,
-                    metadata=database_evidence.metadata,
-                    diagnostics=database_evidence.diagnostics,
-                    timeout_seconds=int(constraints.get("timeout_seconds", 5)),
-                    work_dir=_code_interpreter_work_dir(request_state, code_hash),
-                )
-            except AnalysisCodeError as exc:
-                raise _structured_code_execution_error(
-                    exc,
-                    goal=goal,
-                    database_evidence=database_evidence,
-                    columns=columns,
-                    required_outputs=validated_input.required_outputs,
-                    analysis_request=validated_input.analysis_request,
-                    expected_result_schema=validated_input.expected_result_schema or {},
-                ) from exc
+            sandbox_output, final_code_text = await self._execute_code_with_internal_repair(
+                code=code_text,
+                goal=goal,
+                database_evidence=database_evidence,
+                rows=rows,
+                points=points,
+                columns=columns,
+                canonical_context=canonical_context,
+                constraints=constraints,
+                request_state=request_state,
+                code_hash=code_hash,
+                required_outputs=validated_input.required_outputs,
+                analysis_request=validated_input.analysis_request,
+                expected_result_schema=validated_input.expected_result_schema or {},
+                repair_attempts=repair_attempts,
+            )
+            code_hash = _code_hash(final_code_text)
+            executed_code_preview = _failed_code_summary(final_code_text)
+            generated_code_preview = _failed_code_summary(final_code_text) if generated_code_preview else None
             output = {"result": sandbox_output.result, "diagnostics": {"runtime_ms": sandbox_output.runtime_ms}}
             code_type = "code_interpreter_v1"
             runtime_ms = sandbox_output.runtime_ms
+        elif not validated_input.code and missing_metrics:
+            # Kept for static analyzers; all branches above either set code_text,
+            # execute the template path, or raise a structured code-required error.
+            raise _structured_code_required_error(
+                goal=goal,
+                database_evidence=database_evidence,
+                required_metrics=_requested_metric_labels(
+                    goal=goal,
+                    required_outputs=validated_input.required_outputs,
+                    analysis_request=validated_input.analysis_request,
+                ),
+                missing_metrics=missing_metrics,
+            )
+        else:
+            # Template path has already populated output/code_type/runtime_ms.
+            pass
         requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
         result_payload = output["result"]
         try:
@@ -163,10 +220,158 @@ class CodeInterpreterTool(BaseTool):
                 "input_columns": columns,
                 "input_points_count": len(points),
                 "sandbox": "subprocess_code_interpreter_v1" if code_type == "code_interpreter_v1" else "analysis_request_template_v1",
+                "generated_code_preview": generated_code_preview,
+                "executed_code_preview": executed_code_preview,
+                "internal_repair_attempts": repair_attempts,
+                "canonical_inputs": canonical_context.get("schema"),
                 **output.get("diagnostics", {}),
             },
         )
         return result.model_dump(mode="json")
+
+    async def _execute_code_with_internal_repair(
+        self,
+        *,
+        code: str,
+        goal: str,
+        database_evidence: DatabaseEvidence,
+        rows: list[dict],
+        points: list[dict],
+        columns: list[str],
+        canonical_context: dict,
+        constraints: dict,
+        request_state,
+        code_hash: str,
+        required_outputs: list[str],
+        analysis_request: dict | None,
+        expected_result_schema: dict,
+        repair_attempts: list[dict],
+    ):
+        current_code = code
+        last_error: AnalysisCodeError | None = None
+        max_internal_repairs = 2 if self._llm is not None else 0
+        for attempt in range(max_internal_repairs + 1):
+            preflight_error = _preflight_analysis_code(current_code, canonical_context)
+            if preflight_error is not None:
+                last_error = AnalysisCodeError(preflight_error)
+            else:
+                try:
+                    sandbox_output = execute_python_sandbox_v1(
+                        code=current_code,
+                        rows=rows,
+                        points=points,
+                        columns=columns,
+                        metadata=database_evidence.metadata,
+                        diagnostics=database_evidence.diagnostics,
+                        timeout_seconds=int(constraints.get("timeout_seconds", 5)),
+                        work_dir=_code_interpreter_work_dir(request_state, _code_hash(current_code)),
+                    )
+                    return sandbox_output, current_code
+                except AnalysisCodeError as exc:
+                    last_error = exc
+            repair_attempts.append(
+                {
+                    "attempt": attempt,
+                    "error": str(last_error)[:800] if last_error else None,
+                    "error_classification": _classify_analysis_code_error(str(last_error or "")),
+                    "code_hash": _code_hash(current_code),
+                }
+            )
+            if attempt >= max_internal_repairs or self._llm is None:
+                break
+            try:
+                current_code = await self._repair_analysis_code(
+                    goal=goal,
+                    required_outputs=required_outputs,
+                    required_metrics=_requested_metric_labels(
+                        goal=goal,
+                        required_outputs=required_outputs,
+                        analysis_request=analysis_request,
+                    ),
+                    canonical_context=canonical_context,
+                    failed_code=current_code,
+                    error=str(last_error or ""),
+                )
+            except (AnalysisCodeError, asyncio.TimeoutError):
+                break
+        raise _structured_code_execution_error(
+            last_error or AnalysisCodeError("analysis_code sandbox failed."),
+            goal=goal,
+            database_evidence=database_evidence,
+            columns=columns,
+            required_outputs=required_outputs,
+            analysis_request=analysis_request,
+            expected_result_schema=expected_result_schema,
+            failed_code=current_code,
+            canonical_context=canonical_context,
+        )
+
+    async def _generate_analysis_code(
+        self,
+        *,
+        goal: str,
+        required_outputs: list[str],
+        required_metrics: list[str],
+        canonical_context: dict,
+    ) -> str:
+        return await self._invoke_code_llm(
+            {
+                "mode": "generate",
+                "goal": goal,
+                "required_outputs": required_outputs,
+                "required_metrics": required_metrics,
+                "canonical_inputs": canonical_context.get("schema", {}),
+            }
+        )
+
+    async def _repair_analysis_code(
+        self,
+        *,
+        goal: str,
+        required_outputs: list[str],
+        required_metrics: list[str],
+        canonical_context: dict,
+        failed_code: str,
+        error: str,
+    ) -> str:
+        return await self._invoke_code_llm(
+            {
+                "mode": "repair",
+                "goal": goal,
+                "required_outputs": required_outputs,
+                "required_metrics": required_metrics,
+                "canonical_inputs": canonical_context.get("schema", {}),
+                "failed_code": _failed_code_summary(failed_code),
+                "error": error[:1200],
+                "error_classification": _classify_analysis_code_error(error),
+            }
+        )
+
+    async def _invoke_code_llm(self, payload: dict) -> str:
+        if self._llm is None:
+            raise AnalysisCodeError("code_interpreter has no LLM available for code generation.")
+        system = (
+            "You generate Python code for TSPilot code_interpreter. Return exactly one JSON object "
+            "with key code and no markdown. The sandbox already provides df, time, value, time_col, "
+            "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, "
+            "math, statistics, pd, and np. Prefer value/time/df/series. Do not use pd.np or ellipsis placeholders. "
+            "Do not invent field names. The code must assign result = {'summary': str, 'metrics': dict, 'details': dict}. "
+            "All metric/detail values must be JSON-serializable plain Python scalars, lists, or dicts."
+        )
+        messages = [
+            ("system", system),
+            ("human", json.dumps(payload, ensure_ascii=False, default=str)),
+        ]
+        response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+        content = _llm_content(response)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise AnalysisCodeError(f"code generation LLM returned invalid JSON: {exc}") from exc
+        code = parsed.get("code") if isinstance(parsed, dict) else None
+        if not isinstance(code, str) or not code.strip():
+            raise AnalysisCodeError("code generation LLM returned empty code.")
+        return code.strip()
 
 
 def _resolve_database_evidence(database_evidence, request_state):
@@ -576,12 +781,23 @@ def _structured_code_execution_error(
     required_outputs: list[str],
     analysis_request: dict | None,
     expected_result_schema: dict,
+    failed_code: str | None = None,
+    canonical_context: dict | None = None,
 ) -> StructuredToolError:
     required_metrics = _requested_metric_labels(
         goal=goal,
         required_outputs=required_outputs,
         analysis_request=analysis_request,
     )
+    if canonical_context is None:
+        rows, points, context_columns = _analysis_inputs(database_evidence)
+        canonical_context = build_canonical_analysis_context(
+            rows=rows,
+            points=points,
+            columns=columns or context_columns,
+            metadata=database_evidence.metadata,
+            diagnostics=database_evidence.diagnostics,
+        )
     repair_contract = {
         "mode": "code_execution_repair",
         "input_evidence": database_evidence.evidence_id,
@@ -593,13 +809,20 @@ def _structured_code_execution_error(
             "rows": "list[dict]",
             "points": "list[dict]",
             "columns": columns,
+            "data": "dict with rows, points, and series",
             "metadata": "dict",
             "diagnostics": "dict",
+            "canonical": "df, time, value, time_col, value_col, series, analysis_context",
         },
+        "canonical_inputs": canonical_context.get("schema") if isinstance(canonical_context, dict) else {},
+        "failed_code_summary": _failed_code_summary(failed_code),
+        "error_classification": _classify_analysis_code_error(str(exc)),
         "instruction": (
             "Call code_interpreter again with corrected Python code. The sandbox provides variables "
-            "rows, points, columns, metadata, and diagnostics. Do not assume df, data, or dataframe "
-            "variables already exist; create them from rows or points if needed. The code must assign "
+            "df, data, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
+            "metadata, and diagnostics. Prefer the canonical variables df/time/value/series instead "
+            "of guessing raw row field names. Use pandas frequency aliases compatible with current "
+            "pandas, for example 'h' for hourly grouping. The code must assign "
             "a dict to result with non-empty result['summary'], result['metrics'], and result['details']."
         ),
     }
@@ -636,6 +859,170 @@ def _structured_code_execution_error(
         },
         validation_failure=validation_failure,
     )
+
+
+def _preflight_analysis_code(code: str | None, canonical_context: dict | None = None) -> str | None:
+    text = str(code or "")
+    if not text.strip():
+        return "analysis_code cannot be empty."
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return f"analysis_code syntax error before sandbox execution: {exc.msg} at line {exc.lineno}."
+    if not _assigns_result(tree):
+        return "analysis_code must assign a dict named result with summary, metrics, and details."
+    if re.search(r"freq\s*=\s*['\"]H['\"]", text) or re.search(r"resample\s*\(\s*['\"]H['\"]", text):
+        return "analysis_code uses pandas hourly frequency 'H'; use lowercase 'h' for current pandas compatibility."
+    missing_names = sorted(_missing_runtime_names(tree, canonical_context or {}))
+    if missing_names:
+        return (
+            "analysis_code references unavailable runtime variables: "
+            + ", ".join(missing_names[:8])
+            + ". Use provided variables df, time, value, time_col, value_col, series, rows, points, columns, metadata, diagnostics, or define variables before use."
+        )
+    return None
+
+
+def _assigns_result(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "result":
+                    return True
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "result":
+            return True
+    return False
+
+
+def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
+    provided = {
+        "rows",
+        "points",
+        "columns",
+        "database_evidence",
+        "data",
+        "metadata",
+        "diagnostics",
+        "math",
+        "statistics",
+        "mean",
+        "median",
+        "stdev",
+        "pstdev",
+        "sqrt",
+        "analysis_context",
+        "series",
+        "df",
+        "time",
+        "value",
+        "time_col",
+        "value_col",
+        "pd",
+        "np",
+    }
+    builtins = {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "pow",
+        "range",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+        "BaseException",
+        "Exception",
+        "ArithmeticError",
+        "LookupError",
+        "IndexError",
+        "KeyError",
+        "NameError",
+        "TypeError",
+        "ValueError",
+        "ZeroDivisionError",
+    }
+    assigned: set[str] = set()
+    imported: set[str] = set()
+    loaded: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            assigned.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                assigned.add(node.id)
+            elif isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
+    available = provided | builtins | assigned | imported
+    schema = canonical_context.get("schema") if isinstance(canonical_context.get("schema"), dict) else {}
+    if schema.get("value_col"):
+        available.add(str(schema["value_col"]))
+    if schema.get("time_col"):
+        available.add(str(schema["time_col"]))
+    return {name for name in loaded if name not in available and not name.startswith("__")}
+
+
+def _classify_analysis_code_error(message: str) -> dict:
+    lowered = str(message or "").lower()
+    if "syntax" in lowered:
+        code = "syntax_error"
+    elif "not defined" in lowered or "unavailable runtime variables" in lowered:
+        code = "undefined_variable"
+    elif "keyerror" in lowered or "list indices must be integers" in lowered or "field" in lowered:
+        code = "input_shape_error"
+    elif "frequency" in lowered or "freq" in lowered:
+        code = "pandas_frequency_error"
+    elif "result" in lowered:
+        code = "result_contract_error"
+    else:
+        code = "execution_error"
+    return {"code": code, "message": str(message or "")[:800]}
+
+
+def _failed_code_summary(code: str | None) -> dict:
+    text = str(code or "")
+    if not text.strip():
+        return {}
+    lines = text.splitlines()
+    return {
+        "line_count": len(lines),
+        "char_count": len(text),
+        "preview": "\n".join(lines[:24])[:2000],
+    }
+
+
+def _llm_content(response) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
 
 
 def _structured_analysis_validation_error(

@@ -385,6 +385,38 @@ export default function App() {
       return;
     }
 
+    if (event.event === 'todo_updated') {
+      const iteration = numberFrom(event.data.iteration ?? event.data.current_step, 0);
+      const id = `todo-${iteration || Date.now()}`;
+      const timestamp = now();
+      const progress = asRecord(event.data.todo_progress);
+      const completed = numberFrom(event.data.completed_count ?? progress?.completed, 0);
+      const total = numberFrom(event.data.todo_total ?? progress?.total, 0);
+      const step: TraceStep = {
+        id,
+        iteration,
+        agent: 'runtime',
+        phase: 'intent',
+        status: 'complete',
+        summary: total > 0 ? `Todo progress ${completed}/${total}` : 'Todo progress updated.',
+        tool: 'todowrite',
+        toolResult: {
+          tool: 'todowrite',
+          success: true,
+          summary: 'Todo progress updated.',
+          payload_preview: event.data,
+        },
+        completedAt: timestamp,
+        updatedAt: timestamp,
+      };
+      updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      return;
+    }
+
+    if (event.event === 'policy_decision') {
+      return;
+    }
+
     if (event.event === 'final_answer') {
       const answer = extractFinalAnswer(event.data);
       if (!answer) return;
@@ -523,7 +555,7 @@ export default function App() {
   );
 }
 
-function stringFrom(value: unknown, fallback: string) {
+function stringFrom(value: unknown, fallback = '') {
   return typeof value === 'string' && value.trim() ? value : fallback;
 }
 

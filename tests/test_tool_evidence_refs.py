@@ -205,6 +205,14 @@ async def test_generated_code_execution_error_has_repair_contract():
     assert repair_contract["available_inputs"]["points"] == "list[dict]"
     assert "columns" in repair_contract["available_inputs"]
     assert "df, data" in repair_contract["instruction"]
+    assert repair_contract["available_inputs"]["canonical"] == "df, time, value, time_col, value_col, series, analysis_context"
+    assert repair_contract["canonical_inputs"]["value_col"] in {"value", "price", "_value"}
+    assert repair_contract["failed_code_summary"]["line_count"] == 2
+    assert repair_contract["error_classification"]["code"] in {
+        "execution_error",
+        "result_contract_error",
+        "input_shape_error",
+    }
 
 
 @pytest.mark.asyncio

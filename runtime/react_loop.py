@@ -453,6 +453,15 @@ class ReActLoop:
                 "action_output",
                 execution_result.action_output.model_dump(mode="json"),
             )
+            artifact_payload = self._artifact_registered_payload(execution_result.action_output)
+            if artifact_payload:
+                yield append_trace(request_state, "artifact_registered", artifact_payload)
+            coverage_payload = self._coverage_updated_payload(request_state, execution_result.action_output)
+            if coverage_payload:
+                yield append_trace(request_state, "coverage_updated", coverage_payload)
+            todo_payload = self._todo_snapshot(request_state)
+            if todo_payload:
+                yield append_trace(request_state, "todo_updated", todo_payload)
             sync_from_request(request_state, conversation_state)
 
             if execution_result.tool_spec.produces_terminal_payload:
@@ -572,15 +581,28 @@ class ReActLoop:
         action_output.meta = meta
 
     def _attach_todo_snapshot(self, action_output, request_state: RequestStateModel) -> None:
-        if not request_state.todo_list:
+        snapshot = self._todo_snapshot(request_state)
+        if not snapshot:
             return
+        view = dict(action_output.view or {})
+        payload = dict(view.get("payload") or view)
+        payload.update(snapshot)
+        if isinstance(action_output.view, dict) and "payload" in action_output.view:
+            view["payload"] = payload
+        else:
+            view = payload
+        action_output.view = view
+
+    def _todo_snapshot(self, request_state: RequestStateModel) -> dict:
+        if not request_state.todo_list:
+            return {}
         todos = [
             {
                 key: todo.get(key)
                 for key in ("content", "task_type", "status", "priority", "acceptance_criteria", "result_ref", "completion_reason")
                 if isinstance(todo, dict) and todo.get(key) not in (None, "", [], {})
             }
-            for todo in request_state.todo_list[:8]
+            for todo in request_state.todo_list[:12]
             if isinstance(todo, dict)
         ]
         completed = sum(1 for todo in request_state.todo_list if isinstance(todo, dict) and todo.get("status") == "completed")
@@ -592,7 +614,8 @@ class ReActLoop:
             ),
             None,
         )
-        snapshot = {
+        latest_step = request_state.completion_state.get("latest_step")
+        return {
             "current_step": request_state.plan_current_step,
             "planning_complete": request_state.planning_complete,
             "todo_total": len(request_state.todo_list),
@@ -604,15 +627,38 @@ class ReActLoop:
                 "completed": completed,
                 "in_progress": in_progress,
             },
+            "latest_step": latest_step if isinstance(latest_step, dict) else None,
         }
-        view = dict(action_output.view or {})
-        payload = dict(view.get("payload") or view)
-        payload.update(snapshot)
-        if isinstance(action_output.view, dict) and "payload" in action_output.view:
-            view["payload"] = payload
-        else:
-            view = payload
-        action_output.view = view
+
+    def _artifact_registered_payload(self, action_output) -> dict:
+        if not action_output.resource_ref:
+            return {}
+        return {
+            "tool": action_output.tool_name,
+            "resource_ref": action_output.resource_ref,
+            "resource_type": action_output.resource_type,
+            "success": action_output.success,
+            "iteration": (action_output.meta or {}).get("iteration"),
+        }
+
+    def _coverage_updated_payload(self, request_state: RequestStateModel, action_output) -> dict:
+        coverage = getattr(request_state, "fact_coverage", None)
+        latest_goal = request_state.completion_state.get("latest_goal")
+        latest_step = request_state.completion_state.get("latest_step")
+        if coverage is None and not isinstance(latest_goal, dict) and not isinstance(latest_step, dict):
+            return {}
+        payload = {
+            "tool": action_output.tool_name,
+            "iteration": (action_output.meta or {}).get("iteration"),
+            "resource_ref": action_output.resource_ref,
+        }
+        if coverage is not None:
+            payload["fact_coverage"] = coverage.model_dump(mode="json") if hasattr(coverage, "model_dump") else coverage
+        if isinstance(latest_goal, dict):
+            payload["goal_coverage"] = latest_goal
+        if isinstance(latest_step, dict):
+            payload["step_coverage"] = latest_step
+        return payload
 
     async def _heartbeat_until_done(
         self,
@@ -666,6 +712,21 @@ class ReActLoop:
             iteration = payload.get("meta", {}).get("iteration") if isinstance(payload.get("meta"), dict) else request_state.iteration
             view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
             timing = self._timing_from_action_output_payload(payload)
+            result_target = payload.get("meta", {}).get("result_target") if isinstance(payload.get("meta"), dict) else None
+            if result_target == "policy":
+                yield append_trace(
+                    request_state,
+                    "policy_decision",
+                    {
+                        "tool": payload.get("tool_name"),
+                        "accepted": bool(payload.get("success", False)),
+                        "summary": payload.get("content"),
+                        "iteration": iteration,
+                        "payload_preview": view.get("payload") if isinstance(view.get("payload"), dict) else view,
+                        **timing,
+                    },
+                )
+                return
             yield append_trace(
                 request_state,
                 "tool_result",
@@ -692,6 +753,10 @@ class ReActLoop:
                     **timing,
                 },
             )
+            return
+
+        if event_type in {"artifact_registered", "coverage_updated", "todo_updated", "policy_decision"}:
+            yield event
             return
 
         if event_type == "thought":
@@ -1191,6 +1256,24 @@ class ReActLoop:
             "code_type": visible_payload.get("code_type"),
             "runtime_ms": diagnostics.get("runtime_ms"),
             "input_columns": diagnostics.get("input_columns") if isinstance(diagnostics.get("input_columns"), list) else [],
+            "code_preview": (
+                diagnostics.get("executed_code_preview", {}).get("preview")
+                if isinstance(diagnostics.get("executed_code_preview"), dict)
+                else diagnostics.get("generated_code_preview", {}).get("preview")
+                if isinstance(diagnostics.get("generated_code_preview"), dict)
+                else None
+            ),
+            "analysis_code_chars": (
+                diagnostics.get("executed_code_preview", {}).get("char_count")
+                if isinstance(diagnostics.get("executed_code_preview"), dict)
+                else diagnostics.get("generated_code_preview", {}).get("char_count")
+                if isinstance(diagnostics.get("generated_code_preview"), dict)
+                else None
+            ),
+            "internal_repair_attempts": diagnostics.get("internal_repair_attempts")
+            if isinstance(diagnostics.get("internal_repair_attempts"), list)
+            else [],
+            "canonical_inputs": diagnostics.get("canonical_inputs") if isinstance(diagnostics.get("canonical_inputs"), dict) else None,
         }
 
     def _forecast_payload_preview(self, visible_payload: dict) -> dict:

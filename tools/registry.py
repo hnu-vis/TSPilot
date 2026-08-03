@@ -96,7 +96,7 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
             description="Execute Python code in a subprocess code interpreter over full evidence artifacts for complex analysis.",
             input_model=CodeInterpreterInput,
             output_model=AnalysisResult,
-            tool=CodeInterpreterTool(),
+            tool=CodeInterpreterTool(llm=llm),
             prompt_visible=True,
             runtime_access="request_state_read",
             result_target="analysis",

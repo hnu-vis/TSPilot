@@ -198,6 +198,56 @@ def test_python_sandbox_v1_executes_in_subprocess():
     assert output.result["metrics"]["total"] == 5.0
 
 
+def test_python_sandbox_v1_provides_canonical_timeseries_inputs():
+    output = execute_python_sandbox_v1(
+        code=(
+            "result = {\n"
+            "  'summary': 'canonical inputs available',\n"
+            "  'metrics': {'mean_value': float(value.mean()), 'point_count': int(len(series))},\n"
+            "  'details': {'value_col': value_col, 'time_col': time_col, 'first_timestamp': str(time.iloc[0])},\n"
+            "}\n"
+        ),
+        rows=[],
+        points=[
+            {"_time": "2023-01-01T01:00:00Z", "price": "3.0"},
+            {"_time": "2023-01-01T00:00:00Z", "price": "1.0"},
+        ],
+        columns=["_time", "price"],
+        metadata={},
+        diagnostics={},
+        timeout_seconds=5,
+    )
+
+    assert output.result["metrics"]["mean_value"] == 2.0
+    assert output.result["metrics"]["point_count"] == 2
+    assert output.result["details"]["value_col"] == "price"
+    assert output.result["details"]["time_col"] == "_time"
+    assert output.result["details"]["first_timestamp"].startswith("2023-01-01 00:00:00")
+
+
+def test_python_sandbox_v1_data_supports_column_array_aliases():
+    output = execute_python_sandbox_v1(
+        code=(
+            "values = data['appliances_energy_wh']\n"
+            "result = {'summary': 'column alias available', "
+            "'metrics': {'max_value': float(max(values))}, "
+            "'details': {'value_col': value_col}}\n"
+        ),
+        rows=[
+            {"timestamp": "2023-01-01T00:00:00Z", "appliances_energy_wh": "2"},
+            {"timestamp": "2023-01-01T01:00:00Z", "appliances_energy_wh": "5"},
+        ],
+        points=[],
+        columns=["timestamp", "appliances_energy_wh"],
+        metadata={},
+        diagnostics={},
+        timeout_seconds=5,
+    )
+
+    assert output.result["metrics"]["max_value"] == 5.0
+    assert output.result["details"]["value_col"] == "appliances_energy_wh"
+
+
 def test_python_sandbox_v1_requires_stable_result_shape():
     with pytest.raises(AnalysisCodeError, match="details"):
         execute_python_sandbox_v1(

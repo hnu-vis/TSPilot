@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from core.analysis.python_runner import validate_analysis_result_payload
+from sandbox.analysis_context import canonical_namespace_values
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,6 +45,15 @@ def _execute(payload: dict) -> dict:
     columns = list(payload.get("columns") or [])
     metadata = dict(payload.get("metadata") or {})
     diagnostics = dict(payload.get("diagnostics") or {})
+    canonical_values = canonical_namespace_values(
+        {
+            "rows": rows,
+            "points": points,
+            "columns": columns,
+            "metadata": metadata,
+            "diagnostics": diagnostics,
+        }
+    )
     database_evidence = {
         "rows": rows,
         "points": points,
@@ -56,11 +66,30 @@ def _execute(payload: dict) -> dict:
         "metadata": metadata,
         "diagnostics": diagnostics,
     }
+    data = dict(database_evidence["data"])
+    df = canonical_values.get("df")
+    try:
+        if df is not None:
+            for column in getattr(df, "columns", []):
+                data[str(column)] = list(df[column])
+    except Exception:
+        pass
+    pd = None
+    np = None
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        pd = None
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None
     namespace = {
         "rows": rows,
         "points": points,
         "columns": columns,
         "database_evidence": database_evidence,
+        "data": data,
         "metadata": metadata,
         "diagnostics": diagnostics,
         "math": math,
@@ -70,6 +99,9 @@ def _execute(payload: dict) -> dict:
         "stdev": statistics.stdev,
         "pstdev": statistics.pstdev,
         "sqrt": math.sqrt,
+        "pd": pd,
+        "np": np,
+        **canonical_values,
     }
     exec(compile(code, "<sandbox_analysis_code>", "exec"), namespace, namespace)
     return validate_analysis_result_payload(namespace.get("result"))

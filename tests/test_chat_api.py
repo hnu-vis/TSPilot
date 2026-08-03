@@ -58,7 +58,7 @@ def test_chat_json_path_returns_final_answer():
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
-    assert payload["used_tools"] == ["sql_query", "code_interpreter"]
+    assert payload["used_tools"][:2] == ["sql_query", "code_interpreter"]
     assert payload["answer"]["summary"]
     assert payload["token_usage"]["totals"]["total_tokens"] > 0
     assert payload["token_usage"]["totals"]["call_count"] >= 1
@@ -659,6 +659,13 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     assert "sql_query" in payload["used_tools"]
     assert "code_interpreter" in payload["used_tools"]
     assert "anomaly" in payload["used_tools"]
+    assert any(event["event_type"] == "todo_updated" for event in payload["trace"])
+    assert all(
+        "Required actions" not in str(event["payload"].get("summary") or "")
+        for event in payload["trace"]
+        if event["event_type"] == "tool_result"
+    )
+    assert any(event["event_type"] == "policy_decision" for event in payload["trace"])
     tool_results = [event for event in payload["trace"] if event["event_type"] == "tool_result"]
     todo_updates = [
         event for event in tool_results

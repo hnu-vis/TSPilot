@@ -484,6 +484,22 @@ def _public_response_trace(trace_events: list[TraceEventModel]) -> list[TraceEve
         if event.event_type == "action_output":
             view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
             timing = _timing_from_action_output_payload(payload)
+            result_target = payload.get("meta", {}).get("result_target") if isinstance(payload.get("meta"), dict) else None
+            if result_target == "policy":
+                public_events.append(
+                    TraceEventModel(
+                        event_type="policy_decision",
+                        payload={
+                            "tool": payload.get("tool_name"),
+                            "accepted": bool(payload.get("success", False)),
+                            "summary": payload.get("content"),
+                            "payload_preview": view.get("payload") if isinstance(view.get("payload"), dict) else view,
+                            **timing,
+                        },
+                        timestamp=event.timestamp,
+                    )
+                )
+                continue
             public_events.append(
                 TraceEventModel(
                     event_type="tool_result",
