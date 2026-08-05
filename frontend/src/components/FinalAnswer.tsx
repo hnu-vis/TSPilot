@@ -31,13 +31,10 @@ export function FinalAnswer({
   elapsedSeconds?: number | null;
 }) {
   const summary = answer.summary?.trim() || '我没有生成可展示的回答。';
-  const sections = (answer.sections || []).filter((section) => (
-    section.content?.trim()
-    && section.section_type !== 'summary'
-    && section.section_type !== 'conclusion'
-  ));
+  const sections = supportingSections(answer.sections, summary);
+  const sectionQueryItems = queryResultItemsFromSections(answer.sections);
   const referenceQueryItems = queryResultItemsFromReferences(answer.references);
-  const sectionHasQueryResults = sections.some((section) => section.section_type === 'query_results');
+  const evidenceQueryItems = mergeQueryResultItems(sectionQueryItems, referenceQueryItems);
   const references = answer.references || [];
 
   return (
@@ -80,26 +77,24 @@ export function FinalAnswer({
                 <span className="answer-section-type">{formatLabel(section.section_type)}</span>
               )}
               <h3>{section.heading || formatLabel(section.section_type)}</h3>
-              <StructuredSection section={section} />
+              <StructuredSection section={section} summary={summary} />
             </section>
           ))}
         </div>
       )}
 
-      {!sectionHasQueryResults && referenceQueryItems.length > 0 && (
-        <div className="answer-sections">
-          <section className="answer-section">
-            <span className="answer-section-type">Database Evidence</span>
-            <h3>Query Results</h3>
-            <QueryResultsView items={referenceQueryItems} fallbackContent="" />
-          </section>
-        </div>
+      {evidenceQueryItems.length > 0 && (
+        <section className="answer-section answer-evidence-section">
+          <span className="answer-section-type">Evidence</span>
+          <h3>Database evidence</h3>
+          <QueryResultsView items={evidenceQueryItems} fallbackContent="" />
+        </section>
       )}
     </div>
   );
 }
 
-function StructuredSection({ section }: { section: AnswerSection }) {
+function StructuredSection({ section, summary }: { section: AnswerSection; summary: string }) {
   if (section.section_type === 'query_results') {
     const items = queryResultItems(section.structured_payload);
     if (items.length > 0) {
@@ -108,9 +103,10 @@ function StructuredSection({ section }: { section: AnswerSection }) {
   }
   if (section.section_type === 'analysis') {
     const metrics = metricGroups(section.structured_payload);
+    const content = sectionContentWithoutDuplicateSummary(section.content, summary);
     return (
       <div className="answer-structured-stack">
-        <MarkdownContent content={section.content} />
+        {content && <MarkdownContent content={content} />}
         {metrics.length > 0 && <MetricGroups metrics={metrics} />}
       </div>
     );
@@ -149,7 +145,7 @@ function QueryResultsView({ items, fallbackContent }: { items: QueryResultItem[]
             {previewRows.length === 0 && item.summary && (
               <MarkdownContent content={item.summary} />
             )}
-            {item.query && (
+            {visibleQuery(item.query) && (
               <details className="answer-inline-details">
                 <summary>
                   <ChevronDown size={14} className="collapsible-chevron" />
@@ -341,6 +337,31 @@ function shouldShowSectionType(section: AnswerSection) {
   return Boolean(heading && heading !== sectionType);
 }
 
+function supportingSections(sections: FinalAnswerType['sections'] | undefined, summary: string): AnswerSection[] {
+  const seenContent = new Set<string>();
+  const excludedTypes = new Set(['summary', 'conclusion', 'query_results']);
+  const normalizedSummary = comparableText(summary);
+  const normalizedTitle = (section: AnswerSection) => comparableText(section.heading || formatLabel(section.section_type));
+
+  return (sections || []).filter((section) => {
+    if (excludedTypes.has(section.section_type)) return false;
+    const content = section.content?.trim();
+    if (!content) return false;
+    const normalizedContent = comparableText(content);
+    if (!normalizedContent || normalizedContent === normalizedSummary) return false;
+    if (normalizedContent === normalizedTitle(section)) return false;
+    if (seenContent.has(normalizedContent)) return false;
+    seenContent.add(normalizedContent);
+    return true;
+  });
+}
+
+function sectionContentWithoutDuplicateSummary(content: string, summary: string) {
+  const trimmed = content.trim();
+  if (!trimmed) return '';
+  return comparableText(trimmed) === comparableText(summary) ? '' : trimmed;
+}
+
 function queryResultItems(payload: Record<string, unknown> | null | undefined): QueryResultItem[] {
   const items = asRecord(payload)?.items;
   if (!Array.isArray(items)) return [];
@@ -360,6 +381,15 @@ function queryResultItems(payload: Record<string, unknown> | null | undefined): 
       sampled_for_prompt: typeof record.sampled_for_prompt === 'boolean' ? record.sampled_for_prompt : false,
       artifact_ref: asString(record.artifact_ref),
     });
+  }
+  return normalized;
+}
+
+function queryResultItemsFromSections(sections: FinalAnswerType['sections'] | undefined): QueryResultItem[] {
+  const normalized: QueryResultItem[] = [];
+  for (const section of sections || []) {
+    if (section.section_type !== 'query_results') continue;
+    normalized.push(...queryResultItems(section.structured_payload));
   }
   return normalized;
 }
@@ -400,6 +430,53 @@ function queryResultItemsFromReferences(references: FinalAnswerType['references'
   return normalized;
 }
 
+function mergeQueryResultItems(...groups: QueryResultItem[][]): QueryResultItem[] {
+  const merged: QueryResultItem[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const items of groups) {
+    for (const item of items) {
+      const key = queryResultKey(item, merged.length);
+      const existingIndex = indexByKey.get(key);
+      if (typeof existingIndex === 'number') {
+        merged[existingIndex] = mergeQueryResultItem(merged[existingIndex], item);
+        continue;
+      }
+      indexByKey.set(key, merged.length);
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
+function mergeQueryResultItem(primary: QueryResultItem, secondary: QueryResultItem): QueryResultItem {
+  const primaryRows = primary.rows_preview || [];
+  const secondaryRows = secondary.rows_preview || [];
+  return {
+    evidence_id: primary.evidence_id || secondary.evidence_id,
+    purpose: primary.purpose || secondary.purpose,
+    summary: primary.summary || secondary.summary,
+    query_language: primary.query_language || secondary.query_language,
+    query: visibleQuery(primary.query) ? primary.query : secondary.query,
+    row_count: typeof primary.row_count === 'number' ? primary.row_count : secondary.row_count,
+    columns: (primary.columns?.length || 0) >= (secondary.columns?.length || 0) ? primary.columns : secondary.columns,
+    rows_preview: primaryRows.length >= secondaryRows.length ? primary.rows_preview : secondary.rows_preview,
+    sampled_for_prompt: primary.sampled_for_prompt || secondary.sampled_for_prompt,
+    artifact_ref: primary.artifact_ref || secondary.artifact_ref,
+  };
+}
+
+function queryResultKey(item: QueryResultItem, index: number) {
+  return item.evidence_id
+    || item.artifact_ref
+    || comparableText([item.query, item.purpose, item.summary].filter(Boolean).join('\n'))
+    || `${index}`;
+}
+
+function visibleQuery(query: string | undefined): query is string {
+  if (!query) return false;
+  return comparableText(query) !== '[query omitted]';
+}
+
 function metricGroups(payload: Record<string, unknown> | null | undefined): Array<Record<string, unknown>> {
   const metrics = asRecord(payload)?.metrics;
   if (!Array.isArray(metrics)) return [];
@@ -424,6 +501,10 @@ function asString(value: unknown): string | undefined {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function comparableText(value: string) {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 function formatCell(value: unknown) {

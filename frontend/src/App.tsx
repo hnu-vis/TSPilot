@@ -19,6 +19,7 @@ import {
   appendAssistantPending,
   appendUserMessage,
   buildBackendHistory,
+  completeRunningTraceSteps,
   createConversation,
   loadConversations,
   saveConversations,
@@ -450,7 +451,7 @@ export default function App() {
       const answer = extractFinalAnswer(event.data);
       if (!answer) return;
       updateConversation(conversationId, (conversation) => appendAssistantAnswer(
-        conversation,
+        completeRunningTraceSteps(conversation),
         answer,
         asRecord(event.data.token_usage),
       ));

@@ -151,6 +151,27 @@ export function appendAssistantAnswer(conversation: Conversation, answer: FinalA
   };
 }
 
+export function completeRunningTraceSteps(conversation: Conversation, completedAt = now()): Conversation {
+  let changed = false;
+  const traceSteps = conversation.traceSteps.map((step) => {
+    if (step.status !== 'running') return step;
+    changed = true;
+    return {
+      ...step,
+      status: 'complete' as const,
+      completedAt,
+      elapsedSeconds: step.elapsedSeconds ?? elapsedSecondsBetween(step.startedAt, completedAt),
+      updatedAt: completedAt,
+    };
+  });
+  if (!changed) return conversation;
+  return {
+    ...conversation,
+    traceSteps,
+    updatedAt: completedAt,
+  };
+}
+
 export function appendAssistantError(conversation: Conversation, content: string): Conversation {
   const timestamp = now();
   const streamingIndex = findStreamingAssistantIndex(conversation);

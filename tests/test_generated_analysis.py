@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -148,6 +149,28 @@ def test_python_rows_runner_allows_safe_imports_and_lambda_sorting():
     assert output.result["metrics"]["rows"] == 3
 
 
+def test_python_rows_runner_normalizes_common_non_json_analysis_values():
+    output = execute_python_rows_v1(
+        code=(
+            "from datetime import datetime\n"
+            "result = {\n"
+            "  'summary': 'normalized common values',\n"
+            "  'metrics': {'when': datetime(2023, 1, 1), 'bad': float('nan')},\n"
+            "  'details': {'values': (1, 2, 3)},\n"
+            "}\n"
+        ),
+        rows=[],
+        points=[],
+        columns=[],
+        metadata={},
+        diagnostics={},
+    )
+
+    assert output.result["metrics"]["when"] == "2023-01-01T00:00:00"
+    assert output.result["metrics"]["bad"] is None
+    assert output.result["details"]["values"] == [1, 2, 3]
+
+
 def test_python_rows_runner_rejects_unsafe_imports_and_requires_result_summary():
     with pytest.raises(AnalysisCodeError):
         execute_python_rows_v1(
@@ -246,6 +269,35 @@ def test_python_sandbox_v1_data_supports_column_array_aliases():
 
     assert output.result["metrics"]["max_value"] == 5.0
     assert output.result["details"]["value_col"] == "appliances_energy_wh"
+
+
+def test_python_sandbox_v1_normalizes_pandas_and_numpy_result_values():
+    pytest.importorskip("pandas")
+    pytest.importorskip("numpy")
+    output = execute_python_sandbox_v1(
+        code=(
+            "top = df.nsmallest(2, value_col)\n"
+            "result = {\n"
+            "  'summary': 'lowest rows',\n"
+            "  'metrics': {'min_value': value.min(), 'count': len(top)},\n"
+            "  'details': {'rows': top[[time_col, value_col]], 'values': value.to_numpy()},\n"
+            "}\n"
+        ),
+        rows=[
+            {"timestamp": datetime(2023, 1, 1, tzinfo=timezone.utc).isoformat(), "value": "2"},
+            {"timestamp": datetime(2023, 1, 2, tzinfo=timezone.utc).isoformat(), "value": "1"},
+        ],
+        points=[],
+        columns=["timestamp", "value"],
+        metadata={},
+        diagnostics={},
+        timeout_seconds=5,
+    )
+
+    assert output.result["metrics"]["min_value"] == 1.0
+    assert output.result["metrics"]["count"] == 2
+    assert output.result["details"]["values"] == [2.0, 1.0]
+    assert output.result["details"]["rows"][0]["value"] == 1.0
 
 
 def test_python_sandbox_v1_requires_stable_result_shape():

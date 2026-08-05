@@ -4,6 +4,8 @@ from __future__ import annotations
 import ast
 import collections
 import datetime
+import decimal
+import enum
 import json
 import math
 import signal
@@ -178,13 +180,105 @@ def validate_analysis_result_payload(result) -> dict:
         raise AnalysisCodeError("analysis result must include object field 'details'.")
     normalized = dict(result)
     normalized["summary"] = summary.strip()
-    normalized["metrics"] = dict(metrics)
-    normalized["details"] = dict(details)
+    normalized["metrics"] = _json_safe_value(dict(metrics), path="metrics")
+    normalized["details"] = _json_safe_value(dict(details), path="details")
     try:
-        json.dumps(normalized, ensure_ascii=False)
+        json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except TypeError as exc:
         raise AnalysisCodeError("analysis result must be JSON serializable.") from exc
+    except ValueError as exc:
+        raise AnalysisCodeError("analysis result must be strict JSON without NaN or Infinity.") from exc
     return normalized
+
+
+def _json_safe_value(value: Any, *, path: str, seen: set[int] | None = None) -> Any:
+    """Normalize common analysis-library values to strict JSON primitives."""
+
+    if seen is None:
+        seen = set()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, decimal.Decimal):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, enum.Enum):
+        return _json_safe_value(value.value, path=path, seen=seen)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+
+    value_id = id(value)
+    if value_id in seen:
+        raise AnalysisCodeError(f"analysis result field '{path}' contains a circular reference.")
+
+    scalar = _library_scalar(value)
+    if scalar is not _UNHANDLED:
+        return _json_safe_value(scalar, path=path, seen=seen)
+
+    converted = _library_container(value)
+    if converted is not _UNHANDLED:
+        return _json_safe_value(converted, path=path, seen=seen)
+
+    if isinstance(value, dict):
+        seen.add(value_id)
+        try:
+            return {
+                str(key): _json_safe_value(item, path=f"{path}.{key}", seen=seen)
+                for key, item in value.items()
+            }
+        finally:
+            seen.remove(value_id)
+    if isinstance(value, (list, tuple)):
+        seen.add(value_id)
+        try:
+            return [
+                _json_safe_value(item, path=f"{path}[{index}]", seen=seen)
+                for index, item in enumerate(value)
+            ]
+        finally:
+            seen.remove(value_id)
+    raise AnalysisCodeError(
+        f"analysis result field '{path}' is not JSON serializable: {type(value).__name__}."
+    )
+
+
+_UNHANDLED = object()
+
+
+def _library_scalar(value: Any) -> Any:
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            return _UNHANDLED
+    return _UNHANDLED
+
+
+def _library_container(value: Any) -> Any:
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            type_name = type(value).__name__.lower()
+            if "dataframe" in type_name:
+                return value.to_dict(orient="records")
+            return to_dict()
+        except Exception:
+            return _UNHANDLED
+    to_list = getattr(value, "tolist", None)
+    if callable(to_list):
+        try:
+            return to_list()
+        except Exception:
+            return _UNHANDLED
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            return _UNHANDLED
+    return _UNHANDLED
 
 
 def _prepare_code(code: str) -> tuple[str, dict[str, Any]]:
