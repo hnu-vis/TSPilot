@@ -30,6 +30,46 @@ class SlowTurnLLM:
         return "{}"
 
 
+class StructuredTerminateThenNaturalLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            payload = {
+                "thought": "已有预测结果，可以结束。",
+                "action": "terminate",
+                "action_input": {
+                    "result": {
+                        "summary": "已完成对2023-01-29起BTC/USD价格水平的短期预测。",
+                        "prediction": "根据已生成的线性回归预测，价格大致在24,283美元到24,368美元附近，并呈小幅上行趋势。",
+                        "basis": {"forecast_model": "linear regression", "forecast_horizon": 24},
+                    },
+                    "include_fact_ids": [],
+                    "include_visualization_ids": [],
+                    "section_plan": [],
+                },
+            }
+        else:
+            payload = {
+                "thought": "上次把结构化对象放进了用户可见答案，这次改为自然语言。",
+                "action": "terminate",
+                "action_input": {
+                    "direct_answer": "根据线性回归预测，从2023-01-29开始的短期BTC/USD价格约在24,283美元到24,368美元之间，整体呈小幅上行趋势。",
+                    "include_fact_ids": [],
+                    "include_visualization_ids": [],
+                    "section_plan": [],
+                },
+            }
+        return _FakeResponse(json.dumps(payload, ensure_ascii=False))
+
+
+class _FakeResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
 def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
     settings = get_settings()
     if max_iterations is not None:
@@ -112,6 +152,26 @@ def test_chat_json_path_returns_agent_decision_timeout():
     ]
     assert timeout_events
     assert timeout_events[-1]["payload"]["agent_turn_timeout_seconds"] == 0.01
+
+
+def test_chat_json_path_repairs_structured_terminate_answer():
+    llm = StructuredTerminateThenNaturalLLM()
+    client = _build_client(llm, max_iterations=3)
+    response = client.post(
+        "/api/v1/chat",
+        json={
+            "message": "预测2023-01-29起BTC/USD价格水平",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    summary = payload["answer"]["summary"]
+    assert summary == "根据线性回归预测，从2023-01-29开始的短期BTC/USD价格约在24,283美元到24,368美元之间，整体呈小幅上行趋势。"
+    assert '"summary"' not in summary
+    assert "basis" not in summary
+    assert llm.calls == 2
 
 
 def test_chat_json_path_uses_code_interpreter_tool(tmp_path):

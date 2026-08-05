@@ -70,6 +70,16 @@ def test_parse_turn_rejects_bare_terminal_input():
         DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(bare_input))
 
 
+def test_parse_turn_does_not_treat_top_level_answer_as_react_action_input():
+    payload = {
+        "thought": "已经可以回答。",
+        "answer": "在2023年1月5日到2月3日之间，比特币兑美元价格第一次涨到24000美元的时间是2023-02-02T00:48:00+00:00，当时价格为24099.5781美元。",
+    }
+
+    with pytest.raises(ValueError, match="missing 'action'"):
+        DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload, ensure_ascii=False))
+
+
 def test_parse_turn_rejects_bare_todowrite_input():
     bare_input = {
         "message": "Plan database analysis.",

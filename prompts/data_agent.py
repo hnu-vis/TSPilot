@@ -29,7 +29,8 @@ class DataAgentPromptBuilder:
             "Do not repeat actions listed as completed in progress_summary unless last_observation says the existing artifact is insufficient.\n"
             "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
             "Use the smallest next action that fills the current missing capability. When all requested capabilities are covered, call terminate.\n"
-            "Exact numeric claims in terminate must be grounded by database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate.\n"
+            "Exact numeric claims in terminate must be grounded by database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate. "
+            "For terminate, result/direct_answer are user-visible natural-language prose only; do not put JSON objects, answer wrappers, or summary/prediction/basis maps there.\n"
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
             "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
@@ -100,7 +101,7 @@ class DataAgentPromptBuilder:
         if action in {"forecast", "anomaly"}:
             return ["database_evidence", "constraints?"]
         if action == "terminate":
-            return ["result", "summary_goal?", "include_analysis_ids?", "include_fact_ids?"]
+            return ["result? natural-language prose", "direct_answer? natural-language prose", "summary_goal?", "include_analysis_ids?", "include_fact_ids?"]
         return list(parameters)[:4]
 
     def _task_context(self, request_state: RequestStateModel) -> dict:

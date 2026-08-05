@@ -103,11 +103,8 @@ class ToolExecutor:
             ):
                 if normalized.get(key) in (None, False, ""):
                     normalized[key] = []
-            for key in ("result", "direct_answer", "summary_goal", "unavailable_reason"):
-                if isinstance(normalized.get(key), (dict, list)):
-                    import json
-
-                    normalized[key] = json.dumps(normalized[key], ensure_ascii=False)
+            if isinstance(normalized.get("unavailable_reason"), (dict, list)):
+                normalized["unavailable_reason"] = str(normalized["unavailable_reason"])
         if "time_range" in normalized:
             normalized["time_range"] = self._normalize_time_range_hint(normalized.get("time_range"), normalized)
         normalized["fact_requests"] = self._normalize_fact_requests(normalized.get("fact_requests"), normalized)

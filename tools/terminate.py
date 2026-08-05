@@ -25,6 +25,13 @@ class TerminateInput(BaseModel):
         if not isinstance(data, dict):
             return data
         normalized = dict(data)
+        for key in ("result", "direct_answer", "summary_goal"):
+            value = normalized.get(key)
+            if isinstance(value, (dict, list, tuple)):
+                raise ValueError(
+                    f"terminate.{key} must be a natural-language string, not a structured object. "
+                    "Use evidence IDs for structure and write the user-visible answer as prose."
+                )
         result = normalized.get("result")
         if not normalized.get("direct_answer") and result:
             normalized["direct_answer"] = result

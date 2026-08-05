@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
-from core.database.contracts import QueryRequestContext
+from core.database.contracts import QueryRequestContext, RenderedQuery
 from core.database.engine import infer_evidence_family
 from runtime.request_state import enrich_observation_payload, build_request_state, apply_observation
 from schemas.api import ChatRequest
@@ -18,6 +18,7 @@ from core.database.query_flow import (
     DefaultLogicalQueryPlanner,
     DefaultQueryValidator,
 )
+from core.database.query_plan import QueryFilter
 from core.database.schema_linking import SchemaLinkingPipeline
 from app.settings import get_settings
 from types import SimpleNamespace
@@ -246,6 +247,44 @@ def test_validator_flags_missing_required_value_filters():
 
     assert not validation.valid
     assert any(issue.code == "required_filter_missing" for issue in validation.issues)
+
+
+def test_flux_validator_accepts_unquoted_numeric_threshold_filters():
+    context = QueryRequestContext(
+        database_id="influxdb2-bitcoin-sample",
+        database_type="influxdb",
+        message="找到价格第一次达到或超过24000美元的时间点",
+    )
+    plan = _build_influx_schema()
+    intent = DefaultIntentInterpreter().interpret(context=context)
+    mappings = DefaultFieldMapper().map_fields(context=context, schema=plan, intent=intent)
+    query_plan = DefaultLogicalQueryPlanner().build_plan(
+        context=context,
+        schema=plan,
+        intent=intent,
+        field_mappings=mappings,
+    )
+    query_plan.filters.append(QueryFilter(source="coindesk", column="_value", operator=">=", value=24000.0))
+    rendered = RenderedQuery(
+        query_text=(
+            'from(bucket: "bitcoin")\n'
+            '  |> range(start: 2023-01-05T00:00:00Z, stop: 2023-02-04T00:00:00Z)\n'
+            '  |> filter(fn: (r) => r["_measurement"] == "coindesk")\n'
+            '  |> filter(fn: (r) => r["_field"] == "price")\n'
+            '  |> filter(fn: (r) => r["code"] == "USD")\n'
+            '  |> filter(fn: (r) => r["crypto"] == "bitcoin")\n'
+            '  |> filter(fn: (r) => r._value >= 24000.0)'
+        ),
+        query_language="flux",
+    )
+
+    validation = DefaultQueryValidator().validate(
+        context=context,
+        plan=query_plan,
+        rendered_query=rendered,
+    )
+
+    assert validation.valid
 
 
 def test_schema_linking_pipeline_outputs_plan_and_required_filters_once():

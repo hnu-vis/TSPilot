@@ -273,7 +273,7 @@ def default_capability_registry() -> CapabilityRegistry:
                 card=ActionParameterCard(
                     action="terminate",
                     use_when="Evidence covers the request, or task cannot proceed with available context.",
-                    parameters=("result?", "summary_goal?", "direct_answer?", "include_analysis_ids", "include_fact_ids", "include_visualization_ids", "section_plan", "unavailable_outputs", "unavailable_reason?"),
+                    parameters=("result? natural-language prose", "summary_goal?", "direct_answer? natural-language prose", "include_analysis_ids", "include_fact_ids", "include_visualization_ids", "section_plan", "unavailable_outputs", "unavailable_reason?"),
                 ),
                 aliases=("conclusion", "final"),
                 task_types=("answer",),

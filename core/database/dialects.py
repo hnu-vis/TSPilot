@@ -427,7 +427,14 @@ class InfluxDBFluxDialect(DatabaseDialect):
         value = str(item.value).lower()
         column_patterns = [f"r.{column}", f'r["{column}"]', f"r['{column}']"]
         value_patterns = [f'"{value}"', f"'{value}'"]
-        return any(pattern in text for pattern in column_patterns) and any(pattern in text for pattern in value_patterns)
+        if isinstance(item.value, (int, float)) and not isinstance(item.value, bool):
+            value_patterns.append(rf"(?<![\w.]){re.escape(value)}(?![\w.])")
+        has_column = any(pattern in text for pattern in column_patterns)
+        has_value = any(
+            re.search(pattern, text) if pattern.startswith("(?<!") else pattern in text
+            for pattern in value_patterns
+        )
+        return has_column and has_value
 
     def internal_columns(self) -> set[str]:
         return {"_measurement", "_field", "_time", "_start", "_stop", "time", "timestamp", "result", "table"}
