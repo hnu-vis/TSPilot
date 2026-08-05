@@ -47,7 +47,7 @@ type PreviewState = {
 
 type FormMode = 'create' | 'edit' | null;
 
-const DATABASE_TYPES = ['influxdb', 'timescaledb', 'prometheus', 'iotdb', 'questdb', 'clickhouse'];
+const DATABASE_TYPES = ['influxdb', 'timescaledb', 'prometheus', 'iotdb', 'questdb', 'clickhouse', 'openmldb', 'victoriametrics', 'm3db', 'greptimedb', 'tdengine', 'cnosdb', 'arcadedb', 'cratedb', 'druid', 'influxdb3', 'griddb', 'machbase', 'nsdb', 'axibase', 'opengemini', 'db2', 'timestream', 'riak_ts', 'dolphindb', 'kdb', 'raimadb', 'extremedb', 'ittiadb', 'irondb', 'bangdb', 'arc'];
 
 const emptyForm: DatabaseConfigInput = {
   name: '',

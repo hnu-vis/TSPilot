@@ -520,7 +520,7 @@ class InfluxDBFluxDialect(DatabaseDialect):
 class PrometheusDialect(DatabaseDialect):
     def __init__(self):
         super().__init__(
-            database_types=("prometheus", "promql"),
+            database_types=("prometheus", "promql", "victoriametrics", "m3db"),
             query_language="promql",
             read_only_languages=("promql",),
             generation_rules=(
@@ -561,7 +561,7 @@ class PrometheusDialect(DatabaseDialect):
 
 
 class SqlFamilyDialect(DatabaseDialect):
-    def __init__(self, database_types: tuple[str, ...] = ("sql", "postgresql", "timescaledb", "questdb", "clickhouse")):
+    def __init__(self, database_types: tuple[str, ...] = ("sql", "postgresql", "timescaledb", "questdb", "clickhouse", "openmldb", "greptimedb", "tdengine", "cnosdb", "arcadedb", "cratedb", "druid", "influxdb3", "griddb", "machbase", "nsdb", "axibase", "opengemini", "db2", "timestream", "riak_ts", "dolphindb", "kdb", "raimadb", "extremedb", "ittiadb", "irondb", "bangdb", "arc")):
         super().__init__(
             database_types=database_types,
             query_language="sql",
