@@ -13,6 +13,23 @@ from runtime.language import detect_response_language
 from runtime.token_usage import record_llm_token_usage
 
 
+def _looks_like_single_object(value: dict) -> bool:
+    object_markers = {
+        "id",
+        "name",
+        "description",
+        "output_type",
+        "column",
+        "source",
+        "operator",
+        "value",
+        "measure",
+        "dimension",
+        "field",
+    }
+    return bool(set(value) & object_markers)
+
+
 class QueryTaskContract(BaseModel):
     """Database-independent contract for one generated evidence query."""
 
@@ -25,6 +42,47 @@ class QueryTaskContract(BaseModel):
     preferred_evidence_shape: str | None = None
     dialect_complexity_policy: str | None = None
     coverage: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("required_measures", mode="before")
+    @classmethod
+    def normalize_string_list(cls, value):
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, dict):
+            values = []
+            for key, item in value.items():
+                if item is True and str(key).strip():
+                    values.append(str(key).strip())
+                elif isinstance(item, str) and item.strip():
+                    values.append(item.strip())
+                elif isinstance(item, dict):
+                    label = item.get("name") or item.get("id") or item.get("logical_measure")
+                    if label:
+                        values.append(str(label).strip())
+                elif isinstance(item, (int, float, bool)):
+                    values.append(str(item))
+            return values
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return []
+
+    @field_validator("required_dimensions", "required_filters", "required_outputs", mode="before")
+    @classmethod
+    def normalize_object_list(cls, value):
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            if _looks_like_single_object(value):
+                return [value]
+            return [
+                {str(key): item} if not isinstance(item, dict) else {"id": str(key), **item}
+                for key, item in value.items()
+            ]
+        return [value]
 
 
 class LLMGeneratedQuery(BaseModel):
@@ -295,7 +353,7 @@ class LLMQueryGenerator:
             "\"selected_fields\": string[], "
             "\"assumptions\": string[], "
             "\"task_coverage\": {\"satisfied\": string[], \"missing\": string[], \"next_action_hint\": string|null}, "
-            "\"query_task_contract\": {\"intent_type\": string|null, \"required_measures\": string[], \"required_dimensions\": object[], \"required_filters\": object[], \"required_outputs\": object[], \"downstream_action\": string|null, \"preferred_evidence_shape\": string|null, \"dialect_complexity_policy\": string|null, \"coverage\": object}, "
+            "\"query_task_contract\": {\"intent_type\": string|null, \"required_measures\": array of strings, \"required_dimensions\": array of objects, \"required_filters\": array of objects, \"required_outputs\": array of objects or strings, \"downstream_action\": string|null, \"preferred_evidence_shape\": string|null, \"dialect_complexity_policy\": string|null, \"coverage\": object}, "
             "\"confidence\": number"
             "}."
         )

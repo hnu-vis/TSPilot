@@ -15,7 +15,12 @@ from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
 from schemas.tool import ToolObservation
-from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
+from tools.code_interpreter import (
+    CodeInterpreterInput,
+    CodeInterpreterTool,
+    _preflight_analysis_code,
+    _validate_result_has_numeric_analysis,
+)
 
 
 class _AnalysisSpec:
@@ -311,6 +316,40 @@ def test_python_sandbox_v1_requires_stable_result_shape():
             diagnostics={},
             timeout_seconds=5,
         )
+
+
+def test_code_interpreter_numeric_validation_allows_details_only_outputs():
+    _validate_result_has_numeric_analysis(
+        {
+            "summary": "lowest rows",
+            "metrics": {},
+            "details": {
+                "lowest_three": [
+                    {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
+                ],
+            },
+        },
+        requires_numeric_series=True,
+        input_rows=3,
+    )
+
+    with pytest.raises(AnalysisCodeError, match="no non-empty computed output"):
+        _validate_result_has_numeric_analysis(
+            {"summary": "empty", "metrics": {}, "details": {}},
+            requires_numeric_series=True,
+            input_rows=3,
+        )
+
+
+def test_code_interpreter_preflight_handles_python_local_scopes():
+    error = _preflight_analysis_code(
+        "clean = [x for x in value if isinstance(x, (int, float))]\n"
+        "finite = list(filter(lambda v: v == v, clean))\n"
+        "has_df = 'df' in globals()\n"
+        "result = {'summary': str(has_df), 'metrics': {}, 'details': {'values': finite}}\n",
+    )
+
+    assert error is None
 
 
 def test_python_sandbox_v1_times_out():

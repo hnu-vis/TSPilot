@@ -355,8 +355,11 @@ class CodeInterpreterTool(BaseTool):
             "with key code and no markdown. The sandbox already provides df, time, value, time_col, "
             "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, "
             "math, statistics, pd, and np. Prefer value/time/df/series. Do not use pd.np or ellipsis placeholders. "
-            "Do not invent field names. The code must assign result = {'summary': str, 'metrics': dict, 'details': dict}. "
-            "All metric/detail values must be JSON-serializable plain Python scalars, lists, or dicts."
+            "Do not invent field names. The code must assign result as one dict containing exactly the stable contract fields "
+            "summary, metrics, and details. summary must be a non-empty string. metrics must be a dict/object and may be empty "
+            "when the requested answer is primarily table/list/detail output. details must be a dict/object. Prefer details "
+            "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
+            "values must be JSON-serializable plain Python scalars, lists, or dicts."
         )
         messages = [
             ("system", system),
@@ -927,14 +930,19 @@ def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
         "bool",
         "dict",
         "enumerate",
+        "filter",
         "float",
+        "globals",
         "int",
+        "isinstance",
         "len",
         "list",
         "max",
         "min",
         "pow",
+        "print",
         "range",
+        "repr",
         "round",
         "set",
         "sorted",
@@ -959,12 +967,18 @@ def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             assigned.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assigned.update(_argument_names(node.args))
+        elif isinstance(node, ast.Lambda):
+            assigned.update(_argument_names(node.args))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imported.add(alias.asname or alias.name.split(".", 1)[0])
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 imported.add(alias.asname or alias.name)
+        elif isinstance(node, ast.comprehension):
+            assigned.update(_store_names(node.target))
         elif isinstance(node, ast.Name):
             if isinstance(node.ctx, ast.Store):
                 assigned.add(node.id)
@@ -977,6 +991,23 @@ def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
     if schema.get("time_col"):
         available.add(str(schema["time_col"]))
     return {name for name in loaded if name not in available and not name.startswith("__")}
+
+
+def _argument_names(args: ast.arguments) -> set[str]:
+    names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _store_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            names.add(child.id)
+    return names
 
 
 def _classify_analysis_code_error(message: str) -> dict:
@@ -1387,9 +1418,12 @@ def _analysis_requires_numeric_series(goal: str | None, expected_schema: dict) -
 def _validate_result_has_numeric_analysis(result: dict, *, requires_numeric_series: bool, input_rows: int) -> None:
     if not requires_numeric_series or input_rows == 0:
         return
-    metrics = result.get("metrics") if isinstance(result, dict) else None
-    if not isinstance(metrics, dict) or not metrics:
-        raise AnalysisCodeError("code_interpreter numeric analysis must return non-empty result.metrics.")
+    metrics = result.get("metrics") if isinstance(result, dict) else {}
+    details = result.get("details") if isinstance(result, dict) else {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    if not isinstance(details, dict):
+        details = {}
 
     meaningful_values = [
         value for key, value in metrics.items()
@@ -1398,17 +1432,31 @@ def _validate_result_has_numeric_analysis(result: dict, *, requires_numeric_seri
     if meaningful_values and any(value is not None for value in meaningful_values):
         return
 
-    details = result.get("details") if isinstance(result, dict) else None
-    if isinstance(details, dict):
-        for key in ("raw_metrics", "adjusted_metrics"):
-            nested_metrics = details.get(key)
-            if isinstance(nested_metrics, dict) and any(value is not None for value in nested_metrics.values()):
-                return
+    for key in ("raw_metrics", "adjusted_metrics"):
+        nested_metrics = details.get(key)
+        if isinstance(nested_metrics, dict) and any(value is not None for value in nested_metrics.values()):
+            return
+    if _has_non_empty_detail_output(details):
+        return
 
     raise AnalysisCodeError(
-        "code_interpreter numeric analysis produced no non-empty computed metric values; "
-        "use evidence with numeric values and compute the requested metrics."
+        "code_interpreter numeric analysis produced no non-empty computed output; "
+        "use evidence with numeric values and populate result.metrics or result.details with the requested computation."
     )
+
+
+def _has_non_empty_detail_output(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes)):
+        return bool(value.strip())
+    if isinstance(value, (int, float, bool)):
+        return True
+    if isinstance(value, dict):
+        return any(_has_non_empty_detail_output(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_non_empty_detail_output(item) for item in value)
+    return True
 
 
 def _result_indicates_outlier_treatment(result: dict) -> bool:

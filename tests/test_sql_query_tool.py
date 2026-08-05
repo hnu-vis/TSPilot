@@ -5,6 +5,7 @@ import pytest
 from app.settings import get_settings
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
 from core.database.engine import normalize_query_result
+from core.database.llm_query import LLMGeneratedQuery
 from runtime.request_state import apply_observation, build_request_state
 from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
@@ -50,6 +51,35 @@ class _FakeConnector:
                 )
             ],
         )
+
+
+def test_llm_generated_query_normalizes_object_required_outputs():
+    generated = LLMGeneratedQuery.model_validate(
+        {
+            "query": "SELECT timestamp, value FROM prices",
+            "query_language": "sql",
+            "query_task_contract": {
+                "required_measures": {"price": True},
+                "required_outputs": {
+                    "time_series": {
+                        "columns": ["timestamp", "value"],
+                        "description": "return timestamps and values",
+                    }
+                },
+            },
+        }
+    )
+
+    contract = generated.query_task_contract
+    assert contract is not None
+    assert contract.required_measures == ["price"]
+    assert contract.required_outputs == [
+        {
+            "id": "time_series",
+            "columns": ["timestamp", "value"],
+            "description": "return timestamps and values",
+        }
+    ]
 
 
 class _FailOnceConnector(_FakeConnector):
