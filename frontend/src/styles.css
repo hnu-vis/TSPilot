@@ -3165,7 +3165,7 @@ details[open] > summary .collapsible-chevron {
   display: grid;
   width: 100%;
   min-width: 0;
-  gap: 18px;
+  gap: 20px;
   padding: 0;
   font-family: var(--font-sans);
 }
@@ -3182,7 +3182,7 @@ details[open] > summary .collapsible-chevron {
   justify-content: space-between;
   gap: 12px;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 12px;
+  padding-bottom: 13px;
 }
 
 .answer-header-title,
@@ -3222,10 +3222,21 @@ details[open] > summary .collapsible-chevron {
 }
 
 .answer-summary-block {
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface-soft);
-  padding: 12px 13px;
+  display: grid;
+  gap: 8px;
+  border-left: 3px solid var(--primary);
+  background: oklch(0.975 0.012 165);
+  padding: 14px 16px;
+}
+
+.answer-summary-label {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 7px;
+  color: var(--primary-strong);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .answer-summary {
@@ -3255,7 +3266,7 @@ details[open] > summary .collapsible-chevron {
   color: var(--foreground);
   font-size: 15px;
   font-weight: 400;
-  line-height: 1.75;
+  line-height: 1.7;
   white-space: pre-wrap;
 }
 
@@ -3270,27 +3281,33 @@ details[open] > summary .collapsible-chevron {
 .answer-sections {
   display: grid;
   min-width: 0;
-  gap: 16px;
+  gap: 18px;
 }
 
 .answer-section {
   display: grid;
   min-width: 0;
-  gap: 9px;
+  gap: 12px;
   align-content: start;
   border-top: 1px solid var(--border);
-  padding-top: 14px;
+  padding-top: 16px;
 }
 
-.answer-section-type {
-  width: fit-content;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0;
+.answer-content-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--foreground);
 }
 
-.answer-section h3 {
+.answer-content-heading svg {
+  flex: 0 0 auto;
+  color: var(--primary-strong);
+}
+
+.answer-section h3,
+.answer-content-heading h3 {
   margin: 0;
   color: var(--foreground);
   font-size: 15px;
@@ -3306,12 +3323,12 @@ details[open] > summary .collapsible-chevron {
 }
 
 .query-result-list {
-  gap: 12px;
+  gap: 16px;
 }
 
 .query-result-item {
-  border-left: 2px solid var(--border-strong);
-  padding-left: 12px;
+  border-left: 2px solid oklch(0.72 0.055 170);
+  padding-left: 14px;
 }
 
 .query-result-heading {
@@ -3480,7 +3497,7 @@ details[open] > summary .collapsible-chevron {
   margin: 0;
   padding: 10px;
   color: var(--foreground);
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
@@ -3506,6 +3523,92 @@ details[open] > summary .collapsible-chevron {
   border-radius: var(--radius-sm);
   background: var(--surface-soft);
   padding: 8px 9px;
+}
+
+.answer-reference-list {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.answer-reference-item {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+}
+
+.answer-reference-item summary {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 2px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.answer-reference-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.answer-reference-icon {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--muted-strong);
+}
+
+.answer-reference-label {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.answer-reference-label strong {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.answer-reference-label small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.answer-reference-body {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  padding: 2px 2px 12px 37px;
+}
+
+.answer-reference-body pre,
+.answer-source-id {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin: 0;
+  background: var(--surface-soft);
+  padding: 9px 10px;
+  color: var(--muted-strong);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.answer-source-id {
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px 7px;
 }
 
 .answer-markdown ul,

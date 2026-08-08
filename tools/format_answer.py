@@ -85,7 +85,7 @@ class FormatAnswerTool(BaseTool):
         request_state: RequestStateModel,
         **kwargs,
     ) -> dict:
-        selected_fact_ids = set(validated_input.include_fact_ids)
+        selected_fact_ids = set(self._resource_ids(validated_input.include_fact_ids, "fact"))
         data_facts = [
             fact
             for fact in request_state.fact_set.facts
@@ -161,7 +161,13 @@ class FormatAnswerTool(BaseTool):
                 content=self._render_analysis_section(analyses, request_state),
                 structured_payload={
                     "analysis_ids": [analysis.analysis_id for analysis in analyses],
-                    "metrics": [analysis.result.get("metrics", {}) for analysis in analyses],
+                    "metrics": [
+                        metrics
+                        for analysis in analyses
+                        if isinstance(analysis.result, dict)
+                        and isinstance((metrics := analysis.result.get("metrics")), dict)
+                        and metrics
+                    ],
                     "results": [analysis.result for analysis in analyses],
                 },
             )
@@ -450,30 +456,33 @@ class FormatAnswerTool(BaseTool):
     def _has_requested_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]) -> bool:
         if not include_analysis_ids:
             return False
-        return all(analysis_id in request_state.analysis_artifacts for analysis_id in include_analysis_ids)
+        normalized_ids = self._resource_ids(include_analysis_ids, "analysis")
+        return all(analysis_id in request_state.analysis_artifacts for analysis_id in normalized_ids)
 
     def _selected_analyses(self, request_state: RequestStateModel, include_analysis_ids: list[str]):
         if include_analysis_ids:
             return [
                 request_state.analysis_artifacts[analysis_id]
-                for analysis_id in include_analysis_ids
+                for analysis_id in self._resource_ids(include_analysis_ids, "analysis")
                 if analysis_id in request_state.analysis_artifacts
             ]
         return list(request_state.analysis_artifacts.values())
+
+    def _resource_ids(self, values: list[str], resource_type: str) -> list[str]:
+        normalized = []
+        prefix = f"{resource_type}:"
+        for value in values:
+            resource_id = str(value or "").strip()
+            if resource_id.startswith(prefix):
+                resource_id = resource_id.split(":", 1)[1].strip()
+            if resource_id and resource_id not in normalized:
+                normalized.append(resource_id)
+        return normalized
 
     def _render_analysis_section(self, analyses: list, request_state: RequestStateModel) -> str:
         blocks = []
         for analysis in analyses:
             lines = [f"- {analysis.summary}"]
-            metrics = analysis.result.get("metrics", {}) if isinstance(analysis.result, dict) else {}
-            if metrics:
-                metric_text = ", ".join(
-                    f"{key}: {value}"
-                    for key, value in metrics.items()
-                    if value is not None
-                )
-                if metric_text:
-                    lines.append(f"  {self._label(request_state, 'metrics')}: {metric_text}")
             transparency_lines = self._render_analysis_transparency_details(analysis)
             if transparency_lines:
                 lines.extend(f"  {line}" for line in transparency_lines)

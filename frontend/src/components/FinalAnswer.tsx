@@ -1,8 +1,19 @@
-import { CheckCircle2, ChevronDown, Code2, Database } from 'lucide-react';
+import {
+  BookOpen,
+  CheckCircle2,
+  ChevronDown,
+  Code2,
+  Database,
+  FileSearch,
+  Lightbulb,
+} from 'lucide-react';
+import { useState } from 'react';
+import type { ReactNode } from 'react';
 import type { FinalAnswer as FinalAnswerType, TokenUsage } from '../types';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
-type QueryResultItem = {
+type AnswerReference = NonNullable<FinalAnswerType['references']>[number];
+type EvidenceItem = {
   evidence_id?: string;
   purpose?: string;
   summary?: string;
@@ -13,6 +24,54 @@ type QueryResultItem = {
   rows_preview?: Array<Record<string, unknown>>;
   sampled_for_prompt?: boolean;
   artifact_ref?: string;
+};
+type AnswerLocale = 'zh' | 'en';
+type AnswerCopy = {
+  answer: string;
+  emptyAnswer: string;
+  conclusion: string;
+  evidence: string;
+  sources: string;
+  source: string;
+  referenceCount: (count: number) => string;
+  queryResult: string;
+  sampled: string;
+  showingRows: (visible: number, total?: number | null) => string;
+};
+
+const ANSWER_COPY: Record<AnswerLocale, AnswerCopy> = {
+  zh: {
+    answer: '回答',
+    emptyAnswer: '没有生成可展示的回答。',
+    conclusion: '结论',
+    evidence: '数据依据',
+    sources: '方法与来源',
+    source: '来源',
+    referenceCount: (count) => `${count.toLocaleString()} 项依据`,
+    queryResult: '查询结果',
+    sampled: '采样预览',
+    showingRows: (visible, total) => (
+      typeof total === 'number' && total >= visible
+        ? `显示 ${visible.toLocaleString()} / ${total.toLocaleString()} 行`
+        : `显示 ${visible.toLocaleString()} 行`
+    ),
+  },
+  en: {
+    answer: 'Answer',
+    emptyAnswer: 'No answer was generated.',
+    conclusion: 'Conclusion',
+    evidence: 'Data evidence',
+    sources: 'Methods and sources',
+    source: 'Source',
+    referenceCount: (count) => `${count.toLocaleString()} ${count === 1 ? 'reference' : 'references'}`,
+    queryResult: 'Query result',
+    sampled: 'Sampled preview',
+    showingRows: (visible, total) => (
+      typeof total === 'number' && total >= visible
+        ? `Showing ${visible.toLocaleString()} / ${total.toLocaleString()} rows`
+        : `Showing ${visible.toLocaleString()} rows`
+    ),
+  },
 };
 
 type MarkdownBlock =
@@ -30,19 +89,20 @@ export function FinalAnswer({
   tokenUsage?: TokenUsage | null;
   elapsedSeconds?: number | null;
 }) {
-  const summary = answer.summary?.trim() || '我没有生成可展示的回答。';
+  const locale = answerLocale(answer);
+  const copy = ANSWER_COPY[locale];
+  const summary = answer.summary?.trim() || copy.emptyAnswer;
   const sections = supportingSections(answer.sections, summary);
-  const sectionQueryItems = queryResultItemsFromSections(answer.sections);
-  const referenceQueryItems = queryResultItemsFromReferences(answer.references);
-  const evidenceQueryItems = mergeQueryResultItems(sectionQueryItems, referenceQueryItems);
+  const evidenceItems = normalizeAnswerEvidence(answer);
   const references = answer.references || [];
+  const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
 
   return (
     <div className="final-answer">
       <header className="answer-header">
         <div className="answer-header-title">
           <CheckCircle2 size={17} />
-          <span>Answer</span>
+          <span>{answer.title?.trim() || copy.answer}</span>
         </div>
         <div className="answer-header-meta">
           {typeof elapsedSeconds === 'number' && Number.isFinite(elapsedSeconds) ? (
@@ -59,13 +119,17 @@ export function FinalAnswer({
           {references.length > 0 && (
             <span className="answer-reference-count">
               <Database size={13} />
-              {references.length} reference{references.length > 1 ? 's' : ''}
+              {copy.referenceCount(references.length)}
             </span>
           )}
         </div>
       </header>
 
       <section className="answer-summary-block" aria-label="Answer summary">
+        <div className="answer-summary-label">
+          <Lightbulb size={15} />
+          <span>{copy.conclusion}</span>
+        </div>
         <MarkdownContent content={summary} variant="summary" />
       </section>
 
@@ -73,32 +137,53 @@ export function FinalAnswer({
         <div className="answer-sections">
           {sections.map((section, index) => (
             <section key={`${section.section_type}-${index}`} className="answer-section">
-              {shouldShowSectionType(section) && (
-                <span className="answer-section-type">{formatLabel(section.section_type)}</span>
-              )}
-              <h3>{section.heading || formatLabel(section.section_type)}</h3>
+              <SectionHeading section={section} />
               <StructuredSection section={section} summary={summary} />
             </section>
           ))}
         </div>
       )}
 
-      {evidenceQueryItems.length > 0 && (
+      {evidenceItems.length > 0 && (
         <section className="answer-section answer-evidence-section">
-          <span className="answer-section-type">Evidence</span>
-          <h3>Database evidence</h3>
-          <QueryResultsView items={evidenceQueryItems} fallbackContent="" />
+          <ContentHeading icon={<Database size={16} />} title={copy.evidence} />
+          <EvidenceItemsView items={evidenceItems} fallbackContent="" copy={copy} />
+        </section>
+      )}
+
+      {supportingReferences.length > 0 && (
+        <section className="answer-section answer-sources-section">
+          <ContentHeading icon={<BookOpen size={16} />} title={copy.sources} />
+          <ReferenceList references={supportingReferences} copy={copy} />
         </section>
       )}
     </div>
   );
 }
 
+function ContentHeading({ icon, title }: { icon: ReactNode; title: string }) {
+  return (
+    <div className="answer-content-heading">
+      {icon}
+      <h3>{title}</h3>
+    </div>
+  );
+}
+
+function SectionHeading({ section }: { section: AnswerSection }) {
+  return (
+    <div className="answer-content-heading">
+      <FileSearch size={16} />
+      <h3>{section.heading || formatLabel(section.section_type)}</h3>
+    </div>
+  );
+}
+
 function StructuredSection({ section, summary }: { section: AnswerSection; summary: string }) {
   if (section.section_type === 'query_results') {
-    const items = queryResultItems(section.structured_payload);
+    const items = evidenceItemsFromQueryResultsPayload(section.structured_payload);
     if (items.length > 0) {
-      return <QueryResultsView items={items} fallbackContent={section.content} />;
+      return <EvidenceItemsView items={items} fallbackContent={section.content} />;
     }
   }
   if (section.section_type === 'analysis') {
@@ -114,7 +199,15 @@ function StructuredSection({ section, summary }: { section: AnswerSection; summa
   return <MarkdownContent content={section.content} />;
 }
 
-function QueryResultsView({ items, fallbackContent }: { items: QueryResultItem[]; fallbackContent: string }) {
+function EvidenceItemsView({
+  items,
+  fallbackContent,
+  copy = ANSWER_COPY.en,
+}: {
+  items: EvidenceItem[];
+  fallbackContent: string;
+  copy?: AnswerCopy;
+}) {
   return (
     <div className="query-result-list">
       {items.length === 0 && <MarkdownContent content={fallbackContent} />}
@@ -128,22 +221,22 @@ function QueryResultsView({ items, fallbackContent }: { items: QueryResultItem[]
           <article className="query-result-item" key={item.evidence_id || `${index}`}>
             <div className="query-result-heading">
               <span>{index + 1}</span>
-              <strong>{item.purpose || `Query result ${index + 1}`}</strong>
+              <strong>{item.purpose || `${copy.queryResult} ${index + 1}`}</strong>
               {previewRows.length > 0 && (
                 <div className="query-result-preview">
-                  <span>{previewLabel(Math.min(previewRows.length, 8), item.row_count)}</span>
-                  {item.sampled_for_prompt && <span>Sampled</span>}
+                  <span>{copy.showingRows(Math.min(previewRows.length, 8), item.row_count)}</span>
+                  {item.sampled_for_prompt && <span>{copy.sampled}</span>}
                 </div>
               )}
             </div>
+            {previewRows.length === 0 && item.summary && comparableText(item.summary) !== comparableText(item.purpose || '') && (
+              <MarkdownContent content={item.summary} />
+            )}
             {previewRows.length > 0 && previewColumns.length > 0 && (
               <DataPreviewTable
                 columns={previewColumns.slice(0, 8)}
                 rows={previewRows.slice(0, 8)}
               />
-            )}
-            {previewRows.length === 0 && item.summary && (
-              <MarkdownContent content={item.summary} />
             )}
             {visibleQuery(item.query) && (
               <details className="answer-inline-details">
@@ -157,6 +250,55 @@ function QueryResultsView({ items, fallbackContent }: { items: QueryResultItem[]
           </article>
         );
       })}
+    </div>
+  );
+}
+
+function ReferenceList({ references, copy }: { references: AnswerReference[]; copy: AnswerCopy }) {
+  return (
+    <div className="answer-reference-list">
+      {references.map((reference, index) => (
+        <ReferenceItem
+          copy={copy}
+          index={index}
+          key={reference.source_id || `${reference.source_type}-${index}`}
+          reference={reference}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ReferenceItem({ reference, index, copy }: { reference: AnswerReference; index: number; copy: AnswerCopy }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details className="answer-reference-item" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <span className="answer-reference-icon"><FileSearch size={14} /></span>
+        <span className="answer-reference-label">
+          <strong>{reference.label || `${copy.source} ${index + 1}`}</strong>
+          <small>{formatLabel(reference.source_type)}</small>
+        </span>
+        <ChevronDown size={15} className="collapsible-chevron" />
+      </summary>
+      {open && <ReferenceEvidence evidence={reference.evidence} sourceId={reference.source_id} />}
+    </details>
+  );
+}
+
+function ReferenceEvidence({ evidence, sourceId }: { evidence: Record<string, unknown> | null | undefined; sourceId?: string | null }) {
+  const record = asRecord(evidence);
+  const summary = asString(record?.summary);
+  const details = Object.fromEntries(
+    Object.entries(record || {}).filter(([key, value]) => key !== 'summary' && value !== null && value !== undefined),
+  );
+  return (
+    <div className="answer-reference-body">
+      {summary && <MarkdownContent content={summary} />}
+      {sourceId && <div className="answer-source-id">{sourceId}</div>}
+      {Object.keys(details).length > 0 && (
+        <pre>{JSON.stringify(details, null, 2)}</pre>
+      )}
     </div>
   );
 }
@@ -331,15 +473,9 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
   return blocks.length > 0 ? blocks : [{ type: 'paragraph', content: content.trim() }];
 }
 
-function shouldShowSectionType(section: AnswerSection) {
-  const heading = (section.heading || '').trim().toLowerCase();
-  const sectionType = formatLabel(section.section_type).trim().toLowerCase();
-  return Boolean(heading && heading !== sectionType);
-}
-
 function supportingSections(sections: FinalAnswerType['sections'] | undefined, summary: string): AnswerSection[] {
   const seenContent = new Set<string>();
-  const excludedTypes = new Set(['summary', 'conclusion', 'query_results']);
+  const excludedTypes = new Set(['summary', 'conclusion', 'query', 'query_results']);
   const normalizedSummary = comparableText(summary);
   const normalizedTitle = (section: AnswerSection) => comparableText(section.heading || formatLabel(section.section_type));
 
@@ -362,114 +498,160 @@ function sectionContentWithoutDuplicateSummary(content: string, summary: string)
   return comparableText(trimmed) === comparableText(summary) ? '' : trimmed;
 }
 
-function queryResultItems(payload: Record<string, unknown> | null | undefined): QueryResultItem[] {
+function normalizeAnswerEvidence(answer: FinalAnswerType): EvidenceItem[] {
+  const primaryItems = [
+    ...evidenceItemsFromQueryResultSections(answer.sections),
+    ...evidenceItemsFromQuerySections(answer.sections),
+  ];
+  const referenceItems = evidenceItemsFromQueryReferences(answer.references);
+  return mergeEvidenceItems(primaryItems, referenceItems);
+}
+
+function evidenceItemsFromQueryResultsPayload(payload: Record<string, unknown> | null | undefined): EvidenceItem[] {
   const items = asRecord(payload)?.items;
   if (!Array.isArray(items)) return [];
-  const normalized: QueryResultItem[] = [];
+  const normalized: EvidenceItem[] = [];
   for (const item of items) {
     const record = asRecord(item);
     if (!record) continue;
-    normalized.push({
-      evidence_id: asString(record.evidence_id),
-      purpose: asString(record.purpose),
-      summary: asString(record.summary),
-      query_language: asString(record.query_language),
-      query: asString(record.query),
-      row_count: typeof record.row_count === 'number' ? record.row_count : null,
-      columns: asStringArray(record.columns),
-      rows_preview: asRecordArray(record.rows_preview),
-      sampled_for_prompt: typeof record.sampled_for_prompt === 'boolean' ? record.sampled_for_prompt : false,
-      artifact_ref: asString(record.artifact_ref),
-    });
+    const evidenceItem = normalizeEvidenceRecord(record);
+    if (!hasVisibleEvidence(evidenceItem)) continue;
+    normalized.push(evidenceItem);
   }
   return normalized;
 }
 
-function queryResultItemsFromSections(sections: FinalAnswerType['sections'] | undefined): QueryResultItem[] {
-  const normalized: QueryResultItem[] = [];
+function evidenceItemsFromQueryResultSections(sections: FinalAnswerType['sections'] | undefined): EvidenceItem[] {
+  const normalized: EvidenceItem[] = [];
   for (const section of sections || []) {
     if (section.section_type !== 'query_results') continue;
-    normalized.push(...queryResultItems(section.structured_payload));
+    normalized.push(...evidenceItemsFromQueryResultsPayload(section.structured_payload));
   }
   return normalized;
 }
 
-function queryResultItemsFromReferences(references: FinalAnswerType['references'] | undefined): QueryResultItem[] {
-  const normalized: QueryResultItem[] = [];
-  const seen = new Set<string>();
+function evidenceItemsFromQuerySections(sections: FinalAnswerType['sections'] | undefined): EvidenceItem[] {
+  const normalized: EvidenceItem[] = [];
+  for (const section of sections || []) {
+    if (section.section_type !== 'query') continue;
+    const payload = asRecord(section.structured_payload);
+    const fenced = firstCodeBlock(section.content);
+    const evidenceItem: EvidenceItem = {
+      purpose: section.heading || undefined,
+      summary: section.heading || undefined,
+      query_language: asString(payload?.query_language) || fenced.language || undefined,
+      query: fenced.content || section.content?.trim() || undefined,
+    };
+    if (!hasVisibleEvidence(evidenceItem)) continue;
+    normalized.push(evidenceItem);
+  }
+  return normalized;
+}
+
+function evidenceItemsFromQueryReferences(references: FinalAnswerType['references'] | undefined): EvidenceItem[] {
+  const normalized: EvidenceItem[] = [];
   for (const reference of references || []) {
     if (reference.source_type !== 'query') continue;
     const evidence = asRecord(reference.evidence);
     if (!evidence) continue;
-    const query = asString(evidence.query);
-    const rowsPreview = asRecordArray(evidence.rows_preview);
-    const hasVisibleEvidence = Boolean(
-      query
-      || rowsPreview.length > 0
-      || typeof evidence.row_count === 'number'
-      || asString(evidence.summary)
-      || asString(evidence.artifact_ref)
-    );
-    if (!hasVisibleEvidence) continue;
-    const key = asString(reference.source_id) || asString(evidence.evidence_id) || query || `${normalized.length}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    normalized.push({
-      evidence_id: asString(reference.source_id) || asString(evidence.evidence_id),
-      purpose: asString(reference.label),
-      summary: asString(evidence.summary),
-      query_language: asString(evidence.query_language),
-      query,
-      row_count: typeof evidence.row_count === 'number' ? evidence.row_count : null,
-      columns: asStringArray(evidence.columns),
-      rows_preview: rowsPreview,
-      sampled_for_prompt: typeof evidence.sampled_for_prompt === 'boolean' ? evidence.sampled_for_prompt : false,
-      artifact_ref: asString(evidence.artifact_ref),
-    });
+    const evidenceItem = normalizeEvidenceRecord(evidence, reference);
+    if (!hasVisibleEvidence(evidenceItem)) continue;
+    normalized.push(evidenceItem);
   }
   return normalized;
 }
 
-function mergeQueryResultItems(...groups: QueryResultItem[][]): QueryResultItem[] {
-  const merged: QueryResultItem[] = [];
-  const indexByKey = new Map<string, number>();
-  for (const items of groups) {
-    for (const item of items) {
-      const key = queryResultKey(item, merged.length);
-      const existingIndex = indexByKey.get(key);
-      if (typeof existingIndex === 'number') {
-        merged[existingIndex] = mergeQueryResultItem(merged[existingIndex], item);
-        continue;
-      }
-      indexByKey.set(key, merged.length);
-      merged.push(item);
-    }
-  }
-  return merged;
-}
-
-function mergeQueryResultItem(primary: QueryResultItem, secondary: QueryResultItem): QueryResultItem {
-  const primaryRows = primary.rows_preview || [];
-  const secondaryRows = secondary.rows_preview || [];
+function normalizeEvidenceRecord(record: Record<string, unknown>, reference?: AnswerReference): EvidenceItem {
   return {
-    evidence_id: primary.evidence_id || secondary.evidence_id,
-    purpose: primary.purpose || secondary.purpose,
-    summary: primary.summary || secondary.summary,
-    query_language: primary.query_language || secondary.query_language,
-    query: visibleQuery(primary.query) ? primary.query : secondary.query,
-    row_count: typeof primary.row_count === 'number' ? primary.row_count : secondary.row_count,
-    columns: (primary.columns?.length || 0) >= (secondary.columns?.length || 0) ? primary.columns : secondary.columns,
-    rows_preview: primaryRows.length >= secondaryRows.length ? primary.rows_preview : secondary.rows_preview,
-    sampled_for_prompt: primary.sampled_for_prompt || secondary.sampled_for_prompt,
-    artifact_ref: primary.artifact_ref || secondary.artifact_ref,
+    evidence_id: asString(record.evidence_id) || asString(reference?.source_id),
+    purpose: asString(record.purpose) || asString(reference?.label),
+    summary: asString(record.summary),
+    query_language: asString(record.query_language),
+    query: asString(record.query),
+    row_count: typeof record.row_count === 'number' ? record.row_count : null,
+    columns: asStringArray(record.columns),
+    rows_preview: asRecordArray(record.rows_preview),
+    sampled_for_prompt: typeof record.sampled_for_prompt === 'boolean' ? record.sampled_for_prompt : false,
+    artifact_ref: asString(record.artifact_ref),
   };
 }
 
-function queryResultKey(item: QueryResultItem, index: number) {
-  return item.evidence_id
+function hasVisibleEvidence(item: EvidenceItem) {
+  return Boolean(
+    visibleQuery(item.query)
+    || (item.rows_preview?.length || 0) > 0
+    || typeof item.row_count === 'number'
+    || item.summary
     || item.artifact_ref
-    || comparableText([item.query, item.purpose, item.summary].filter(Boolean).join('\n'))
-    || `${index}`;
+  );
+}
+
+function mergeEvidenceItems(primaryItems: EvidenceItem[], supplementalItems: EvidenceItem[]): EvidenceItem[] {
+  const merged: EvidenceItem[] = [];
+  const indexByKey = new Map<string, number>();
+
+  for (const item of primaryItems) {
+    const existingIndex = evidenceIdentityKeys(item).map((key) => indexByKey.get(key)).find((index) => typeof index === 'number');
+    if (typeof existingIndex === 'number') {
+      merged[existingIndex] = supplementEvidenceItem(merged[existingIndex], item);
+      evidenceIdentityKeys(merged[existingIndex]).forEach((key) => indexByKey.set(key, existingIndex));
+      continue;
+    }
+    const nextIndex = merged.length;
+    merged.push(item);
+    evidenceIdentityKeys(item).forEach((key) => indexByKey.set(key, nextIndex));
+  }
+
+  for (const item of supplementalItems) {
+    const existingIndex = evidenceIdentityKeys(item).map((key) => indexByKey.get(key)).find((index) => typeof index === 'number');
+    if (typeof existingIndex === 'number') {
+      merged[existingIndex] = supplementEvidenceItem(merged[existingIndex], item);
+      evidenceIdentityKeys(merged[existingIndex]).forEach((key) => indexByKey.set(key, existingIndex));
+      continue;
+    }
+    const nextIndex = merged.length;
+    merged.push(item);
+    evidenceIdentityKeys(item).forEach((key) => indexByKey.set(key, nextIndex));
+  }
+
+  return merged;
+}
+
+function supplementEvidenceItem(primary: EvidenceItem, supplemental: EvidenceItem): EvidenceItem {
+  return {
+    evidence_id: primary.evidence_id || supplemental.evidence_id,
+    purpose: genericEvidencePurpose(primary.purpose) ? supplemental.purpose || primary.purpose : primary.purpose || supplemental.purpose,
+    summary: genericEvidencePurpose(primary.summary) ? supplemental.summary || primary.summary : primary.summary || supplemental.summary,
+    query_language: primary.query_language || supplemental.query_language,
+    query: visibleQuery(primary.query) ? primary.query : supplemental.query,
+    row_count: typeof primary.row_count === 'number' ? primary.row_count : supplemental.row_count,
+    columns: primary.columns?.length ? primary.columns : supplemental.columns,
+    rows_preview: primary.rows_preview?.length ? primary.rows_preview : supplemental.rows_preview,
+    sampled_for_prompt: primary.sampled_for_prompt || supplemental.sampled_for_prompt,
+    artifact_ref: primary.artifact_ref || supplemental.artifact_ref,
+  };
+}
+
+function genericEvidencePurpose(value: string | undefined) {
+  const normalized = comparableText(value || '');
+  return normalized === 'query' || normalized === '查询' || normalized === 'database evidence';
+}
+
+function evidenceIdentityKeys(item: EvidenceItem) {
+  return [
+    item.evidence_id && `id:${comparableText(item.evidence_id)}`,
+    item.artifact_ref && `artifact:${comparableText(item.artifact_ref)}`,
+    visibleQuery(item.query) && `query:${comparableText(item.query)}`,
+  ].filter((key): key is string => Boolean(key));
+}
+
+function firstCodeBlock(content: string | undefined): { language?: string; content?: string } {
+  const match = (content || '').match(/```([A-Za-z0-9_+.-]*)\s*\n([\s\S]*?)```/);
+  if (!match) return {};
+  return {
+    language: match[1]?.trim() || undefined,
+    content: match[2]?.trim() || undefined,
+  };
 }
 
 function visibleQuery(query: string | undefined): query is string {
@@ -483,6 +665,15 @@ function metricGroups(payload: Record<string, unknown> | null | undefined): Arra
   return metrics
     .map(asRecord)
     .filter((item): item is Record<string, unknown> => Boolean(item && Object.keys(item).length > 0));
+}
+
+function answerLocale(answer: FinalAnswerType): AnswerLocale {
+  const visibleText = [
+    answer.title,
+    answer.summary,
+    ...(answer.sections || []).flatMap((section) => [section.heading, section.content]),
+  ].filter((value): value is string => typeof value === 'string').join(' ');
+  return /[\u3400-\u9fff]/.test(visibleText) ? 'zh' : 'en';
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

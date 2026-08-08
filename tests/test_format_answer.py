@@ -319,7 +319,7 @@ def test_format_answer_assembles_selected_analysis_results():
         FormatAnswerTool().execute(
             FormatAnswerInput(
                 summary_goal="汇总",
-                include_analysis_ids=["ana_ratio", "ana_bucket"],
+                include_analysis_ids=["analysis:ana_ratio", "analysis:ana_bucket"],
                 section_plan=["analysis"],
             ),
             request_state=request_state,
@@ -329,8 +329,8 @@ def test_format_answer_assembles_selected_analysis_results():
     assert "比例为 60%" in result["summary"]
     assert "低位/中位/高位已划分" in result["summary"]
     assert result["sections"][0]["section_type"] == "analysis"
-    assert "指标: ratio: 0.6" in result["sections"][0]["content"]
-    assert result["sections"][0]["structured_payload"]["metrics"] == [{"ratio": 0.6}, {}]
+    assert "ratio: 0.6" not in result["sections"][0]["content"]
+    assert result["sections"][0]["structured_payload"]["metrics"] == [{"ratio": 0.6}]
     assert [ref["source_type"] for ref in result["references"]] == ["analysis", "analysis"]
 
 

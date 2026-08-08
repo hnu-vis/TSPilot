@@ -24,7 +24,7 @@ from runtime.token_usage import token_usage_summary
 from runtime.trace import TraceEventModel
 from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
-from schemas.output import FinalAnswer
+from schemas.output import AnswerSection, FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
 from core.data_fact import register_data_facts_from_payload
 from core.harness import default_capability_registry
@@ -448,11 +448,11 @@ def public_final_answer_payload(payload: dict) -> dict:
 def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
     return FinalAnswer(
         title=answer.title,
-        summary=_strip_public_query_text(answer.summary),
+        summary=_public_final_answer_text(answer.summary),
         sections=[
             section.model_copy(
                 update={
-                    "content": _strip_public_query_text(section.content),
+                    "content": _public_final_answer_section_content(section),
                     "structured_payload": _sanitize_public_value(
                         section.structured_payload,
                         allow_query_fields=section.section_type in {"query", "query_results"},
@@ -464,7 +464,7 @@ def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
         references=[
             reference.model_copy(
                 update={
-                    "label": _strip_public_query_text(reference.label),
+                    "label": _public_final_answer_text(reference.label),
                     "evidence": _sanitize_public_value(
                         reference.evidence,
                         allow_query_fields=reference.source_type == "query",
@@ -475,6 +475,21 @@ def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
         ],
         visualizations=answer.visualizations,
     )
+
+
+def _public_final_answer_section_content(section: AnswerSection) -> str:
+    if section.section_type in {"query", "query_results"}:
+        return section.content
+    return _public_final_answer_text(section.content)
+
+
+def _public_final_answer_text(value: str | None) -> str:
+    text = _strip_public_query_text(value)
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("[query omitted]", "")
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines).strip()
 
 
 def _public_response_trace(trace_events: list[TraceEventModel]) -> list[TraceEventModel]:

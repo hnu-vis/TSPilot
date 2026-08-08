@@ -108,6 +108,50 @@ def test_public_final_answer_preserves_query_evidence_fields():
     assert "query" not in public_answer.references[1].evidence
 
 
+def test_public_final_answer_preserves_user_visible_query_sections():
+    query = 'from(bucket:"bitcoin") |> range(start: -30d) |> max()'
+    answer = FinalAnswer(
+        summary=f"最大值是 12.3。Query statement:\n```flux\n{query}\n```",
+        sections=[
+            AnswerSection(
+                section_type="query",
+                heading="查询",
+                content=f"```flux\n{query}\n```",
+                structured_payload={"query_language": "flux", "database": "bitcoin"},
+            ),
+            AnswerSection(
+                section_type="query_results",
+                heading="查询结果",
+                content=f"查询语句：\n```flux\n{query}\n```",
+                structured_payload={
+                    "items": [
+                        {
+                            "query_language": "flux",
+                            "query": query,
+                            "rows_preview": [{"value": 12.3}],
+                        }
+                    ]
+                },
+            ),
+            AnswerSection(
+                section_type="analysis",
+                heading="分析",
+                content=f"分析基于内部查询：\n```flux\n{query}\n```",
+            ),
+        ],
+    )
+
+    public_answer = public_final_answer(answer)
+
+    assert "[query omitted]" not in public_answer.sections[0].content
+    assert "[query omitted]" not in public_answer.sections[1].content
+    assert query in public_answer.sections[0].content
+    assert query in public_answer.sections[1].content
+    assert public_answer.sections[1].structured_payload["items"][0]["query"] == query
+    assert public_answer.summary == "最大值是 12.3。"
+    assert public_answer.sections[2].content == "分析基于内部查询："
+
+
 def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
     action_output = ActionOutputBuilder().build(
         ActionOutputBuildInput(
