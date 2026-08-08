@@ -328,6 +328,7 @@ class FormatAnswerTool(BaseTool):
 
     def _data_fact_reference_payload(self, fact: DataFact) -> dict:
         return {
+            "fact_key": fact.fact_key,
             "name": fact.name,
             "status": fact.status,
             "value": fact.value,

@@ -6,9 +6,7 @@ from functools import lru_cache
 from agents.data_agent import DataAgent
 from langchain_openai import ChatOpenAI
 from prompts.data_agent import DataAgentPromptBuilder
-from core.data_fact.embedding import OpenAICompatibleEmbeddingProvider
-from core.data_fact.embedding_store import FactMemoryEmbeddingStore
-from core.data_fact.retriever import EmbeddingFactMemoryRetriever
+from core.data_fact.retriever import LlmFactMemoryRetriever
 from runtime.plain_chat import PlainChatService
 from runtime.react_loop import ReActLoop
 from runtime.tool_executor import ToolExecutor
@@ -59,26 +57,12 @@ def get_tool_registry():
 
 @lru_cache(maxsize=1)
 def get_tool_executor() -> ToolExecutor:
-    return ToolExecutor(get_tool_registry())
+    return ToolExecutor(get_tool_registry(), memory_retriever=get_fact_memory_retriever())
 
 
 @lru_cache(maxsize=1)
-def get_fact_memory_retriever() -> EmbeddingFactMemoryRetriever | None:
-    settings = get_settings()
-    api_key = settings.resolved_embedding_api_key
-    if not api_key:
-        return None
-    provider = OpenAICompatibleEmbeddingProvider(
-        api_key=api_key,
-        api_base=settings.resolved_embedding_api_base,
-        model=settings.embedding_model,
-    )
-    return EmbeddingFactMemoryRetriever(
-        embedding_provider=provider,
-        embedding_store=FactMemoryEmbeddingStore(settings.resolved_memory_embedding_cache_dir),
-        top_k=settings.memory_embedding_top_k,
-        score_threshold=settings.memory_embedding_score_threshold,
-    )
+def get_fact_memory_retriever() -> LlmFactMemoryRetriever:
+    return LlmFactMemoryRetriever(llm=get_llm())
 
 
 @lru_cache(maxsize=1)
@@ -90,7 +74,6 @@ def get_react_loop() -> ReActLoop:
     return ReActLoop(
         data_agent=get_data_agent(),
         tool_executor=get_tool_executor(),
-        memory_retriever=get_fact_memory_retriever(),
         settings=get_settings(),
     )
 

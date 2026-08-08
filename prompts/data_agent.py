@@ -5,6 +5,7 @@ import json
 
 from core.harness import default_capability_registry
 from core.harness.observation_view import model_observation_view
+from core.data_fact import data_fact_prompt_view
 from runtime.action_policy import runtime_action_constraints
 from schemas.state import ConversationStateModel, RequestStateModel
 
@@ -33,6 +34,11 @@ class DataAgentPromptBuilder:
             "For terminate, result/direct_answer are user-visible natural-language prose only; do not put JSON objects, answer wrappers, or summary/prediction/basis maps there.\n"
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
+            "Data Fact contract: use fact_requests to name the facts a tool must produce. Give every request a stable semantic fact_key. "
+            "For a fact computed from earlier facts, list their fact_key values in derived_from. Reuse fact keys from state.fact_state; "
+            "do not treat metric labels as Fact IDs. SQL should produce evidence-backed atomic facts; code_interpreter should produce derived or analytical facts.\n"
+            "SQL Fact contracts support point_value or time_boundary with requirements.time_position=start|end, extreme with "
+            "requirements.operator=min|max, and count. Do not request scalar, change, ratio, trend, or other derived Fact types from sql_query.\n"
             "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
             "If requested analysis metrics require custom formulas, sequence/window calculations, returns, volatility, drawdown, correlation, or any metric not clearly template-covered, call code_interpreter with Python code.\n"
             "Code interpreter sandbox contract: generated Python code receives canonical variables df, time, value, "
@@ -40,7 +46,8 @@ class DataAgentPromptBuilder:
             "metadata, and diagnostics. Prefer value/time/df/series; do not guess business field names or index raw "
             "rows/points unless canonical inputs are unavailable. data supports both original rows/points and column arrays. "
             "Use pandas-compatible frequency aliases such as 'h' for hourly grouping. "
-            "The code must assign a dict named result with a non-empty summary string, a metrics dict, and a details dict.\n"
+            "The code must assign a dict named result with a non-empty summary string, a metrics dict, a details dict, and a facts list. "
+            "When fact_requests is non-empty, facts must preserve each satisfied request's fact_key, name, fact_type, and derived_from and include value, statement, and calculation_trace.\n"
             "Tool-internal rules live inside tools. Do not recreate schema linking, query generation, validation, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
             "If a tool returns structured failure diagnostics, choose the recommended next action or a materially different action that addresses the diagnostics.\n"
             "Do not output markdown fences."
@@ -68,6 +75,7 @@ class DataAgentPromptBuilder:
                 "progress_summary": self._progress_summary(request_state, conversation_state),
                 "todo_progress": self._todo_progress_context(request_state, conversation_state),
                 "artifact_inventory": self._artifact_inventory(request_state),
+                "fact_state": data_fact_prompt_view(request_state),
             },
             "artifacts": {
                 "refs": self._artifact_ref_index(request_state),
@@ -93,11 +101,11 @@ class DataAgentPromptBuilder:
 
     def _minimal_parameters(self, action: str | None, parameters: list[str]) -> list[str]:
         if action == "sql_query":
-            return ["message", "purpose?"]
+            return ["message", "purpose?", "fact_requests?"]
         if action == "todowrite":
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
-            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?"]
+            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "fact_requests?"]
         if action in {"forecast", "anomaly"}:
             return ["database_evidence", "constraints?"]
         if action == "terminate":

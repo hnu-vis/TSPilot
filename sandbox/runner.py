@@ -30,6 +30,7 @@ def execute_python_sandbox_v1(
     columns: list[str],
     metadata: dict,
     diagnostics: dict,
+    input_facts: list[dict] | None = None,
     timeout_seconds: int = 5,
     work_dir: str | Path | None = None,
 ) -> ExecutionOutput:
@@ -47,6 +48,7 @@ def execute_python_sandbox_v1(
         "columns": list(columns),
         "metadata": dict(metadata),
         "diagnostics": dict(diagnostics),
+        "input_facts": [dict(fact) for fact in input_facts or [] if isinstance(fact, dict)],
     }
     payload["analysis_context"] = build_canonical_analysis_context(
         rows=payload["rows"],

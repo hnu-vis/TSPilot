@@ -15,6 +15,7 @@ from core.data_fact.embedding_store import (
     top_similar_cards,
 )
 from core.data_fact.memory import memory_cards_view, memory_detail, memory_details
+from core.data_fact.contracts import fact_request_contract_error
 from schemas.data_fact import DataFactRequest, MemoryCard, MemoryDetail
 from schemas.state import RequestStateModel
 
@@ -182,7 +183,22 @@ class LlmFactMemoryRetriever:
             if isinstance(item, dict)
         ]
         if not cards:
-            return MemoryRetrievalResult(diagnostics={"memory_enabled": True, "card_count": 0})
+            explicit_requests = _validated_fact_requests(action_input.get("fact_requests"))
+            planned_requests = []
+            if not explicit_requests:
+                planned_requests = await self._plan_tool_fact_requests(
+                    request_state=request_state,
+                    tool_name=tool_name,
+                    action_input=action_input,
+                )
+            return MemoryRetrievalResult(
+                fact_requests=planned_requests,
+                diagnostics={
+                    "memory_enabled": True,
+                    "card_count": 0,
+                    "fact_request_count": len(planned_requests),
+                },
+            )
 
         started = time.perf_counter()
         try:
@@ -205,7 +221,21 @@ class LlmFactMemoryRetriever:
 
         selected_ids = [hit.card_id for hit in selected[: self.max_selected] if hit.card_id]
         details = memory_details(database_id, selected_ids)
-        fact_requests = _fact_requests_from_details(details)
+        fact_requests = _fact_requests_from_details(details, tool_name=tool_name)
+        explicit_requests = _validated_fact_requests(action_input.get("fact_requests"))
+        if explicit_requests and fact_requests:
+            fact_requests = await self._reconcile_memory_requests(
+                request_state=request_state,
+                tool_name=tool_name,
+                explicit_requests=explicit_requests,
+                memory_requests=fact_requests,
+            )
+        elif not explicit_requests and not fact_requests:
+            fact_requests = await self._plan_tool_fact_requests(
+                request_state=request_state,
+                tool_name=tool_name,
+                action_input=action_input,
+            )
         return MemoryRetrievalResult(
             hits=selected[: self.max_selected],
             fact_requests=fact_requests,
@@ -217,6 +247,125 @@ class LlmFactMemoryRetriever:
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
+
+    async def _reconcile_memory_requests(
+        self,
+        *,
+        request_state: RequestStateModel,
+        tool_name: str,
+        explicit_requests: list[DataFactRequest],
+        memory_requests: list[DataFactRequest],
+    ) -> list[DataFactRequest]:
+        """Use semantic reconciliation instead of name-based duplicate rules."""
+
+        messages = [
+            (
+                "system",
+                (
+                    "You reconcile explicit and retrieved Data Fact contracts for one tool call. "
+                    "Explicit contracts are authoritative. Select a memory contract only when it adds a distinct fact required "
+                    "by the user and is not semantically equivalent to an explicit contract. Different names or fact_key values "
+                    "do not make facts distinct. Do not repair or replace malformed explicit contracts here. "
+                    "Return exactly {\"selected_memory_fact_keys\": [string]} and no markdown."
+                ),
+            ),
+            (
+                "user",
+                json.dumps(
+                    {
+                        "message": request_state.message,
+                        "tool_name": tool_name,
+                        "explicit_fact_contracts": [
+                            request.model_dump(mode="json", exclude_none=True) for request in explicit_requests
+                        ],
+                        "memory_fact_contracts": [
+                            request.model_dump(mode="json", exclude_none=True) for request in memory_requests
+                        ],
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            ),
+        ]
+        try:
+            response = await self.llm.ainvoke(messages)
+            payload = _parse_json_response(getattr(response, "content", response))
+        except Exception:
+            return []
+        selected = payload.get("selected_memory_fact_keys") if isinstance(payload, dict) else []
+        selected_keys = {str(item).strip() for item in selected if str(item).strip()} if isinstance(selected, list) else set()
+        return [request for request in memory_requests if request.fact_key in selected_keys]
+
+    async def _plan_tool_fact_requests(
+        self,
+        *,
+        request_state: RequestStateModel,
+        tool_name: str,
+        action_input: dict,
+    ) -> list[DataFactRequest]:
+        current_facts = [
+            {
+                "fact_key": fact.fact_key,
+                "name": fact.name,
+                "fact_type": fact.fact_type,
+                "status": fact.status,
+                "derived_from": fact.derived_from,
+            }
+            for fact in request_state.fact_set.facts[-12:]
+        ]
+        messages = [
+            (
+                "system",
+                (
+                    "You create semantic Data Fact contracts for one tool call only when its intended outputs are numerical, "
+                    "statistical, analytical, or interpretive facts needed by the user. Return exactly "
+                    "{\"fact_requests\": [object]} and no markdown. Return an empty list when the tool does not produce a useful Fact. "
+                    "Each request requires fact_key, name, and fact_type. A derived Fact must list verified parent fact_key values "
+                    "in derived_from; parents are inputs, not duplicate output requests. For sql_query use only point_value or "
+                    "time_boundary with requirements.time_position=start|end, extreme with requirements.operator=min|max, or count. "
+                    "Use code_interpreter for change, ratio, trend, distribution, association, and multi-Fact composition. "
+                    "Do not invent parent keys and do not return already verified facts unless this call must replace them."
+                ),
+            ),
+            (
+                "user",
+                json.dumps(
+                    {
+                        "message": request_state.message,
+                        "tool_name": tool_name,
+                        "action_input": _bounded_action_input(action_input),
+                        "current_fact_dag": current_facts,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            ),
+        ]
+        try:
+            response = await self.llm.ainvoke(messages)
+            payload = _parse_json_response(getattr(response, "content", response))
+        except Exception:
+            return []
+        requests = _validated_fact_requests(payload.get("fact_requests") if isinstance(payload, dict) else None)
+        requests = [request for request in requests[:6] if not fact_request_contract_error(request, tool_name)]
+        if tool_name != "code_interpreter":
+            return requests
+
+        verified_keys = {
+            fact.fact_key
+            for fact in request_state.fact_set.facts
+            if fact.status == "verified" and fact.fact_key
+        }
+        has_rows = _latest_evidence_row_count(request_state) > 0
+        return [
+            request
+            for request in requests
+            if (
+                request.derived_from
+                and all(parent_key in verified_keys for parent_key in request.derived_from)
+            )
+            or (not request.derived_from and has_rows)
+        ]
 
     async def _select_cards(
         self,
@@ -234,6 +383,7 @@ class LlmFactMemoryRetriever:
                     "Return exactly one JSON object and no markdown.\n"
                     "Select only cards whose details should be loaded to construct fact_requests for the current tool.\n"
                     "Do not select cards for facts that are unrelated to the user request or not useful for this tool call.\n"
+                    "Do not select a card when action_input.fact_requests already requests the same semantic fact, even if its name or key differs.\n"
                     "Never return concrete historical fact values; memory only guides what current evidence should produce.\n"
                     "JSON schema: {\"selected\": [{\"card_id\": string, \"reason\": string, \"confidence\": number}]}."
                 ),
@@ -288,12 +438,16 @@ class LlmFactMemoryRetriever:
 FactMemoryRetriever = LlmFactMemoryRetriever
 
 
-def _fact_requests_from_details(details: list[MemoryDetail]) -> list[DataFactRequest]:
+def _fact_requests_from_details(details: list[MemoryDetail], tool_name: str | None = None) -> list[DataFactRequest]:
     result: list[DataFactRequest] = []
     seen: set[str] = set()
     for detail in details:
         request = detail.fact_request
         if request is None:
+            continue
+        if tool_name and detail.preferred_tool and detail.preferred_tool != tool_name:
+            continue
+        if tool_name and fact_request_contract_error(request, tool_name):
             continue
         key = json.dumps(request.model_dump(mode="json", exclude_none=True), ensure_ascii=False, sort_keys=True, default=str)
         if key in seen:
@@ -301,6 +455,30 @@ def _fact_requests_from_details(details: list[MemoryDetail]) -> list[DataFactReq
         result.append(request)
         seen.add(key)
     return result
+
+
+def _validated_fact_requests(value: Any) -> list[DataFactRequest]:
+    if not isinstance(value, list):
+        return []
+    result: list[DataFactRequest] = []
+    for item in value:
+        try:
+            result.append(item if isinstance(item, DataFactRequest) else DataFactRequest.model_validate(item))
+        except Exception:
+            continue
+    return result
+
+
+def _latest_evidence_row_count(request_state: RequestStateModel) -> int:
+    evidence = getattr(request_state, "latest_database_evidence", None)
+    data = getattr(evidence, "data", None) if evidence is not None else None
+    if not isinstance(data, dict):
+        return 0
+    rows = data.get("rows")
+    if isinstance(rows, list):
+        return len(rows)
+    points = data.get("points")
+    return len(points) if isinstance(points, list) else 0
 
 
 def _database_id(request_state: RequestStateModel) -> str | None:

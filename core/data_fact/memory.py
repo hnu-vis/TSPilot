@@ -6,6 +6,7 @@ persist concrete numeric fact instances as reusable answers.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha1
 import json
 import re
 from pathlib import Path
@@ -20,6 +21,7 @@ from schemas.data_fact import (
     MemoryCard,
     MemoryDetail,
 )
+from core.data_fact.contracts import fact_request_contract_error
 
 
 def utc_now_iso() -> str:
@@ -128,47 +130,59 @@ def observe_fact_usage(
     requests: Iterable[DataFactRequest],
     facts: Iterable[DataFact],
 ) -> FactMemory:
-    """Persist reusable fact definitions/recipes inferred from usage."""
+    """Persist recipes only when a requested fact was produced and verified."""
 
     memory = read_fact_memory(database_id)
     now = utc_now_iso()
     definitions = {item.fact_type: item for item in memory.definitions}
     recipes = {item.recipe_id: item for item in memory.recipes}
+    verified_facts = [fact for fact in facts if fact.status == "verified"]
+    verified_by_key = {fact.fact_key: fact for fact in verified_facts if fact.fact_key}
 
     for request in requests:
+        if fact_request_contract_error(request, tool_name):
+            continue
+        produced_fact = verified_by_key.get(request.fact_key)
+        if produced_fact is None:
+            continue
         fact_type = request.fact_type or "custom"
-        definitions.setdefault(
-            fact_type,
-            FactDefinition(
+        existing_definition = definitions.get(fact_type)
+        if existing_definition is None or existing_definition.source in {"observed_fact_request", "observed_data_fact", "verified_data_fact"}:
+            definitions[fact_type] = FactDefinition(
                 fact_type=fact_type,
-                description=f"Observed fact type '{fact_type}' from fact request '{request.name}'.",
+                description=f"Verified fact type '{fact_type}' from fact request '{request.name}'.",
                 required_evidence=_required_evidence_for_tool(tool_name),
                 preferred_tool=tool_name,
-                output_schema=_output_schema_from_request(request),
+                output_schema=_output_schema_from_fact(produced_fact),
                 verification_requirements=_default_verification_requirements(),
                 scope=database_id or "global",
-                source="observed_fact_request",
+                source="verified_data_fact",
                 updated_at=now,
-            ),
-        )
-        recipe_id = _recipe_id(fact_type, request.name, tool_name)
-        recipes.setdefault(
-            recipe_id,
-            FactRecipe(
-                recipe_id=recipe_id,
-                fact_type=fact_type,
-                name=request.name,
-                preferred_tool=tool_name,
-                fact_request_template=request.model_dump(mode="json", exclude_none=True),
-                expected_result_schema={"facts": [{"name": request.name, "fact_type": fact_type}]},
-                verification_notes=_default_verification_requirements(),
-                scope=database_id or "global",
-                source="observed_fact_request",
-                updated_at=now,
-            ),
+            )
+        recipe_id = _recipe_id(fact_type, request.fact_key, tool_name)
+        recipes[recipe_id] = FactRecipe(
+            recipe_id=recipe_id,
+            fact_type=fact_type,
+            name=request.name,
+            preferred_tool=tool_name,
+            fact_request_template=_stable_fact_request_template(request),
+            expected_result_schema={
+                "facts": [
+                    {
+                        "fact_key": request.fact_key,
+                        "name": request.name,
+                        "fact_type": fact_type,
+                        "derived_from": request.derived_from,
+                    }
+                ]
+            },
+            verification_notes=_default_verification_requirements(),
+            scope=database_id or "global",
+            source="verified_data_fact",
+            updated_at=now,
         )
 
-    for fact in facts:
+    for fact in verified_facts:
         fact_type = fact.fact_type or "custom"
         definitions.setdefault(
             fact_type,
@@ -367,14 +381,18 @@ def _detail_from_definition(definition: FactDefinition, card: MemoryCard) -> Mem
 
 
 def _card_from_recipe(recipe: FactRecipe) -> MemoryCard:
+    preferred_tool = _safe_id(recipe.preferred_tool)
     fact_type = _safe_id(recipe.fact_type)
-    name = _safe_id(recipe.name)
+    fact_key = ""
+    if isinstance(recipe.fact_request_template, dict):
+        fact_key = str(recipe.fact_request_template.get("fact_key") or "")
+    name = _safe_component(fact_key or recipe.name)
     return MemoryCard(
-        id=f"recipe.{fact_type}.{name}",
+        id=f"recipe.{preferred_tool}.{fact_type}.{name}",
         kind="fact_recipe",
         title=recipe.name,
         description=_recipe_description(recipe),
-        tags=[item for item in [recipe.fact_type, recipe.name, recipe.scope] if item],
+        tags=[item for item in [recipe.fact_type, recipe.name, recipe.preferred_tool, recipe.scope] if item],
         updated_at=recipe.updated_at,
     )
 
@@ -390,9 +408,21 @@ def _detail_from_recipe(recipe: FactRecipe, card: MemoryCard) -> MemoryDetail:
         id=card.id,
         card=card,
         fact_request=fact_request,
+        preferred_tool=recipe.preferred_tool,
         guidance="; ".join(recipe.verification_notes or []) or None,
         examples=[],
     )
+
+
+def _stable_fact_request_template(request: DataFactRequest) -> dict:
+    """Strip request-local retrieval diagnostics before long-term persistence."""
+
+    payload = request.model_dump(mode="json", exclude_none=True)
+    requirements = dict(payload.get("requirements") or {})
+    for key in ("source", "memory_card_ids", "retrieval_reason", "retrieval_confidence"):
+        requirements.pop(key, None)
+    payload["requirements"] = requirements
+    return payload
 
 
 def _recipe_description(recipe: FactRecipe) -> str:
@@ -417,8 +447,15 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "global"
 
 
-def _recipe_id(fact_type: str, name: str, tool_name: str) -> str:
-    return _safe_id(f"recipe_{tool_name}_{fact_type}_{name}")
+def _safe_component(value: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    if readable:
+        return readable
+    return sha1(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _recipe_id(fact_type: str, fact_key: str, tool_name: str) -> str:
+    return f"recipe_{_safe_component(tool_name)}_{_safe_component(fact_type)}_{_safe_component(fact_key)}"
 
 
 def _required_evidence_for_tool(tool_name: str) -> list[str]:

@@ -183,3 +183,144 @@ def test_code_interpreter_ignores_unrequested_analysis_metrics():
     assert coverage.verified == ["max_min_difference"]
     assert facts_by_name["max_min_difference"].value == 4.0
     assert set(facts_by_name) == {"max_min_difference"}
+
+
+def test_fact_coverage_accumulates_across_sql_and_composite_analysis():
+    request_state = _request_state()
+    request_state.iteration = 1
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "fact_key": "price.start",
+                        "name": "start_price",
+                        "fact_type": "point_value",
+                        "requirements": {"time_position": "start"},
+                    },
+                    {
+                        "fact_key": "price.end",
+                        "name": "end_price",
+                        "fact_type": "point_value",
+                        "requirements": {"time_position": "end"},
+                    },
+                ]
+            },
+        )
+    )
+    register_data_facts_from_payload(
+        request_state,
+        "sql_query",
+        {
+            "evidence_id": "evi_prices",
+            "summary": "Price evidence.",
+            "data": {
+                "rows": [
+                    {"timestamp": "2023-01-01", "price": 10.0},
+                    {"timestamp": "2023-01-02", "price": 12.0},
+                ]
+            },
+        },
+    )
+
+    request_state.iteration = 2
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="code_interpreter",
+            iteration=2,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "fact_key": "price.percentage_change",
+                        "name": "percentage_change",
+                        "fact_type": "difference",
+                        "derived_from": ["price.start", "price.end"],
+                    }
+                ]
+            },
+        )
+    )
+    coverage = register_data_facts_from_payload(
+        request_state,
+        "code_interpreter",
+        {
+            "analysis_id": "ana_change",
+            "analysis_goal": "Calculate percentage change.",
+            "input_evidence_id": "evi_prices",
+            "code_hash": "change123",
+            "result": {
+                "summary": "Price increased by 20%.",
+                "metrics": {"percentage_change": 20.0},
+                "details": {},
+                "facts": [
+                    {
+                        "fact_key": "price.percentage_change",
+                        "name": "percentage_change",
+                        "fact_type": "difference",
+                        "statement": "Price increased by 20%.",
+                        "value": 20.0,
+                        "derived_from": ["price.start", "price.end"],
+                        "calculation_trace": {"formula": "(end - start) / start * 100"},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert coverage.missing == []
+    assert coverage.verified == ["start_price", "end_price", "percentage_change"]
+    composite = next(fact for fact in request_state.fact_set.facts if fact.fact_key == "price.percentage_change")
+    assert composite.status == "verified"
+    assert composite.derived_from == ["price.start", "price.end"]
+    assert {ref.source_id for ref in composite.evidence_refs} >= {"evi_prices", "ana_change"}
+
+
+def test_composite_fact_with_missing_parent_is_partial():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="code_interpreter",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "fact_key": "price.change",
+                        "name": "change",
+                        "fact_type": "difference",
+                        "derived_from": ["price.start", "price.end"],
+                    }
+                ]
+            },
+        )
+    )
+
+    coverage = register_data_facts_from_payload(
+        request_state,
+        "code_interpreter",
+        {
+            "analysis_id": "ana_partial",
+            "input_evidence_id": "evi_prices",
+            "result": {
+                "facts": [
+                    {
+                        "fact_key": "price.change",
+                        "name": "change",
+                        "fact_type": "difference",
+                        "statement": "Change is 2.",
+                        "value": 2.0,
+                        "derived_from": ["price.start", "price.end"],
+                        "calculation_trace": {"formula": "end - start"},
+                    }
+                ],
+                "metrics": {},
+                "details": {},
+            },
+        },
+    )
+
+    assert coverage.partial == ["change"]
+    fact = request_state.fact_set.facts[0]
+    assert fact.status == "partial"
+    assert "unverified_dependencies" in fact.quality_flags

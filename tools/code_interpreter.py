@@ -12,11 +12,12 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from core.analysis.python_runner import AnalysisCodeError
+from core.data_fact.contracts import fact_request_contract_error
 from sandbox import execute_python_sandbox_v1
 from sandbox.analysis_context import build_canonical_analysis_context
 from schemas.analysis import AnalysisResult
 from schemas.database import DatabaseEvidence
-from schemas.data_fact import DataFactRequest
+from schemas.data_fact import DataFactRequest, normalize_fact_key
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -64,6 +65,17 @@ class CodeInterpreterInput(BaseModel):
                 )
         return data
 
+    @model_validator(mode="after")
+    def validate_fact_contracts(self):
+        errors = [
+            error
+            for request in self.fact_requests
+            if (error := fact_request_contract_error(request, "code_interpreter"))
+        ]
+        if errors:
+            raise ValueError(" ".join(errors))
+        return self
+
 
 class CodeInterpreterTool(BaseTool):
     def __init__(self, llm=None):
@@ -90,6 +102,12 @@ class CodeInterpreterTool(BaseTool):
             metadata=database_evidence.metadata,
             diagnostics=database_evidence.diagnostics,
         )
+        input_facts = _input_facts_for_requests(request_state, validated_input.fact_requests)
+        canonical_context["fact_contracts"] = [
+            request.model_dump(mode="json", exclude_none=True)
+            for request in validated_input.fact_requests
+        ]
+        canonical_context["input_facts"] = input_facts
         if not code_text:
             missing_metrics = _missing_template_metrics(
                 goal=goal,
@@ -108,6 +126,7 @@ class CodeInterpreterTool(BaseTool):
                                 analysis_request=validated_input.analysis_request,
                             ),
                             canonical_context=canonical_context,
+                            fact_requests=validated_input.fact_requests,
                         )
                         generated_code_preview = _failed_code_summary(code_text)
                     except (AnalysisCodeError, asyncio.TimeoutError):
@@ -141,6 +160,8 @@ class CodeInterpreterTool(BaseTool):
                     required_outputs=validated_input.required_outputs,
                     analysis_request=validated_input.analysis_request,
                     constraints=constraints,
+                    fact_requests=validated_input.fact_requests,
+                    input_facts=input_facts,
                 )
                 code_type = "analysis_request_v1"
                 code_hash = _code_hash(json.dumps(output.get("diagnostics", {}), ensure_ascii=False, sort_keys=True, default=str))
@@ -167,6 +188,8 @@ class CodeInterpreterTool(BaseTool):
                 required_outputs=validated_input.required_outputs,
                 analysis_request=validated_input.analysis_request,
                 expected_result_schema=validated_input.expected_result_schema or {},
+                fact_requests=validated_input.fact_requests,
+                input_facts=input_facts,
                 repair_attempts=repair_attempts,
             )
             code_hash = _code_hash(final_code_text)
@@ -197,6 +220,12 @@ class CodeInterpreterTool(BaseTool):
             _validate_expected_result_schema(result_payload, validated_input.expected_result_schema or {})
             _validate_outlier_treatment_transparency(result_payload)
             _validate_result_has_numeric_analysis(result_payload, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
+            _validate_fact_output_contract(
+                result_payload,
+                validated_input.fact_requests,
+                input_row_count=len(rows),
+                input_facts=input_facts,
+            )
         except AnalysisCodeError as exc:
             raise _structured_analysis_validation_error(
                 exc,
@@ -245,6 +274,8 @@ class CodeInterpreterTool(BaseTool):
         required_outputs: list[str],
         analysis_request: dict | None,
         expected_result_schema: dict,
+        fact_requests: list[DataFactRequest],
+        input_facts: list[dict],
         repair_attempts: list[dict],
     ):
         current_code = code
@@ -263,8 +294,15 @@ class CodeInterpreterTool(BaseTool):
                         columns=columns,
                         metadata=database_evidence.metadata,
                         diagnostics=database_evidence.diagnostics,
+                        input_facts=input_facts,
                         timeout_seconds=int(constraints.get("timeout_seconds", 5)),
                         work_dir=_code_interpreter_work_dir(request_state, _code_hash(current_code)),
+                    )
+                    _validate_fact_output_contract(
+                        sandbox_output.result,
+                        fact_requests,
+                        input_row_count=len(rows),
+                        input_facts=input_facts,
                     )
                     return sandbox_output, current_code
                 except AnalysisCodeError as exc:
@@ -289,6 +327,7 @@ class CodeInterpreterTool(BaseTool):
                         analysis_request=analysis_request,
                     ),
                     canonical_context=canonical_context,
+                    fact_requests=fact_requests,
                     failed_code=current_code,
                     error=str(last_error or ""),
                 )
@@ -313,6 +352,7 @@ class CodeInterpreterTool(BaseTool):
         required_outputs: list[str],
         required_metrics: list[str],
         canonical_context: dict,
+        fact_requests: list[DataFactRequest],
     ) -> str:
         return await self._invoke_code_llm(
             {
@@ -321,6 +361,8 @@ class CodeInterpreterTool(BaseTool):
                 "required_outputs": required_outputs,
                 "required_metrics": required_metrics,
                 "canonical_inputs": canonical_context.get("schema", {}),
+                "fact_contracts": [request.model_dump(mode="json", exclude_none=True) for request in fact_requests],
+                "input_facts": canonical_context.get("input_facts", []),
             }
         )
 
@@ -331,6 +373,7 @@ class CodeInterpreterTool(BaseTool):
         required_outputs: list[str],
         required_metrics: list[str],
         canonical_context: dict,
+        fact_requests: list[DataFactRequest],
         failed_code: str,
         error: str,
     ) -> str:
@@ -341,6 +384,8 @@ class CodeInterpreterTool(BaseTool):
                 "required_outputs": required_outputs,
                 "required_metrics": required_metrics,
                 "canonical_inputs": canonical_context.get("schema", {}),
+                "fact_contracts": [request.model_dump(mode="json", exclude_none=True) for request in fact_requests],
+                "input_facts": canonical_context.get("input_facts", []),
                 "failed_code": _failed_code_summary(failed_code),
                 "error": error[:1200],
                 "error_classification": _classify_analysis_code_error(error),
@@ -353,13 +398,15 @@ class CodeInterpreterTool(BaseTool):
         system = (
             "You generate Python code for TSPilot code_interpreter. Return exactly one JSON object "
             "with key code and no markdown. The sandbox already provides df, time, value, time_col, "
-            "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, "
+            "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, input_facts, fact_by_key, "
             "math, statistics, pd, and np. Prefer value/time/df/series. Do not use pd.np or ellipsis placeholders. "
-            "Do not invent field names. The code must assign result as one dict containing exactly the stable contract fields "
-            "summary, metrics, and details. summary must be a non-empty string. metrics must be a dict/object and may be empty "
+            "Do not invent field names. The code must assign result as one dict containing the stable contract fields "
+            "summary, metrics, details, and facts. summary must be a non-empty string. metrics must be a dict/object and may be empty "
             "when the requested answer is primarily table/list/detail output. details must be a dict/object. Prefer details "
             "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
-            "values must be JSON-serializable plain Python scalars, lists, or dicts."
+            "values must be JSON-serializable plain Python scalars, lists, or dicts. facts must be a list with one object per "
+            "satisfied fact_contract, preserving its fact_key, name, fact_type, and derived_from. Each fact must include value, "
+            "statement, and calculation_trace. Use input_facts or fact_by_key for dependencies; never invent a dependency value."
         )
         messages = [
             ("system", system),
@@ -402,6 +449,88 @@ def _resolve_database_evidence(database_evidence, request_state):
             return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
         return DatabaseEvidence.model_validate(database_evidence)
     return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)
+
+
+def _input_facts_for_requests(request_state, requests: list[DataFactRequest]) -> list[dict]:
+    if request_state is None:
+        return []
+    required_keys = {dependency for request in requests for dependency in request.derived_from}
+    if not required_keys:
+        return []
+    result: list[dict] = []
+    for fact in request_state.fact_set.facts:
+        if fact.status != "verified" or fact.fact_key not in required_keys:
+            continue
+        result.append(
+            fact.model_dump(
+                mode="json",
+                include={
+                    "fact_id",
+                    "fact_key",
+                    "name",
+                    "fact_type",
+                    "value",
+                    "unit",
+                    "subject",
+                    "dimensions",
+                    "time_range",
+                    "derived_from",
+                    "calculation_trace",
+                },
+            )
+        )
+    return result
+
+
+def _validate_fact_output_contract(
+    result: dict,
+    requests: list[DataFactRequest],
+    *,
+    input_row_count: int = 0,
+    input_facts: list[dict] | None = None,
+) -> None:
+    if not requests:
+        return
+    facts = result.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise AnalysisCodeError("analysis result must include structured facts for the requested fact contracts.")
+    requests_by_key = {request.fact_key: request for request in requests}
+    verified_input_keys = {
+        normalize_fact_key(fact.get("fact_key") or fact.get("fact_id") or fact.get("name") or "")
+        for fact in (input_facts or [])
+        if isinstance(fact, dict) and fact.get("status", "verified") == "verified"
+    }
+    seen: set[str] = set()
+    for raw in facts:
+        if not isinstance(raw, dict):
+            raise AnalysisCodeError("analysis result facts must contain objects.")
+        fact_key = normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
+        request = requests_by_key.get(fact_key)
+        if request is None:
+            raise AnalysisCodeError(f"analysis returned unrequested fact_key '{fact_key}'.")
+        if fact_key in seen:
+            raise AnalysisCodeError(f"analysis returned duplicate fact_key '{fact_key}'.")
+        seen.add(fact_key)
+        if request.derived_from:
+            missing_parents = [key for key in request.derived_from if key not in verified_input_keys]
+            if missing_parents:
+                raise AnalysisCodeError(
+                    f"analysis fact '{fact_key}' depends on unavailable verified input facts: {missing_parents}."
+                )
+        elif input_row_count <= 0:
+            raise AnalysisCodeError(
+                f"analysis fact '{fact_key}' cannot be created without database rows or verified parent facts."
+            )
+        raw["fact_key"] = request.fact_key
+        raw["name"] = request.name
+        raw["fact_type"] = request.fact_type
+        raw["derived_from"] = request.derived_from
+        if raw.get("value") is None:
+            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a non-null value.")
+        if not str(raw.get("statement") or "").strip():
+            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a statement.")
+        if not isinstance(raw.get("calculation_trace"), dict) or not raw["calculation_trace"]:
+            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a calculation_trace.")
 
 
 def _normalize_analysis_request(value) -> dict | None:
@@ -616,6 +745,8 @@ def _execute_analysis_request(
     required_outputs: list[str],
     analysis_request: dict | None,
     constraints: dict,
+    fact_requests: list[DataFactRequest],
+    input_facts: list[dict],
 ) -> dict:
     canonical_points = _canonical_numeric_points(rows=rows, points=points)
     if not canonical_points:
@@ -673,11 +804,13 @@ def _execute_analysis_request(
             }
         )
     summary = _analysis_request_summary(goal, metrics, details)
+    facts = _template_facts_from_metrics(fact_requests, metrics, input_facts)
     return {
         "result": {
             "summary": summary,
             "metrics": metrics,
             "details": details,
+            "facts": facts,
         },
         "diagnostics": {
             "analysis_request": analysis_request or {},
@@ -686,6 +819,43 @@ def _execute_analysis_request(
             "input_point_count": len(sorted_points),
         },
     }
+
+
+def _template_facts_from_metrics(
+    requests: list[DataFactRequest],
+    metrics: dict,
+    input_facts: list[dict],
+) -> list[dict]:
+    input_keys = {
+        normalize_fact_key(fact.get("fact_key") or fact.get("fact_id") or fact.get("name") or "")
+        for fact in input_facts
+    }
+    facts: list[dict] = []
+    for request in requests:
+        metric_key = str(request.requirements.get("metric_key") or request.name)
+        if metric_key not in metrics:
+            continue
+        if any(dependency not in input_keys for dependency in request.derived_from):
+            continue
+        value = metrics[metric_key]
+        facts.append(
+            {
+                "fact_key": request.fact_key,
+                "name": request.name,
+                "fact_type": request.fact_type,
+                "statement": f"{request.name} is {value}.",
+                "value": value,
+                "subject": request.subject,
+                "dimensions": request.dimensions,
+                "time_range": request.time_range,
+                "derived_from": request.derived_from,
+                "calculation_trace": {
+                    "template": "canonical_timeseries_metrics_v1",
+                    "metric_key": metric_key,
+                },
+            }
+        )
+    return facts
 
 
 def _analysis_context_indicates_outlier_treatment(goal: str, analysis_request: dict | None, constraints: dict | None) -> bool:
@@ -881,7 +1051,7 @@ def _preflight_analysis_code(code: str | None, canonical_context: dict | None = 
         return (
             "analysis_code references unavailable runtime variables: "
             + ", ".join(missing_names[:8])
-            + ". Use provided variables df, time, value, time_col, value_col, series, rows, points, columns, metadata, diagnostics, or define variables before use."
+            + ". Use provided variables df, time, value, time_col, value_col, series, rows, points, columns, metadata, diagnostics, input_facts, fact_by_key, or define variables before use."
         )
     return None
 
@@ -920,6 +1090,8 @@ def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
         "value",
         "time_col",
         "value_col",
+        "input_facts",
+        "fact_by_key",
         "pd",
         "np",
     }

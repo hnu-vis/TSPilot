@@ -337,6 +337,8 @@ class LLMQueryGenerator:
             "Before returning, self-check whether this single query covers the whole user request. "
             "If request.fact_requests is non-empty, treat it as current-tool fact output guidance. "
             "When requested facts can be produced directly by this query, return columns or rows that make those facts verifiable from current evidence. "
+            "For point_value or time_boundary facts with requirements.time_position=start|end, the boundary means the first or last available observation inside the requested range. "
+            "Query the complete applicable range and preserve native timestamp/value rows; do not require an observation to equal the range boundary timestamp exactly. "
             "When a requested fact requires downstream calculation, preserve the necessary raw/current evidence and list that fact in task_coverage.missing with the downstream action. "
             "Use request.response_language for all natural-language JSON values you generate, including purpose, assumptions, "
             "task_coverage.satisfied, task_coverage.missing, and task_coverage.next_action_hint. "

@@ -10,6 +10,7 @@ from schemas.data_fact import (
     FactCoverage,
     FactEvent,
     FactEvidenceRef,
+    normalize_fact_key,
 )
 from core.data_fact.memory import observe_fact_usage
 
@@ -22,16 +23,19 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
     """
 
     action_input = _latest_action_input(request_state, tool_name)
-    requests = _request_relevant_fact_requests(getattr(request_state, "message", ""), _fact_requests(action_input))
+    requests = _fact_requests(action_input)
     produced: list[DataFact] = []
     rejected: list[DataFact] = []
 
     for raw_fact in full_payload.get("produced_facts") or []:
-        fact = _validate_fact(raw_fact, default_method=tool_name)
+        fact = _bind_fact_contract(_validate_fact(raw_fact, default_method=tool_name), requests)
         if fact is not None:
             produced.append(fact)
     for raw_fact in full_payload.get("rejected_facts") or []:
-        fact = _validate_fact(raw_fact, default_method=tool_name, default_status="rejected")
+        fact = _bind_fact_contract(
+            _validate_fact(raw_fact, default_method=tool_name, default_status="rejected"),
+            requests,
+        )
         if fact is not None:
             rejected.append(fact)
 
@@ -44,11 +48,14 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
     elif tool_name == "anomaly":
         produced.extend(_facts_from_anomaly(full_payload, requests))
 
-    produced = _dedupe_facts([fact for fact in produced if _fact_has_evidence_or_unavailable(fact)])
+    produced = _verify_fact_dependencies(
+        _dedupe_facts([fact for fact in produced if _fact_has_evidence_or_unavailable(fact)]),
+        request_state.fact_set.facts,
+    )
     rejected = _dedupe_facts(rejected)
-    coverage = _coverage_for(requests, produced, rejected)
-    _merge_fact_state(request_state, tool_name, produced, rejected, coverage)
-    _attach_facts_to_artifact(request_state, tool_name, full_payload, produced, rejected, coverage)
+    event_coverage = _coverage_for(requests, produced, rejected)
+    coverage = _merge_fact_state(request_state, tool_name, requests, produced, rejected, event_coverage)
+    _attach_facts_to_artifact(request_state, tool_name, full_payload, produced, rejected, event_coverage)
     observe_fact_usage(
         database_id=_database_id_for_memory(request_state),
         tool_name=tool_name,
@@ -60,6 +67,7 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
 
 def data_fact_prompt_view(request_state) -> dict:
     facts = list(getattr(getattr(request_state, "fact_set", None), "facts", []) or [])
+    requests = list(getattr(getattr(request_state, "fact_set", None), "requests", []) or [])
     coverage = getattr(getattr(request_state, "fact_set", None), "coverage", None)
     recent = facts[-12:]
     return {
@@ -69,14 +77,25 @@ def data_fact_prompt_view(request_state) -> dict:
             "rejected": [fact.name for fact in facts if fact.status == "rejected"][-8:],
             "missing": list(getattr(coverage, "missing", []) or [])[-12:],
         },
+        "plan": [
+            {
+                "fact_key": request.fact_key,
+                "name": request.name,
+                "fact_type": request.fact_type,
+                "derived_from": request.derived_from,
+            }
+            for request in requests[-12:]
+        ],
         "recent_facts": [
             {
                 "fact_id": fact.fact_id,
+                "fact_key": fact.fact_key,
                 "name": fact.name,
                 "fact_type": fact.fact_type,
                 "status": fact.status,
                 "statement": fact.statement,
                 "evidence_refs": [ref.source_id for ref in fact.evidence_refs[:4]],
+                "derived_from": fact.derived_from,
                 "unavailable_reason": fact.unavailable_reason,
             }
             for fact in recent
@@ -112,54 +131,6 @@ def _fact_requests(action_input: dict) -> list[DataFactRequest]:
     return requests
 
 
-def _request_relevant_fact_requests(message: str, requests: list[DataFactRequest]) -> list[DataFactRequest]:
-    relevant_names = _fact_names_implied_by_text(message)
-    if not relevant_names:
-        return requests
-    return [
-        request
-        for request in requests
-        if _canonical_fact_name(request.name, request.fact_type) in relevant_names
-    ]
-
-
-def _fact_names_implied_by_text(text: str) -> set[str]:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return set()
-    result: set[str] = set()
-    asks_difference = any(marker in lowered for marker in ("difference", "差异", "差值", "相差", "之差"))
-    asks_change = any(marker in lowered for marker in ("change", "变化", "涨跌", "增减", "percentage", "百分比"))
-    if asks_difference:
-        result.update({"max_min_difference", "difference", "max_value", "highest_value", "min_value", "lowest_value"})
-        return result
-    if any(marker in lowered for marker in ("highest", "maximum", "max", "最大", "最高")):
-        result.update({"max_value", "highest_value"})
-    if any(marker in lowered for marker in ("lowest", "minimum", "min", "最小", "最低")):
-        result.update({"min_value", "lowest_value"})
-    if any(marker in lowered for marker in ("start", "first", "起始", "开始", "首个")):
-        result.update({"start_value", "start_time"})
-    if any(marker in lowered for marker in ("end", "last", "结束", "最终", "最后", "最晚")):
-        result.update({"end_value", "end_time"})
-    if asks_change:
-        result.update({"change", "start_end_change", "percentage_change"})
-    if any(marker in lowered for marker in ("count", "record", "数量", "条数", "多少条")):
-        result.update({"record_count", "row_count", "count"})
-    return result
-
-
-def _canonical_fact_name(name: str, fact_type: str | None = None) -> str:
-    normalized = str(name or "").strip().lower()
-    type_text = str(fact_type or "").strip().lower()
-    if normalized in {"highest_value", "max_value"} or (type_text == "extreme" and "min" not in normalized and "low" not in normalized):
-        return "max_value" if normalized == "max_value" else "highest_value"
-    if normalized in {"lowest_value", "min_value"}:
-        return "min_value" if normalized == "min_value" else "lowest_value"
-    if normalized in {"max_min_difference", "difference"}:
-        return "max_min_difference" if normalized == "max_min_difference" else "difference"
-    return normalized
-
-
 def _validate_fact(raw_fact: Any, *, default_method: str, default_status: str = "verified") -> DataFact | None:
     if not isinstance(raw_fact, dict):
         return None
@@ -176,6 +147,23 @@ def _validate_fact(raw_fact: Any, *, default_method: str, default_status: str = 
         return None
 
 
+def _bind_fact_contract(fact: DataFact | None, requests: list[DataFactRequest]) -> DataFact | None:
+    if fact is None or not requests:
+        return fact
+    request = next((item for item in requests if item.fact_key == fact.fact_key), None)
+    if request is None:
+        return None
+    return fact.model_copy(
+        update={
+            "fact_key": request.fact_key,
+            "name": request.name,
+            "fact_type": request.fact_type,
+            "subject": fact.subject or request.subject,
+            "time_range": fact.time_range or request.time_range,
+            "dimensions": fact.dimensions or request.dimensions,
+            "derived_from": fact.derived_from or request.derived_from,
+        }
+    )
 def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
     evidence_id = str(payload.get("evidence_id") or "")
     if not evidence_id:
@@ -221,6 +209,7 @@ def _database_fact_for_request(
             fact_id=_fact_id(evidence_ref.source_id, name, value),
             name=name,
             fact_type="count",
+            fact_key=request.fact_key,
             statement=f"{name} is {value}.",
             value=value,
             subject=request.subject,
@@ -228,17 +217,21 @@ def _database_fact_for_request(
             method="sql_query",
             evidence_refs=[evidence_ref],
             calculation_trace={"source": "normalized_database_evidence", "count_target": requirements.get("count_target") or "rows"},
+            derived_from=request.derived_from,
         )
-    if fact_type in {"time_boundary", "boundary_time"} or normalized_name in {"start_time", "end_time", "first_time", "last_time"}:
+    if fact_type in {"time_boundary", "boundary_time"}:
         if not time_key:
             return None
-        position = requirements.get("time_position") or ("end" if normalized_name in {"end_time", "last_time"} else "start")
+        position = requirements.get("time_position")
+        if position not in {"start", "end"}:
+            return None
         row = rows[-1] if position == "end" else rows[0]
         value = row.get(time_key)
         return DataFact(
             fact_id=_fact_id(evidence_ref.source_id, name, value),
             name=name,
             fact_type="time_boundary",
+            fact_key=request.fact_key,
             statement=f"{name} is {value}.",
             value=value,
             subject=request.subject,
@@ -246,9 +239,12 @@ def _database_fact_for_request(
             method="sql_query",
             evidence_refs=[evidence_ref],
             calculation_trace={"row": row, "time_key": time_key, "position": position},
+            derived_from=request.derived_from,
         )
-    if fact_type == "point_value" or name in {"start_value", "end_value"}:
-        position = requirements.get("time_position") or ("end" if "end" in name else "start")
+    if fact_type == "point_value":
+        position = requirements.get("time_position")
+        if position not in {"start", "end"}:
+            return None
         row = rows[-1] if position == "end" else rows[0]
         value = row.get(value_key)
         timestamp = row.get(time_key) if time_key else None
@@ -256,6 +252,7 @@ def _database_fact_for_request(
             fact_id=_fact_id(evidence_ref.source_id, name, value),
             name=name,
             fact_type="point_value",
+            fact_key=request.fact_key,
             statement=f"{name} is {value}" + (f" at {timestamp}." if timestamp else "."),
             value=value,
             subject=request.subject,
@@ -263,9 +260,12 @@ def _database_fact_for_request(
             method="sql_query",
             evidence_refs=[evidence_ref],
             calculation_trace={"row": row, "value_key": value_key, "time_key": time_key, "position": position},
+            derived_from=request.derived_from,
         )
-    if fact_type in {"extreme", "extrema", "extreme_time"} or name in {"highest_value", "lowest_value", "max_value", "min_value", "max_time", "min_time"}:
-        operator = requirements.get("operator") or ("min" if "low" in name or "min" in name else "max")
+    if fact_type in {"extreme", "extrema", "extreme_time"}:
+        operator = requirements.get("operator")
+        if operator not in {"min", "max"}:
+            return None
         numeric_rows = [row for row in rows if _number(row.get(value_key)) is not None]
         if not numeric_rows:
             return None
@@ -277,6 +277,7 @@ def _database_fact_for_request(
             fact_id=_fact_id(evidence_ref.source_id, name, fact_value),
             name=name,
             fact_type="extreme_time" if fact_type == "extreme_time" or name in {"max_time", "min_time"} else "extreme",
+            fact_key=request.fact_key,
             statement=(
                 f"{name} is {timestamp} for {operator}_value {value}."
                 if fact_type == "extreme_time" or name in {"max_time", "min_time"}
@@ -288,6 +289,7 @@ def _database_fact_for_request(
             method="sql_query",
             evidence_refs=[evidence_ref],
             calculation_trace={"row": row, "value_key": value_key, "time_key": time_key, "operator": operator},
+            derived_from=request.derived_from,
         )
     return None
 
@@ -302,11 +304,12 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
     if input_evidence_id:
         evidence_refs.append(FactEvidenceRef(source_type="query", source_id=str(input_evidence_id)))
     facts: list[DataFact] = []
-    requested_names = {request.name for request in requests}
+    requested_keys = {request.fact_key for request in requests}
     for raw in result.get("facts") or []:
         if not isinstance(raw, dict):
             continue
-        if requested_names and raw.get("name") not in requested_names:
+        raw_key = normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
+        if requested_keys and raw_key not in requested_keys:
             continue
         fact = _validate_fact(
             {
@@ -316,17 +319,20 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
             },
             default_method="code_interpreter",
         )
+        fact = _bind_fact_contract(fact, requests)
         if fact is not None:
             facts.append(fact)
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    native_keys = {fact.fact_key for fact in facts}
     for request in requests:
-        if request.name in metrics:
+        if request.fact_key not in native_keys and request.name in metrics:
             value = metrics[request.name]
             facts.append(
                 DataFact(
                     fact_id=_fact_id(analysis_id, request.name, value),
                     name=request.name,
                     fact_type=request.fact_type,
+                    fact_key=request.fact_key,
                     statement=f"{request.name} is {value}.",
                     value=value,
                     subject=request.subject,
@@ -334,6 +340,7 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
                     method="code_interpreter",
                     evidence_refs=evidence_refs,
                     calculation_trace={"metric_key": request.name, "code_hash": payload.get("code_hash")},
+                    derived_from=request.derived_from,
                 )
             )
     return facts
@@ -378,6 +385,7 @@ def _unavailable_fact(request: DataFactRequest, evidence_ref: FactEvidenceRef, r
         fact_id=_fact_id(evidence_ref.source_id, request.name, "unavailable"),
         name=request.name,
         fact_type=request.fact_type,
+        fact_key=request.fact_key,
         statement=f"{request.name} is unavailable: {reason}",
         subject=request.subject,
         time_range=request.time_range,
@@ -385,29 +393,53 @@ def _unavailable_fact(request: DataFactRequest, evidence_ref: FactEvidenceRef, r
         evidence_refs=[evidence_ref],
         status="unavailable",
         unavailable_reason=reason,
+        derived_from=request.derived_from,
     )
 
 
 def _coverage_for(requests: list[DataFactRequest], produced: list[DataFact], rejected: list[DataFact]) -> FactCoverage:
-    requested = [request.name for request in requests]
-    by_name = {fact.name: fact for fact in produced}
-    rejected_names = [fact.name for fact in rejected]
+    requested = list(dict.fromkeys(request.name for request in requests))
+    requests_by_key = {request.fact_key: request for request in requests}
+    by_key = {fact.fact_key: fact for fact in produced}
+    rejected_keys = {fact.fact_key for fact in rejected}
+    names_for_status = lambda status: [
+        request.name
+        for key, request in requests_by_key.items()
+        if key in by_key and by_key[key].status == status
+    ]
     return FactCoverage(
         requested=requested,
-        verified=[name for name, fact in by_name.items() if fact.status == "verified"],
-        unavailable=[name for name, fact in by_name.items() if fact.status == "unavailable"],
-        partial=[name for name, fact in by_name.items() if fact.status == "partial"],
-        rejected=rejected_names,
-        missing=[name for name in requested if name not in by_name and name not in rejected_names],
+        verified=names_for_status("verified"),
+        unavailable=names_for_status("unavailable"),
+        partial=names_for_status("partial"),
+        rejected=[request.name for key, request in requests_by_key.items() if key in rejected_keys],
+        missing=[
+            request.name
+            for key, request in requests_by_key.items()
+            if key not in by_key and key not in rejected_keys
+        ],
     )
 
 
-def _merge_fact_state(request_state, tool_name: str, produced: list[DataFact], rejected: list[DataFact], coverage: FactCoverage) -> None:
+def _merge_fact_state(
+    request_state,
+    tool_name: str,
+    requests: list[DataFactRequest],
+    produced: list[DataFact],
+    rejected: list[DataFact],
+    event_coverage: FactCoverage,
+) -> FactCoverage:
     fact_set = request_state.fact_set
-    existing = {fact.fact_id: fact for fact in fact_set.facts}
+    planned = {request.fact_key: request for request in fact_set.requests}
+    planned.update({request.fact_key: request for request in requests})
+    fact_set.requests = list(planned.values())
+    existing = {fact.fact_key: fact for fact in fact_set.facts}
     for fact in [*produced, *rejected]:
-        existing[fact.fact_id] = fact
+        current = existing.get(fact.fact_key)
+        if current is None or _fact_status_rank(fact.status) >= _fact_status_rank(current.status):
+            existing[fact.fact_key] = fact
     fact_set.facts = list(existing.values())
+    coverage = _coverage_for(fact_set.requests, fact_set.facts, [fact for fact in fact_set.facts if fact.status == "rejected"])
     fact_set.coverage = coverage
     request_state.fact_coverage = coverage
     request_state.fact_events.append(
@@ -417,9 +449,14 @@ def _merge_fact_state(request_state, tool_name: str, produced: list[DataFact], r
             produced_fact_ids=[fact.fact_id for fact in produced if fact.status == "verified"],
             unavailable_fact_ids=[fact.fact_id for fact in produced if fact.status == "unavailable"],
             rejected_fact_ids=[fact.fact_id for fact in rejected],
-            coverage=coverage,
+            coverage=event_coverage,
         )
     )
+    return coverage
+
+
+def _fact_status_rank(status: str) -> int:
+    return {"rejected": 0, "unavailable": 1, "partial": 2, "verified": 3}.get(status, 0)
 
 
 def _attach_facts_to_artifact(
@@ -464,12 +501,77 @@ def _attach_facts_to_artifact(
 def _dedupe_facts(facts: list[DataFact]) -> list[DataFact]:
     result: dict[str, DataFact] = {}
     for fact in facts:
-        result[fact.fact_id] = fact
+        result[fact.fact_key or fact.fact_id] = fact
     return list(result.values())
 
 
+def _verify_fact_dependencies(produced: list[DataFact], existing: list[DataFact]) -> list[DataFact]:
+    """Verify a Fact DAG and inherit source evidence through verified parents."""
+
+    existing_index: dict[str, DataFact] = {}
+    pending: dict[str, DataFact] = {}
+    aliases: dict[str, str] = {}
+    for fact in existing:
+        existing_index[normalize_fact_key(fact.fact_id)] = fact
+        existing_index[fact.fact_key] = fact
+    for fact in produced:
+        pending[fact.fact_key] = fact
+        aliases[normalize_fact_key(fact.fact_id)] = fact.fact_key
+    resolved: dict[str, DataFact] = {}
+
+    def verify(fact_key: str, stack: set[str]) -> DataFact:
+        if fact_key in resolved:
+            return resolved[fact_key]
+        fact = pending[fact_key]
+        if not fact.derived_from:
+            resolved[fact_key] = fact
+            return fact
+        dependencies: list[DataFact | None] = []
+        for reference in fact.derived_from:
+            reference_key = normalize_fact_key(reference)
+            dependency_key = reference_key if reference_key in pending else aliases.get(reference_key)
+            if dependency_key in stack:
+                dependencies.append(None)
+            elif dependency_key in pending:
+                dependencies.append(verify(dependency_key, {*stack, fact_key}))
+            else:
+                dependencies.append(existing_index.get(reference_key))
+        quality_flags = list(fact.quality_flags)
+        if any(dependency is None or dependency.status != "verified" for dependency in dependencies):
+            if "unverified_dependencies" not in quality_flags:
+                quality_flags.append("unverified_dependencies")
+            result = fact.model_copy(update={"status": "partial", "quality_flags": quality_flags})
+            resolved[fact_key] = result
+            return result
+        evidence_refs = list(fact.evidence_refs)
+        seen_refs = {(ref.source_type, ref.source_id) for ref in evidence_refs}
+        for dependency in dependencies:
+            for ref in dependency.evidence_refs:
+                key = (ref.source_type, ref.source_id)
+                if key not in seen_refs:
+                    evidence_refs.append(ref)
+                    seen_refs.add(key)
+        if not fact.calculation_trace:
+            if "missing_calculation_trace" not in quality_flags:
+                quality_flags.append("missing_calculation_trace")
+            result = fact.model_copy(
+                update={
+                    "status": "partial",
+                    "quality_flags": quality_flags,
+                    "evidence_refs": evidence_refs,
+                }
+            )
+            resolved[fact_key] = result
+            return result
+        result = fact.model_copy(update={"evidence_refs": evidence_refs, "quality_flags": quality_flags})
+        resolved[fact_key] = result
+        return result
+
+    return [verify(fact.fact_key, set()) for fact in produced]
+
+
 def _fact_has_evidence_or_unavailable(fact: DataFact) -> bool:
-    return fact.status == "unavailable" or bool(fact.evidence_refs)
+    return fact.status == "unavailable" or bool(fact.evidence_refs) or bool(fact.derived_from)
 
 
 def _rows_from_evidence(payload: dict) -> list[dict]:

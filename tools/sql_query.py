@@ -20,6 +20,7 @@ from core.database.schema_linking import SchemaLinkingPipeline
 from schemas.state import RequestStateModel
 from schemas.database_context import DatabaseContext
 from schemas.data_fact import DataFactRequest
+from core.data_fact.contracts import fact_request_contract_error
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -87,6 +88,9 @@ class SqlQueryInput(BaseModel):
 
     @model_validator(mode="after")
     def require_message_or_query(self):
+        errors = [error for request in self.fact_requests if (error := fact_request_contract_error(request, "sql_query"))]
+        if errors:
+            raise ValueError(" ".join(errors))
         if not (self.query and self.query.strip()) and not (self.message and self.message.strip()):
             raise ValueError("sql_query requires either message for automatic planning or query for explicit read-only execution.")
         return self

@@ -14,11 +14,13 @@ from runtime.request_state import apply_observation, build_conversation_state, b
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
+from schemas.data_fact import DataFact, DataFactRequest, FactEvidenceRef
 from schemas.tool import ToolObservation
 from tools.code_interpreter import (
     CodeInterpreterInput,
     CodeInterpreterTool,
     _preflight_analysis_code,
+    _validate_fact_output_contract,
     _validate_result_has_numeric_analysis,
 )
 
@@ -89,6 +91,85 @@ def test_generated_analysis_executes_code_over_full_evidence():
     assert result["input_row_count"] == 3
     assert result["result"]["metrics"]["count"] == 2
     assert result["result"]["metrics"]["proportion"] == pytest.approx(2 / 3)
+
+
+def test_code_interpreter_composes_structured_fact_from_verified_parent_facts():
+    request_state = _request_state()
+    request_state.fact_set.facts = [
+        DataFact(
+            fact_id="fact_start",
+            fact_key="price.start",
+            name="start_price",
+            fact_type="point_value",
+            statement="Start price is 10.",
+            value=10.0,
+            method="sql_query",
+            evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_generated")],
+        ),
+        DataFact(
+            fact_id="fact_end",
+            fact_key="price.end",
+            name="end_price",
+            fact_type="point_value",
+            statement="End price is 30.",
+            value=30.0,
+            method="sql_query",
+            evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_generated")],
+        ),
+    ]
+    code = (
+        "start = float(fact_by_key['price.start']['value'])\n"
+        "end = float(fact_by_key['price.end']['value'])\n"
+        "change = (end - start) / start * 100\n"
+        "result = {'summary': 'price change computed', 'metrics': {'percentage_change': change}, 'details': {}, "
+        "'facts': [{'fact_key': 'price.percentage_change', 'name': 'percentage_change', "
+        "'fact_type': 'difference', 'statement': f'Price changed by {change}%.', 'value': change, "
+        "'derived_from': ['price.start', 'price.end'], "
+        "'calculation_trace': {'formula': '(end - start) / start * 100'}}]}"
+    )
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence="evi_generated",
+                analysis_goal="percentage change",
+                code=code,
+                fact_requests=[
+                    {
+                        "fact_key": "price.percentage_change",
+                        "name": "percentage_change",
+                        "fact_type": "difference",
+                        "derived_from": ["price.start", "price.end"],
+                    }
+                ],
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["facts"][0]["fact_key"] == "price.percentage_change"
+    assert result["result"]["facts"][0]["value"] == pytest.approx(200.0)
+
+
+def test_code_interpreter_rejects_root_fact_when_database_evidence_is_empty():
+    request = DataFactRequest(
+        fact_key="price.start",
+        name="start_price",
+        fact_type="point_value",
+    )
+    result = {
+        "facts": [
+            {
+                "fact_key": "price.start",
+                "value": 16838.35,
+                "statement": "Start price is 16838.35.",
+                "calculation_trace": {"source": "generated"},
+            }
+        ]
+    }
+
+    with pytest.raises(AnalysisCodeError, match="without database rows or verified parent facts"):
+        _validate_fact_output_contract(result, [request], input_row_count=0, input_facts=[])
 
 
 def test_multiple_generated_analyses_accumulate_in_analysis_workspace():

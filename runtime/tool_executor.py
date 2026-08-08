@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+from typing import Any
 
 from core.harness import ActionOutputBuildInput, ActionOutputBuilder, default_capability_registry
 from schemas.action_output import ActionOutput
@@ -27,8 +28,9 @@ class ExecutionResult:
 class ToolExecutor:
     """Resolve, validate, and invoke one tool."""
 
-    def __init__(self, registry: ToolRegistry):
+    def __init__(self, registry: ToolRegistry, memory_retriever: Any | None = None):
         self._registry = registry
+        self._memory_retriever = memory_retriever
         self._capability_registry = default_capability_registry()
         self._action_output_builder = ActionOutputBuilder()
 
@@ -324,25 +326,29 @@ class ToolExecutor:
     ) -> dict:
         if action_name not in {"sql_query", "code_interpreter", "forecast", "anomaly"}:
             return normalized_input
-        memory_context = request_state.completion_state.get("memory_context")
-        if not isinstance(memory_context, dict):
+        if self._memory_retriever is None:
             return normalized_input
+        retrieval = await self._memory_retriever.retrieve(
+            request_state=request_state,
+            tool_name=action_name,
+            action_input=normalized_input,
+        )
         merged = dict(normalized_input)
         explicit = self._normalize_fact_requests(merged.get("fact_requests"), merged)
-        raw_requests = memory_context.get("fact_requests") if isinstance(memory_context.get("fact_requests"), list) else []
-        selected_card_ids = memory_context.get("selected_card_ids") if isinstance(memory_context.get("selected_card_ids"), list) else []
-        memory_requests = [self._memory_fact_request_payload(item, selected_card_ids) for item in raw_requests]
+        selected_card_ids = [hit.card_id for hit in retrieval.hits]
+        memory_requests = [self._memory_fact_request_payload(item, selected_card_ids) for item in retrieval.fact_requests]
         merged["fact_requests"] = self._dedupe_fact_requests([*explicit, *memory_requests])
-        diagnostics = dict(memory_context.get("diagnostics") or {})
-        diagnostics["source"] = "request_memory_context"
+        diagnostics = dict(retrieval.diagnostics or {})
+        diagnostics["source"] = "tool_scoped_memory_retrieval"
         diagnostics["selected_card_ids"] = selected_card_ids
         diagnostics["fact_request_count"] = len(memory_requests)
         constraints = merged.setdefault("constraints", {})
         if isinstance(constraints, dict) and diagnostics:
             constraints["memory_diagnostics"] = diagnostics
-        used_by_tools = memory_context.setdefault("used_by_tools", {})
-        if isinstance(used_by_tools, dict):
-            used_by_tools[action_name] = int(used_by_tools.get(action_name) or 0) + 1
+        memory_context = request_state.completion_state.setdefault("memory_context", {})
+        tool_calls = memory_context.setdefault("tool_calls", []) if isinstance(memory_context, dict) else []
+        if isinstance(tool_calls, list):
+            tool_calls.append({"tool_name": action_name, **diagnostics})
         return merged
 
     def _memory_fact_request_payload(self, request, selected_card_ids: list) -> dict:
@@ -369,8 +375,10 @@ class ToolExecutor:
                 continue
             key = json.dumps(
                 {
+                    "fact_key": payload.get("fact_key"),
                     "name": payload.get("name"),
                     "fact_type": payload.get("fact_type"),
+                    "derived_from": payload.get("derived_from") or [],
                     "requirements": payload.get("requirements") or {},
                 },
                 ensure_ascii=False,

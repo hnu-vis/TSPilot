@@ -45,6 +45,12 @@ def _execute(payload: dict) -> dict:
     columns = list(payload.get("columns") or [])
     metadata = dict(payload.get("metadata") or {})
     diagnostics = dict(payload.get("diagnostics") or {})
+    input_facts = [dict(fact) for fact in payload.get("input_facts") or [] if isinstance(fact, dict)]
+    fact_by_key = {
+        str(fact.get("fact_key") or fact.get("fact_id") or fact.get("name")): fact
+        for fact in input_facts
+        if fact.get("fact_key") or fact.get("fact_id") or fact.get("name")
+    }
     canonical_values = canonical_namespace_values(
         {
             "rows": rows,
@@ -65,6 +71,8 @@ def _execute(payload: dict) -> dict:
         "columns": columns,
         "metadata": metadata,
         "diagnostics": diagnostics,
+        "input_facts": input_facts,
+        "fact_by_key": fact_by_key,
     }
     data = dict(database_evidence["data"])
     df = canonical_values.get("df")
@@ -92,6 +100,8 @@ def _execute(payload: dict) -> dict:
         "data": data,
         "metadata": metadata,
         "diagnostics": diagnostics,
+        "input_facts": input_facts,
+        "fact_by_key": fact_by_key,
         "math": math,
         "statistics": statistics,
         "mean": statistics.mean,

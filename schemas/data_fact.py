@@ -3,21 +3,29 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 FactStatus = Literal["verified", "unavailable", "rejected", "partial"]
 
 
 class DataFactRequest(BaseModel):
-    """A tool-scoped request for a fact the tool may produce."""
+    """A semantic fact contract that one tool call may satisfy."""
 
     name: str
     fact_type: str
+    fact_key: str | None = None
     subject: str | None = None
     time_range: dict | None = None
     dimensions: dict = Field(default_factory=dict)
     requirements: dict = Field(default_factory=dict)
+    derived_from: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def assign_semantic_key(self):
+        self.fact_key = normalize_fact_key(self.fact_key or self.name)
+        self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        return self
 
 
 class FactEvidenceRef(BaseModel):
@@ -33,6 +41,7 @@ class DataFact(BaseModel):
     fact_id: str
     name: str
     fact_type: str
+    fact_key: str | None = None
     statement: str
     value: Any = None
     unit: str | None = None
@@ -48,6 +57,12 @@ class DataFact(BaseModel):
     unavailable_reason: str | None = None
     derived_from: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def assign_semantic_key(self):
+        self.fact_key = normalize_fact_key(self.fact_key or self.name)
+        self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        return self
+
 
 class FactCoverage(BaseModel):
     requested: list[str] = Field(default_factory=list)
@@ -59,6 +74,7 @@ class FactCoverage(BaseModel):
 
 
 class FactSet(BaseModel):
+    requests: list[DataFactRequest] = Field(default_factory=list)
     facts: list[DataFact] = Field(default_factory=list)
     coverage: FactCoverage = Field(default_factory=FactCoverage)
 
@@ -115,6 +131,7 @@ class MemoryDetail(BaseModel):
     id: str
     card: MemoryCard
     fact_request: DataFactRequest | None = None
+    preferred_tool: str | None = None
     guidance: str | None = None
     examples: list[str] = Field(default_factory=list)
 
@@ -126,3 +143,11 @@ class FactMemory(BaseModel):
     details: list[MemoryDetail] = Field(default_factory=list)
     storage_path: str | None = None
     updated_at: str | None = None
+
+
+def normalize_fact_key(value: str) -> str:
+    """Normalize a model-provided semantic key without inferring aliases."""
+
+    text = str(value or "").strip().lower()
+    normalized = "".join(character if character.isalnum() or character in {".", "_", "-"} else "_" for character in text)
+    return "_".join(part for part in normalized.split("_") if part) or "fact"

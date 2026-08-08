@@ -121,3 +121,32 @@ async def test_terminate_defaults_to_process_fact_ids_for_formatter():
     facts_section = next(section for section in payload["sections"] if section["section_type"] == "facts")
     assert "max_value is 51.0" in facts_section["content"]
     assert "record_count" not in facts_section["content"]
+
+
+@pytest.mark.asyncio
+async def test_terminate_resolves_semantic_fact_keys_and_names():
+    request_state = RequestStateModel(
+        request_id="req-semantic-facts",
+        message="change",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+    )
+    fact = DataFact(
+        fact_id="fact_change",
+        fact_key="price.percentage_change",
+        name="percentage_change",
+        fact_type="difference",
+        statement="Price increased by 20%.",
+        value=20.0,
+        method="code_interpreter",
+        evidence_refs=[FactEvidenceRef(source_type="analysis", source_id="ana_change")],
+    )
+    request_state.fact_set.facts = [fact]
+
+    payload = await TerminateTool().execute(
+        TerminateInput(result="Price increased by 20%.", include_fact_ids=["percentage_change"]),
+        request_state=request_state,
+    )
+
+    facts_section = next(section for section in payload["sections"] if section["section_type"] == "facts")
+    assert "Price increased by 20%." in facts_section["content"]

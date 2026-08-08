@@ -7,7 +7,8 @@ Assemble the final user-facing answer from verified outputs.
 ## Input
 
 - `summary_goal: str`
-- optional `include_fact_ids: list[str]`
+- optional `include_fact_ids: list[str]` accepting Fact IDs, semantic Fact keys,
+  or unambiguous Fact names
 - optional `include_visualization_ids: list[str]`
 - optional `section_plan: list[str]`
 

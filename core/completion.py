@@ -287,6 +287,7 @@ def _contract_output_keys(output) -> set[str]:
 def _fact_keys(fact) -> set[str]:
     keys = {
         str(getattr(fact, "fact_id", "") or "").strip().lower(),
+        str(getattr(fact, "fact_key", "") or "").strip().lower(),
         str(getattr(fact, "name", "") or "").strip().lower(),
         str(getattr(fact, "fact_type", "") or "").strip().lower(),
         str(getattr(fact, "subject", "") or "").strip().lower(),
@@ -304,6 +305,7 @@ def _fact_keys(fact) -> set[str]:
             value = trace.get(key)
             if isinstance(value, (str, int, float, bool)):
                 keys.add(str(value).strip().lower())
+    keys.update(str(item or "").strip().lower() for item in getattr(fact, "derived_from", []) or [])
     return {key for key in keys if key}
 
 
