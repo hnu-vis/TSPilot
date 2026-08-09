@@ -470,5 +470,6 @@ def test_generated_analysis_supports_python_sandbox_v1():
     assert result["status"] == "succeeded"
     assert result["code_type"] == "code_interpreter_v1"
     assert result["diagnostics"]["sandbox"] == "subprocess_code_interpreter_v1"
+    assert result["diagnostics"]["executed_code"].startswith("total = len(rows)")
     assert result["input_row_count"] == 3
     assert result["result"]["metrics"]["count"] == 2

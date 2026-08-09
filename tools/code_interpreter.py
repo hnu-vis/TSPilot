@@ -249,6 +249,7 @@ class CodeInterpreterTool(BaseTool):
                 "input_columns": columns,
                 "input_points_count": len(points),
                 "sandbox": "subprocess_code_interpreter_v1" if code_type == "code_interpreter_v1" else "analysis_request_template_v1",
+                "executed_code": final_code_text if code_text else None,
                 "generated_code_preview": generated_code_preview,
                 "executed_code_preview": executed_code_preview,
                 "internal_repair_attempts": repair_attempts,

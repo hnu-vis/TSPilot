@@ -1,5 +1,16 @@
-import { AlertCircle, BrainCircuit, Database, FileText, RefreshCw } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import {
+  AlertCircle,
+  BookOpen,
+  BrainCircuit,
+  Braces,
+  Database,
+  FileText,
+  HardDrive,
+  RefreshCw,
+  Search,
+  Wrench,
+} from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import { fetchFactMemory, fetchFactMemoryDetail } from '../services/api';
 import type { DatabaseResource, FactMemoryResponse, MemoryCard, MemoryDetail } from '../types';
 
@@ -16,6 +27,8 @@ type MemoryState = {
 
 export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
   const [scope, setScope] = useState<'global' | 'database'>('global');
+  const [query, setQuery] = useState('');
+  const [kindFilter, setKindFilter] = useState<'all' | 'definition' | 'recipe'>('all');
   const [reloadToken, setReloadToken] = useState(0);
   const [state, setState] = useState<MemoryState>({ loading: false, error: null, data: null });
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
@@ -49,6 +62,34 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
   }, [databaseId, reloadToken]);
 
   const cards = state.data?.memory.cards || [];
+  const visibleCards = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return cards.filter((card) => {
+      const kindMatches = kindFilter === 'all'
+        || (kindFilter === 'definition' && card.kind === 'fact_definition')
+        || (kindFilter === 'recipe' && card.kind === 'fact_recipe');
+      if (!kindMatches) return false;
+      if (!normalizedQuery) return true;
+      return [card.title, card.description, card.kind, ...(card.tags || [])]
+        .join(' ')
+        .toLowerCase()
+        .includes(normalizedQuery);
+    });
+  }, [cards, kindFilter, query]);
+  const summary = state.data?.prompt_view?.summary;
+  const summaryRecord = summary && typeof summary === 'object'
+    ? summary as Record<string, unknown>
+    : {};
+
+  useEffect(() => {
+    if (cards.length === 0) {
+      setSelectedCardId(null);
+      return;
+    }
+    if (!selectedCardId || !cards.some((card) => card.id === selectedCardId)) {
+      setSelectedCardId(cards[0].id);
+    }
+  }, [cards, selectedCardId]);
 
   useEffect(() => {
     if (!selectedCardId) {
@@ -77,13 +118,8 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
 
   return (
     <section className="fact-memory-manager" aria-label="Fact memory">
-      <div className="fact-memory-header">
-        <div>
-          <span className="database-kicker">Long-term memory</span>
-          <h2>Fact Memory</h2>
-          <p>Memory cards summarize reusable fact-generation intent. Concrete numeric facts are regenerated from current evidence.</p>
-        </div>
-        <div className="fact-memory-actions">
+      <div className="fact-memory-toolbar">
+        <div className="fact-memory-scope">
           <div className="segmented-control" aria-label="Fact memory scope">
             <button type="button" className={scope === 'global' ? 'active' : ''} onClick={() => setScope('global')}>
               <BrainCircuit size={14} />
@@ -99,9 +135,33 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
               <span>Database</span>
             </button>
           </div>
-          <button className="icon-text-button" type="button" disabled={state.loading} onClick={() => setReloadToken((value) => value + 1)}>
-            <RefreshCw size={14} />
-            <span>{state.loading ? 'Loading' : 'Refresh'}</span>
+          <span className="fact-memory-scope-label">
+            {scope === 'database' ? activeDatabase?.display_name || activeDatabase?.name || 'No database' : 'Shared definitions and recipes'}
+          </span>
+        </div>
+        <div className="fact-memory-tools">
+          <label className="fact-memory-search">
+            <Search size={14} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search memory" aria-label="Search fact memory" />
+          </label>
+          <div className="segmented-control fact-memory-kind-filter" aria-label="Memory card type">
+            <button type="button" className={kindFilter === 'all' ? 'active' : ''} onClick={() => setKindFilter('all')}>All</button>
+            <button type="button" className={kindFilter === 'definition' ? 'active' : ''} onClick={() => setKindFilter('definition')}>
+              <BookOpen size={13} /><span>Definitions</span>
+            </button>
+            <button type="button" className={kindFilter === 'recipe' ? 'active' : ''} onClick={() => setKindFilter('recipe')}>
+              <Wrench size={13} /><span>Recipes</span>
+            </button>
+          </div>
+          <button
+            className="database-source-add"
+            type="button"
+            title="Refresh memory"
+            aria-label="Refresh memory"
+            disabled={state.loading}
+            onClick={() => setReloadToken((value) => value + 1)}
+          >
+            <RefreshCw size={14} className={state.loading ? 'spin' : ''} />
           </button>
         </div>
       </div>
@@ -121,25 +181,29 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
 
       <div className="fact-memory-meta">
         <div>
-          <strong>{cards.length.toLocaleString()}</strong>
-          <span>cards</span>
+          <span>Visible</span>
+          <strong>{visibleCards.length.toLocaleString()} <small>of {cards.length.toLocaleString()}</small></strong>
         </div>
         <div>
-          <strong>{scope === 'database' ? activeDatabase?.display_name || activeDatabase?.name || 'Database' : 'Global'}</strong>
-          <span>scope</span>
+          <span>Definitions</span>
+          <strong>{String(summaryRecord.definition_count ?? cards.filter((card) => card.kind === 'fact_definition').length)}</strong>
         </div>
         <div>
-          <strong>{state.data?.memory.updated_at || 'default'}</strong>
-          <span>updated</span>
+          <span>Recipes</span>
+          <strong>{String(summaryRecord.recipe_count ?? cards.filter((card) => card.kind === 'fact_recipe').length)}</strong>
+        </div>
+        <div>
+          <span>Updated</span>
+          <strong>{formatMemoryTimestamp(state.data?.memory.updated_at)}</strong>
         </div>
       </div>
 
       <div className="fact-memory-grid">
-        <section className="database-section">
-          <SectionTitle icon={BrainCircuit} title="Memory cards" count={cards.length} />
-          {cards.length > 0 ? (
+        <section className="database-section fact-memory-index">
+          <SectionTitle icon={BrainCircuit} title="Memory index" count={visibleCards.length} />
+          {visibleCards.length > 0 ? (
             <div className="fact-definition-list">
-              {cards.map((card) => (
+              {visibleCards.map((card) => (
                 <MemoryCardItem
                   key={card.id}
                   card={card}
@@ -149,12 +213,12 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
               ))}
             </div>
           ) : (
-            <EmptyState label="No memory cards stored." />
+            <EmptyState label={cards.length ? 'No memory cards match the current filter.' : 'No memory cards stored.'} />
           )}
         </section>
 
-        <section className="database-section">
-          <SectionTitle icon={FileText} title="Selected detail" count={detailState.detail ? 1 : 0} />
+        <section className="database-section fact-memory-detail">
+          <SectionTitle icon={FileText} title="Contract detail" count={detailState.detail ? 1 : 0} />
           {detailState.loading ? (
             <EmptyState label="Loading memory detail." />
           ) : detailState.error ? (
@@ -164,20 +228,12 @@ export function FactMemoryManager({ databases, selectedDatabaseId }: Props) {
           ) : (
             <EmptyState label="Select a memory card to load its detail." />
           )}
+          <div className="fact-memory-storage">
+            <span><HardDrive size={13} /> Storage</span>
+            <code>{state.data?.memory.storage_path || 'Default in-memory definitions'}</code>
+          </div>
         </section>
       </div>
-
-      <section className="database-section fact-memory-source-section">
-        <SectionTitle icon={FileText} title="Storage" count={state.data?.memory.storage_path ? 1 : 0} />
-        <div className="chip-list compact">
-          {(state.data?.prompt_view?.summary && typeof state.data.prompt_view.summary === 'object')
-            ? Object.entries(state.data.prompt_view.summary as Record<string, unknown>).slice(0, 6).map(([key, value]) => (
-              <span key={key}>{key}: {String(value)}</span>
-            ))
-            : null}
-        </div>
-        {state.data?.memory.storage_path && <p className="sample-note">{state.data.memory.storage_path}</p>}
-      </section>
     </section>
   );
 }
@@ -195,8 +251,9 @@ function MemoryCardItem({ card, selected, onSelect }: { card: MemoryCard; select
   return (
     <button type="button" className={`fact-memory-card ${selected ? 'selected' : ''}`} onClick={onSelect}>
       <div className="fact-memory-card-title">
+        <span className="fact-memory-card-icon">{card.kind === 'fact_recipe' ? <Wrench size={14} /> : <BookOpen size={14} />}</span>
         <strong>{card.title}</strong>
-        <span>{card.kind}</span>
+        <span>{card.kind === 'fact_recipe' ? 'Recipe' : 'Definition'}</span>
       </div>
       <p>{card.description}</p>
       <div className="chip-list compact">
@@ -211,10 +268,16 @@ function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
   return (
     <article className="fact-memory-card">
       <div className="fact-memory-card-title">
+        <span className="fact-memory-card-icon"><Braces size={14} /></span>
         <strong>{detail.card.title}</strong>
-        <span>{detail.card.kind}</span>
+        <span>{detail.card.kind === 'fact_recipe' ? 'Recipe' : 'Definition'}</span>
       </div>
       <p>{detail.guidance || detail.card.description}</p>
+      <dl className="fact-memory-contract-meta">
+        <div><dt>Memory ID</dt><dd><code>{detail.id}</code></dd></div>
+        <div><dt>Preferred tool</dt><dd>{detail.preferred_tool || 'Defined by runtime contract'}</dd></div>
+        <div><dt>Verification tags</dt><dd>{(detail.card.tags || []).join(' · ') || 'None'}</dd></div>
+      </dl>
       {detail.fact_request && <pre className="debug-json">{JSON.stringify(detail.fact_request, null, 2)}</pre>}
       {detail.examples && detail.examples.length > 0 && (
         <div className="chip-list compact">
@@ -223,6 +286,18 @@ function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
       )}
     </article>
   );
+}
+
+function formatMemoryTimestamp(value?: string | null) {
+  if (!value) return 'Built in';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
 }
 
 function EmptyState({ label }: { label: string }) {

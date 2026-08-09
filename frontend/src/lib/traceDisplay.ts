@@ -286,6 +286,7 @@ export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null
 export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite') return 'Plan the work';
   if (tool === 'sql_query' || tool === 'query_database') return 'Data retrieval';
+  if (tool === 'code_interpreter') return 'Code analysis';
   if (tool === 'anomaly') return 'Check anomalies';
   if (tool === 'forecast') return 'Forecast trend';
   if (tool === 'rag') return 'Retrieve knowledge';
@@ -300,6 +301,7 @@ export function titleForTool(tool?: string, phase?: string) {
 function categoryForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite' || phase === 'intent') return 'Plan';
   if (tool === 'sql_query' || tool === 'query_database' || phase === 'tool_selection') return 'Data';
+  if (tool === 'code_interpreter') return 'Analysis';
   if (phase === 'answer_assembly') return 'Answer';
   if (tool === 'rag' || tool === 'skill') return 'Context';
   return 'Analysis';
@@ -345,7 +347,7 @@ function metricsForTool(
   addMetric(metrics, 'Points', numberFrom(preview?.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
   addMetric(metrics, 'Series', numberFrom(preview?.series_count) ?? nestedNumber(preview, ['summary_stats', 'series_count']));
   addMetric(metrics, 'Facts', numberFrom(preview?.verified_fact_count));
-  const producedFacts = recordsFrom(preview?.produced_facts);
+  const producedFacts = factRecordsFrom(preview);
   if (producedFacts.length > 0 && !metrics.some((metric) => metric.label === 'Facts')) {
     addMetric(metrics, 'Facts', producedFacts.length);
   }
@@ -372,22 +374,26 @@ function factDetailFor(
   step: TraceStep,
 ): FactDetail | null {
   const actionInput = asRecord(step.actionInput) || asRecord(call?.action_input);
-  const requested = recordsFrom(actionInput?.fact_requests)
+  const analysisRequest = asRecord(actionInput?.analysis_request);
+  const directRequests = recordsFrom(actionInput?.fact_requests);
+  const requested = (directRequests.length > 0 ? directRequests : recordsFrom(analysisRequest?.fact_requests))
     .map((item) => ({
+      fact_key: stringFrom(item.fact_key) || undefined,
       name: stringFrom(item.name) || '',
       fact_type: stringFrom(item.fact_type) || 'custom',
       subject: stringFrom(item.subject),
       time_range: asRecord(item.time_range),
       dimensions: asRecord(item.dimensions) || {},
       requirements: asRecord(item.requirements) || {},
+      derived_from: stringsFrom(item.derived_from),
     }))
     .filter((item) => item.name);
-  const produced = recordsFrom(preview?.produced_facts)
+  const produced = factRecordsFrom(preview)
     .map((item) => dataFactFromRecord(item))
     .filter((item): item is DataFact => Boolean(item));
   const coverage = coverageFromRecord(asRecord(preview?.fact_coverage));
   const contextSummary = asRecord(asRecord(preview?.data_fact_context)?.summary);
-  if (requested.length === 0 && produced.length === 0 && !coverage && !contextSummary) return null;
+  if (requested.length === 0 && produced.length === 0 && !coverage) return null;
   return {
     requested,
     produced,
@@ -402,6 +408,7 @@ function dataFactFromRecord(item: Record<string, unknown>): DataFact | null {
   if (!factId || !name) return null;
   return {
     fact_id: factId,
+    fact_key: stringFrom(item.fact_key) || undefined,
     name,
     fact_type: stringFrom(item.fact_type) || 'custom',
     statement: stringFrom(item.statement) || name,
@@ -428,7 +435,7 @@ function dataFactFromRecord(item: Record<string, unknown>): DataFact | null {
 
 function coverageFromRecord(record: Record<string, unknown> | null): FactCoverage | null {
   if (!record) return null;
-  return {
+  const coverage = {
     requested: stringsFrom(record.requested),
     verified: stringsFrom(record.verified),
     missing: stringsFrom(record.missing),
@@ -436,6 +443,7 @@ function coverageFromRecord(record: Record<string, unknown> | null): FactCoverag
     rejected: stringsFrom(record.rejected),
     partial: stringsFrom(record.partial),
   };
+  return Object.values(coverage).some((items) => items.length > 0) ? coverage : null;
 }
 
 function artifactRefsFor(preview: Record<string, unknown> | null, result: Record<string, unknown> | null) {
@@ -695,6 +703,11 @@ function recordsFrom(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => Boolean(asRecord(item)))
     : [];
+}
+
+function factRecordsFrom(preview: Record<string, unknown> | null | undefined) {
+  const complete = recordsFrom(preview?.produced_facts);
+  return complete.length > 0 ? complete : recordsFrom(preview?.produced_facts_preview);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

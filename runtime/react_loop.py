@@ -474,6 +474,12 @@ class ReActLoop:
                 execution_result.tool_spec,
             )
             execution_result.observation = transition_result.observation
+            execution_result.action_output = self._action_output_builder.refresh_after_transition(
+                execution_result.action_output,
+                transition_result.observation,
+                action_input=turn.action_input,
+                request_id=request_state.request_id,
+            )
             self._attach_action_output_timing(execution_result.action_output, tool_timing)
             self._attach_todo_snapshot(execution_result.action_output, request_state)
             self._store_action_output(request_state, execution_result.action_output)
@@ -1317,14 +1323,18 @@ class ReActLoop:
             "runtime_ms": diagnostics.get("runtime_ms"),
             "input_columns": diagnostics.get("input_columns") if isinstance(diagnostics.get("input_columns"), list) else [],
             "code_preview": (
-                diagnostics.get("executed_code_preview", {}).get("preview")
+                diagnostics.get("executed_code")
+                if isinstance(diagnostics.get("executed_code"), str)
+                else diagnostics.get("executed_code_preview", {}).get("preview")
                 if isinstance(diagnostics.get("executed_code_preview"), dict)
                 else diagnostics.get("generated_code_preview", {}).get("preview")
                 if isinstance(diagnostics.get("generated_code_preview"), dict)
                 else None
             ),
             "analysis_code_chars": (
-                diagnostics.get("executed_code_preview", {}).get("char_count")
+                len(diagnostics.get("executed_code"))
+                if isinstance(diagnostics.get("executed_code"), str)
+                else diagnostics.get("executed_code_preview", {}).get("char_count")
                 if isinstance(diagnostics.get("executed_code_preview"), dict)
                 else diagnostics.get("generated_code_preview", {}).get("char_count")
                 if isinstance(diagnostics.get("generated_code_preview"), dict)

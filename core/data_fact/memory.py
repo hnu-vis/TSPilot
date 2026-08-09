@@ -72,7 +72,7 @@ def prompt_fact_memory_view(database_id: str | None = None) -> dict:
     return memory_cards_view(database_id)
 
 
-def memory_cards_view(database_id: str | None = None) -> dict:
+def memory_cards_view(database_id: str | None = None, *, max_cards: int | None = 24) -> dict:
     global_memory = read_fact_memory(None)
     scoped_memory = read_fact_memory(database_id) if database_id else FactMemory()
     memory = _materialize_card_memory(_dedupe_memory(
@@ -85,11 +85,13 @@ def memory_cards_view(database_id: str | None = None) -> dict:
             updated_at=scoped_memory.updated_at or global_memory.updated_at,
         )
     ))
-    cards = memory.cards[:24]
+    cards = memory.cards if max_cards is None else memory.cards[:max_cards]
+    definition_cards = [card for card in memory.cards if card.kind == "fact_definition"]
+    recipe_cards = [card for card in memory.cards if card.kind == "fact_recipe"]
     return {
         "summary": {
-            "definition_count": len(memory.definitions),
-            "recipe_count": len(memory.recipes),
+            "definition_count": len(definition_cards),
+            "recipe_count": len(recipe_cards),
             "card_count": len(memory.cards),
             "available_titles": [item.title for item in cards[:12]],
         },

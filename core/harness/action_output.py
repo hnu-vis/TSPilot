@@ -86,6 +86,45 @@ class ActionOutputBuilder:
             )
         )
 
+    def refresh_after_transition(
+        self,
+        action_output: ActionOutput,
+        observation: ToolObservation,
+        *,
+        action_input: dict,
+        request_id: str,
+    ) -> ActionOutput:
+        """Rebuild model and UI views from the post-transition observation."""
+
+        refreshed = self.build(
+            ActionOutputBuildInput(
+                tool_name=action_output.tool_name,
+                success=action_output.success,
+                summary=observation.summary,
+                full_payload=observation.payload if isinstance(observation.payload, dict) else {},
+                result_target=str((action_output.meta or {}).get("result_target") or "tool"),
+                action_input=action_input,
+                iteration=int((action_output.meta or {}).get("iteration") or 0),
+                request_id=request_id,
+                produces_terminal_payload=action_output.terminate,
+                error=action_output.error,
+            )
+        )
+        old_view = action_output.view if isinstance(action_output.view, dict) else {}
+        new_view = refreshed.view if isinstance(refreshed.view, dict) else {}
+        old_payload = old_view.get("payload") if isinstance(old_view.get("payload"), dict) else {}
+        new_payload = new_view.get("payload") if isinstance(new_view.get("payload"), dict) else {}
+        merged_view = {**old_view, **new_view, "payload": {**old_payload, **new_payload}}
+        return refreshed.model_copy(
+            update={
+                "view": merged_view,
+                "resource_type": action_output.resource_type,
+                "resource_value": action_output.resource_value,
+                "resource_ref": action_output.resource_ref or refreshed.resource_ref,
+                "meta": {**refreshed.meta, **(action_output.meta or {})},
+            }
+        )
+
     def to_tool_observation(self, action_output: ActionOutput) -> ToolObservation:
         payload = action_output.observations if isinstance(action_output.observations, dict) else {"summary": action_output.observations}
         return ToolObservation(

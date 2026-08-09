@@ -172,7 +172,16 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
                     "metrics": {"mean": 1.5},
                     "details": {"n": 2},
                 },
-                "diagnostics": {"runtime_ms": 12.5, "sandbox": "subprocess_code_interpreter_v1"},
+                "diagnostics": {
+                    "runtime_ms": 12.5,
+                    "sandbox": "subprocess_code_interpreter_v1",
+                    "executed_code": "result = {'summary': 'computed', 'metrics': {'mean': 1.5}, 'details': {'n': 2}}",
+                    "executed_code_preview": {
+                        "line_count": 1,
+                        "char_count": 87,
+                        "preview": "result = {'summary': 'computed', 'metrics': {'mean': 1.5}, 'details': {'n': 2}}",
+                    },
+                },
             },
             result_target="analysis",
             action_input={
@@ -190,5 +199,72 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
     assert payload["analysis_code_chars"] > 0
     assert payload["metrics_preview"] == {"mean": 1.5}
     assert payload["details_preview"] == {"n": 2}
+    assert payload["runtime_ms"] == 12.5
+    assert payload["code_preview"].startswith("result =")
+    assert payload["analysis_code_chars"] == len(payload["code_preview"])
     assert action_output.memory_fragment["action_input"]["analysis_goal"] == "compute stats"
     assert "analysis_code" not in action_output.memory_fragment["action_input"]
+
+
+def test_refresh_after_transition_exposes_registered_code_facts_and_keeps_artifact():
+    builder = ActionOutputBuilder()
+    initial = builder.build(
+        ActionOutputBuildInput(
+            tool_name="code_interpreter",
+            success=True,
+            summary="computed",
+            full_payload={"analysis_id": "ana_demo", "status": "succeeded", "result": {}},
+            result_target="analysis",
+            action_input={"analysis_code": "result = {}"},
+            iteration=2,
+            request_id="req_demo",
+        )
+    )
+    observation = ToolObservation(
+        tool_name="code_interpreter",
+        success=True,
+        summary="computed",
+        payload={
+            "analysis_id": "ana_demo",
+            "status": "succeeded",
+            "result": {},
+            "produced_facts": [
+                {
+                    "fact_id": "fact_demo",
+                    "fact_key": "mean_value",
+                    "name": "Mean value",
+                    "fact_type": "aggregate",
+                    "statement": "Mean value is 1.5.",
+                    "value": 1.5,
+                    "method": "code_interpreter",
+                    "status": "verified",
+                    "evidence_refs": [],
+                    "calculation_trace": {},
+                    "derived_from": [],
+                }
+            ],
+            "fact_coverage": {
+                "requested": ["Mean value"],
+                "verified": ["Mean value"],
+                "missing": [],
+                "unavailable": [],
+                "rejected": [],
+                "partial": [],
+            },
+        },
+    )
+
+    refreshed = builder.refresh_after_transition(
+        initial,
+        observation,
+        action_input={},
+        request_id="req_demo",
+    )
+
+    payload = refreshed.view["payload"]
+    assert payload["produced_fact_count"] == 1
+    assert payload["produced_facts_preview"][0]["fact_key"] == "mean_value"
+    assert payload["fact_coverage"]["verified"] == ["Mean value"]
+    assert payload["code_preview"] == "result = {}"
+    assert refreshed.resource_value == initial.resource_value
+    assert refreshed.resource_ref == initial.resource_ref

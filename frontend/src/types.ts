@@ -57,6 +57,7 @@ export type FactEvidenceRef = {
 
 export type DataFact = {
   fact_id: string;
+  fact_key?: string;
   name: string;
   fact_type: string;
   statement: string;
@@ -76,12 +77,14 @@ export type DataFact = {
 };
 
 export type DataFactRequest = {
+  fact_key?: string;
   name: string;
   fact_type: string;
   subject?: string | null;
   time_range?: Record<string, unknown> | null;
   dimensions?: Record<string, unknown>;
   requirements?: Record<string, unknown>;
+  derived_from?: string[];
 };
 
 export type FactCoverage = {
@@ -106,6 +109,7 @@ export type MemoryDetail = {
   id: string;
   card: MemoryCard;
   fact_request?: Record<string, unknown> | null;
+  preferred_tool?: string | null;
   guidance?: string | null;
   examples?: string[];
 };

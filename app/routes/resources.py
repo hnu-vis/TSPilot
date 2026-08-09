@@ -203,7 +203,7 @@ async def preview_database_resource(database_id: str, refresh: bool = Query(defa
 async def get_global_fact_memory() -> dict:
     """Return prompt-safe fact memory cards."""
     memory = read_fact_memory(None)
-    view = memory_cards_view(None)
+    view = memory_cards_view(None, max_cards=None)
     return {
         "memory": {
             "cards": view.get("cards", []),
@@ -230,7 +230,7 @@ async def get_database_fact_memory(database_id: str) -> dict:
     if not config:
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
     memory = read_fact_memory(database_id)
-    view = memory_cards_view(database_id)
+    view = memory_cards_view(database_id, max_cards=None)
     return {
         "database": _public_database_config(database_id, config),
         "memory": {

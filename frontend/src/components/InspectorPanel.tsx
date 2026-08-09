@@ -1,4 +1,4 @@
-import { Activity, AlertCircle, CheckCircle2, ChevronDown, Clipboard, Code2, Database, FileText, LineChart, ListChecks, Network, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { Activity, AlertCircle, ArrowRight, CheckCircle2, ChevronDown, Clipboard, Code2, FileText, LineChart, ListChecks, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
@@ -19,6 +19,7 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
     : null;
   const activeStep = selectedStep || steps[steps.length - 1] || null;
   const displayStep = activeStep ? toDisplayStep(activeStep) : null;
+  const activeStepIndex = activeStep ? steps.findIndex((step) => step.id === activeStep.id) : -1;
 
   if (collapsed) {
     return (
@@ -35,10 +36,11 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
     <aside className="inspector-panel" aria-label="Run details">
       <header>
         <div>
-          <p>Detail</p>
+          <p>{displayStep ? `Step ${activeStepIndex + 1} of ${steps.length} · ${displayStep.category}` : 'Run detail'}</p>
           <h2>{displayStep?.title || 'Answer'}</h2>
         </div>
         <div className="inspector-header-actions">
+          {displayStep && <span className={`status-line compact ${displayStep.status}`}>{statusLabel(displayStep.status)}</span>}
           <button type="button" onClick={onToggleCollapsed} aria-label="Collapse run details">
             <PanelRightClose size={18} />
           </button>
@@ -76,27 +78,13 @@ function ReferenceList({ answer }: { answer: FinalAnswer }) {
 }
 
 function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
-  const visibleMetrics = step.metrics.filter((metric) => metric.value !== '0' && metric.value !== '0/0');
   return (
     <>
-      {step.planDetail && <PlanPreview step={step} />}
-
-      {step.sqlDetail ? <QueryRunSummary step={step} /> : !step.hasPrimaryDetail && <StepStatusCard step={step} />}
-
-      {!step.hasPrimaryDetail && step.status !== 'error' && visibleMetrics.length > 0 && (
-        <section className="metric-grid" aria-label="Step metrics">
-          {visibleMetrics.map((metric) => (
-            <div key={metric.label} className="metric-tile">
-              <span>{metric.label}</span>
-              <strong>{metric.value}</strong>
-            </div>
-          ))}
-        </section>
-      )}
+      <ReactStepCard step={step} />
 
       {step.sqlDetail?.query && <QueryPreview detail={step.sqlDetail} />}
 
-      {step.sqlDetail && <DataPreview detail={step.sqlDetail} />}
+      {step.sqlDetail && hasQueryData(step.sqlDetail) && <DataPreview detail={step.sqlDetail} />}
 
       {step.codeInterpreterDetail && <CodeInterpreterPreview detail={step.codeInterpreterDetail} />}
 
@@ -105,198 +93,54 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
       {step.anomalyDetail && <AnomalyPreview detail={step.anomalyDetail} />}
 
       {step.factDetail && <FactPreview detail={step.factDetail} />}
-
-      {step.schemaLinkingDetail && <SchemaLinkingPreview detail={step.schemaLinkingDetail} />}
-
-      {step.completionDetail && shouldShowCompletion(step.completionDetail) && (
-        <CompletionPreview detail={step.completionDetail} />
-      )}
-
-      <ReactStepCard step={step} />
-
-      {(step.artifactRefs.length > 0 || step.debugPayload) && (
-        <AdvancedDetails step={step} />
-      )}
     </>
   );
 }
 
 function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   const detail = step.reactDetail;
+  const actionInput = compactReactInput(detail.actionInput);
+  const observation = detail.observation;
   return (
-    <details className="inspector-card react-step-card collapsible-card" open>
-      <summary className="collapsible-summary">
-        <span>
-          <ChevronDown size={15} className="collapsible-chevron" />
-          <Code2 size={16} />
-          <strong>ReAct details</strong>
-        </span>
-      </summary>
-      <div className="react-grid">
-        <ReactBlock label="Thought" value={detail.thought || 'Waiting for model reasoning.'} />
-        <ReactBlock label="Action" value={detail.action || step.category} />
-        <ReactBlock label="Action Input" value={detail.actionInput} />
-        <ReactBlock label="Observation" value={detail.observation} />
-      </div>
-    </details>
-  );
-}
-
-function ReactBlock({ label, value }: { label: string; value: unknown }) {
-  return (
-    <div className="react-block">
-      <span>{label}</span>
-      {typeof value === 'string' ? (
-        <pre>{value}</pre>
-      ) : value ? (
-        <pre>{JSON.stringify(value, null, 2)}</pre>
-      ) : (
-        <pre>Pending</pre>
-      )}
-    </div>
-  );
-}
-
-function StepStatusCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
-  return (
-    <section className="inspector-card">
+    <section className="inspector-card react-step-card">
       <div className="inspector-card-title">
-        <StatusIcon status={step.status} />
-        <h3>Status</h3>
+        <Activity size={16} />
+        <h3>ReAct</h3>
       </div>
-      <p className="step-summary">{step.summary}</p>
-      <div className={`status-line ${step.status}`}>{statusLabel(step.status)}</div>
-    </section>
-  );
-}
-
-function PlanPreview({ step }: { step: ReturnType<typeof toDisplayStep> }) {
-  const detail = step.planDetail;
-  if (!detail) return null;
-  const requiredOutputs = recordsFrom(detail.taskContract?.required_outputs);
-  return (
-    <section className="inspector-card plan-preview-card">
-      <div className="inspector-card-title">
-        <ListChecks size={16} />
-        <h3>Todo list</h3>
-        <span className={`status-line compact ${detail.planningComplete ? 'complete' : step.status}`}>
-          {detail.completed}/{detail.total || detail.todos.length}
-        </span>
-      </div>
-
-      {detail.inProgress && <p className="step-summary">Current: {detail.inProgress}</p>}
-
-      {detail.todos.length > 0 && (
-        <ol className="inspector-todo-list">
-          {detail.todos.map((todo, index) => (
-            <li key={`${todo.priority ?? index}-${todo.content}`} className={`inspector-todo-item ${todo.status}`}>
-              <span className="inspector-todo-index">{todo.priority ?? index + 1}</span>
-              <span className="inspector-todo-copy">
-                <strong>{todo.content}</strong>
-                <small>
-                  {[formatLabel(todo.status), todo.taskType ? formatLabel(todo.taskType) : null]
-                    .filter(Boolean)
-                    .join(' · ')}
-                </small>
-                {todo.acceptanceCriteria && <em>{todo.acceptanceCriteria}</em>}
-              </span>
-            </li>
-          ))}
-        </ol>
-      )}
-
-      {requiredOutputs.length > 0 && (
-        <div className="tool-result-section">
-          <div className="sample-table-caption">
-            <span>
-              <CheckCircle2 size={14} />
-              Required outputs
-            </span>
-          </div>
-          <div className="chip-list compact">
-            {requiredOutputs.slice(0, 12).map((output, index) => (
-              <span key={stringFrom(output.id) || stringFrom(output.description) || index}>
-                {stringFrom(output.description) || stringFrom(output.id) || `Output ${index + 1}`}
-              </span>
-            ))}
-          </div>
+      {detail.thought && (
+        <div className="react-thought">
+          <span>Thought</span>
+          <p>{detail.thought}</p>
         </div>
       )}
-    </section>
-  );
-}
-
-function QueryRunSummary({ step }: { step: ReturnType<typeof toDisplayStep> }) {
-  const detail = step.sqlDetail;
-  if (!detail) return null;
-  const resultSize = [
-    detail.rowCount !== null ? `${detail.rowCount.toLocaleString()} rows` : null,
-    shouldShowPointCount(detail) ? `${detail.pointCount?.toLocaleString()} points` : null,
-  ].filter(Boolean).join(' / ') || 'No visible rows';
-  const dataShape = detail.columns.length > 0
-    ? `${detail.columns.length} columns`
-    : detail.sampleRows.length || detail.samplePoints.length
-      ? 'Sample available'
-      : 'No preview';
-  return (
-    <section className="inspector-card query-run-summary">
-      <div className="inspector-card-title">
-        <StatusIcon status={step.status} />
-        <h3>Result</h3>
-        <span className={`status-line compact ${step.status}`}>{statusLabel(step.status)}</span>
-      </div>
-      <p className="step-summary">{step.summary}</p>
-      <div className="query-run-facts" aria-label="Result facts">
+      <div className="react-transition" aria-label="ReAct action and observation">
         <div>
-          <Database size={14} />
-          <span>{resultSize}</span>
+          <span>Action</span>
+          <strong>{detail.action || step.category}</strong>
         </div>
+        <ArrowRight size={15} />
         <div>
-          <Table2 size={14} />
-          <span>{dataShape}</span>
+          <span>Observation</span>
+          <strong>{step.summary}</strong>
         </div>
-        {detail.queryLanguage && (
-          <div>
-            <Code2 size={14} />
-            <span>{detail.queryLanguage.toUpperCase()}</span>
-          </div>
-        )}
       </div>
-    </section>
-  );
-}
-
-function CompletionPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['completionDetail']> }) {
-  const status =
-    detail.completed === true ? 'Complete' : detail.completed === false ? 'Needs more evidence' : 'Tracking';
-  return (
-    <section className="inspector-card">
-      <div className="inspector-card-title">
-        <CheckCircle2 size={16} />
-        <h3>Completion</h3>
-      </div>
-      <div className={`status-line ${detail.completed === false ? 'error' : 'complete'}`}>{status}</div>
-      {detail.todoProgress && detail.todoProgress.total > 0 && (
-        <p className="step-summary">
-          Todo progress: {detail.todoProgress.completed}/{detail.todoProgress.total}
-          {detail.todoProgress.inProgress ? ` · ${detail.todoProgress.inProgress}` : ''}
-        </p>
+      {actionInput && (
+        <details className="react-input-details">
+          <summary><ChevronDown size={14} className="collapsible-chevron" /> Action input</summary>
+          <pre>{JSON.stringify(actionInput, null, 2)}</pre>
+        </details>
       )}
-      {detail.reason && <p className="step-summary">{detail.reason}</p>}
-      {detail.missingItems.length > 0 && (
-        <div className="chip-list compact">
-          {detail.missingItems.map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
+      {observation && Object.keys(observation).length > 0 && (
+        <details className="react-input-details react-observation-details">
+          <summary><ChevronDown size={14} className="collapsible-chevron" /> Observation details</summary>
+          <pre>{JSON.stringify(observation, null, 2)}</pre>
+        </details>
       )}
-      {detail.nextActionHint && <p className="sample-note">{detail.nextActionHint}</p>}
     </section>
   );
 }
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
-  const queryLanguage = detail.queryLanguage || 'query';
   const queryMarkdown = fencedQueryMarkdown(detail.query || '', detail.queryLanguage);
   return (
     <details className="inspector-card sql-query-preview collapsible-card" open>
@@ -304,22 +148,25 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
         <span>
           <ChevronDown size={15} className="collapsible-chevron" />
           <Code2 size={16} />
-          <strong>Generated query</strong>
+          <strong>Query</strong>
         </span>
-        {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+        <span className="query-summary-actions">
+          {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
+          <button
+            type="button"
+            className="inspector-icon-button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              void navigator.clipboard?.writeText(detail.query || '');
+            }}
+            aria-label="Copy generated query"
+            title="Copy query"
+          >
+            <Clipboard size={13} />
+          </button>
+        </span>
       </summary>
-      <div className="query-actions">
-        <button
-          type="button"
-          className="icon-text-button"
-          onClick={() => void navigator.clipboard?.writeText(detail.query || '')}
-          aria-label="Copy generated query"
-          title="Copy query"
-        >
-          <Clipboard size={13} />
-          <span>Copy {queryLanguage}</span>
-        </button>
-      </div>
       <div className="query-markdown-render">
         <MarkdownContent content={queryMarkdown} />
       </div>
@@ -334,7 +181,7 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
     <section className="inspector-card data-preview">
       <div className="inspector-card-title sql-detail-title">
         <Table2 size={16} />
-        <h3>Returned data</h3>
+        <h3>Query data</h3>
         <span className="query-language-badge">{formatCounts(detail)}</span>
       </div>
 
@@ -348,13 +195,6 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
 
       {rows.length > 0 && tableColumns.length > 0 && (
         <div className="sample-table-section">
-          <div className="sample-table-caption">
-            <span>
-              <Table2 size={14} />
-              Sample data
-            </span>
-            <strong>{formatCounts(detail)}</strong>
-          </div>
           <div className="sample-table-wrap">
             <table className="sample-table">
               <thead>
@@ -394,7 +234,7 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
     <section className="inspector-card tool-detail-card">
       <div className="inspector-card-title sql-detail-title">
         <Code2 size={16} />
-        <h3>Code interpreter</h3>
+        <h3>Code</h3>
         {detail.codeType && <span className="query-language-badge">{detail.codeType}</span>}
       </div>
 
@@ -413,28 +253,26 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
             <span>{Math.round(detail.runtimeMs).toLocaleString()} ms</span>
           </div>
         )}
-        {detail.codeHash && (
-          <div>
-            <Code2 size={14} />
-            <span>{detail.codeHash}</span>
-          </div>
-        )}
       </div>
 
-      <ToolCodeBlock
-        title="Python code"
-        language="python"
-        code={detail.code}
-        copyLabel="Copy code"
-      />
+      {detail.code && (
+        <ToolCodeBlock
+          title="Python code"
+          language="python"
+          code={detail.code}
+          copyLabel="Copy code"
+        />
+      )}
 
-      <StructuredResult
-        title="Result"
-        summary={detail.summary}
-        metrics={detail.metrics}
-        details={detail.details}
-        fallback={detail.result}
-      />
+      {hasStructuredResult(detail) && (
+        <StructuredResult
+          title="Result"
+          summary={detail.summary}
+          metrics={detail.metrics}
+          details={detail.details}
+          fallback={detail.result}
+        />
+      )}
     </section>
   );
 }
@@ -521,7 +359,7 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
     <section className="inspector-card data-fact-preview">
       <div className="inspector-card-title sql-detail-title">
         <CheckCircle2 size={16} />
-        <h3>Data facts</h3>
+        <h3>Fact selection</h3>
         {detail.produced.length > 0 && <span className="query-language-badge">{detail.produced.length} facts</span>}
       </div>
 
@@ -535,7 +373,10 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
           </div>
           <div className="chip-list compact">
             {detail.requested.slice(0, 16).map((request) => (
-              <span key={`${request.name}-${request.fact_type}`}>{request.name} · {request.fact_type}</span>
+              <span key={request.fact_key || `${request.name}-${request.fact_type}`}>
+                {request.name} · {request.fact_type}
+                {request.derived_from?.length ? ` ← ${request.derived_from.join(', ')}` : ''}
+              </span>
             ))}
           </div>
         </div>
@@ -561,9 +402,12 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
                 <span>
                   <StatusIcon status={fact.status === 'verified' ? 'complete' : fact.status === 'unavailable' ? 'attention' : 'error'} />
                   <strong>{fact.name}</strong>
-                  <code>{fact.fact_type}</code>
+                  <code>{fact.fact_key || fact.fact_type}</code>
                 </span>
-                <span className={`status-line compact ${factStatusClass(fact.status)}`}>{formatLabel(fact.status)}</span>
+                <span className="data-fact-summary-value">
+                  {fact.value !== undefined && <strong>{formatCell(fact.value)}</strong>}
+                  <span className={`status-line compact ${factStatusClass(fact.status)}`}>{formatLabel(fact.status)}</span>
+                </span>
               </summary>
               <p className="step-summary">{fact.statement}</p>
               <dl className="answer-metric-grid">
@@ -571,6 +415,12 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
                   <dt>Method</dt>
                   <dd>{fact.method}</dd>
                 </div>
+                {fact.fact_key && (
+                  <div>
+                    <dt>Fact key</dt>
+                    <dd>{fact.fact_key}</dd>
+                  </div>
+                )}
                 {fact.value !== undefined && (
                   <div>
                     <dt>Value</dt>
@@ -581,6 +431,12 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
                   <div>
                     <dt>Reason</dt>
                     <dd>{fact.unavailable_reason}</dd>
+                  </div>
+                )}
+                {fact.derived_from && fact.derived_from.length > 0 && (
+                  <div>
+                    <dt>Derived from</dt>
+                    <dd>{fact.derived_from.join(', ')}</dd>
                   </div>
                 )}
               </dl>
@@ -594,7 +450,15 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
                 </div>
               )}
               {fact.calculation_trace && Object.keys(fact.calculation_trace).length > 0 && (
-                <pre className="debug-json">{JSON.stringify(fact.calculation_trace, null, 2)}</pre>
+                <div className="tool-result-section">
+                  <div className="sample-table-caption">
+                    <span>
+                      <Code2 size={14} />
+                      Calculation trace
+                    </span>
+                  </div>
+                  <pre className="debug-json">{JSON.stringify(fact.calculation_trace, null, 2)}</pre>
+                </div>
               )}
             </details>
           ))}
@@ -619,8 +483,10 @@ function StructuredResult({
   details: Record<string, unknown>;
   fallback: Record<string, unknown> | null;
 }) {
-  const hasMetrics = Object.keys(metrics).length > 0;
-  const hasDetails = Object.keys(details).length > 0;
+  const visibleMetrics = deduplicateStructuredEntries(metrics);
+  const visibleDetails = deduplicateStructuredEntries(details, visibleMetrics.map(([, value]) => value));
+  const hasMetrics = visibleMetrics.length > 0;
+  const hasDetails = visibleDetails.length > 0;
   return (
     <div className="tool-result-section">
       <div className="sample-table-caption">
@@ -630,17 +496,17 @@ function StructuredResult({
         </span>
       </div>
       {summary && <MarkdownContent content={summary} />}
-      {hasMetrics && <InspectorMetricGroup metrics={metrics} />}
-      {hasDetails && <KeyValuePreview title="Details" data={details} />}
+      {hasMetrics && <InspectorMetricGroup entries={visibleMetrics} />}
+      {hasDetails && <KeyValuePreview title="Details" data={Object.fromEntries(visibleDetails)} />}
       {!summary && !hasMetrics && !hasDetails && fallback && <pre className="debug-json">{JSON.stringify(fallback, null, 2)}</pre>}
     </div>
   );
 }
 
-function InspectorMetricGroup({ metrics }: { metrics: Record<string, unknown> }) {
+function InspectorMetricGroup({ entries }: { entries: Array<[string, unknown]> }) {
   return (
     <dl className="answer-metric-grid">
-      {Object.entries(metrics).map(([key, value]) => (
+      {entries.map(([key, value]) => (
         <div key={key}>
           <dt>{formatLabel(key)}</dt>
           <dd>{formatCell(value)}</dd>
@@ -726,7 +592,7 @@ function ToolCodeBlock({
         </span>
         <button
           type="button"
-          className="icon-text-button inline-copy-button"
+          className="inspector-icon-button inline-copy-button"
           onClick={(event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -736,125 +602,10 @@ function ToolCodeBlock({
           title={copyLabel}
         >
           <Clipboard size={13} />
-          <span>Copy</span>
         </button>
       </summary>
       <div className="query-markdown-render">
         <MarkdownContent content={codeMarkdown} />
-      </div>
-    </details>
-  );
-}
-
-function SchemaLinkingPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['schemaLinkingDetail']> }) {
-  return (
-    <section className="inspector-card schema-linking-preview">
-      <div className="inspector-card-title sql-detail-title">
-        <Network size={16} />
-        <h3>Schema linking</h3>
-        {detail.confidence && <span className="query-language-badge">{detail.confidence}</span>}
-      </div>
-
-      {detail.sources.length > 0 && (
-        <div className="schema-linking-group">
-          <span className="schema-linking-label">Sources</span>
-          {detail.sources.map((source) => (
-            <div key={source.name} className="schema-source-row">
-              <strong>{source.name}</strong>
-              {source.kind && <span>{source.kind}</span>}
-              {source.timeColumn && <code>{source.timeColumn}</code>}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {detail.requiredFilters.length > 0 && (
-        <div className="schema-linking-group">
-          <span className="schema-linking-label">Required filters</span>
-          <div className="schema-chip-list">
-            {detail.requiredFilters.map((filter) => (
-              <code key={`${filter.column}-${filter.value}`}>
-                {filter.column} {filter.operator} {filter.value}
-              </code>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {detail.fieldMappings.length > 0 && (
-        <div className="schema-linking-group">
-          <span className="schema-linking-label">Field mappings</span>
-          <div className="schema-mapping-list">
-            {detail.fieldMappings.slice(0, 6).map((mapping) => (
-              <div key={`${mapping.sourceName || 'source'}-${mapping.fieldName}-${mapping.role || 'role'}`} className="schema-mapping-row">
-                <span>{mapping.sourceName || 'source'}</span>
-                <strong>{mapping.fieldName}</strong>
-                {mapping.role && <code>{mapping.role}</code>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {detail.sources.some((source) => source.valueColumns.length > 0 || source.dimensionColumns.length > 0) && (
-        <div className="schema-linking-group">
-          <span className="schema-linking-label">Linked fields</span>
-          <div className="schema-chip-list">
-            {detail.sources.flatMap((source) => [
-              ...source.valueColumns.map((column) => ({ key: `${source.name}-value-${column}`, label: column, role: 'value' })),
-              ...source.dimensionColumns.map((column) => ({ key: `${source.name}-dimension-${column}`, label: column, role: 'dimension' })),
-            ]).slice(0, 10).map((field) => (
-              <code key={field.key}>{field.label} · {field.role}</code>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {detail.ambiguousTerms.length > 0 && (
-        <div className="schema-linking-group">
-          <span className="schema-linking-label">Ambiguous</span>
-          <div className="schema-chip-list">
-            {detail.ambiguousTerms.map((item) => (
-              <code key={item.term}>{item.term}: {item.candidates.join(', ')}</code>
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function AdvancedDetails({ step }: { step: ReturnType<typeof toDisplayStep> }) {
-  return (
-    <details className="debug-details advanced-details">
-      <summary>
-        <ChevronDown size={15} />
-        Advanced
-      </summary>
-      <div className="advanced-body">
-        {step.artifactRefs.length > 0 && (
-          <section className="advanced-section">
-            <div className="advanced-section-title">
-              <FileText size={14} />
-              <h4>References</h4>
-            </div>
-            <div className="chip-list compact">
-              {step.artifactRefs.map((reference) => (
-                <span key={reference}>{reference}</span>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {step.debugPayload && (
-          <section className="advanced-section">
-            <div className="advanced-section-title">
-              <Code2 size={14} />
-              <h4>Raw event</h4>
-            </div>
-            <pre className="debug-json">{JSON.stringify(step.debugPayload, null, 2)}</pre>
-          </section>
-        )}
       </div>
     </details>
   );
@@ -904,12 +655,35 @@ function shouldShowPointCount(detail: NonNullable<ReturnType<typeof toDisplaySte
   return true;
 }
 
-function shouldShowCompletion(detail: ReturnType<typeof toDisplayStep>['completionDetail']) {
-  if (!detail) return false;
-  if (detail.completed === false) return true;
-  if (detail.missingItems.length > 0) return true;
-  if (detail.nextActionHint) return true;
-  return false;
+function hasQueryData(detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']>) {
+  return detail.columns.length > 0
+    || detail.sampleRows.length > 0
+    || detail.samplePoints.length > 0
+    || detail.rowCount !== null
+    || detail.pointCount !== null;
+}
+
+function hasStructuredResult(detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']>) {
+  return Boolean(
+    detail.summary
+    || Object.keys(detail.metrics).length > 0
+    || Object.keys(detail.details).length > 0
+    || detail.result,
+  );
+}
+
+function compactReactInput(value: Record<string, unknown> | null) {
+  if (!value) return null;
+  const omitted = new Set(['code', 'analysis_code', 'database_evidence', 'history', 'fact_requests']);
+  const entries = Object.entries(value).filter(([key, entryValue]) => (
+    !omitted.has(key)
+    && entryValue !== null
+    && entryValue !== undefined
+    && entryValue !== ''
+    && !(Array.isArray(entryValue) && entryValue.length === 0)
+    && !(typeof entryValue === 'object' && !Array.isArray(entryValue) && Object.keys(entryValue as object).length === 0)
+  ));
+  return entries.length > 0 ? Object.fromEntries(entries) : null;
 }
 
 function factCoverageItems(coverage: NonNullable<ReturnType<typeof toDisplayStep>['factDetail']>['coverage']) {
@@ -937,14 +711,27 @@ function formatCell(value: unknown) {
   return JSON.stringify(value);
 }
 
-function stringFrom(value: unknown) {
-  return typeof value === 'string' && value.trim() ? value : null;
+function deduplicateStructuredEntries(
+  values: Record<string, unknown>,
+  existingValues: unknown[] = [],
+): Array<[string, unknown]> {
+  const seen = new Set(existingValues.map(structuredValueKey).filter((value): value is string => Boolean(value)));
+  return Object.entries(values).filter(([, value]) => {
+    const key = structuredValueKey(value);
+    if (!key) return true;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
-function recordsFrom(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-    : [];
+function structuredValueKey(value: unknown) {
+  if (!value || typeof value !== 'object') return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
 }
 
 function fencedQueryMarkdown(query: string, queryLanguage: string | null) {

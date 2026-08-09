@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from core.data_fact import memory as fact_memory
 from core.data_fact.contracts import fact_request_contract_error
-from schemas.data_fact import DataFact, DataFactRequest, FactEvidenceRef, FactMemory
+from schemas.data_fact import DataFact, DataFactRequest, FactEvidenceRef, FactMemory, MemoryCard
 
 
 def test_fact_memory_persists_only_verified_matching_recipes(monkeypatch):
@@ -69,3 +69,21 @@ def test_code_interpreter_cannot_replace_atomic_database_fact_without_parents():
     )
 
     assert "sql_query" in fact_request_contract_error(request, "code_interpreter")
+
+
+def test_memory_management_view_can_load_all_cards_without_expanding_prompt_view(monkeypatch):
+    cards = [
+        MemoryCard(
+            id=f"recipe.test.{index}",
+            kind="fact_recipe",
+            title=f"recipe_{index}",
+            description="Test recipe.",
+        )
+        for index in range(30)
+    ]
+    monkeypatch.setattr(fact_memory, "read_fact_memory", lambda database_id=None: FactMemory(cards=cards))
+
+    assert len(fact_memory.memory_cards_view()["cards"]) == 24
+    management_view = fact_memory.memory_cards_view(max_cards=None)
+    assert len(management_view["cards"]) == 30
+    assert management_view["summary"]["recipe_count"] == 30

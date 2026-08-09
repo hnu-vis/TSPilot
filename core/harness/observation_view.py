@@ -94,7 +94,7 @@ def _payload_view(tool_name: str, payload: dict, *, consumer: str) -> dict:
     if tool_name in {"sql_query", "query_database"}:
         return _database_payload_view(payload, consumer=consumer)
     if tool_name == "code_interpreter":
-        return _analysis_payload_view(payload)
+        return _analysis_payload_view(payload, consumer=consumer)
     if tool_name == "forecast":
         return _forecast_payload_view(payload)
     if tool_name == "anomaly":
@@ -145,10 +145,12 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
     if consumer == "public" and isinstance(produced, list):
         view["produced_fact_count"] = len(produced)
         view["produced_facts_preview"] = [_fact_view(item) for item in produced[:6] if isinstance(item, dict)]
+    if consumer == "public" and isinstance(payload.get("fact_coverage"), dict):
+        view["fact_coverage"] = payload["fact_coverage"]
     return _drop_empty(view)
 
 
-def _analysis_payload_view(payload: dict) -> dict:
+def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
     view = {
@@ -164,9 +166,27 @@ def _analysis_payload_view(payload: dict) -> dict:
         "details_preview": _bounded_value(result.get("details") if isinstance(result.get("details"), dict) else {}, max_dict_items=12),
         "diagnostics": _diagnostics_view(diagnostics),
     }
+    executed_code = diagnostics.get("executed_code_preview") if isinstance(diagnostics.get("executed_code_preview"), dict) else {}
+    generated_code = diagnostics.get("generated_code_preview") if isinstance(diagnostics.get("generated_code_preview"), dict) else {}
+    code_view = executed_code or generated_code
+    full_code = diagnostics.get("executed_code")
+    if consumer == "public" and isinstance(full_code, str) and full_code.strip():
+        view["code_preview"] = full_code
+        view["analysis_code_chars"] = len(full_code)
+    elif consumer == "public" and isinstance(code_view.get("preview"), str):
+        view["code_preview"] = code_view["preview"]
+        view["analysis_code_chars"] = code_view.get("char_count") or len(code_view["preview"])
+    if consumer == "public" and diagnostics.get("runtime_ms") is not None:
+        view["runtime_ms"] = diagnostics.get("runtime_ms")
     artifact_ref = _artifact_ref(payload)
     if artifact_ref:
         view["artifact_ref"] = artifact_ref
+    produced = payload.get("produced_facts")
+    if consumer == "public" and isinstance(produced, list):
+        view["produced_fact_count"] = len(produced)
+        view["produced_facts_preview"] = [_fact_view(item) for item in produced[:6] if isinstance(item, dict)]
+    if consumer == "public" and isinstance(payload.get("fact_coverage"), dict):
+        view["fact_coverage"] = payload["fact_coverage"]
     return _drop_empty(view)
 
 
@@ -336,14 +356,32 @@ def _series_view(series: dict) -> dict:
 
 
 def _fact_view(fact: dict) -> dict:
+    evidence_refs = fact.get("evidence_refs") if isinstance(fact.get("evidence_refs"), list) else []
     return _drop_empty(
         {
             "fact_id": fact.get("fact_id"),
+            "fact_key": fact.get("fact_key"),
             "name": fact.get("name"),
             "fact_type": fact.get("fact_type"),
             "statement": _strip_query_code(fact.get("statement")),
             "value": _sanitize_value(fact.get("value"), max_string_chars=300),
+            "unit": fact.get("unit"),
+            "method": fact.get("method"),
             "status": fact.get("status"),
+            "derived_from": _sanitize_value(fact.get("derived_from"), max_string_chars=160),
+            "evidence_refs": [
+                _drop_empty(
+                    {
+                        "source_type": item.get("source_type"),
+                        "source_id": item.get("source_id"),
+                        "locator": _sanitize_value(item.get("locator"), max_string_chars=160),
+                    }
+                )
+                for item in evidence_refs[:6]
+                if isinstance(item, dict)
+            ],
+            "calculation_trace": _sanitize_value(fact.get("calculation_trace"), max_string_chars=300),
+            "unavailable_reason": _sanitize_value(fact.get("unavailable_reason"), max_string_chars=300),
         }
     )
 

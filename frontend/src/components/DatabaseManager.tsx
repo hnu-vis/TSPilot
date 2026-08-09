@@ -247,21 +247,17 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
         {!sourcesCollapsed && (
           <>
             <div className="database-source-actions" aria-label="Source actions">
-              <button className="icon-text-button primary" type="button" onClick={openCreateForm}>
+              <button className="database-action-button primary" type="button" title="Add connection" aria-label="Add connection" onClick={openCreateForm}>
                 <Plus size={14} />
-                <span>Add</span>
               </button>
-              <button className="icon-text-button" type="button" disabled={!activeDatabase} onClick={openEditForm}>
+              <button className="database-action-button" type="button" title="Edit connection" aria-label="Edit connection" disabled={!activeDatabase} onClick={openEditForm}>
                 <Pencil size={14} />
-                <span>Edit</span>
               </button>
-              <button className="icon-text-button" type="button" disabled={!activeDatabase || testing} onClick={handleTestConnection}>
+              <button className="database-action-button" type="button" title="Test connection" aria-label="Test connection" disabled={!activeDatabase || testing} onClick={handleTestConnection}>
                 <PlugZap size={14} />
-                <span>{testing ? 'Testing' : 'Test'}</span>
               </button>
-              <button className="icon-text-button danger" type="button" disabled={!activeDatabase || saving} onClick={handleDeleteConfig}>
+              <button className="database-action-button danger" type="button" title="Delete connection" aria-label="Delete connection" disabled={!activeDatabase || saving} onClick={handleDeleteConfig}>
                 <Trash2 size={14} />
-                <span>Delete</span>
               </button>
             </div>
             <div className="database-source-list">
@@ -351,7 +347,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
             <div className="database-content-stack">
               <section className="database-section database-schema-browser">
-                <SectionTitle icon={Table2} title="Schema Objects" count={schemaObjects.length} />
+                <SectionTitle icon={Table2} title="Schema objects" count={schemaObjects.length} />
                 <SchemaObjectTable
                   items={schemaObjects}
                   activeKey={schemaObjectKey(activeObject)}
@@ -561,58 +557,31 @@ function SchemaObjectTable({
   if (items.length === 0) return <EmptyPreview label="No schema objects returned." />;
 
   return (
-    <div className="schema-table-wrap">
-      <table className="schema-object-table">
-        <thead>
-          <tr>
-            <th>Object</th>
-            <th>Namespace</th>
-            <th>Type</th>
-            <th>Rows</th>
-            <th>Fields</th>
-            <th>Preview</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => {
-            const key = schemaObjectKey(item);
-            const columns = item.columns || [];
-            const fieldValues = item.field_values || [];
-            const fieldCount = columns.length || fieldValues.length;
-            return (
-              <tr
-                key={key}
-                className={key === activeKey ? 'selected' : ''}
-                onClick={() => onSelect(item)}
-              >
-                <td>
-                  <button
-                    type="button"
-                    className="schema-object-name"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onSelect(item);
-                    }}
-                  >
-                    <Database size={14} />
-                    <span>{item.name}</span>
-                  </button>
-                </td>
-                <td>{item.schema || 'default'}</td>
-                <td>{item.type || objectTypeLabel(columns, fieldValues)}</td>
-                <td>{typeof item.row_count === 'number' ? item.row_count.toLocaleString() : 'n/a'}</td>
-                <td>{fieldCount.toLocaleString()}</td>
-                <td>
-                  <div className="schema-field-preview">
-                    {summarizeFields(item).map((field, index) => <code key={`${field}-${index}`}>{field}</code>)}
-                    {fieldCount === 0 && <span>n/a</span>}
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+    <div className="schema-object-list">
+      {items.map((item) => {
+        const key = schemaObjectKey(item);
+        const columns = item.columns || [];
+        const fieldValues = item.field_values || [];
+        const fieldCount = columns.length || fieldValues.length;
+        return (
+          <button
+            key={key}
+            type="button"
+            className={`schema-object-row ${key === activeKey ? 'selected' : ''}`}
+            onClick={() => onSelect(item)}
+          >
+            <span className="schema-object-row-icon"><Database size={14} /></span>
+            <span className="schema-object-row-copy">
+              <strong>{item.name}</strong>
+              <small>{item.schema || 'default'} · {item.type || objectTypeLabel(columns, fieldValues)}</small>
+            </span>
+            <span className="schema-object-row-counts">
+              <strong>{fieldCount}</strong>
+              <small>fields</small>
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -851,16 +820,6 @@ function normalizeFormPayload(value: DatabaseConfigInput, mode: FormMode): Parti
 function nullableString(value: string | null | undefined) {
   const trimmed = String(value || '').trim();
   return trimmed || null;
-}
-
-function summarizeFields(item: DatabasePreviewObject) {
-  const columns = item.columns || [];
-  if (columns.length > 0) {
-    return columns.slice(0, 6).map((column) => (
-      column.data_type ? `${column.name}: ${column.data_type}` : column.name
-    ));
-  }
-  return (item.field_values || []).slice(0, 6);
 }
 
 function objectTypeLabel(
