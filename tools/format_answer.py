@@ -737,7 +737,7 @@ class FormatAnswerTool(BaseTool):
         if artifact_ref:
             lines.append(f"结果引用：{artifact_ref}" if language == "zh" else f"Result reference: {artifact_ref}")
         query = str(summary.get("query") or "").strip()
-        if query and not self._is_internal_query(evidence):
+        if query:
             language = self._markdown_language(evidence.query_language)
             fence = f"```{language}\n{query}\n```" if language else f"```\n{query}\n```"
             lines.append("查询语句：" if language == "zh" else "Query statement:")
@@ -827,7 +827,7 @@ class FormatAnswerTool(BaseTool):
 
     def _query_sections(self, evidence, request_state: RequestStateModel | None = None) -> list[AnswerSection]:
         query = str(evidence.query or "").strip()
-        if not query or self._is_internal_query(evidence):
+        if not query:
             return []
         language = self._markdown_language(evidence.query_language)
         fence = f"```{language}\n{query}\n```" if language else f"```\n{query}\n```"
@@ -842,11 +842,6 @@ class FormatAnswerTool(BaseTool):
                 },
             )
         ]
-
-    def _is_internal_query(self, evidence) -> bool:
-        language = str(evidence.query_language or "").strip().lower()
-        query = str(evidence.query or "").strip().lower()
-        return language == "reference_dataset" or query.startswith("reference_dataset:")
 
     def _markdown_language(self, query_language: str | None) -> str | None:
         if not str(query_language or "").strip():

@@ -154,7 +154,10 @@ class ActionSpaceBuilder:
         if "skill" not in capabilities:
             prohibited.append("skill")
         if required:
-            prohibited.append("terminate")
+            if required[0].action != "terminate":
+                prohibited.append("terminate")
+            else:
+                prohibited.extend(VALID_ACTIONS - {"terminate"})
             return ActionSpace(
                 required_actions=tuple(required[:1]),
                 prohibited_actions=tuple(_dedupe_sorted(prohibited)),
@@ -172,11 +175,25 @@ class ActionSpaceBuilder:
             return None
         repeated = int(payload.get("repeated_failure_count") or 1)
         max_retries = int(retry_policy.get("max_equivalent_retries") or 2)
-        if repeated > max_retries and retry_policy.get("terminal_after_exhausted") is True:
-            return None
         action = str(retry_policy.get("required_action") or validation_failure.get("tool") or frame.latest_failed_tool or "").strip()
         if action not in VALID_ACTIONS:
             return None
+        if repeated > max_retries and retry_policy.get("terminal_after_exhausted") is True:
+            capability = str(validation_failure.get("capability") or action).strip()
+            return RequiredAction(
+                action="terminate",
+                reason=(
+                    f"Equivalent {action} repair attempts are exhausted. "
+                    "Return the available grounded evidence and mark the blocked output unavailable."
+                ),
+                input_guidance={
+                    "unavailable_outputs": [capability],
+                    "unavailable_reason": (
+                        f"{action} failed the same validation contract {repeated} times; "
+                        "no further equivalent retry is allowed."
+                    ),
+                },
+            )
         return RequiredAction(
             action=action,
             reason=f"Previous {action} output failed validation and must be repaired via structured repair_contract.",

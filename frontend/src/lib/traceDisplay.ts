@@ -285,7 +285,7 @@ export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null
 
 export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite') return 'Plan the work';
-  if (tool === 'sql_query' || tool === 'query_database') return 'Data retrieval';
+  if (tool === 'sql_query') return 'Data retrieval';
   if (tool === 'code_interpreter') return 'Code analysis';
   if (tool === 'anomaly') return 'Check anomalies';
   if (tool === 'forecast') return 'Forecast trend';
@@ -300,7 +300,7 @@ export function titleForTool(tool?: string, phase?: string) {
 
 function categoryForTool(tool?: string, phase?: string) {
   if (tool === 'todowrite' || phase === 'intent') return 'Plan';
-  if (tool === 'sql_query' || tool === 'query_database' || phase === 'tool_selection') return 'Data';
+  if (tool === 'sql_query' || phase === 'tool_selection') return 'Data';
   if (tool === 'code_interpreter') return 'Analysis';
   if (phase === 'answer_assembly') return 'Answer';
   if (tool === 'rag' || tool === 'skill') return 'Context';
@@ -313,7 +313,7 @@ function summaryForStep(step: TraceStep, preview: Record<string, unknown> | null
     return completionDetail.reason || completionDetail.nextActionHint || 'Needs more evidence.';
   }
   const tool = step.tool;
-  if ((tool === 'sql_query' || tool === 'query_database') && preview) {
+  if (tool === 'sql_query' && preview) {
     const rowCount = numberFrom(preview.row_count) ?? nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']);
     const pointCount = numberFrom(preview.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']);
     const seriesCount = numberFrom(preview.series_count);
@@ -459,7 +459,7 @@ function artifactRefsFor(preview: Record<string, unknown> | null, result: Record
 }
 
 function sqlDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): SqlDetail | null {
-  if (tool !== 'sql_query' && tool !== 'query_database') return null;
+  if (tool !== 'sql_query') return null;
   if (!preview) return null;
   const dataPreview = asRecord(preview.data_preview);
   const sampleRows = recordsFrom(preview.sample_rows).length > 0
@@ -562,7 +562,7 @@ function anomalyDetailFor(tool: string | undefined, preview: Record<string, unkn
 }
 
 function schemaLinkingDetailFor(tool: string | undefined, preview: Record<string, unknown> | null): SchemaLinkingDetail | null {
-  if (tool !== 'sql_query' && tool !== 'query_database') return null;
+  if (tool !== 'sql_query') return null;
   const linking = asRecord(preview?.schema_linking);
   if (!linking) return null;
   const sources = recordsFrom(linking.sources).map((source) => ({

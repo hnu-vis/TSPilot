@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the evidence contract returned by `query_database`.
+Define the evidence contract returned by `sql_query`.
 
 ## Models
 
@@ -104,7 +104,7 @@ Use when the question requires time-indexed points, trend analysis, forecast inp
 - `evidence_id` must be stable within one request and usable by references, verified facts, and visualizations
 - `summary` must always be human-readable
 - `data` must match the chosen evidence family
-- `query_database` should return the smallest evidence family that answers the request
+- `sql_query` should return the smallest evidence family that answers the request
 - if the user asks for trend / forecast / anomaly / chartable change, prefer `timeseries`
 - if the user asks for a direct scalar answer, prefer `statistics`
 - if the user asks for structure or available metrics, prefer `schema` or `metric_list`

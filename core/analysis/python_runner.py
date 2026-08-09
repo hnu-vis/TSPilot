@@ -53,6 +53,7 @@ _SAFE_BUILTINS = {
     "enumerate": enumerate,
     "filter": filter,
     "float": float,
+    "hasattr": hasattr,
     "int": int,
     "isinstance": isinstance,
     "len": len,

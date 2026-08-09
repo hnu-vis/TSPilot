@@ -27,7 +27,7 @@ def fact_request_contract_error(request: DataFactRequest, tool_name: str) -> str
                 "Produce it with sql_query, or declare verified parent fact_key values in derived_from."
             )
         return None
-    if tool_name not in {"sql_query", "query_database"}:
+    if tool_name != "sql_query":
         return None
     if request.fact_type not in SQL_FACT_TYPES:
         return (

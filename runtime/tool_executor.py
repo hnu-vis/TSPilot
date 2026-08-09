@@ -45,6 +45,11 @@ class ToolExecutor:
         tool_spec = self._registry.resolve(action_name)
         normalized_input = self._normalize_action_input(action_name, action_input, request_state)
         normalized_input = await self._apply_fact_memory(action_name, normalized_input, request_state)
+        if action_name == "code_interpreter":
+            normalized_input["fact_requests"] = self._remove_evidence_refs_from_fact_dependencies(
+                normalized_input.get("fact_requests"),
+                request_state,
+            )
         validated = tool_spec.input_model.model_validate(normalized_input)
         request_state.tool_history.append(
             ToolCall(
@@ -390,6 +395,28 @@ class ToolExecutor:
             result.append(payload)
             seen.add(key)
         return result
+
+    def _remove_evidence_refs_from_fact_dependencies(
+        self,
+        requests: list | None,
+        request_state: RequestStateModel,
+    ) -> list:
+        evidence_ids = set(request_state.database_evidence_artifacts.keys())
+        if request_state.latest_database_evidence is not None:
+            evidence_ids.add(request_state.latest_database_evidence.evidence_id)
+        evidence_refs = evidence_ids | {f"evidence:{evidence_id}" for evidence_id in evidence_ids}
+        normalized: list = []
+        for request in requests or []:
+            payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
+            dependencies = payload.get("derived_from")
+            if isinstance(dependencies, list):
+                payload["derived_from"] = [
+                    dependency
+                    for dependency in dependencies
+                    if str(dependency).strip() not in evidence_refs
+                ]
+            normalized.append(payload)
+        return normalized
 
     def _truncate_payload(self, payload: dict, request_state: RequestStateModel) -> tuple[dict, bool]:
         max_chars = int(request_state.context_budget.get("max_observation_chars", 1600))

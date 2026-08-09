@@ -8,14 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-import math
 from typing import Any
-
-from core.time_range import normalize_time_value
-
-from .contracts import QueryRequestContext, RenderedQuery
-from .query_compiler import QueryCompiler
-from .query_plan import DatabaseQueryPlan, QueryFilter, TimeRangePlan
 
 
 @dataclass(frozen=True)
@@ -28,14 +21,6 @@ class DatabaseDialect:
     generation_rules: str
     schema_linking_rules: str = ""
     sql_family: bool = False
-
-    def render_plan(self, *, context: QueryRequestContext, plan: DatabaseQueryPlan, config: dict[str, Any]) -> RenderedQuery:
-        compiled = QueryCompiler().compile(plan, db_type=self.normalized_type(context.database_type), dialect=self.normalized_type(context.database_type))
-        return RenderedQuery(
-            query_text=compiled.query,
-            query_language=compiled.language or self.query_language,
-            warnings=list(compiled.warnings),
-        )
 
     def validate_read_only(self, query: str, query_language: str | None) -> None:
         stripped = query.strip()
@@ -57,21 +42,16 @@ class DatabaseDialect:
     def schema_preview_extensions(self, *, schema: Any, preview: dict[str, Any]) -> dict[str, Any]:
         return {}
 
-    def repair_query(self, *, query: str, query_language: str | None = None, error: Exception | str | None = None):
-        from .repair import QueryRepairResult
-
-        return QueryRepairResult(query=query)
-
     def normalize_query_language(self, query_language: str | None, query: str | None = None) -> str:
         language = str(query_language or "").strip().lower()
         if language:
             return language
         return self.query_language
 
-    def has_rendered_filter(self, rendered_query: RenderedQuery, item: QueryFilter) -> bool:
-        text = rendered_query.query_text.lower()
-        column = str(item.column).lower()
-        value = str(item.value).lower()
+    def has_filter(self, query: str, *, column: str, value: Any) -> bool:
+        text = query.lower()
+        column = str(column).lower()
+        value = str(value).lower()
         return column in text and value in text
 
     def internal_columns(self) -> set[str]:
@@ -107,12 +87,6 @@ class DatabaseDialect:
             return "sql"
         return normalized
 
-    def supports_range_query(self, *, context: QueryRequestContext, intent_query_shape: str, connector: Any) -> bool:
-        return False
-
-    def range_step(self, *, time_range: dict[str, Any], constraints: dict[str, Any], parse_time) -> str | None:
-        return None
-
     @staticmethod
     def normalized_type(database_type: str | None) -> str:
         return str(database_type or "").strip().lower()
@@ -140,30 +114,6 @@ class InfluxDBFluxDialect(DatabaseDialect):
                 "when candidate tag values support them."
             ),
         )
-
-    def render_plan(self, *, context: QueryRequestContext, plan: DatabaseQueryPlan, config: dict[str, Any]) -> RenderedQuery:
-        bucket = str(config.get("bucket") or config.get("database") or "")
-        source = plan.sources[0] if plan.sources else None
-        measurement = source.name if source else ""
-        field_projection = next((item for item in plan.projections if item.alias == "value"), None)
-        field_name = field_projection.column if field_projection else (source.value_columns[0] if source and source.value_columns else "_value")
-        lines = [f'from(bucket: "{_escape_flux_string(bucket)}")', f"  |> {self._flux_range(plan.time_range, config)}"]
-        if measurement:
-            lines.append(f'  |> filter(fn: (r) => r["_measurement"] == "{_escape_flux_string(measurement)}")')
-        if field_name:
-            lines.append(f'  |> filter(fn: (r) => r["_field"] == "{_escape_flux_string(field_name)}")')
-        for item in plan.filters:
-            if item.column in {"_measurement", "_field", "_time", "time", "timestamp"}:
-                continue
-            lines.append(
-                f'  |> filter(fn: (r) => r["{_escape_flux_string(item.column)}"] {self._flux_operator(item.operator)} "{_escape_flux_string(item.value)}")'
-            )
-        aggregation = next((item.aggregation for item in plan.projections if item.aggregation), None)
-        if aggregation:
-            flux_fn = {"avg": "mean", "mean": "mean", "max": "max", "min": "min", "sum": "sum", "count": "count"}.get(aggregation, aggregation)
-            lines.append("  |> group()")
-            lines.append(f"  |> {flux_fn}()")
-        return RenderedQuery(query_text="\n".join(lines), query_language="flux")
 
     def validate_read_only(self, query: str, query_language: str | None) -> None:
         stripped = query.strip()
@@ -346,11 +296,6 @@ class InfluxDBFluxDialect(DatabaseDialect):
                 value = diagnostics.get(key)
                 if isinstance(value, list):
                     candidates.extend(value)
-            raw_rule = diagnostics.get("raw_rule_diagnostics")
-            if isinstance(raw_rule, dict):
-                value = raw_rule.get("measure_mappings")
-                if isinstance(value, list):
-                    candidates.extend(value)
         mappings = []
         seen = set()
         for item in candidates:
@@ -367,51 +312,6 @@ class InfluxDBFluxDialect(DatabaseDialect):
             mappings.append(item)
         return mappings
 
-    def repair_query(self, *, query: str, query_language: str | None = None, error: Exception | str | None = None):
-        from .repair import QueryRepairResult
-
-        error_text = str(error or "").lower()
-        raw_keep_result = self._repair_raw_keep_projection(query, error_text)
-        if raw_keep_result.changed:
-            return raw_keep_result
-        date_result = self._repair_date_import(query, error_text)
-        if date_result.changed:
-            return date_result
-        yield_result = self._repair_duplicate_default_result(query, error_text)
-        if yield_result.changed:
-            return yield_result
-        return QueryRepairResult(query=query)
-
-    def _repair_raw_keep_projection(self, query: str, error_text: str):
-        from .repair import QueryRepairResult
-
-        if "raw_series_missing_native_time_value" not in error_text and "raw flux evidence" not in error_text:
-            return QueryRepairResult(query=query)
-
-        def replace_keep(match: re.Match) -> str:
-            raw_columns = match.group(1)
-            columns = [item[0] or item[1] for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', raw_columns)]
-            preserved_tags = [
-                column
-                for column in columns
-                if column not in {"_time", "_value", "_field", "time", "timestamp", "value", "price"}
-                and not column.startswith("_")
-            ]
-            repaired = ["_time", "_value", "_field", *preserved_tags]
-            rendered = ", ".join(f'"{column}"' for column in dict.fromkeys(repaired))
-            return f"keep(columns: [{rendered}]"
-
-        repaired = re.sub(
-            r"keep\s*\(\s*columns\s*:\s*\[([^\]]*)\]",
-            replace_keep,
-            query,
-            flags=re.IGNORECASE,
-            count=1,
-        )
-        if repaired != query:
-            return QueryRepairResult(query=repaired, changed=True, reason="repaired_flux_raw_keep_projection")
-        return QueryRepairResult(query=query)
-
     def normalize_query_language(self, query_language: str | None, query: str | None = None) -> str:
         language = str(query_language or "").strip().lower()
         if language:
@@ -421,14 +321,15 @@ class InfluxDBFluxDialect(DatabaseDialect):
             return "flux"
         return "flux"
 
-    def has_rendered_filter(self, rendered_query: RenderedQuery, item: QueryFilter) -> bool:
-        text = rendered_query.query_text.lower()
-        column = str(item.column).lower()
-        value = str(item.value).lower()
+    def has_filter(self, query: str, *, column: str, value: Any) -> bool:
+        text = query.lower()
+        column = str(column).lower()
+        raw_value = value
+        normalized_value = str(value).lower()
         column_patterns = [f"r.{column}", f'r["{column}"]', f"r['{column}']"]
-        value_patterns = [f'"{value}"', f"'{value}'"]
-        if isinstance(item.value, (int, float)) and not isinstance(item.value, bool):
-            value_patterns.append(rf"(?<![\w.]){re.escape(value)}(?![\w.])")
+        value_patterns = [f'"{normalized_value}"', f"'{normalized_value}'"]
+        if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            value_patterns.append(rf"(?<![\w.]){re.escape(normalized_value)}(?![\w.])")
         has_column = any(pattern in text for pattern in column_patterns)
         has_value = any(
             re.search(pattern, text) if pattern.startswith("(?<!") else pattern in text
@@ -460,70 +361,6 @@ class InfluxDBFluxDialect(DatabaseDialect):
     def markdown_language(self, query_language: str | None = None) -> str | None:
         return "flux"
 
-    def _flux_range(self, time_range: TimeRangePlan, config: dict[str, Any]) -> str:
-        if time_range.start and time_range.end:
-            return f'range(start: {normalize_time_value(time_range.start)}, stop: {normalize_time_value(time_range.end)})'
-        if time_range.start:
-            return f'range(start: {normalize_time_value(time_range.start)})'
-        if time_range.lookback:
-            return f"range(start: -{time_range.lookback})"
-        default_range = _default_time_range(config)
-        if default_range.get("start") and default_range.get("end"):
-            return f'range(start: {normalize_time_value(default_range["start"])}, stop: {normalize_time_value(default_range["end"])})'
-        if default_range.get("start"):
-            return f'range(start: {normalize_time_value(default_range["start"])})'
-        return "range(start: 1970-01-01T00:00:00Z)"
-
-    @staticmethod
-    def _flux_operator(operator: str) -> str:
-        return "==" if operator == "=" else operator
-
-    @staticmethod
-    def _repair_date_import(query: str, error_text: str):
-        from .repair import QueryRepairResult
-
-        if "date." not in query:
-            return QueryRepairResult(query=query)
-        if 'import "date"' in query or "import 'date'" in query:
-            return QueryRepairResult(query=query)
-        if error_text and "undefined identifier date" not in error_text:
-            return QueryRepairResult(query=query)
-        return QueryRepairResult(
-            query='import "date"\n' + query,
-            changed=True,
-            reason="add_flux_date_import",
-            hint='Added Flux import "date" because the query uses date.* functions.',
-        )
-
-    @staticmethod
-    def _repair_duplicate_default_result(query: str, error_text: str):
-        from .repair import QueryRepairResult
-
-        if "tried to produce more than one result" not in error_text:
-            return QueryRepairResult(query=query)
-        if "yield(" in query:
-            return QueryRepairResult(
-                query=query,
-                hint="Flux produced multiple default results; split the query or give each result a unique yield(name).",
-            )
-        parts = [part.strip() for part in re.split(r"\n\s*\n(?=from\s*\()", query) if part.strip()]
-        if len(parts) < 2:
-            return QueryRepairResult(
-                query=query,
-                hint="Flux produced multiple default results; split the query or give each result a unique yield(name).",
-            )
-        repaired_parts = [
-            f'{part}\n  |> yield(name: "result_{index}")'
-            for index, part in enumerate(parts, start=1)
-        ]
-        return QueryRepairResult(
-            query="\n\n".join(repaired_parts),
-            changed=True,
-            reason="name_flux_results",
-            hint="Added unique yield names to multiple Flux result streams.",
-        )
-
-
 class PrometheusDialect(DatabaseDialect):
     def __init__(self):
         super().__init__(
@@ -537,34 +374,14 @@ class PrometheusDialect(DatabaseDialect):
             schema_linking_rules="For Prometheus, treat metric names as sources and labels as dimensions.",
         )
 
-    def render_plan(self, *, context: QueryRequestContext, plan: DatabaseQueryPlan, config: dict[str, Any]) -> RenderedQuery:
-        source = plan.sources[0] if plan.sources else None
-        metric_name = source.name if source else ""
-        label_filters = [item for item in plan.filters if item.column not in {"timestamp", "time", "_time"}]
-        matcher_text = ""
-        if label_filters:
-            matcher_text = "{" + ",".join(f'{item.column}="{item.value}"' for item in label_filters) + "}"
-        return RenderedQuery(query_text=f"{metric_name}{matcher_text}".strip(), query_language="promql")
-
-    def has_rendered_filter(self, rendered_query: RenderedQuery, item: QueryFilter) -> bool:
-        text = rendered_query.query_text.lower()
-        column = str(item.column).lower()
-        value = str(item.value).lower()
+    def has_filter(self, query: str, *, column: str, value: Any) -> bool:
+        text = query.lower()
+        column = str(column).lower()
+        value = str(value).lower()
         return column in text and (f'"{value}"' in text or f"'{value}'" in text)
 
     def markdown_language(self, query_language: str | None = None) -> str | None:
         return "promql"
-
-    def supports_range_query(self, *, context: QueryRequestContext, intent_query_shape: str, connector: Any) -> bool:
-        return bool(context.time_range and intent_query_shape == "raw_timeseries" and hasattr(connector, "get_range"))
-
-    def range_step(self, *, time_range: dict[str, Any], constraints: dict[str, Any], parse_time) -> str | None:
-        max_points = int(constraints.get("max_points", 240))
-        start = parse_time(time_range["start"])
-        end = parse_time(time_range["end"])
-        total_seconds = max(1, int((end - start).total_seconds()))
-        step_seconds = max(1, math.ceil(total_seconds / max_points))
-        return f"{step_seconds}s"
 
 
 class SqlFamilyDialect(DatabaseDialect):
@@ -610,34 +427,6 @@ def dialect_for_database(database_type: str | None) -> DatabaseDialect:
 
 def query_language_for_database_type(database_type: str | None) -> str:
     return dialect_for_database(database_type).query_language
-
-
-def _default_time_range(config: dict[str, Any]) -> dict[str, Any]:
-    configured = config.get("default_query_time_range") or config.get("default_time_range")
-    if isinstance(configured, dict):
-        return _normalize_time_range(configured)
-    reference_dataset = config.get("reference_dataset")
-    if isinstance(reference_dataset, dict):
-        configured = reference_dataset.get("time_range")
-        if isinstance(configured, dict):
-            return _normalize_time_range(configured)
-    return {"start": "1970-01-01T00:00:00Z"}
-
-
-def _normalize_time_range(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: raw
-        for key, raw in {
-            "start": value.get("start") or value.get("from"),
-            "end": value.get("end") or value.get("stop") or value.get("to"),
-            "lookback": value.get("lookback"),
-        }.items()
-        if raw not in (None, "")
-    }
-
-
-def _escape_flux_string(value: Any) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _apply_renames(projected: set[str], query: str) -> set[str]:

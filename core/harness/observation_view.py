@@ -26,7 +26,6 @@ INTERNAL_KEYS = {
     "repaired_from_query",
     "previous_error",
     "repair_contract",
-    "raw_rule_diagnostics",
     "runtime_ms",
     "sandbox",
     "sql_query",
@@ -91,7 +90,7 @@ def _observation_payload(observation: ToolObservation | dict | None) -> dict | N
 def _payload_view(tool_name: str, payload: dict, *, consumer: str) -> dict:
     if not isinstance(payload, dict):
         return {}
-    if tool_name in {"sql_query", "query_database"}:
+    if tool_name == "sql_query":
         return _database_payload_view(payload, consumer=consumer)
     if tool_name == "code_interpreter":
         return _analysis_payload_view(payload, consumer=consumer)
@@ -307,7 +306,17 @@ def _diagnostics_view(diagnostics: dict) -> dict:
 
 def _validation_failure_view(validation_failure: dict, *, include_retry: bool) -> dict:
     view = {}
-    for key in ("tool_name", "error_type", "message", "missing_required_filters", "missing_requirements"):
+    for key in (
+        "tool",
+        "tool_name",
+        "scope",
+        "capability",
+        "error_code",
+        "error_type",
+        "message",
+        "missing_required_filters",
+        "missing_requirements",
+    ):
         if key in validation_failure:
             view[key] = _sanitize_value(validation_failure.get(key), max_string_chars=700)
     repair_contract = validation_failure.get("repair_contract")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from core.data_fact import register_data_facts_from_payload
 from runtime.conversation_state import sync_from_request
+from runtime.tool_executor import ToolExecutor
+from schemas.database import DatabaseEvidence
 from schemas.state import ConversationStateModel, RequestStateModel
 from schemas.tool import ToolCall
 
@@ -82,6 +84,114 @@ def test_sql_evidence_without_fact_requests_does_not_register_default_facts():
 
     assert coverage.requested == []
     assert request_state.fact_set.facts == []
+
+
+def test_sql_fact_uses_query_selected_measure_when_rows_have_multiple_numeric_columns():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {"name": "latest_price", "fact_type": "point_value", "requirements": {"time_position": "end"}}
+                ]
+            },
+        )
+    )
+    payload = {
+        "evidence_id": "evi_multi_numeric",
+        "summary": "Loaded rows.",
+        "data": {
+            "rows": [
+                {"timestamp": "2023-01-01", "sequence": 1, "price": 10.0},
+                {"timestamp": "2023-01-02", "sequence": 2, "price": 12.0},
+            ]
+        },
+        "diagnostics": {"llm_query_generation": {"selected_fields": ["price"]}},
+    }
+
+    coverage = register_data_facts_from_payload(request_state, "sql_query", payload)
+
+    assert coverage.verified == ["latest_price"]
+    assert request_state.fact_set.facts[-1].value == 12.0
+    assert request_state.fact_set.facts[-1].calculation_trace["value_key"] == "price"
+
+
+def test_sql_fact_does_not_guess_between_ambiguous_numeric_columns():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {"name": "latest_value", "fact_type": "point_value", "requirements": {"time_position": "end"}}
+                ]
+            },
+        )
+    )
+    payload = {
+        "evidence_id": "evi_ambiguous",
+        "summary": "Loaded rows.",
+        "data": {"rows": [{"timestamp": "2023-01-01", "left": 1.0, "right": 2.0}]},
+    }
+
+    coverage = register_data_facts_from_payload(request_state, "sql_query", payload)
+
+    assert coverage.verified == []
+    assert coverage.missing == ["latest_value"]
+
+
+def test_sql_time_boundary_fact_does_not_require_numeric_measure():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {"name": "latest_time", "fact_type": "time_boundary", "requirements": {"time_position": "end"}}
+                ]
+            },
+        )
+    )
+    payload = {
+        "evidence_id": "evi_time_only",
+        "summary": "Loaded timestamps.",
+        "data": {"rows": [{"timestamp": "2023-01-01"}, {"timestamp": "2023-01-02"}]},
+    }
+
+    coverage = register_data_facts_from_payload(request_state, "sql_query", payload)
+
+    assert coverage.verified == ["latest_time"]
+    assert request_state.fact_set.facts[-1].value == "2023-01-02"
+
+
+def test_code_analysis_fact_dependencies_drop_evidence_refs_but_keep_fact_keys():
+    request_state = _request_state()
+    request_state.latest_database_evidence = DatabaseEvidence(
+        evidence_id="evi_series",
+        result_type="timeseries",
+        database="demo",
+        summary="Loaded rows.",
+        data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+    )
+    executor = ToolExecutor.__new__(ToolExecutor)
+
+    normalized = executor._remove_evidence_refs_from_fact_dependencies(
+        [
+            {
+                "fact_key": "trend",
+                "name": "trend",
+                "fact_type": "analysis",
+                "derived_from": ["evi_series", "evidence:evi_series", "verified_parent"],
+            }
+        ],
+        request_state,
+    )
+
+    assert normalized[0]["derived_from"] == ["verified_parent"]
 
 
 def test_empty_sql_evidence_marks_requested_facts_unavailable():

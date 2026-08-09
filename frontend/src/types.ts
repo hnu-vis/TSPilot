@@ -163,7 +163,6 @@ export type DatabaseResource = {
   database?: string | null;
   display_name?: string | null;
   config_source?: string | null;
-  has_reference_dataset?: boolean;
   username?: string | null;
   ssl_enabled?: boolean;
 };
@@ -217,7 +216,7 @@ export type DatabasePreviewPayload = {
 
 export type DatabasePreviewResponse = {
   database: DatabaseResource;
-  preview_kind: 'schema' | 'metrics' | 'reference_dataset' | 'error' | string;
+  preview_kind: 'schema' | 'metrics' | 'error' | string;
   summary?: string;
   preview?: DatabasePreviewPayload;
   error?: string;

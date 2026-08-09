@@ -12,38 +12,12 @@ from .connector import DBConnector, QueryResult, DBConfig, DatabaseSchema, Table
 from .connection_pool import ConnectionPool, PoolHealth
 from .result_processor import ResultProcessor, ProcessedResult, Aggregation, PaginatedResult
 from .engine import (
-    build_reference_dataset_statistics_evidence,
-    build_reference_dataset_timeseries_evidence,
     execute_query,
-    execute_range_query,
-    infer_evidence_family,
-    infer_prometheus_metric,
     normalize_query_result,
 )
 from .schema import schema_preview, metric_list_preview
-from .repair import classify_query_error, should_retry_query
+from .query_errors import classify_query_error
 from .profile_cache import DEFAULT_PROFILE_TTL_SECONDS, profile_is_fresh, profile_path, read_profile, utc_now_iso, write_profile
-try:
-    from .semantic_context import MetricContextBuilder
-except Exception:
-    MetricContextBuilder = None
-from .schema_linker import SchemaLinker
-from .schema_linking import SchemaLinkingPipeline, SchemaLinkingPipelineResult
-from .query_compiler import QueryCompiler, CompiledQuery
-from .query_plan import (
-    DatabaseQueryPlan,
-    LinkedColumn,
-    LinkedSource,
-    QueryAlignment,
-    QueryFilter,
-    QueryJoin,
-    QueryProjection,
-    QuerySource,
-    SchemaLinkingResult,
-    TimeRangePlan,
-    query_plan_from_dict,
-    schema_linking_from_dict,
-)
 from .connectors import (
     InfluxDBConnector,
     InfluxDBConfig,
@@ -112,12 +86,6 @@ from .connectors import (
     ArcConfig,
 )
 
-try:
-    from .query_translator import QueryTranslator, TranslationResult, ValidationResult
-except Exception:
-    QueryTranslator = None
-    TranslationResult = None
-    ValidationResult = None
 
 try:
     from .metadata_fetcher import MetadataFetcher, TableMetadata, ColumnMetadata, MetricMetadata, TableSizeInfo
@@ -264,16 +232,12 @@ class DatabaseFactory:
 
         merged["config_source"] = project_config.get("config_source")
         merged["project_config_keys"] = project_config.get("project_config_keys", [])
-        if "reference_dataset" in project_config:
-            merged["reference_dataset"] = project_config["reference_dataset"]
-        else:
-            merged.pop("reference_dataset", None)
         if "influxdb_tasks" in project_config:
             merged["influxdb_tasks"] = project_config["influxdb_tasks"]
         else:
             merged.pop("influxdb_tasks", None)
         for key, value in project_config.items():
-            if key in {"config_source", "project_config_keys", "reference_dataset", "influxdb_tasks"}:
+            if key in {"config_source", "project_config_keys", "influxdb_tasks"}:
                 continue
             if merged.get(key) in (None, "", [], {}):
                 merged[key] = value
@@ -304,38 +268,6 @@ class DatabaseFactory:
             for key in current
             if key not in {"config_source", "project_config_keys", "status"}
         }
-
-    @classmethod
-    def _load_reference_dataset_config(cls, config_path: Path) -> dict | None:
-        """Load an optional reference dataset config adjacent to a connection config."""
-        reference_dir = config_path.parent / config_path.stem
-        if not reference_dir.exists():
-            return None
-
-        for candidate in ("reference_dataset.yaml", "reference_dataset.yml"):
-            reference_path = reference_dir / candidate
-            if not reference_path.exists():
-                continue
-            try:
-                payload = yaml.safe_load(reference_path.read_text(encoding="utf-8")) or {}
-            except Exception as e:
-                logger.warning(f"Failed to read reference dataset config {reference_path}: {e}")
-                return None
-
-            if not isinstance(payload, dict):
-                return None
-
-            dataset_path = payload.get("dataset_path")
-            if dataset_path:
-                resolved_path = Path(str(dataset_path))
-                if not resolved_path.is_absolute():
-                    resolved_path = (cls._project_root / resolved_path).resolve()
-                payload["resolved_dataset_path"] = str(resolved_path)
-
-            payload["config_source"] = str(reference_path.relative_to(cls._project_root))
-            return payload
-
-        return None
 
     @classmethod
     def _load_project_config(cls, config_path: Path) -> dict | None:
@@ -384,9 +316,6 @@ class DatabaseFactory:
             "status": payload.get("status", "disconnected"),
             "config_source": str(config_path.relative_to(cls._project_root)),
         }
-        reference_dataset = cls._load_reference_dataset_config(config_path)
-        if reference_dataset:
-            config["reference_dataset"] = reference_dataset
         config["project_config_keys"] = sorted(
             key for key in config if key not in {"config_source", "project_config_keys"}
         )
@@ -638,8 +567,6 @@ class DatabaseFactory:
         config = cls._databases.get(db_id)
         if not isinstance(config, dict):
             return {"success": False, "error": f"Database '{db_id}' was not found."}
-        if isinstance(config.get("reference_dataset"), dict):
-            return {"success": False, "skipped": True, "reason": "reference_dataset_profile_is_derived_from_config"}
         try:
             _schema, cache_meta = await cls.load_schema_with_profile_cache(db_id, config, force_refresh=True)
             return {"success": cache_meta.get("source") != "unavailable", "profile_cache": cache_meta}
@@ -747,31 +674,10 @@ __all__ = [
     "DatabaseFactory",
     "ConnectionPool",
     "PoolHealth",
-    "QueryTranslator",
-    "TranslationResult",
-    "ValidationResult",
     "ResultProcessor",
     "ProcessedResult",
     "Aggregation",
     "PaginatedResult",
-    "MetricContextBuilder",
-    "SchemaLinker",
-    "SchemaLinkingPipeline",
-    "SchemaLinkingPipelineResult",
-    "QueryCompiler",
-    "CompiledQuery",
-    "DatabaseQueryPlan",
-    "LinkedColumn",
-    "LinkedSource",
-    "QueryAlignment",
-    "QueryFilter",
-    "QueryJoin",
-    "QueryProjection",
-    "QuerySource",
-    "SchemaLinkingResult",
-    "TimeRangePlan",
-    "query_plan_from_dict",
-    "schema_linking_from_dict",
     "MetadataFetcher",
     "TableMetadata",
     "ColumnMetadata",

@@ -77,11 +77,11 @@
 
 ## Evidence layer
 
-### `tools/query_database.py`
+### `tools/sql_query.py`
 
 - Inputs: request message, database context, time range, constraints, optional history
 - Outputs: `DatabaseEvidence`
-- Can: resolve backend, inspect schema, draft query, execute, repair, normalize
+- Can: run LLM schema linking, generate a dialect-specific read-only query, execute it once, and normalize evidence
 - Cannot: write facts, write final answer, decide charts
 
 ### `schemas/database.py`

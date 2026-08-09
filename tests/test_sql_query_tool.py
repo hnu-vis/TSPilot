@@ -5,7 +5,7 @@ import pytest
 from app.settings import get_settings
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
 from core.database.engine import normalize_query_result
-from core.database.llm_query import LLMGeneratedQuery
+from core.database.llm_query import LLMGeneratedQuery, LLMSchemaLinkingContract
 from runtime.request_state import apply_observation, build_request_state
 from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
@@ -13,7 +13,7 @@ from schemas.database import DatabaseEvidence
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
 from tools.sql_query import SqlQueryInput, SqlQueryTool
-from tools.query_database import QueryDatabaseTool
+from tools.base import StructuredToolError
 from tools.registry import ToolSpec
 
 
@@ -51,6 +51,29 @@ class _FakeConnector:
                 )
             ],
         )
+
+
+def test_schema_linking_contract_keeps_time_range_out_of_dimension_filters():
+    contract = LLMSchemaLinkingContract.model_validate(
+        {
+            "required_filters": [
+                {"column": "_field", "operator": "=", "value": "price"},
+                {"column": "_time", "operator": ">=", "value": "2023-01-01T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert contract.required_filters == [{"column": "_field", "operator": "=", "value": "price"}]
+
+
+def test_sql_query_repair_contract_is_valid_without_duplicate_message():
+    validated = SqlQueryInput(
+        mode="repair",
+        repair_contract={"mode": "query_repair", "previous_query": "SELECT bad FROM prices"},
+        database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
+    )
+
+    assert validated.repair_contract["mode"] == "query_repair"
 
 
 def test_llm_generated_query_normalizes_object_required_outputs():
@@ -120,6 +143,21 @@ class _QueryLLM:
         self.messages = []
 
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        system_prompt = str(messages[0][1]) if messages else ""
+        if "schema linking" in system_prompt.lower():
+            payload = {
+                "sources": [{"name": "prices"}],
+                "measures": [{"name": "value"}],
+                "value_columns": [{"name": "value"}],
+                "aggregate_targets": [],
+                "dimension_columns": [{"name": "timestamp"}],
+                "required_filters": [],
+                "candidate_filters": [],
+                "unresolved_terms": [],
+                "confidence": "high",
+                "evidence": ["test schema"],
+            }
+            return type("_Response", (), {"content": __import__("json").dumps(payload)})()
         self.messages.append(messages)
         payload = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
@@ -143,39 +181,6 @@ class _BitcoinConnector(_FakeConnector):
             ],
             metadata={"value_domains": {"coindesk": {"code": ["EUR", "GBP", "USD"], "crypto": ["bitcoin"]}}},
         )
-
-
-def test_reference_dataset_filter_handles_naive_rows_and_utc_request_range():
-    tool = QueryDatabaseTool(get_settings())
-    rows = [
-        {"timestamp": "2016-01-11 16:50:00", "value": "1"},
-        {"timestamp": "2016-01-11 17:00:00", "value": "2"},
-        {"timestamp": "2016-01-11 17:10:00", "value": "3"},
-    ]
-
-    filtered = tool._filter_rows(
-        rows,
-        "timestamp",
-        {"start": "2016-01-11T17:00:00Z", "end": "2016-01-11T17:10:00Z"},
-    )
-
-    assert [row["value"] for row in filtered] == ["2", "3"]
-
-
-def test_reference_dataset_filter_does_not_fallback_to_full_dataset_when_range_is_empty():
-    tool = QueryDatabaseTool(get_settings())
-    rows = [
-        {"timestamp": "2016-01-11 17:00:00", "value": "2"},
-        {"timestamp": "2016-01-11 17:10:00", "value": "3"},
-    ]
-
-    filtered = tool._filter_rows(
-        rows,
-        "timestamp",
-        {"start": "2023-01-01T00:00:00Z", "end": "2023-01-02T00:00:00Z"},
-    )
-
-    assert filtered == []
 
 
 def test_sql_query_runtime_field_check_treats_time_aliases_as_present():
@@ -299,7 +304,7 @@ async def test_sql_query_executes_read_only_explicit_query(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sql_query_adds_flux_date_import(monkeypatch):
+async def test_sql_query_does_not_rewrite_flux_before_execution(monkeypatch):
     from tools import sql_query as module
 
     connector = _FakeConnector()
@@ -325,8 +330,7 @@ async def test_sql_query_adds_flux_date_import(monkeypatch):
         )
     )
 
-    assert connector.last_query is not None
-    assert connector.last_query.startswith('import "date"\n')
+    assert connector.last_query == 'from(bucket: "bitcoin") |> map(fn: (r) => ({ r with hour: date.hour(t: r._time) }))'
 
 
 @pytest.mark.asyncio
@@ -418,8 +422,8 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
     ]
     prompt_payload = __import__("json").loads(llm.messages[0][1][1].split("LLM SQL Query Generation JSON:\n", 1)[1])
     schema_linking = prompt_payload["request"]["schema_preview"]["schema_linking"]
-    assert schema_linking["schema_linking"]["sources"][0]["name"] == "prices"
-    assert result["diagnostics"]["schema_linking_generation"]["schema_linking"]["sources"][0]["name"] == "prices"
+    assert schema_linking["sources"][0]["name"] == "prices"
+    assert result["diagnostics"]["schema_linking_generation"]["sources"][0]["name"] == "prices"
 
 
 @pytest.mark.asyncio
@@ -504,7 +508,7 @@ async def test_sql_query_automatic_mode_rejects_llm_write_query_before_execution
         }
     ])
 
-    with pytest.raises(ValueError, match="Only read-only|Write or DDL"):
+    with pytest.raises(StructuredToolError, match="Only read-only|Write or DDL") as error:
         await SqlQueryTool(get_settings(), llm=llm).execute(
             SqlQueryInput(
                 message="删除数据",
@@ -513,10 +517,11 @@ async def test_sql_query_automatic_mode_rejects_llm_write_query_before_execution
         )
 
     assert connector.executed_queries == []
+    assert error.value.error_type == "query_read_only_violation"
 
 
 @pytest.mark.asyncio
-async def test_sql_query_automatic_mode_repairs_failed_llm_query(monkeypatch):
+async def test_sql_query_automatic_mode_returns_execution_failure_to_react(monkeypatch):
     from tools import sql_query as module
 
     connector = _FailOnceConnector()
@@ -555,23 +560,25 @@ async def test_sql_query_automatic_mode_repairs_failed_llm_query(monkeypatch):
         },
     ])
 
-    result = await SqlQueryTool(get_settings(), llm=llm).execute(
-        SqlQueryInput(
-            message="分析价格趋势",
-            database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
+    with pytest.raises(StructuredToolError) as error:
+        await SqlQueryTool(get_settings(), llm=llm).execute(
+            SqlQueryInput(
+                message="分析价格趋势",
+                database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
+            )
         )
-    )
 
-    assert connector.executed_queries == ["SELECT bad_query FROM prices", "SELECT timestamp, value FROM prices"]
-    assert llm.calls == 2
-    assert result["diagnostics"]["llm_query_generation"]["repaired_from_query"] == "SELECT bad_query FROM prices"
+    assert error.value.error_type == "query_execution_failed"
+    assert error.value.validation_failure["repair_contract"]["previous_query"] == "SELECT bad_query FROM prices"
+    assert connector.executed_queries == ["SELECT bad_query FROM prices"]
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_sql_query_rejects_write_sql():
     tool = SqlQueryTool(get_settings())
 
-    with pytest.raises(ValueError, match="Only read-only|Write or DDL"):
+    with pytest.raises(StructuredToolError, match="Only read-only|Write or DDL") as error:
         await tool.execute(
             SqlQueryInput(
                 database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
@@ -579,6 +586,7 @@ async def test_sql_query_rejects_write_sql():
                 query_language="sql",
             )
         )
+    assert error.value.error_type == "query_read_only_violation"
 
 
 @pytest.mark.asyncio
@@ -607,7 +615,7 @@ async def test_explicit_flux_query_rejects_missing_user_value_domain_filters(mon
         get_settings(),
     )
 
-    with pytest.raises(ValueError, match="code='USD'|code=\\'USD\\'|code=.*USD"):
+    with pytest.raises(StructuredToolError, match="code='USD'|code=\\'USD\\'|code=.*USD") as error:
         await SqlQueryTool(get_settings()).execute(
             SqlQueryInput(
                 database_context=DatabaseContext(database_id="bitcoin", database_type="influxdb"),
@@ -621,9 +629,17 @@ async def test_explicit_flux_query_rejects_missing_user_value_domain_filters(mon
                 ),
                 query_language="flux",
                 purpose="inspect latest raw rows",
+                constraints={
+                    "_schema_linking_contract": {
+                        "required_filters": [
+                            {"source": "coindesk", "column": "code", "operator": "=", "value": "USD"},
+                        ],
+                    },
+                },
             ),
             request_state=request_state,
         )
+    assert error.value.error_type == "required_filter_missing"
 
     assert connector.executed_queries == []
 

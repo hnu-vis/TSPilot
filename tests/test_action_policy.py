@@ -33,6 +33,64 @@ class _NoTargetSpec:
     produces_terminal_payload = False
 
 
+def test_equivalent_structured_failures_are_counted_and_exhaust_into_terminate():
+    request_state = RequestStateModel(
+        request_id="req-repair-exhaustion",
+        message="分析趋势",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "analysis"],
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_demo",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded rows.",
+            data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
+        ),
+    )
+    payload = {
+        "error_type": "analysis_transparency_missing",
+        "validation_failure": {
+            "scope": "artifact_output",
+            "capability": "analysis",
+            "tool": "code_interpreter",
+            "error_code": "analysis_transparency_missing",
+            "repair_contract": {
+                "mode": "analysis_artifact_repair",
+                "required_details_fields": ["raw_metrics", "adjusted_metrics"],
+            },
+            "retry_policy": {
+                "required_action": "code_interpreter",
+                "max_equivalent_retries": 2,
+                "terminal_after_exhausted": True,
+            },
+        },
+    }
+
+    for expected_count in (1, 2, 3):
+        safe = apply_observation(
+            request_state,
+            ToolObservation(
+                tool_name="code_interpreter",
+                success=False,
+                summary="analysis contract failed",
+                payload=payload,
+                error="analysis contract failed",
+            ),
+            payload,
+            _NoTargetSpec(),
+        )
+        assert safe.payload["repeated_failure_count"] == expected_count
+
+    constraints = runtime_action_constraints(request_state)
+    assert constraints["required_actions"][0]["action"] == "terminate"
+    assert "code_interpreter" in constraints["prohibited_actions"]
+    terminal_input = constraints["required_actions"][0]["input_guidance"]
+    allowed, reason = validate_action(request_state, "terminate", terminal_input)
+    assert allowed is True
+    assert reason is None
+
+
 def _assess_previous_complete(request_state: RequestStateModel, reason: str = "Previous observation satisfies active todo."):
     return apply_previous_observation_assessment(
         request_state,
@@ -2078,8 +2136,8 @@ def test_runtime_completes_count_todo_with_statistics_evidence():
         "evidence_id": "evi_count",
         "result_type": "statistics",
         "database": "demo",
-        "query_language": "reference_dataset",
-        "query": "reference_dataset:value:statistics",
+        "query_language": "flux",
+        "query": 'from(bucket: "demo") |> range(start: 0) |> count()',
         "summary": "Computed count.",
         "data": {"statistics": {"count": 19735}},
         "columns": ["metric", "value"],

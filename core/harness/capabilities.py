@@ -123,7 +123,7 @@ class CapabilityRegistry:
 
     def artifact_ref_for_payload(self, action_name: str, payload: dict) -> str | None:
         action = str(action_name or "").strip().lower()
-        if action in {"sql_query", "query_database"} and payload.get("evidence_id"):
+        if action == "sql_query" and payload.get("evidence_id"):
             return f"evidence:{payload['evidence_id']}"
         if action == "code_interpreter" and payload.get("analysis_id"):
             return f"analysis:{payload['analysis_id']}"

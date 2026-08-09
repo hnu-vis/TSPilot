@@ -1,8 +1,5 @@
 """InfluxDB connector implementation."""
-import csv
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 import re
 from typing import Any
 
@@ -270,10 +267,6 @@ class InfluxDBConnector(DBConnector):
                 "query_language": "flux",
             },
         )
-        reference_dataset = self._build_reference_dataset_metadata()
-        if reference_dataset:
-            schema.metadata["reference_dataset"] = reference_dataset
-
         try:
             measurements = await self._query_schema_values(
                 f'import "influxdata/influxdb/schema"\n'
@@ -328,14 +321,6 @@ class InfluxDBConnector(DBConnector):
                 ]
                 schema.tables.append(TableSchema(name=measurement, columns=columns))
 
-            reference_domains = self._reference_dataset_value_domains(reference_dataset)
-            for measurement, domains in reference_domains.items():
-                merged_domains = value_domains.setdefault(measurement, {})
-                for key, values in domains.items():
-                    existing = merged_domains.setdefault(key, [])
-                    for value in values:
-                        if value not in existing:
-                            existing.append(value)
             if value_domains:
                 schema.metadata["value_domains"] = value_domains
             if self._schema_data_profile_enabled():
@@ -355,14 +340,6 @@ class InfluxDBConnector(DBConnector):
         columns: list[str],
         limit: int,
     ) -> dict[str, list[str]]:
-        reference_domains = self._reference_dataset_value_domains(self._build_reference_dataset_metadata())
-        if source_name in reference_domains:
-            return {
-                column: list(reference_domains[source_name].get(column, []))[:limit]
-                for column in columns
-                if reference_domains[source_name].get(column)
-            }
-
         domains: dict[str, list[str]] = {}
         for column in columns:
             values = await self._query_schema_values(
@@ -770,191 +747,6 @@ class InfluxDBConnector(DBConnector):
         if value is None and hasattr(record, "get_value"):
             value = record.get_value()
         return str(value) if value not in (None, "") else None
-
-    def _build_reference_dataset_metadata(self) -> dict[str, Any] | None:
-        """Build metadata for the configured reference dataset, if any."""
-        reference_dataset = self.config.extra.get("reference_dataset")
-        if not isinstance(reference_dataset, dict):
-            return None
-        raw_dataset_path = reference_dataset.get("dataset_path")
-        resolved_dataset_path = reference_dataset.get("resolved_dataset_path")
-        dataset_path = resolved_dataset_path or raw_dataset_path
-        row_count = self._count_reference_dataset_rows(dataset_path)
-        time_range = self._reference_dataset_time_range(
-            dataset_path=dataset_path,
-            timestamp_column=reference_dataset.get("timestamp_column"),
-        )
-        return {
-            **reference_dataset,
-            "dataset_path": raw_dataset_path,
-            "resolved_dataset_path": resolved_dataset_path,
-            "row_count": row_count,
-            "time_range": time_range,
-            "sample_rows": self._reference_dataset_sample_rows(dataset_path, limit=3),
-        }
-
-    def _count_reference_dataset_rows(self, dataset_path: str | None) -> int | None:
-        """Count CSV rows for the configured reference dataset."""
-        if not dataset_path:
-            return None
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return None
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                return sum(1 for _ in csv.DictReader(handle))
-        except Exception:
-            return None
-
-    def _reference_dataset_time_range(
-        self,
-        *,
-        dataset_path: str | None,
-        timestamp_column: str | None,
-    ) -> dict[str, str] | None:
-        """Infer the timestamp bounds of the configured CSV reference dataset."""
-        if not dataset_path or not timestamp_column:
-            return None
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return None
-
-        start: datetime | None = None
-        stop: datetime | None = None
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    timestamp = self._parse_reference_timestamp(row.get(str(timestamp_column)))
-                    if timestamp is None:
-                        continue
-                    start = timestamp if start is None or timestamp < start else start
-                    stop = timestamp if stop is None or timestamp > stop else stop
-        except Exception:
-            return None
-        if start is None or stop is None:
-            return None
-        return {
-            "start": self._format_flux_bound_timestamp(start),
-            "stop": self._format_flux_bound_timestamp(stop),
-        }
-
-    def _reference_dataset_sample_rows(self, dataset_path: str | None, *, limit: int) -> list[dict[str, Any]]:
-        """Read a bounded set of CSV rows for schema grounding."""
-        if not dataset_path or limit <= 0:
-            return []
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return []
-        rows: list[dict[str, Any]] = []
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    rows.append(dict(row))
-                    if len(rows) >= limit:
-                        break
-        except Exception:
-            return []
-        return rows
-
-    def _parse_reference_timestamp(self, raw_value: Any) -> datetime | None:
-        """Parse common CSV timestamp shapes into a naive UTC-compatible datetime."""
-        if raw_value in (None, ""):
-            return None
-        text = str(raw_value).strip().strip('"')
-        if not text:
-            return None
-        normalized = text.replace("T", " ")
-        if normalized.endswith("Z"):
-            normalized = normalized[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                try:
-                    parsed = datetime.strptime(text, fmt)
-                    break
-                except ValueError:
-                    continue
-            else:
-                return None
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
-
-    def _format_flux_bound_timestamp(self, value: datetime) -> str:
-        """Format a timestamp as a Flux RFC3339 bound."""
-        return value.replace(microsecond=0).isoformat().replace("+00:00", "") + "Z"
-
-    def _reference_dataset_value_domains(
-        self,
-        reference_dataset: dict[str, Any] | None,
-    ) -> dict[str, dict[str, list[str]]]:
-        """Infer canonical value domains from the configured CSV reference dataset."""
-        if not isinstance(reference_dataset, dict):
-            return {}
-        measurement = (
-            reference_dataset.get("measurement")
-            or reference_dataset.get("metric_name")
-            or reference_dataset.get("table")
-        )
-        dataset_path = reference_dataset.get("resolved_dataset_path") or reference_dataset.get("dataset_path")
-        if not measurement or not dataset_path:
-            return {}
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return {}
-
-        field_columns = reference_dataset.get("field_columns")
-        if isinstance(field_columns, list) and field_columns:
-            domains: dict[str, list[str]] = {
-                "_field": [str(column) for column in field_columns if column not in (None, "")]
-            }
-            static_tags = reference_dataset.get("static_tags")
-            if isinstance(static_tags, dict):
-                for key, raw_value in static_tags.items():
-                    if raw_value in (None, ""):
-                        continue
-                    domains[str(key)] = [str(raw_value)]
-            return {str(measurement): domains}
-
-        value_column = str(reference_dataset.get("value_column") or "")
-        timestamp_column = str(reference_dataset.get("timestamp_column") or "")
-        domains: dict[str, list[str]] = {}
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    for key, raw_value in row.items():
-                        if key in {timestamp_column, value_column} or raw_value in (None, ""):
-                            continue
-                        values = domains.setdefault(key, [])
-                        value = str(raw_value)
-                        if value not in values:
-                            values.append(value)
-        except Exception:
-            return {}
-
-        static_tags = reference_dataset.get("static_tags")
-        if isinstance(static_tags, dict):
-            for key, raw_value in static_tags.items():
-                if raw_value in (None, ""):
-                    continue
-                values = domains.setdefault(str(key), [])
-                value = str(raw_value)
-                if value not in values:
-                    values.append(value)
-        if value_column:
-            domains.setdefault("_field", [])
-            if value_column not in domains["_field"]:
-                domains["_field"].append(value_column)
-        return {str(measurement): domains}
 
     async def _build_data_profile_v2(self, *, value_domains: dict[str, dict[str, list[str]]]) -> dict[str, Any] | None:
         """Build lightweight time-coverage profiles for bounded schema grounding."""

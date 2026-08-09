@@ -2,16 +2,17 @@
 
 ## Purpose
 
-Provide deterministic database execution helpers for `query_database`.
+Provide single-attempt connector execution and backend-result normalization for `sql_query`.
 
 ## Responsibilities
 
 - execute database queries
 - return backend results in a normalized shape
-- expose adapter hooks for dialect differences
+- preserve connector errors for outer ReAct recovery
 
 ## Must not do
 
 - decide user intent
+- generate, repair, or retry queries
 - narrate facts
 - assemble final answers

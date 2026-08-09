@@ -1,9 +1,7 @@
 """Prometheus connector implementation."""
-import csv
 import re
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -234,10 +232,6 @@ class PrometheusConnector(DBConnector):
         except Exception as e:
             schema.metadata["error"] = str(e)
 
-        reference_dataset = self._build_reference_dataset_metadata()
-        if reference_dataset:
-            self._inject_reference_dataset_schema(schema, reference_dataset)
-
         return schema
 
     async def health_check(self) -> bool:
@@ -407,84 +401,6 @@ class PrometheusConnector(DBConnector):
             return None
         return float(value)
 
-    def _build_reference_dataset_metadata(self) -> dict[str, Any] | None:
-        """Build metadata for the configured reference dataset, if any."""
-        reference_dataset = self.config.extra.get("reference_dataset")
-        if not isinstance(reference_dataset, dict):
-            return None
-
-        raw_dataset_path = reference_dataset.get("dataset_path")
-        resolved_dataset_path = reference_dataset.get("resolved_dataset_path")
-        row_count = self._count_reference_dataset_rows(resolved_dataset_path or raw_dataset_path)
-
-        static_labels = reference_dataset.get("static_labels")
-        if not isinstance(static_labels, dict):
-            static_labels = {}
-
-        dataset_name = ""
-        if raw_dataset_path:
-            dataset_name = Path(str(raw_dataset_path)).name
-
-        labels = {
-            "dataset": dataset_name,
-            "series": reference_dataset.get("series_name"),
-            "source": reference_dataset.get("source"),
-            **static_labels,
-        }
-
-        return {
-            **reference_dataset,
-            "dataset_path": raw_dataset_path,
-            "resolved_dataset_path": resolved_dataset_path,
-            "row_count": row_count,
-            "sample_rows": self._reference_dataset_sample_rows(resolved_dataset_path or raw_dataset_path, limit=3),
-            "labels": {
-                key: str(value)
-                for key, value in labels.items()
-                if value not in (None, "")
-            },
-            "value_domains": self._reference_dataset_value_domains(reference_dataset),
-        }
-
-    def _count_reference_dataset_rows(self, dataset_path: str | None) -> int | None:
-        """Count CSV rows for the configured reference dataset."""
-        if not dataset_path:
-            return None
-
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return None
-
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                return sum(1 for _ in csv.DictReader(handle))
-        except Exception:
-            return None
-
-    def _reference_dataset_sample_rows(self, dataset_path: str | None, *, limit: int) -> list[dict[str, Any]]:
-        """Read a bounded set of CSV rows for schema grounding."""
-        if not dataset_path or limit <= 0:
-            return []
-
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return []
-
-        rows: list[dict[str, Any]] = []
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    rows.append(dict(row))
-                    if len(rows) >= limit:
-                        break
-        except Exception:
-            return []
-        return rows
-
     def _get_configured_schema_metric_names(self) -> list[str]:
         """Return schema metric names configured for this logical Prometheus database."""
         configured = self.config.extra.get("schema_metric_names")
@@ -513,104 +429,6 @@ class PrometheusConnector(DBConnector):
         else:
             hidden_label_names = set(self._HIDDEN_SCHEMA_LABELS)
         return label_name not in hidden_label_names
-
-    def _inject_reference_dataset_schema(
-        self,
-        schema: DatabaseSchema,
-        reference_dataset: dict[str, Any],
-    ) -> None:
-        """Attach reference dataset metadata and a synthetic metric schema."""
-        metric_name = reference_dataset.get("metric_name")
-        if not metric_name:
-            return
-
-        label_columns = [
-            ColumnSchema(name=f"label_{key}", data_type="string")
-            for key in sorted(reference_dataset.get("labels", {}))
-            if self._is_schema_label_visible(key)
-        ]
-        reference_columns = [
-            ColumnSchema(name="timestamp", data_type="datetime"),
-            ColumnSchema(name="value", data_type="float"),
-            *label_columns,
-        ]
-
-        table_index = next(
-            (
-                index
-                for index, table in enumerate(schema.tables)
-                if getattr(table, "name", "") == metric_name
-            ),
-            None,
-        )
-
-        if table_index is None:
-            schema.tables.insert(
-                0,
-                TableSchema(
-                    name=metric_name,
-                    type="metric",
-                    columns=reference_columns,
-                    row_count=reference_dataset.get("row_count"),
-                ),
-            )
-        else:
-            table = schema.tables.pop(table_index)
-            existing_columns = {column.name for column in table.columns}
-            for column in reference_columns:
-                if column.name not in existing_columns:
-                    table.columns.append(column)
-            if table.row_count is None:
-                table.row_count = reference_dataset.get("row_count")
-            schema.tables.insert(0, table)
-
-        schema.metadata["reference_dataset"] = reference_dataset
-        value_domains = reference_dataset.get("value_domains")
-        if isinstance(value_domains, dict):
-            existing_domains = schema.metadata.setdefault("value_domains", {})
-            if isinstance(existing_domains, dict):
-                existing_domains[metric_name] = value_domains
-
-    def _reference_dataset_value_domains(self, reference_dataset: dict[str, Any]) -> dict[str, list[str]]:
-        """Infer canonical label value domains from the configured CSV reference dataset."""
-        dataset_path = reference_dataset.get("resolved_dataset_path") or reference_dataset.get("dataset_path")
-        if not dataset_path:
-            return {}
-        resolved_path = Path(str(dataset_path))
-        if not resolved_path.is_absolute():
-            resolved_path = (Path(__file__).resolve().parents[3] / resolved_path).resolve()
-        if not resolved_path.exists():
-            return {}
-
-        value_column = str(reference_dataset.get("value_column") or "")
-        timestamp_column = str(reference_dataset.get("timestamp_column") or "")
-        domains: dict[str, list[str]] = {}
-        try:
-            with resolved_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    for key, raw_value in row.items():
-                        if key in {timestamp_column, value_column} or raw_value in (None, ""):
-                            continue
-                        values = domains.setdefault(key, [])
-                        value = str(raw_value)
-                        if value not in values:
-                            values.append(value)
-        except Exception:
-            return {}
-
-        static_labels = reference_dataset.get("static_labels")
-        if not isinstance(static_labels, dict):
-            static_labels = reference_dataset.get("static_tags")
-        if isinstance(static_labels, dict):
-            for key, raw_value in static_labels.items():
-                if raw_value in (None, ""):
-                    continue
-                values = domains.setdefault(str(key), [])
-                value = str(raw_value)
-                if value not in values:
-                    values.append(value)
-        return domains
-
 
 class DevMockPrometheusConnector(PrometheusConnector):
     """Development-only Prometheus connector that reliably exercises ReAct repair."""

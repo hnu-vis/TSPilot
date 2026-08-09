@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from core.database.connector import ColumnSchema, DatabaseSchema, TableSchema
-from core.database.schema import schema_preview
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
@@ -237,58 +235,6 @@ def test_prompt_builder_summarizes_heavy_context():
     assert "chart" not in context["outputs"]["visualizations"][0]
     assert "latest_database_evidence" not in context
     assert "visualizations" not in context
-
-
-def test_initial_context_includes_bounded_schema_hint_for_reference_dataset():
-    settings = get_settings()
-    request = ChatRequest(
-        message="总共有多少条数据？",
-        database_context={"database_id": "influxdb2-energydata", "database_type": "influxdb"},
-    )
-    request_state = build_request_state(request, settings)
-    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
-
-    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    schema_hint = context["task"]["database_context"]["schema_hint"]
-
-    assert schema_hint["query_language"] == "flux"
-    assert schema_hint["tables_or_measurements"][0]["name"] == "home_energy_environment"
-    assert schema_hint["tables_or_measurements"][0]["row_count"] == 19735
-    assert "appliances_energy_wh" in schema_hint["tables_or_measurements"][0]["field_columns"]
-    assert len(schema_hint["tables_or_measurements"][0]["sample_rows"]) == 3
-
-
-def test_schema_preview_promotes_reference_dataset_metadata_to_table_preview():
-    schema = DatabaseSchema(
-        database="demo",
-        tables=[
-            TableSchema(
-                name="metrics",
-                columns=[
-                    ColumnSchema(name="_time", data_type="datetime"),
-                    ColumnSchema(name="value", data_type="float"),
-                    ColumnSchema(name="host", data_type="string"),
-                ],
-            )
-        ],
-        metadata={
-            "reference_dataset": {
-                "measurement": "metrics",
-                "row_count": 42,
-                "time_range": {"start": "2024-01-01T00:00:00Z", "stop": "2024-01-02T00:00:00Z"},
-                "sample_rows": [{"timestamp": "2024-01-01 00:00:00", "value": "1.0"}],
-            },
-            "value_domains": {"metrics": {"_field": ["value"], "host": ["a", "b"]}},
-        },
-    )
-
-    preview = schema_preview(schema)
-    table = preview["tables_or_measurements"][0]
-
-    assert table["row_count"] == 42
-    assert table["field_values"] == ["value"]
-    assert table["sample_rows"] == [{"timestamp": "2024-01-01 00:00:00", "value": "1.0"}]
-    assert preview["labels_or_tags"] == [{"table": "metrics", "name": "host", "values": ["a", "b"]}]
 
 
 def test_prompt_builder_exposes_sql_observation_details():

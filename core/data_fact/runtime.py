@@ -39,7 +39,7 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
         if fact is not None:
             rejected.append(fact)
 
-    if tool_name in {"sql_query", "query_database"}:
+    if tool_name == "sql_query":
         produced.extend(_facts_from_database_evidence(full_payload, requests))
     elif tool_name == "code_interpreter":
         produced.extend(_facts_from_analysis(full_payload, requests))
@@ -181,9 +181,7 @@ def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]
         return facts
 
     time_key = _first_key(rows, ["timestamp", "time", "_time", "date"])
-    value_key = _first_numeric_key(rows, ["value", "price", "_value", "close", "amount"])
-    if not value_key:
-        return facts
+    value_key = _database_value_key(payload, rows, time_key)
     sorted_rows = sorted(rows, key=lambda row: str(row.get(time_key) or "")) if time_key else rows
     for request in requests:
         fact = _database_fact_for_request(request, sorted_rows, value_key, time_key, evidence_ref)
@@ -195,7 +193,7 @@ def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]
 def _database_fact_for_request(
     request: DataFactRequest,
     rows: list[dict],
-    value_key: str,
+    value_key: str | None,
     time_key: str | None,
     evidence_ref: FactEvidenceRef,
 ) -> DataFact | None:
@@ -242,6 +240,8 @@ def _database_fact_for_request(
             derived_from=request.derived_from,
         )
     if fact_type == "point_value":
+        if not value_key:
+            return None
         position = requirements.get("time_position")
         if position not in {"start", "end"}:
             return None
@@ -263,6 +263,8 @@ def _database_fact_for_request(
             derived_from=request.derived_from,
         )
     if fact_type in {"extreme", "extrema", "extreme_time"}:
+        if not value_key:
+            return None
         operator = requirements.get("operator")
         if operator not in {"min", "max"}:
             return None
@@ -472,7 +474,7 @@ def _attach_facts_to_artifact(
         "rejected_facts": rejected,
         "fact_coverage": coverage,
     }
-    if tool_name in {"sql_query", "query_database"}:
+    if tool_name == "sql_query":
         evidence_id = str(payload.get("evidence_id") or "")
         artifact = getattr(request_state, "database_evidence_artifacts", {}).get(evidence_id)
         if artifact is not None:
@@ -597,12 +599,48 @@ def _first_key(rows: list[dict], candidates: list[str]) -> str | None:
     return next((key for key in candidates if key in keys), None)
 
 
-def _first_numeric_key(rows: list[dict], candidates: list[str]) -> str | None:
-    keys = list(dict.fromkeys([*candidates, *(key for row in rows[:20] for key in row.keys())]))
-    for key in keys:
-        if any(_number(row.get(key)) is not None for row in rows[:20]):
-            return key
-    return None
+def _database_value_key(payload: dict, rows: list[dict], time_key: str | None) -> str | None:
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    generation = diagnostics.get("llm_query_generation") if isinstance(diagnostics.get("llm_query_generation"), dict) else {}
+    candidates: list[str] = []
+
+    for source in (metadata, diagnostics, generation):
+        selected = source.get("selected_fields")
+        if isinstance(selected, list):
+            candidates.extend(str(item) for item in selected if str(item).strip())
+        selected_one = source.get("selected_field")
+        if isinstance(selected_one, str) and selected_one.strip():
+            candidates.append(selected_one)
+
+    schema_linking = diagnostics.get("schema_linking_generation")
+    if isinstance(schema_linking, dict):
+        for group_name in ("value_columns", "measures", "aggregate_targets"):
+            group = schema_linking.get(group_name)
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if isinstance(item, str):
+                    candidates.append(item)
+                elif isinstance(item, dict):
+                    for key in ("physical_name", "column", "field", "name"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value.strip():
+                            candidates.append(value)
+
+    available_keys = set().union(*(row.keys() for row in rows[:20])) if rows else set()
+    for candidate in dict.fromkeys(candidates):
+        if candidate == time_key or candidate not in available_keys:
+            continue
+        if any(_number(row.get(candidate)) is not None for row in rows[:20]):
+            return candidate
+
+    numeric_keys = [
+        key
+        for key in available_keys
+        if key != time_key and any(_number(row.get(key)) is not None for row in rows[:20])
+    ]
+    return numeric_keys[0] if len(numeric_keys) == 1 else None
 
 
 def _number(value: Any) -> float | None:

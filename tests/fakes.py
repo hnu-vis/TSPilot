@@ -740,8 +740,9 @@ def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
         tables = schema_preview.get("tables_or_measurements") or []
         table = tables[0] if tables and isinstance(tables[0], dict) else {}
         table_name = table.get("name") or "measurement"
-        fields = table.get("field_columns") or []
-        field = fields[0] if fields else "value"
+        fields = _schema_value_fields(table)
+        message = str(payload.get("message") or "")
+        field = next((name for name in fields if name in message), fields[0] if fields else "value")
         return _FakeResponse(
             json.dumps(
                 {
@@ -766,8 +767,12 @@ def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
     tables = schema_preview.get("tables_or_measurements") or []
     table = tables[0] if tables and isinstance(tables[0], dict) else {}
     table_name = table.get("name") or "measurement"
-    fields = table.get("field_columns") or []
-    field = fields[0] if fields else "value"
+    linking = schema_preview.get("schema_linking") if isinstance(schema_preview.get("schema_linking"), dict) else {}
+    linked_values = linking.get("value_columns") if isinstance(linking.get("value_columns"), list) else []
+    linked_names = [str(item.get("name")) for item in linked_values if isinstance(item, dict) and item.get("name")]
+    fields = linked_names or _schema_value_fields(table)
+    message = str(request.get("message") or "")
+    field = next((name for name in fields if name in message), fields[0] if fields else "value")
     time_range = request.get("time_range") or {}
     start = time_range.get("start") or "1970-01-01T00:00:00Z"
     end = time_range.get("end")
@@ -801,6 +806,21 @@ def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
     )
 
 
+def _schema_value_fields(table: dict) -> list[str]:
+    values = table.get("field_values") or table.get("field_columns") or []
+    fields = [str(item) for item in values if str(item).strip()]
+    if fields:
+        return fields
+    columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+    return [
+        str(item.get("name"))
+        for item in columns
+        if isinstance(item, dict)
+        and item.get("name")
+        and str(item.get("name")).lower() not in {"time", "timestamp", "_time"}
+    ]
+
+
 def _compat_context(context: dict) -> dict:
     if "task" not in context:
         return context
@@ -816,7 +836,7 @@ def _compat_context(context: dict) -> dict:
     latest_observation = observations[-1] if observations else {}
     latest_observation_payload = latest_observation.get("payload") if isinstance(latest_observation.get("payload"), dict) else latest_observation
     latest_evidence = evidence.get("latest") or _latest_ref_payload(refs, "database_evidence") or _latest_ref_payload(refs, "evidence")
-    if not latest_evidence and latest_observation.get("tool_name") in {"sql_query", "query_database"} and latest_observation.get("success") is not False:
+    if not latest_evidence and latest_observation.get("tool_name") == "sql_query" and latest_observation.get("success") is not False:
         latest_evidence = latest_observation_payload
     analyses = _ref_payloads(refs, "analysis")
     if latest_observation.get("tool_name") == "code_interpreter" and latest_observation.get("success") is not False:

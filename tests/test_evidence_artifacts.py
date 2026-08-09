@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -15,6 +16,28 @@ from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 
 class _ToolSpec:
     result_target = "evidence"
+
+
+class _CapturingCodeLLM:
+    def __init__(self):
+        self.payload = None
+
+    async def ainvoke(self, messages, **kwargs):
+        self.payload = json.loads(messages[-1][1])
+        code = (
+            "result = {"
+            "'summary': 'computed transparent outlier analysis', "
+            "'metrics': {'mean': float(value.mean()) if hasattr(value, 'mean') else 0.0}, "
+            "'details': {"
+            "'outlier_rule': 'IQR upper fence', "
+            "'threshold_or_formula': 'Q3 + 1.5 * IQR', "
+            "'rationale': 'robust high-value screening', "
+            "'excluded_rows': [], "
+            "'raw_metrics': {'mean': float(value.mean()) if hasattr(value, 'mean') else 0.0}, "
+            "'adjusted_metrics': {'mean': float(value.mean()) if hasattr(value, 'mean') else 0.0}}, "
+            "'facts': []}"
+        )
+        return type("_Response", (), {"content": json.dumps({"code": code})})()
 
 
 def _build_full_evidence_payload():
@@ -95,6 +118,95 @@ def _build_large_evidence_payload(size: int = 20_000):
             "query_trace": {"raw_result_summary": {"row_count": size, "columns": ["timestamp", "value", "marker"]}}
         },
     }
+
+
+def test_code_interpreter_generation_consumes_repair_contract():
+    llm = _CapturingCodeLLM()
+    repair_contract = {
+        "mode": "analysis_artifact_repair",
+        "required_details_fields": [
+            "outlier_rule",
+            "threshold_or_formula",
+            "rationale",
+            "excluded_rows",
+            "raw_metrics",
+            "adjusted_metrics",
+        ],
+    }
+
+    result = asyncio.run(
+        CodeInterpreterTool(llm=llm).execute(
+            CodeInterpreterInput(
+                database_evidence=_build_full_evidence_payload(),
+                analysis_goal="identify high outliers with a custom robust rule",
+                analysis_request={"required_outputs": ["custom robust outlier analysis"]},
+                required_outputs=["custom robust outlier analysis"],
+                repair_contract=repair_contract,
+            )
+        )
+    )
+
+    assert llm.payload["mode"] == "repair"
+    assert llm.payload["repair_contract"] == repair_contract
+    assert llm.payload["analysis_request"]["required_outputs"] == ["custom robust outlier analysis"]
+    assert result["result"]["details"]["outlier_rule"] == "IQR upper fence"
+    assert result["diagnostics"]["internal_repair_attempts"] == []
+
+
+def test_code_interpreter_allows_fact_composition_within_one_result():
+    facts = [
+        {
+            "fact_key": "trend",
+            "name": "trend",
+            "fact_type": "analysis",
+            "value": "down",
+            "statement": "trend is down",
+            "calculation_trace": {"method": "slope"},
+            "derived_from": [],
+        },
+        {
+            "fact_key": "anomalies",
+            "name": "anomalies",
+            "fact_type": "analysis",
+            "value": 2,
+            "statement": "two anomalies",
+            "calculation_trace": {"method": "iqr"},
+            "derived_from": [],
+        },
+        {
+            "fact_key": "conclusion",
+            "name": "conclusion",
+            "fact_type": "analysis",
+            "value": "down with two anomalies",
+            "statement": "series declines with two anomalies",
+            "calculation_trace": {"method": "composition"},
+            "derived_from": ["trend", "anomalies"],
+        },
+    ]
+    code = "result = " + repr(
+        {
+            "summary": "computed",
+            "metrics": {"anomaly_count": 2},
+            "details": {},
+            "facts": facts,
+        }
+    )
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence=_build_full_evidence_payload(),
+                analysis_goal="compose analysis facts",
+                code=code,
+                fact_requests=[
+                    {key: value for key, value in fact.items() if key in {"fact_key", "name", "fact_type", "derived_from"}}
+                    for fact in facts
+                ],
+            )
+        )
+    )
+
+    assert [fact["fact_key"] for fact in result["result"]["facts"]] == ["trend", "anomalies", "conclusion"]
 
 
 def _build_rows_only_price_evidence_payload():

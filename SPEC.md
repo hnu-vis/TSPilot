@@ -31,7 +31,7 @@ TSPilot-v0.2/
 │   ├── base.py
 │   ├── registry.py
 │   ├── todowrite.py
-│   ├── query_database.py
+│   ├── sql_query.py
 │   ├── code_interpreter.py
 │   ├── forecast.py
 │   ├── anomaly.py
@@ -42,7 +42,7 @@ TSPilot-v0.2/
 ├── core/
 │   ├── database/
 │   │   ├── engine.py
-│   │   ├── repair.py
+│   │   ├── llm_query.py
 │   │   ├── schema.py
 │   │   └── SPEC/
 │   ├── analysis/
@@ -98,7 +98,7 @@ TSPilot-v0.2/
 - [base.py](tools/SPEC/base_SPEC.md)
 - [registry.py](tools/SPEC/registry_SPEC.md)
 - [todowrite.py](tools/SPEC/todowrite_SPEC.md)
-- [query_database.py](tools/SPEC/query_database_SPEC.md)
+- `sql_query.py`: LLM schema linking, dialect-specific query generation, and single connector execution
 - [code_interpreter.py](tools/SPEC/code_interpreter_SPEC.md)
 - [forecast.py](tools/SPEC/forecast_SPEC.md)
 - [anomaly.py](tools/SPEC/anomaly_SPEC.md)
@@ -109,7 +109,6 @@ TSPilot-v0.2/
 ### core/database
 
 - [engine.py](core/database/SPEC/engine_SPEC.md)
-- [repair.py](core/database/SPEC/repair_SPEC.md)
 - [schema.py](core/database/SPEC/schema_SPEC.md)
 - [schema linking](core/database/SPEC/schema_linking_SPEC.md)
 

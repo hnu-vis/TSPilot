@@ -1,4 +1,4 @@
-"""Deterministic schema and catalog inspection helpers."""
+"""Schema and catalog inspection helpers."""
 from __future__ import annotations
 
 from typing import Any
@@ -9,16 +9,10 @@ from .connector import DatabaseSchema
 def schema_preview(schema: DatabaseSchema, *, dialect: Any | None = None) -> dict:
     metadata = schema.metadata or {}
     value_domains = metadata.get("value_domains") if isinstance(metadata.get("value_domains"), dict) else {}
-    reference_dataset = (
-        metadata.get("reference_dataset")
-        if isinstance(metadata.get("reference_dataset"), dict)
-        else None
-    )
     tables = [
         _table_preview(
             table=table,
             table_domains=value_domains.get(table.name) if isinstance(value_domains, dict) else None,
-            reference_dataset=reference_dataset,
         )
         for table in schema.tables
     ]
@@ -77,17 +71,12 @@ def metric_list_preview(schema: DatabaseSchema) -> dict:
     }
 
 
-def _table_preview(*, table, table_domains: dict | None, reference_dataset: dict | None) -> dict:
-    row_count = table.row_count
-    reference_matches = _reference_matches_table(reference_dataset, table.name)
-    if row_count is None and reference_matches:
-        row_count = reference_dataset.get("row_count") if reference_dataset else None
-
+def _table_preview(*, table, table_domains: dict | None) -> dict:
     preview = {
         "name": table.name,
         "schema": table.schema,
         "type": table.type,
-        "row_count": row_count,
+        "row_count": table.row_count,
         "columns": [
             {
                 "name": column.name,
@@ -101,21 +90,4 @@ def _table_preview(*, table, table_domains: dict | None, reference_dataset: dict
         field_values = table_domains.get("_field")
         if isinstance(field_values, list):
             preview["field_values"] = field_values[:100]
-    if reference_matches and reference_dataset:
-        if isinstance(reference_dataset.get("time_range"), dict):
-            preview["time_range"] = reference_dataset["time_range"]
-        if isinstance(reference_dataset.get("sample_rows"), list):
-            preview["sample_rows"] = reference_dataset["sample_rows"][:3]
     return preview
-
-
-def _reference_matches_table(reference_dataset: dict | None, table_name: str) -> bool:
-    if not isinstance(reference_dataset, dict):
-        return False
-    candidates = {
-        reference_dataset.get("measurement"),
-        reference_dataset.get("metric_name"),
-        reference_dataset.get("table"),
-        reference_dataset.get("series_name"),
-    }
-    return table_name in {str(value) for value in candidates if value not in (None, "")}

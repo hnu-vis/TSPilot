@@ -1,138 +1,20 @@
-"""Deterministic execution helpers for database-backed queries."""
+"""Execution helpers for database-backed queries."""
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
-import re
 
 from .connector import QueryResult
-from .repair import classify_query_error, should_retry_query
-from core.intent import build_intent_profile_fallback
 from schemas.database import DatabaseEvidence
 
 
 async def execute_query(connector, query: str, *, timeout: int | None = None) -> QueryResult:
-    attempts = 0
-    while True:
-        try:
-            return await connector.execute(query, timeout=timeout)
-        except Exception as exc:
-            repair = classify_query_error(exc)
-            if not should_retry_query(repair, attempts):
-                raise RuntimeError(repair["message"]) from exc
-            attempts += 1
-
-
-async def execute_range_query(connector, query: str, *, start, end, step: str) -> QueryResult:
-    attempts = 0
-    while True:
-        try:
-            return await connector.get_range(query, start, end, step=step)
-        except Exception as exc:
-            repair = classify_query_error(exc)
-            if not should_retry_query(repair, attempts):
-                raise RuntimeError(repair["message"]) from exc
-            attempts += 1
-
-
-def infer_evidence_family(message: str) -> str:
-    normalized = message.lower()
-    intent_profile = build_intent_profile_fallback(message)
-    capabilities = set(intent_profile.get("requested_capabilities") or [])
-    has_statistics_request = "analysis" in capabilities
-    has_timeseries_request = bool(capabilities & {"forecast", "anomaly"})
-
-    metric_keywords = ("metric list", "metrics", "available metrics", "有哪些指标", "有哪些 metric")
-    if any(keyword in normalized for keyword in metric_keywords):
-        return "metric_list"
-
-    schema_keywords = (
-        "schema",
-        "field",
-        "label",
-        "有哪些表",
-        "有哪些字段",
-        "结构",
-        "labels",
-        "schema preview",
-    )
-    if any(keyword in normalized for keyword in schema_keywords):
-        return "schema"
-
-    if _asks_for_raw_timeseries(normalized) and not _asks_for_scalar_aggregate(normalized):
-        return "timeseries"
-
-    if has_statistics_request:
-        return "statistics"
-
-    if has_timeseries_request:
-        return "timeseries"
-
-    table_keywords = ("group by", "table", "rows", "明细", "列表")
-    if any(keyword in normalized for keyword in table_keywords):
-        return "table"
-
-    return "timeseries"
-
-
-def _asks_for_raw_timeseries(normalized: str) -> bool:
-    return any(
-        token in normalized
-        for token in (
-            "原始时间序列",
-            "时间序列",
-            "时序",
-            "周期",
-            "周期性",
-            "seasonality",
-            "daily",
-            "weekly",
-            "raw series",
-            "time series",
-            "forecast",
-            "predict",
-            "prediction",
-            "anomaly",
-            "outlier",
-            "预测",
-            "异常",
-            "离群",
-        )
-    )
-
-
-def _asks_for_scalar_aggregate(normalized: str) -> bool:
-    if any(
-        pattern in normalized
-        for pattern in (
-            "不要使用 max",
-            "不要用 max",
-            "avoid max",
-            "avoid aggregation",
-            "avoid aggregations",
-            "not use max",
-            "without max",
-        )
-    ):
-        return False
-    if any(token in normalized for token in ("最高", "最低", "最大", "最小", "平均", "均值", "总和", "总数", "多少条")):
-        return True
-    return bool(re.search(r"(?<![A-Za-z0-9_])(max|min|avg|mean|sum|count)(?![A-Za-z0-9_])", normalized))
+    return await connector.execute(query, timeout=timeout)
 
 
 def evidence_id_for_query(database_id: str, query: str, result_type: str) -> str:
     digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:12]
     safe_result_type = "".join(char if char.isalnum() else "_" for char in result_type).strip("_") or "query"
     return f"evi_{database_id}_{safe_result_type}_{digest}"
-
-
-def infer_prometheus_metric(message: str, schema) -> str | None:
-    normalized = message.lower()
-    metric_names = [table.name for table in schema.tables]
-    for metric_name in metric_names:
-        if metric_name.lower() in normalized:
-            return metric_name
-    return metric_names[0] if metric_names else None
 
 
 def normalize_query_result(
@@ -335,103 +217,6 @@ def _normalize_result_row(row: dict) -> dict:
     if "time" in row and "timestamp" not in row:
         row["timestamp"] = row.pop("time")
     return row
-
-
-def build_reference_dataset_statistics_evidence(
-    *,
-    database_id: str,
-    database_type: str,
-    config_path: Path,
-    dataset_path: Path,
-    value_field: str,
-    time_field: str,
-    values: list[float],
-) -> DatabaseEvidence:
-    stats = {
-        "count": len(values),
-        "min": min(values),
-        "max": max(values),
-        "avg": sum(values) / len(values),
-        "sum": sum(values),
-    }
-    return DatabaseEvidence(
-        evidence_id=f"evi_{database_id}_{value_field}_stats",
-        result_type="statistics",
-        database=database_id,
-        query_language="reference_dataset",
-        query=f"reference_dataset:{value_field}:statistics",
-        summary=f"Computed statistics for {value_field} over {len(values)} rows.",
-        data={"statistics": stats, "value_field": value_field, "time_field": time_field},
-        columns=["metric", "value"],
-        metadata={
-            "config_path": str(config_path),
-            "dataset_path": str(dataset_path),
-            "database_type": database_type,
-        },
-        diagnostics={"selected_field": value_field},
-    )
-
-
-def build_reference_dataset_timeseries_evidence(
-    *,
-    database_id: str,
-    database_type: str,
-    config_path: Path,
-    dataset_path: Path,
-    value_field: str,
-    value_fields: list[str] | None,
-    time_field: str,
-    rows: list[dict] | None,
-    points: list[dict],
-    source: str,
-) -> DatabaseEvidence:
-    selected_fields = value_fields or [value_field]
-    series = []
-    if rows:
-        for field in selected_fields:
-            column_points = []
-            for row in rows:
-                value = row.get(field)
-                if value is None:
-                    continue
-                column_points.append({"timestamp": str(row[time_field]), "value": float(value)})
-            series.append(
-                {
-                    "series_name": field,
-                    "value_field": field,
-                    "time_field": time_field,
-                    "points": column_points,
-                    "labels": {"source": source},
-                }
-            )
-    return DatabaseEvidence(
-        evidence_id=f"evi_{database_id}_{value_field}",
-        result_type="timeseries",
-        database=database_id,
-        query_language="reference_dataset",
-        query=f"reference_dataset:{value_field}",
-        summary=(
-            f"Loaded {len(points)} points for {value_field} from the configured reference dataset."
-            if len(selected_fields) == 1
-            else f"Loaded {len(rows or [])} rows across {len(selected_fields)} series from the configured reference dataset."
-        ),
-        data={
-            "points": points,
-            "rows": rows or [],
-            "series": series,
-            "time_field": time_field,
-            "value_field": value_field,
-            "series_name": value_field,
-            "labels": {"source": source},
-        },
-        columns=[time_field, *selected_fields],
-        metadata={
-            "config_path": str(config_path),
-            "dataset_path": str(dataset_path),
-            "database_type": database_type,
-        },
-        diagnostics={"selected_field": value_field, "selected_fields": selected_fields, "series_count": len(selected_fields)},
-    )
 
 
 def _is_numeric_column(rows: list[dict], column: str) -> bool:

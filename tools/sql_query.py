@@ -8,15 +8,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.settings import Settings
 from core.database import DatabaseFactory, execute_query, normalize_query_result
-from core.database.connector import DatabaseSchema
-from core.database.contracts import QueryRequestContext, RenderedQuery
 from core.database.dialects import dialect_for_database, query_language_for_database_type
 from core.database.llm_query import LLMGeneratedQuery, LLMQueryGenerationResult, LLMQueryGenerator
-from core.database.query_flow import DefaultIntentInterpreter, DefaultQueryValidator
-from core.database.query_plan import QueryFilter
-from core.database.repair import classify_query_error, repair_read_only_query
+from core.database.query_errors import classify_query_error
 from core.database.schema import schema_preview
-from core.database.schema_linking import SchemaLinkingPipeline
 from schemas.state import RequestStateModel
 from schemas.database_context import DatabaseContext
 from schemas.data_fact import DataFactRequest
@@ -91,7 +86,8 @@ class SqlQueryInput(BaseModel):
         errors = [error for request in self.fact_requests if (error := fact_request_contract_error(request, "sql_query"))]
         if errors:
             raise ValueError(" ".join(errors))
-        if not (self.query and self.query.strip()) and not (self.message and self.message.strip()):
+        has_repair_contract = str(self.mode or "").strip().lower() == "repair" and isinstance(self.repair_contract, dict)
+        if not has_repair_contract and not (self.query and self.query.strip()) and not (self.message and self.message.strip()):
             raise ValueError("sql_query requires either message for automatic planning or query for explicit read-only execution.")
         return self
 
@@ -101,7 +97,6 @@ class _ExplicitQueryExecutor(BaseTool):
 
     def __init__(self, settings: Settings):
         self._settings = settings
-        self._schema_linking_pipeline = SchemaLinkingPipeline()
 
     async def execute(self, validated_input: _ExplicitQueryInput, **kwargs) -> dict:
         return await self.execute_query_input(validated_input, mode="explicit")
@@ -115,12 +110,41 @@ class _ExplicitQueryExecutor(BaseTool):
         extra_diagnostics: dict | None = None,
         **kwargs,
     ) -> dict:
-        repair = repair_read_only_query(
-            query=validated_input.query,
-            query_language=validated_input.query_language,
-        )
-        query = repair.query
-        self._validate_read_only(query, validated_input.query_language)
+        query = validated_input.query
+        try:
+            self._validate_read_only(query, validated_input.query_language)
+        except ValueError as exc:
+            query_language = validated_input.query_language
+            repair_contract = {
+                "mode": "query_repair",
+                "previous_query": query,
+                "query_language": query_language,
+                "required_contract": {"read_only": True},
+            }
+            validation_failure = {
+                "scope": "query_validation",
+                "capability": "query",
+                "tool": "sql_query",
+                "error_code": "query_read_only_violation",
+                "message": str(exc),
+                "failed_artifact": {"query": query, "query_language": query_language},
+                "required_contract": {"read_only": True},
+                "repair_contract": repair_contract,
+                "retry_policy": {
+                    "required_action": "sql_query",
+                    "max_equivalent_retries": 1,
+                    "allow_same_action": True,
+                    "terminal_after_exhausted": True,
+                },
+            }
+            raise StructuredToolError(
+                f"Query validation failed: {exc}",
+                error_type="query_read_only_violation",
+                retryable=True,
+                recommended_next_action="sql_query",
+                diagnostics={"query": query, "query_language": query_language, "repair_contract": repair_contract},
+                validation_failure=validation_failure,
+            ) from exc
         config = await self._load_database_config(validated_input.database_context.database_id)
         connector = await DatabaseFactory.create_connector(**config)
         async with connector:
@@ -133,12 +157,10 @@ class _ExplicitQueryExecutor(BaseTool):
                 request_state=request_state if isinstance(request_state, RequestStateModel) else None,
             )
             try:
-                result, executed_query, repair_diagnostics = await self._execute_with_repair(
-                    connector=connector,
-                    query=query,
-                    query_language=validated_input.query_language,
+                result = await execute_query(
+                    connector,
+                    query,
                     timeout=int(validated_input.constraints.get("timeout", config.get("query_timeout", 60))),
-                    initial_repair_reason=repair.reason,
                 )
             except StructuredToolError:
                 raise
@@ -187,7 +209,7 @@ class _ExplicitQueryExecutor(BaseTool):
             database_id=validated_input.database_context.database_id,
             database_type=str(config.get("type", validated_input.database_context.database_type)),
             query_language=validated_input.query_language or self._infer_query_language(config),
-            query=executed_query,
+            query=query,
             result=result,
         )
         evidence.metadata = {
@@ -204,14 +226,14 @@ class _ExplicitQueryExecutor(BaseTool):
                 "columns": result.columns,
                 "truncated": result.truncated,
                 "execution_time_ms": result.execution_time_ms,
-                "repair": repair_diagnostics,
+                "repair": {"attempted": False, "strategy": "react"},
             },
             **(extra_diagnostics or {}),
         }
         evidence.diagnostics["task_coverage"] = self._task_coverage_diagnostics(
             validated_input=validated_input,
             evidence=evidence.model_dump(mode="json"),
-            query=executed_query,
+            query=query,
             query_language=validated_input.query_language or self._infer_query_language(config),
             base=(extra_diagnostics or {}).get("task_coverage") if isinstance(extra_diagnostics, dict) else None,
             selected_fields=(
@@ -222,51 +244,6 @@ class _ExplicitQueryExecutor(BaseTool):
             ),
         )
         return evidence.model_dump(mode="json")
-
-    async def _execute_with_repair(
-        self,
-        *,
-        connector,
-        query: str,
-        query_language: str | None,
-        timeout: int,
-        initial_repair_reason: str | None,
-    ):
-        repair_diagnostics = {
-            "attempted": bool(initial_repair_reason),
-            "initial_repair": initial_repair_reason,
-            "retry_repair": None,
-            "retry_hint": None,
-            "error_classification": None,
-        }
-        try:
-            return await execute_query(connector, query, timeout=timeout), query, repair_diagnostics
-        except Exception as exc:
-            classification = classify_query_error(exc)
-            retry_repair = repair_read_only_query(
-                query=query,
-                query_language=query_language,
-                error=exc,
-            )
-            repair_diagnostics["attempted"] = repair_diagnostics["attempted"] or retry_repair.changed
-            repair_diagnostics["retry_repair"] = retry_repair.reason
-            repair_diagnostics["retry_hint"] = retry_repair.hint or classification.get("suggestion")
-            repair_diagnostics["error_classification"] = classification
-            if not retry_repair.changed or retry_repair.query == query:
-                raise RuntimeError(
-                    f"{classification['message']} "
-                    f"Repair hint: {repair_diagnostics['retry_hint'] or 'rewrite the read-only query based on the error.'}"
-                ) from exc
-            self._validate_read_only(retry_repair.query, query_language)
-            try:
-                return await execute_query(connector, retry_repair.query, timeout=timeout), retry_repair.query, repair_diagnostics
-            except Exception as retry_exc:
-                retry_classification = classify_query_error(retry_exc)
-                repair_diagnostics["error_classification"] = retry_classification
-                raise RuntimeError(
-                    f"{retry_classification['message']} "
-                    f"Repair hint: {retry_repair.hint or retry_classification.get('suggestion') or 'rewrite the read-only query based on the error.'}"
-                ) from retry_exc
 
     async def _load_database_config(self, database_id: str) -> dict:
         await DatabaseFactory.load_databases()
@@ -302,96 +279,51 @@ class _ExplicitQueryExecutor(BaseTool):
         query: str,
         request_state: RequestStateModel | None,
     ) -> None:
-        rendered = RenderedQuery(
-            query_text=query,
-            query_language=validated_input.query_language or self._infer_query_language(config),
-        )
         contract_filters = self._contract_required_filters(validated_input.constraints)
-        if contract_filters:
-            missing = self._missing_rendered_required_filters(rendered, contract_filters)
-            if missing:
-                self._raise_missing_required_filters(
-                    missing,
-                    schema_linking_contract=validated_input.constraints.get("_schema_linking_contract"),
-                    query=query,
-                    query_language=rendered.query_language,
-                )
+        if not contract_filters:
             return
-
-        message = (request_state.message if request_state is not None else None) or validated_input.purpose or ""
-        if not message.strip():
-            return
-        try:
-            schema = await connector.get_schema()
-        except Exception:
-            return
-        context = QueryRequestContext(
-            database_id=validated_input.database_context.database_id,
-            database_type=str(config.get("type", validated_input.database_context.database_type)),
-            message=message,
-            constraints=validated_input.constraints,
-            intent_profile=request_state.intent_profile if request_state is not None else {},
-        )
-        intent = DefaultIntentInterpreter().interpret(context=context)
-        linking_result = self._schema_linking_pipeline.ground(
-            context=context,
-            schema=schema,
-            intent=intent,
-        )
-        if not linking_result.required_filters:
-            return
-        validation = DefaultQueryValidator(dialect_for_database(context.database_type)).validate(
-            context=context,
-            plan=linking_result.plan,
-            rendered_query=rendered,
-        )
-        missing = [issue for issue in validation.issues if issue.code == "required_filter_missing"]
+        query_language = validated_input.query_language or self._infer_query_language(config)
+        missing = self._missing_rendered_required_filters(query, query_language, contract_filters)
         if missing:
             self._raise_missing_required_filters(
-                [
-                    QueryFilter(source=None, column=self._filter_column_from_message(issue.message), value=self._filter_value_from_message(issue.message))
-                    for issue in missing
-                ],
-                schema_linking_contract=linking_result.diagnostics(),
-                details="; ".join(issue.message for issue in missing),
+                missing,
+                schema_linking_contract=validated_input.constraints.get("_schema_linking_contract"),
                 query=query,
-                query_language=rendered.query_language,
+                query_language=query_language,
             )
 
-    def _contract_required_filters(self, constraints: dict) -> list[QueryFilter]:
+    def _contract_required_filters(self, constraints: dict) -> list[dict]:
         contract = constraints.get("_schema_linking_contract") if isinstance(constraints, dict) else None
         if not isinstance(contract, dict):
             return []
         raw_filters = contract.get("required_filters")
         if not isinstance(raw_filters, list):
             return []
-        filters: list[QueryFilter] = []
+        filters: list[dict] = []
         for item in raw_filters:
             if not isinstance(item, dict):
                 continue
             column = str(item.get("column") or "").strip()
             if not column:
                 continue
-            filters.append(
-                QueryFilter(
-                    source=item.get("source"),
-                    column=column,
-                    operator=str(item.get("operator") or "="),
-                    value=item.get("value"),
-                )
-            )
+            filters.append({
+                "source": item.get("source"),
+                "column": column,
+                "operator": str(item.get("operator") or "="),
+                "value": item.get("value"),
+            })
         return filters
 
-    def _missing_rendered_required_filters(self, rendered: RenderedQuery, required_filters: list[QueryFilter]) -> list[QueryFilter]:
-        dialect = dialect_for_database(rendered.query_language)
+    def _missing_rendered_required_filters(self, query: str, query_language: str, required_filters: list[dict]) -> list[dict]:
+        dialect = dialect_for_database(query_language)
         return [
             item for item in required_filters
-            if not dialect.has_rendered_filter(rendered, item)
+            if not dialect.has_filter(query, column=item["column"], value=item.get("value"))
         ]
 
     def _raise_missing_required_filters(
         self,
-        missing: list[QueryFilter],
+        missing: list[dict],
         *,
         schema_linking_contract: dict | None,
         details: str | None = None,
@@ -399,18 +331,10 @@ class _ExplicitQueryExecutor(BaseTool):
         query_language: str | None = None,
     ) -> None:
         rendered_details = details or "; ".join(
-            f"Rendered query is missing the required filter {item.column}={item.value!r}."
+            f"Rendered query is missing the required filter {item['column']}={item.get('value')!r}."
             for item in missing
         )
-        missing_filters = [
-            {
-                "source": item.source,
-                "column": item.column,
-                "operator": item.operator,
-                "value": item.value,
-            }
-            for item in missing
-        ]
+        missing_filters = [dict(item) for item in missing]
         repair_contract = {
             "mode": "query_repair",
             "previous_query": query,
@@ -450,16 +374,6 @@ class _ExplicitQueryExecutor(BaseTool):
             },
             validation_failure=validation_failure,
         )
-
-    def _filter_column_from_message(self, message: str) -> str:
-        match = re.search(r"filter\s+([^=\s]+)=", message)
-        return match.group(1) if match else ""
-
-    def _filter_value_from_message(self, message: str):
-        match = re.search(r"=([^.;]+)", message)
-        if not match:
-            return None
-        return match.group(1).strip().strip("'\"")
 
     def _task_coverage_diagnostics(
         self,
@@ -628,9 +542,6 @@ class SqlQueryTool(BaseTool):
     """Unified database query tool for planned and explicit read-only queries."""
 
     def __init__(self, settings: Settings, llm=None):
-        from tools.query_database import QueryDatabaseTool
-
-        self._planned_query_tool = QueryDatabaseTool(settings)
         self._explicit_query_executor = _ExplicitQueryExecutor(settings)
         self._llm_query_generator = LLMQueryGenerator(llm) if llm is not None else None
         self._settings = settings
@@ -657,7 +568,7 @@ class SqlQueryTool(BaseTool):
             raise RuntimeError("sql_query automatic mode requires an LLM query generator.")
 
         total_started = time.perf_counter()
-        config_path, config = await self._planned_query_tool._load_database_config(
+        config = await self._explicit_query_executor._load_database_config(
             validated_input.database_context.database_id
         )
         schema, preview = await self._load_schema_and_preview(validated_input, config)
@@ -666,14 +577,6 @@ class SqlQueryTool(BaseTool):
             validated_input,
             request_state if isinstance(request_state, RequestStateModel) else None,
         )
-        rule_started = time.perf_counter()
-        linking_diagnostics = self._schema_linking_for_generation(
-            validated_input,
-            config,
-            schema,
-            message=grounding_message,
-        )
-        rule_duration_ms = int((time.perf_counter() - rule_started) * 1000)
         llm_linking_started = time.perf_counter()
         schema_linking_contract = None
         try:
@@ -682,7 +585,6 @@ class SqlQueryTool(BaseTool):
                 database_type=str(config.get("type", validated_input.database_context.database_type)),
                 message=grounding_message,
                 schema_preview=preview,
-                rule_diagnostics=linking_diagnostics,
                 time_range=validated_input.time_range,
                 constraints=validated_input.constraints,
                 history=validated_input.history,
@@ -695,7 +597,6 @@ class SqlQueryTool(BaseTool):
                 retryable=True,
                 recommended_next_action="sql_query",
                 diagnostics={
-                    "rule_schema_linking": linking_diagnostics,
                     "grounding_message": grounding_message,
                 },
             ) from exc
@@ -741,80 +642,27 @@ class SqlQueryTool(BaseTool):
                     "schema_linking": schema_linking_contract,
                     "grounding_message": grounding_message,
                     "runtime_ms": {
-                        "schema_linking_rule_duration_ms": rule_duration_ms,
-                        "schema_linking_llm_duration_ms": llm_linking_duration_ms,
+                    "schema_linking_llm_duration_ms": llm_linking_duration_ms,
                         "query_generation_duration_ms": int((time.perf_counter() - generation_started) * 1000),
                     },
                 },
             ) from exc
         generation_duration_ms = int((time.perf_counter() - generation_started) * 1000)
         runtime_diagnostics = {
-            "schema_linking_rule_duration_ms": rule_duration_ms,
             "schema_linking_llm_duration_ms": llm_linking_duration_ms,
             "query_generation_duration_ms": generation_duration_ms,
             "sql_query_planning_duration_ms": int((time.perf_counter() - total_started) * 1000),
         }
-        try:
-            return await self._execute_generated_query(
-                validated_input,
-                config,
-                generation,
-                schema_linking_diagnostics=schema_linking_contract,
-                extra_runtime_diagnostics=runtime_diagnostics,
-                **kwargs,
-            )
-        except StructuredToolError as exc:
-            if exc.error_type != "query_shape_invalid":
-                raise
-            repair_constraints = dict(validated_input.constraints or {})
-            if self._shape_issue_requires_raw_series(exc):
-                repair_constraints.setdefault("evidence_shape", "raw_timeseries")
-            else:
-                repair_constraints.setdefault("repair_strategy", "schema_grounded_query")
-            repair_started = time.perf_counter()
-            repair_generation = await self._llm_query_generator.generate(
-                database_id=validated_input.database_context.database_id,
-                database_type=str(config.get("type", validated_input.database_context.database_type)),
-                message=grounding_message,
-                schema_preview=preview,
-                time_range=validated_input.time_range,
-                constraints=repair_constraints,
-                history=validated_input.history,
-                fact_requests=[item.model_dump(mode="json", exclude_none=True) for item in validated_input.fact_requests],
-                previous_query=generation.generated_query.query,
-                error=exc.to_observation_payload(),
-                request_state=request_state,
-            )
-            return await self._execute_generated_query(
-                validated_input.model_copy(update={"constraints": repair_constraints}),
-                config,
-                repair_generation,
-                previous_error=exc,
-                schema_linking_diagnostics=schema_linking_contract,
-                extra_runtime_diagnostics={
-                    **runtime_diagnostics,
-                    "shape_repair_generation_duration_ms": int((time.perf_counter() - repair_started) * 1000),
-                },
-                **kwargs,
-            )
+        return await self._execute_generated_query(
+            validated_input,
+            config,
+            generation,
+            schema_linking_diagnostics=schema_linking_contract,
+            extra_runtime_diagnostics=runtime_diagnostics,
+            **kwargs,
+        )
 
-    def _shape_issue_requires_raw_series(self, exc: StructuredToolError) -> bool:
-        diagnostics = exc.diagnostics if isinstance(exc.diagnostics, dict) else {}
-        issues = diagnostics.get("query_shape_issues") if isinstance(diagnostics.get("query_shape_issues"), list) else []
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            recommended = str(issue.get("recommended_shape") or "").strip().lower()
-            if recommended == "schema_grounded_flux_aggregate":
-                return False
-            if recommended in {"raw_series", "raw_series_or_simple_aggregate_table"}:
-                return True
-        return True
-
-    async def _load_schema_and_preview(self, validated_input: SqlQueryInput, config: dict) -> tuple[DatabaseSchema | None, dict]:
-        reference_dataset = config.get("reference_dataset")
-        if isinstance(reference_dataset, dict):
-            return None, self._reference_dataset_schema_preview(config)
+    async def _load_schema_and_preview(self, validated_input: SqlQueryInput, config: dict):
         try:
             schema, _profile_cache = await DatabaseFactory.load_schema_with_profile_cache(
                 validated_input.database_context.database_id,
@@ -831,35 +679,6 @@ class SqlQueryTool(BaseTool):
         _, preview = await self._load_schema_and_preview(validated_input, config)
         return preview
 
-    def _schema_linking_for_generation(
-        self,
-        validated_input: SqlQueryInput,
-        config: dict,
-        schema: DatabaseSchema | None,
-        *,
-        message: str | None = None,
-    ) -> dict | None:
-        if schema is None:
-            return None
-        message = message if message is not None else validated_input.message or ""
-        if not message.strip():
-            return None
-        context = QueryRequestContext(
-            database_id=validated_input.database_context.database_id,
-            database_type=str(config.get("type", validated_input.database_context.database_type)),
-            message=message,
-            time_range=validated_input.time_range,
-            constraints=validated_input.constraints,
-            history=validated_input.history,
-            intent_profile=validated_input.intent_profile,
-        )
-        intent = DefaultIntentInterpreter().interpret(context=context)
-        return SchemaLinkingPipeline().ground(
-            context=context,
-            schema=schema,
-            intent=intent,
-        ).diagnostics()
-
     def _grounding_message(
         self,
         validated_input: SqlQueryInput,
@@ -870,38 +689,6 @@ class SqlQueryTool(BaseTool):
         if user_message.strip() and tool_message.strip() and user_message.strip() != tool_message.strip():
             return f"User request: {user_message.strip()}\nTool query purpose: {tool_message.strip()}"
         return user_message.strip() or tool_message.strip()
-
-    def _reference_dataset_schema_preview(self, config: dict) -> dict:
-        reference_dataset = config.get("reference_dataset") if isinstance(config.get("reference_dataset"), dict) else {}
-        table_name = (
-            reference_dataset.get("measurement")
-            or reference_dataset.get("metric_name")
-            or reference_dataset.get("table")
-            or reference_dataset.get("series_name")
-            or config.get("database")
-            or config.get("name")
-        )
-        fields = list(reference_dataset.get("field_columns") or [])
-        value_column = reference_dataset.get("value_column")
-        if value_column and value_column not in fields:
-            fields.append(value_column)
-        time_column = reference_dataset.get("timestamp_column")
-        return {
-            "source": "reference_dataset_config",
-            "database_type": config.get("type"),
-            "query_language": self._infer_query_language(config),
-            "tables_or_measurements": [
-                {
-                    "name": table_name,
-                    "time_column": time_column,
-                    "field_columns": fields[:100],
-                    "time_range": reference_dataset.get("time_range"),
-                    "sample_rows": reference_dataset.get("sample_rows", [])[:3]
-                    if isinstance(reference_dataset.get("sample_rows"), list)
-                    else [],
-                }
-            ],
-        }
 
     async def _execute_generated_query(
         self,
@@ -921,8 +708,6 @@ class SqlQueryTool(BaseTool):
             constraints=validated_input.constraints,
             schema_linking_diagnostics=schema_linking_diagnostics,
         )
-        if isinstance(config.get("reference_dataset"), dict):
-            return await self._execute_reference_dataset_query(validated_input, config, generated, generation, previous_error, **kwargs)
         query_language = generated.query_language or self._infer_query_language(config)
         contract = (
             generated.query_task_contract.model_dump(mode="json")
@@ -1004,19 +789,6 @@ class SqlQueryTool(BaseTool):
             query_language=query_language,
             query_task_contract=contract if isinstance(contract, dict) else None,
         )
-        if issues:
-            repair = dialect.repair_query(
-                query=generated.query,
-                query_language=query_language,
-                error={"query_shape_issues": issues},
-            )
-            if repair.changed:
-                generated.query = repair.query
-                issues = dialect.query_shape_issues(
-                    query=generated.query,
-                    query_language=query_language,
-                    query_task_contract=contract if isinstance(contract, dict) else None,
-                )
         if not issues:
             return
         recommended = None
@@ -1061,66 +833,11 @@ class SqlQueryTool(BaseTool):
             validation_failure=validation_failure,
         )
 
-    async def _execute_reference_dataset_query(
-        self,
-        validated_input: SqlQueryInput,
-        config: dict,
-        generated: LLMGeneratedQuery,
-        generation: LLMQueryGenerationResult,
-        previous_error: Exception | None,
-        **kwargs,
-    ) -> dict:
-        from tools.query_database import QueryDatabaseInput
-
-        self._explicit_query_executor._validate_read_only(
-            generated.query,
-            generated.query_language or self._infer_query_language(config),
-        )
-        constraints = {
-            **validated_input.constraints,
-            "selected_fields": generated.selected_fields,
-            "expected_result_type": generated.expected_result_type or "timeseries",
-            "llm_generated_query": generated.query,
-            "llm_query_language": generated.query_language or self._infer_query_language(config),
-        }
-        evidence = await self._planned_query_tool.execute(
-            QueryDatabaseInput(
-                message=validated_input.message or "",
-                database_context=validated_input.database_context,
-                time_range=validated_input.time_range,
-                constraints=constraints,
-                intent_profile=validated_input.intent_profile,
-                selected_database=validated_input.selected_database,
-                selected_database_type=validated_input.selected_database_type,
-                history=validated_input.history,
-            ),
-            **kwargs,
-        )
-        evidence["query"] = generated.query
-        evidence["query_language"] = generated.query_language or self._infer_query_language(config)
-        evidence["metadata"] = {
-            **evidence.get("metadata", {}),
-            "sql_query_mode": "llm",
-            "generation_mode": "llm",
-            "purpose": generated.purpose,
-            "expected_result_type": generated.expected_result_type,
-        }
-        evidence["diagnostics"] = {
-            **evidence.get("diagnostics", {}),
-            **self._generation_diagnostics(
-                generation,
-                previous_error=previous_error,
-                reference_dataset=True,
-            ),
-        }
-        return evidence
-
     def _generation_diagnostics(
         self,
         generation: LLMQueryGenerationResult,
         *,
         previous_error: Exception | None,
-        reference_dataset: bool = False,
     ) -> dict:
         generated = generation.generated_query
         return {
@@ -1140,7 +857,6 @@ class SqlQueryTool(BaseTool):
                 "confidence": generated.confidence,
                 "repaired_from_query": generation.repaired_from_query,
                 "previous_error": str(previous_error) if previous_error is not None else None,
-                "reference_dataset_execution": reference_dataset,
             },
             "task_coverage": self._generation_task_coverage(generation),
         }

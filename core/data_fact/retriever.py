@@ -323,6 +323,9 @@ class LlmFactMemoryRetriever:
                     "Each request requires fact_key, name, and fact_type. A derived Fact must list verified parent fact_key values "
                     "in derived_from; parents are inputs, not duplicate output requests. For sql_query use only point_value or "
                     "time_boundary with requirements.time_position=start|end, extreme with requirements.operator=min|max, or count. "
+                    "Use time_boundary for timestamps, point_value only for scalar measure values, and count only when the user asks "
+                    "for a row/record count. Return no Fact request for tables, detail lists, or complete time series because the query "
+                    "Evidence Artifact already represents those outputs. "
                     "Use code_interpreter for change, ratio, trend, distribution, association, and multi-Fact composition. "
                     "Do not invent parent keys and do not return already verified facts unless this call must replace them."
                 ),

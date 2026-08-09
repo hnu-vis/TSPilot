@@ -94,7 +94,7 @@ def validate_action(
     if repeat_failure_reason:
         return False, repeat_failure_reason
     if action_name in TERMINAL_ACTIONS:
-        terminal_reason = _terminal_boundary_violation(request_state)
+        terminal_reason = _terminal_boundary_violation(request_state, action_input)
         if terminal_reason:
             return False, terminal_reason
         return True, None
@@ -164,7 +164,10 @@ def _contains_database_query_code(value) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns)
 
 
-def _terminal_boundary_violation(request_state: RequestStateModel) -> str | None:
+def _terminal_boundary_violation(
+    request_state: RequestStateModel,
+    action_input: dict | None = None,
+) -> str | None:
     """Return a minimal DB-GPT-style terminal guard violation.
 
     Terminate should end the ReAct loop once useful tool observations exist. It
@@ -178,6 +181,10 @@ def _terminal_boundary_violation(request_state: RequestStateModel) -> str | None
         return None
     missing = _missing_explicit_terminal_capabilities(request_state)
     if missing:
+        if _repair_retry_exhausted(request_state) and _terminal_input_covers_items(action_input, missing):
+            return None
+        if _latest_database_evidence_is_empty(request_state) and _terminal_input_explains_unavailable_outputs(request_state, action_input):
+            return None
         return (
             "Final answer is blocked because an explicitly requested tool output is missing: "
             + ", ".join(missing)
@@ -189,6 +196,29 @@ def _terminal_boundary_violation(request_state: RequestStateModel) -> str | None
             "Call sql_query or another evidence-producing tool first."
         )
     return None
+
+
+def _repair_retry_exhausted(request_state: RequestStateModel) -> bool:
+    latest = request_state.observations[-1] if request_state.observations else None
+    if latest is None or latest.success:
+        return False
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    validation_failure = payload.get("validation_failure") if isinstance(payload.get("validation_failure"), dict) else {}
+    retry_policy = validation_failure.get("retry_policy") if isinstance(validation_failure.get("retry_policy"), dict) else {}
+    repeated = int(payload.get("repeated_failure_count") or 1)
+    max_retries = int(retry_policy.get("max_equivalent_retries") or 2)
+    return retry_policy.get("terminal_after_exhausted") is True and repeated > max_retries
+
+
+def _terminal_input_covers_items(action_input: dict | None, items: list[str]) -> bool:
+    if not isinstance(action_input, dict) or not str(action_input.get("unavailable_reason") or "").strip():
+        return False
+    unavailable = {
+        str(item).strip()
+        for item in action_input.get("unavailable_outputs", [])
+        if str(item).strip()
+    }
+    return bool(unavailable) and all(item in unavailable for item in items)
 
 
 def _missing_explicit_terminal_capabilities(request_state: RequestStateModel) -> list[str]:
@@ -250,7 +280,7 @@ def _covered_action_repeat_reason(
     if latest is not None and not latest.success:
         return None
     refs = _available_artifact_refs(request_state)
-    if action_name in {"sql_query", "query_database"} and any(ref.startswith("evidence:") for ref in refs):
+    if action_name == "sql_query" and any(ref.startswith("evidence:") for ref in refs):
         if _has_successful_action(request_state, action_name):
             return (
                 "Equivalent query evidence already exists. Reuse the available evidence artifact "

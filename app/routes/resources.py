@@ -1,9 +1,7 @@
 """Read-only resource endpoints for the frontend workspace."""
 from __future__ import annotations
 
-import csv
 from time import perf_counter
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -57,7 +55,6 @@ def _public_database_config(db_id: str, config: dict) -> dict:
         "database": config.get("database"),
         "display_name": config.get("display_name") or config.get("name") or db_id,
         "config_source": config.get("config_source"),
-        "has_reference_dataset": bool(config.get("reference_dataset")),
         "username": config.get("username"),
         "ssl_enabled": bool(config.get("ssl_enabled", False)),
     }
@@ -154,16 +151,6 @@ async def preview_database_resource(database_id: str, refresh: bool = Query(defa
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
 
     public_config = _public_database_config(database_id, config)
-    reference_dataset = config.get("reference_dataset")
-    if isinstance(reference_dataset, dict):
-        preview = _reference_dataset_preview(config)
-        return {
-            "database": public_config,
-            "preview_kind": "reference_dataset",
-            "summary": f"Loaded reference dataset schema for {len(preview.get('tables_or_measurements', []))} object.",
-            "preview": preview,
-        }
-
     try:
         schema, profile_cache = await DatabaseFactory.load_schema_with_profile_cache(
             database_id,
@@ -255,95 +242,6 @@ async def get_database_fact_memory_detail(database_id: str, memory_id: str) -> d
         "database": _public_database_config(database_id, config),
         "detail": detail.model_dump(mode="json"),
     }
-
-
-def _reference_dataset_preview(config: dict) -> dict:
-    reference_dataset = config.get("reference_dataset") if isinstance(config.get("reference_dataset"), dict) else {}
-    dataset_path = _resolve_reference_dataset_path(config, reference_dataset)
-    sample_rows = _read_sample_rows(dataset_path, limit=3)
-    row_count = _count_csv_rows(dataset_path)
-    field_columns = reference_dataset.get("field_columns")
-    if not isinstance(field_columns, list):
-        value_column = reference_dataset.get("value_column")
-        field_columns = [value_column] if value_column else []
-    time_column = reference_dataset.get("timestamp_column")
-    columns = []
-    if time_column:
-        columns.append({"name": str(time_column), "data_type": "datetime", "nullable": True})
-    columns.extend(
-        {"name": str(column), "data_type": "unknown", "nullable": True}
-        for column in field_columns
-        if column not in (None, "")
-    )
-    table_name = (
-        reference_dataset.get("measurement")
-        or reference_dataset.get("metric_name")
-        or reference_dataset.get("table")
-        or reference_dataset.get("series_name")
-        or config.get("name")
-    )
-    table = {
-        "name": table_name,
-        "schema": "",
-        "type": "reference_dataset",
-        "row_count": row_count,
-        "columns": columns,
-        "field_values": [str(column) for column in field_columns if column not in (None, "")],
-        "sample_rows": sample_rows,
-    }
-    return {
-        "tables_or_measurements": [table],
-        "fields": [
-            {"table": table_name, **column}
-            for column in columns
-        ],
-        "labels_or_tags": [],
-        "time_columns": [str(time_column)] if time_column else [],
-        "metadata": {
-            "database_type": config.get("type") or config.get("db_type"),
-            "reference_dataset": {
-                "dataset_path": reference_dataset.get("dataset_path"),
-                "row_count": row_count,
-                "timestamp_column": time_column,
-                "source": reference_dataset.get("source"),
-            },
-        },
-    }
-
-
-def _resolve_reference_dataset_path(config: dict, reference_dataset: dict) -> Path | None:
-    raw_path = reference_dataset.get("resolved_dataset_path") or reference_dataset.get("dataset_path")
-    if not raw_path:
-        return None
-    path = Path(str(raw_path))
-    if path.is_absolute():
-        return path
-    return (Path(get_settings().tspilot_root) / path).resolve()
-
-
-def _count_csv_rows(path: Path | None) -> int | None:
-    if path is None or not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            return sum(1 for _ in csv.DictReader(handle))
-    except Exception:
-        return None
-
-
-def _read_sample_rows(path: Path | None, *, limit: int) -> list[dict]:
-    if path is None or not path.exists() or limit <= 0:
-        return []
-    rows = []
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle):
-                rows.append(dict(row))
-                if len(rows) >= limit:
-                    break
-    except Exception:
-        return []
-    return rows
 
 
 @router.get("/knowledge")

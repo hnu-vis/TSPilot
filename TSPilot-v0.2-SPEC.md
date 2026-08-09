@@ -26,7 +26,7 @@ Build one simple and strict execution model for time-series data work:
 ## Main action space
 
 - `todowrite`
-- `query_database`
+- `sql_query`
 - `code_interpreter`
 - `forecast`
 - `anomaly`
@@ -36,7 +36,7 @@ Build one simple and strict execution model for time-series data work:
 
 ## Core design rules
 
-- `query_database` returns evidence only
+- `sql_query` returns evidence only; schema linking and query generation are LLM-driven
 - analysis tools convert evidence into request-scoped facts and analysis artifacts
 - `forecast` and `anomaly` only consume time-series evidence
 - `format_answer` only assembles verified outputs

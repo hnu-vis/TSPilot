@@ -91,6 +91,12 @@ class CodeInterpreterTool(BaseTool):
         rows, points, columns = _analysis_inputs(database_evidence)
         goal = validated_input.analysis_goal or "Code interpreter analysis"
         constraints = validated_input.constraints or {}
+        analysis_request = validated_input.analysis_request or {}
+        repair_contract = validated_input.repair_contract
+        if repair_contract is None and isinstance(analysis_request.get("repair_contract"), dict):
+            repair_contract = analysis_request.get("repair_contract")
+        if repair_contract is None and isinstance(constraints.get("_repair_contract"), dict):
+            repair_contract = constraints.get("_repair_contract")
         code_text = str(validated_input.code or "").strip()
         generated_code_preview = None
         executed_code_preview = None
@@ -127,6 +133,9 @@ class CodeInterpreterTool(BaseTool):
                             ),
                             canonical_context=canonical_context,
                             fact_requests=validated_input.fact_requests,
+                            analysis_request=analysis_request,
+                            expected_result_schema=validated_input.expected_result_schema or {},
+                            repair_contract=repair_contract,
                         )
                         generated_code_preview = _failed_code_summary(code_text)
                     except (AnalysisCodeError, asyncio.TimeoutError):
@@ -281,7 +290,7 @@ class CodeInterpreterTool(BaseTool):
     ):
         current_code = code
         last_error: AnalysisCodeError | None = None
-        max_internal_repairs = 2 if self._llm is not None else 0
+        max_internal_repairs = 0
         for attempt in range(max_internal_repairs + 1):
             preflight_error = _preflight_analysis_code(current_code, canonical_context)
             if preflight_error is not None:
@@ -316,24 +325,7 @@ class CodeInterpreterTool(BaseTool):
                     "code_hash": _code_hash(current_code),
                 }
             )
-            if attempt >= max_internal_repairs or self._llm is None:
-                break
-            try:
-                current_code = await self._repair_analysis_code(
-                    goal=goal,
-                    required_outputs=required_outputs,
-                    required_metrics=_requested_metric_labels(
-                        goal=goal,
-                        required_outputs=required_outputs,
-                        analysis_request=analysis_request,
-                    ),
-                    canonical_context=canonical_context,
-                    fact_requests=fact_requests,
-                    failed_code=current_code,
-                    error=str(last_error or ""),
-                )
-            except (AnalysisCodeError, asyncio.TimeoutError):
-                break
+            break
         raise _structured_code_execution_error(
             last_error or AnalysisCodeError("analysis_code sandbox failed."),
             goal=goal,
@@ -354,42 +346,22 @@ class CodeInterpreterTool(BaseTool):
         required_metrics: list[str],
         canonical_context: dict,
         fact_requests: list[DataFactRequest],
+        analysis_request: dict,
+        expected_result_schema: dict,
+        repair_contract: dict | None,
     ) -> str:
         return await self._invoke_code_llm(
             {
-                "mode": "generate",
+                "mode": "repair" if repair_contract else "generate",
                 "goal": goal,
                 "required_outputs": required_outputs,
                 "required_metrics": required_metrics,
+                "analysis_request": analysis_request,
+                "expected_result_schema": expected_result_schema,
+                "repair_contract": repair_contract,
                 "canonical_inputs": canonical_context.get("schema", {}),
                 "fact_contracts": [request.model_dump(mode="json", exclude_none=True) for request in fact_requests],
                 "input_facts": canonical_context.get("input_facts", []),
-            }
-        )
-
-    async def _repair_analysis_code(
-        self,
-        *,
-        goal: str,
-        required_outputs: list[str],
-        required_metrics: list[str],
-        canonical_context: dict,
-        fact_requests: list[DataFactRequest],
-        failed_code: str,
-        error: str,
-    ) -> str:
-        return await self._invoke_code_llm(
-            {
-                "mode": "repair",
-                "goal": goal,
-                "required_outputs": required_outputs,
-                "required_metrics": required_metrics,
-                "canonical_inputs": canonical_context.get("schema", {}),
-                "fact_contracts": [request.model_dump(mode="json", exclude_none=True) for request in fact_requests],
-                "input_facts": canonical_context.get("input_facts", []),
-                "failed_code": _failed_code_summary(failed_code),
-                "error": error[:1200],
-                "error_classification": _classify_analysis_code_error(error),
             }
         )
 
@@ -407,7 +379,11 @@ class CodeInterpreterTool(BaseTool):
             "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
             "values must be JSON-serializable plain Python scalars, lists, or dicts. facts must be a list with one object per "
             "satisfied fact_contract, preserving its fact_key, name, fact_type, and derived_from. Each fact must include value, "
-            "statement, and calculation_trace. Use input_facts or fact_by_key for dependencies; never invent a dependency value."
+            "statement, and calculation_trace. Use input_facts or fact_by_key for dependencies; never invent a dependency value. "
+            "Treat analysis_request, expected_result_schema, and repair_contract as authoritative output requirements. When a "
+            "repair_contract lists required_details_fields, result.details must contain every listed field with the requested types. "
+            "When the goal or analysis_request performs outlier/anomaly treatment, result.details must include outlier_rule, "
+            "threshold_or_formula, rationale, excluded_rows as a row list, raw_metrics, and adjusted_metrics."
         )
         messages = [
             ("system", system),
@@ -501,6 +477,11 @@ def _validate_fact_output_contract(
         for fact in (input_facts or [])
         if isinstance(fact, dict) and fact.get("status", "verified") == "verified"
     }
+    output_fact_keys = {
+        normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
+        for raw in facts
+        if isinstance(raw, dict)
+    }
     seen: set[str] = set()
     for raw in facts:
         if not isinstance(raw, dict):
@@ -513,7 +494,10 @@ def _validate_fact_output_contract(
             raise AnalysisCodeError(f"analysis returned duplicate fact_key '{fact_key}'.")
         seen.add(fact_key)
         if request.derived_from:
-            missing_parents = [key for key in request.derived_from if key not in verified_input_keys]
+            if fact_key in request.derived_from:
+                raise AnalysisCodeError(f"analysis fact '{fact_key}' cannot depend on itself.")
+            available_parents = verified_input_keys | output_fact_keys
+            missing_parents = [key for key in request.derived_from if key not in available_parents]
             if missing_parents:
                 raise AnalysisCodeError(
                     f"analysis fact '{fact_key}' depends on unavailable verified input facts: {missing_parents}."
@@ -1106,6 +1090,7 @@ def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
         "filter",
         "float",
         "globals",
+        "hasattr",
         "int",
         "isinstance",
         "len",

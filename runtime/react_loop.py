@@ -1151,7 +1151,7 @@ class ReActLoop:
             preview["pending_count"] = visible_payload.get("pending_count")
         if "results" in visible_payload:
             preview["result_count"] = len(visible_payload.get("results", []))
-        if payload.get("tool_name") in {"sql_query", "query_database"}:
+        if payload.get("tool_name") == "sql_query":
             preview.update(self._sql_payload_preview(visible_payload))
         if payload.get("tool_name") == "code_interpreter":
             preview.update(self._code_interpreter_payload_preview(visible_payload))

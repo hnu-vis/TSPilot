@@ -83,7 +83,7 @@ The model must treat anything outside that window as unavailable.
 
 ```text
 Thought: I need evidence before deciding the facts.
-Action: query_database
+Action: sql_query
 Action Input: {"message":"最近7天CPU有什么趋势？","database_context":{"database_id":"prometheus-prod","database_type":"prometheus","display_name":"Prometheus Prod"},"time_range":{"start":"2026-07-07T00:00:00Z","end":"2026-07-14T00:00:00Z"},"constraints":{"max_points":100},"history":[]}
 ```
 
@@ -102,7 +102,7 @@ Optional fields:
 
 - `evidence_summary`
 
-### `query_database`
+### `sql_query`
 
 Required fields:
 
@@ -296,7 +296,7 @@ The prompt should guide the model with this order:
 - `Action Input` must satisfy the selected action contract
 - `Observation` is not model output
 - prefer deterministic recovery or a failed observation over guessing when required fields are missing
-- treat `query_database` output as evidence, not as a final answer
+- treat `sql_query` output as evidence, not as a final answer
 - use only selected `fact_set` facts from the current request flow in final narration
 - prefer `linechart` for time-indexed or ratio/comparison facts when the evidence supports it
 - do not emit hidden state changes outside the structured block

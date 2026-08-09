@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
@@ -62,6 +64,7 @@ class StateTransitionEngine:
     ) -> ToolObservation:
         if not observation.success:
             safe_observation = request_state_runtime._build_prompt_safe_failure_observation(observation)
+            safe_observation = _annotate_failure_repetition(request_state, safe_observation, observation)
             request_state.observations.append(safe_observation)
             return safe_observation
 
@@ -100,3 +103,35 @@ class StateTransitionEngine:
         )
         request_state.observations.append(safe_observation)
         return safe_observation
+
+
+def _annotate_failure_repetition(
+    request_state: RequestStateModel,
+    safe_observation: ToolObservation,
+    raw_observation: ToolObservation,
+) -> ToolObservation:
+    payload = raw_observation.payload if isinstance(raw_observation.payload, dict) else {}
+    validation_failure = payload.get("validation_failure") if isinstance(payload.get("validation_failure"), dict) else {}
+    repair_contract = validation_failure.get("repair_contract") if isinstance(validation_failure.get("repair_contract"), dict) else {}
+    identity = {
+        "tool": raw_observation.tool_name,
+        "error_code": validation_failure.get("error_code") or payload.get("error_type") or "tool_failure",
+        "scope": validation_failure.get("scope"),
+        "capability": validation_failure.get("capability"),
+        "repair_mode": repair_contract.get("mode"),
+    }
+    encoded = json.dumps(identity, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    signature = hashlib.sha256(encoded).hexdigest()[:16]
+    repeated = 1
+    for previous in reversed(request_state.observations):
+        if previous.success:
+            break
+        previous_payload = previous.payload if isinstance(previous.payload, dict) else {}
+        if previous_payload.get("failure_signature") != signature:
+            break
+        repeated += 1
+
+    safe_payload = dict(safe_observation.payload or {})
+    safe_payload["failure_signature"] = signature
+    safe_payload["repeated_failure_count"] = repeated
+    return safe_observation.model_copy(update={"payload": safe_payload})

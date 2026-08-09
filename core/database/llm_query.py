@@ -149,6 +149,16 @@ class LLMSchemaLinkingContract(BaseModel):
                 normalized.append({key: item.strip()})
         return normalized
 
+    @field_validator("required_filters", mode="after")
+    @classmethod
+    def keep_only_schema_value_filters(cls, value):
+        return [item for item in value if not _is_time_boundary_filter(item)]
+
+
+def _is_time_boundary_filter(item: dict[str, Any]) -> bool:
+    column = str(item.get("column") or item.get("name") or "").strip().lower()
+    return column in {"time", "timestamp", "datetime", "date", "_time", "_start", "_stop"}
+
 
 @dataclass
 class LLMQueryGenerationResult:
@@ -173,7 +183,6 @@ class LLMQueryGenerator:
         database_type: str,
         message: str,
         schema_preview: dict,
-        rule_diagnostics: dict | None,
         time_range: dict | None,
         constraints: dict,
         history: list[dict],
@@ -189,7 +198,6 @@ class LLMQueryGenerator:
             "message": message,
             "response_language": response_language,
             "schema_preview": schema_preview,
-            "rule_schema_linking": rule_diagnostics,
             "time_range": time_range,
             "constraints": constraints,
             "history": history[-4:],
@@ -207,7 +215,6 @@ class LLMQueryGenerator:
         return {
             **contract.model_dump(mode="json"),
             "contract_version": "llm_schema_linking.v1",
-            "raw_rule_diagnostics": rule_diagnostics,
         }
 
     async def generate(
@@ -365,15 +372,16 @@ class LLMQueryGenerator:
         return (
             "You perform schema linking for TSPilot text-to-query.\n"
             "Return exactly one JSON object and no markdown.\n"
-            "Use only schema_preview and rule_schema_linking as evidence.\n"
+            "Use only schema_preview as schema evidence.\n"
             "Select the minimal physical sources, value columns, dimension columns, and filters needed for the user request.\n"
             f"Dialect-specific grounding rules for this datasource ({database_type}): {dialect.schema_linking_rules}\n"
-            "If schema_preview.physical_model or rule_schema_linking.measure_mappings is present, use it as authoritative physical-column evidence. "
+            "If schema_preview.physical_model is present, use it as authoritative physical-column evidence. "
             "For each requested measure, preserve logical_measure, selector_column/selector_value, physical_value_column, and aggregate_column in measures/aggregate_targets. "
             "Do not put a logical field value into value_columns as if it were a physical aggregate column unless physical_model proves that column exists after pivoting. "
-            "Treat rule_schema_linking.candidate_filters as value-domain evidence. "
+            "Treat schema_preview value-domain candidates as filter evidence. "
             "When the user mentions an entity, unit, ticker, symbol, code, label, or multilingual alias that matches a candidate value, include it in required_filters. "
             "required_filters must contain every source/dimension value that is necessary for the query to answer the specific user request, not optional filters.\n"
+            "Do not put time-window boundaries in required_filters; request.time_range is the authoritative temporal contract consumed by query generation.\n"
             "If a term cannot be grounded, put it in unresolved_terms and lower confidence. Do not invent schema objects or values.\n"
             "For each filter use {\"source\": string|null, \"column\": string, \"operator\": \"=\", \"value\": string|number|boolean}.\n"
             "JSON schema: {"

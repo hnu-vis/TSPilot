@@ -219,9 +219,9 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
 
         section_types = [section["section_type"] for section in payload["answer"]["sections"]]
         assert "analysis" in section_types
-        assert "Code interpreter computed 180 pairwise deltas" in payload["answer"]["summary"]
+        assert f"Code interpreter computed {code_payload['metrics_preview']['delta_count']} pairwise deltas" in payload["answer"]["summary"]
         conclusion = next(section for section in payload["answer"]["sections"] if section["section_type"] == "conclusion")
-        assert "Code interpreter computed 180 pairwise deltas" in conclusion["content"]
+        assert f"Code interpreter computed {code_payload['metrics_preview']['delta_count']} pairwise deltas" in conclusion["content"]
         assert any(reference["source_type"] == "analysis" for reference in payload["answer"]["references"])
 
         request_dir = next(tmp_path.glob(f"*_{payload['conversation_id']}/requests/{payload['request_id']}"))

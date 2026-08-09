@@ -98,8 +98,8 @@ def test_format_answer_allows_statistics_evidence_for_count_direct_answer():
         evidence_id="evi_count_stats",
         result_type="statistics",
         database="demo",
-        query_language="reference_dataset",
-        query="reference_dataset:value:statistics",
+        query_language="flux",
+        query='from(bucket: "demo") |> range(start: 0) |> count()',
         summary="Computed statistics over 19735 rows.",
         data={"statistics": {"count": 19735}},
         columns=["metric", "value"],
@@ -205,37 +205,6 @@ def test_format_answer_preserves_direct_answer_for_timeseries_query_evidence():
     assert result["sections"][0]["content"] == direct_answer
     assert result["sections"][1]["section_type"] == "query"
     assert result["sections"][1]["content"].startswith("```flux\n")
-
-
-def test_format_answer_does_not_render_internal_reference_dataset_query_section():
-    request_state = build_request_state(
-        ChatRequest(
-            message="总共有多少条数据？",
-            database_context={"database_id": "demo", "database_type": "influxdb"},
-        ),
-        get_settings(),
-    )
-    request_state.latest_database_evidence = DatabaseEvidence(
-        evidence_id="evi_count_stats",
-        result_type="statistics",
-        database="demo",
-        query_language="reference_dataset",
-        query="reference_dataset:value:statistics",
-        summary="Computed statistics over 19735 rows.",
-        data={"statistics": {"count": 19735}},
-        columns=["metric", "value"],
-        metadata={},
-        diagnostics={},
-    )
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="回答总条数"),
-            request_state=request_state,
-        )
-    )
-
-    assert "query" not in [section["section_type"] for section in result["sections"]]
 
 
 def test_format_answer_forecast_section_uses_full_count_from_prompt_safe_metadata():

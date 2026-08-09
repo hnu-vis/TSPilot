@@ -36,9 +36,13 @@ class DataAgentPromptBuilder:
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
             "Data Fact contract: use fact_requests to name the facts a tool must produce. Give every request a stable semantic fact_key. "
             "For a fact computed from earlier facts, list their fact_key values in derived_from. Reuse fact keys from state.fact_state; "
-            "do not treat metric labels as Fact IDs. SQL should produce evidence-backed atomic facts; code_interpreter should produce derived or analytical facts.\n"
+            "do not put Evidence IDs, artifact refs, or metric labels in derived_from. An analytical Fact computed directly from the "
+            "selected database Evidence may leave derived_from empty because the analysis artifact records that evidence dependency. "
+            "SQL should produce evidence-backed atomic facts; code_interpreter should produce derived or analytical facts.\n"
             "SQL Fact contracts support point_value or time_boundary with requirements.time_position=start|end, extreme with "
-            "requirements.operator=min|max, and count. Do not request scalar, change, ratio, trend, or other derived Fact types from sql_query.\n"
+            "requirements.operator=min|max, and count. Use time_boundary for timestamps and point_value only for scalar measure values. "
+            "Use count only when the requested fact is a row/record count. Tables, detail lists, and complete time series are query Evidence "
+            "Artifacts, not scalar Facts, so leave fact_requests empty for those outputs. Do not request change, ratio, trend, or other derived Fact types from sql_query.\n"
             "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
             "If requested analysis metrics require custom formulas, sequence/window calculations, returns, volatility, drawdown, correlation, or any metric not clearly template-covered, call code_interpreter with Python code.\n"
             "Code interpreter sandbox contract: generated Python code receives canonical variables df, time, value, "
@@ -208,7 +212,6 @@ class DataAgentPromptBuilder:
         return {
             "todowrite": "todo_plan",
             "sql_query": "query",
-            "query_database": "query",
             "code_interpreter": "analysis",
             "forecast": "forecast",
             "anomaly": "anomaly",

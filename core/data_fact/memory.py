@@ -461,7 +461,7 @@ def _recipe_id(fact_type: str, fact_key: str, tool_name: str) -> str:
 
 
 def _required_evidence_for_tool(tool_name: str) -> list[str]:
-    if tool_name in {"sql_query", "query_database"}:
+    if tool_name == "sql_query":
         return ["database_evidence"]
     if tool_name == "code_interpreter":
         return ["database_evidence", "analysis_result"]
