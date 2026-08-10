@@ -170,7 +170,12 @@ def test_code_interpreter_marks_root_fact_partial_when_database_evidence_is_empt
 
     diagnostics = _validate_fact_output_contract(result, [request], input_row_count=0, input_facts=[])
 
-    assert diagnostics == {"bound": ["price.start"], "missing": [], "rejected": []}
+    assert diagnostics == {
+        "bound": ["price.start"],
+        "missing": [],
+        "rejected": [],
+        "partial": [{"fact_key": "price.start", "quality_flags": ["ungrounded_candidate"]}],
+    }
     assert result["facts"][0]["status"] == "partial"
     assert result["facts"][0]["quality_flags"] == ["ungrounded_candidate"]
 

@@ -20,6 +20,11 @@ SQL_FACT_TYPES = {
 def fact_request_contract_error(request: DataFactRequest, tool_name: str) -> str | None:
     """Return a precise contract error without deriving missing semantics."""
 
+    if tool_name in {"forecast", "anomaly"}:
+        return (
+            f"{tool_name} produces an analysis artifact, not a verified Data Fact. "
+            "Keep its points in the artifact and request deterministic Facts from sql_query or code_interpreter."
+        )
     if tool_name == "code_interpreter":
         # Result validation requires database rows or verified Fact parents and
         # a calculation trace, so scalar calculations remain grounded.

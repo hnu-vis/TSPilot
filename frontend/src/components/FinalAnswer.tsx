@@ -1,5 +1,6 @@
 import {
   BookOpen,
+  BarChart3,
   CheckCircle2,
   ChevronDown,
   Code2,
@@ -9,7 +10,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import type { ReactNode } from 'react';
-import type { FinalAnswer as FinalAnswerType, TokenUsage } from '../types';
+import type { AnswerClaim, FinalAnswer as FinalAnswerType, TokenUsage, Visualization } from '../types';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
 type AnswerReference = NonNullable<FinalAnswerType['references']>[number];
@@ -96,6 +97,7 @@ export function FinalAnswer({
   const evidenceItems = normalizeAnswerEvidence(answer);
   const references = answer.references || [];
   const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
+  const [activeBindingId, setActiveBindingId] = useState<string | null>(null);
 
   return (
     <div className="final-answer">
@@ -133,6 +135,14 @@ export function FinalAnswer({
         <MarkdownContent content={summary} variant="summary" />
       </section>
 
+      {answer.claims && answer.claims.length > 0 && (
+        <ClaimLinks
+          claims={answer.claims}
+          visualizations={answer.visualizations || []}
+          onSelectBinding={setActiveBindingId}
+        />
+      )}
+
       {sections.length > 0 && (
         <div className="answer-sections">
           {sections.map((section, index) => (
@@ -142,6 +152,17 @@ export function FinalAnswer({
             </section>
           ))}
         </div>
+      )}
+
+      {answer.visualizations && answer.visualizations.length > 0 && (
+        <section className="answer-section answer-visualizations-section" aria-label="Visualizations">
+          <ContentHeading icon={<BarChart3 size={16} />} title={locale === 'zh' ? '可视化' : 'Visualizations'} />
+          <VisualizationGallery
+            visualizations={answer.visualizations}
+            activeBindingId={activeBindingId}
+            onSelectBinding={setActiveBindingId}
+          />
+        </section>
       )}
 
       {evidenceItems.length > 0 && (
@@ -157,6 +178,224 @@ export function FinalAnswer({
           <ReferenceList references={supportingReferences} copy={copy} />
         </section>
       )}
+    </div>
+  );
+}
+
+function ClaimLinks({
+  claims,
+  visualizations,
+  onSelectBinding,
+}: {
+  claims: AnswerClaim[];
+  visualizations: Visualization[];
+  onSelectBinding: (bindingId: string) => void;
+}) {
+  const bindings = visualizations.flatMap((visualization) => visualization.bindings || []);
+  const linkedClaims = claims.filter((claim) => (
+    claim.fact_ids?.length
+    || claim.item_ids?.length
+    || claim.analysis_ids?.length
+    || claim.artifact_ids?.length
+    || claim.visualization_ids?.length
+  ));
+  if (linkedClaims.length === 0) return null;
+  return (
+    <div className="answer-claim-links" aria-label="Grounded answer claims">
+      {linkedClaims.map((claim) => {
+        const binding = bindings.find((item) => (
+          (claim.item_ids || []).includes(item.item_id || '')
+          && (claim.fact_ids || []).includes(item.fact_id || '')
+        )) || bindings.find((item) => (claim.fact_ids || []).includes(item.fact_id || ''));
+        const visualizationBinding = !binding
+          ? visualizations
+            .filter((visualization) => (claim.visualization_ids || []).includes(visualization.visualization_id))
+            .flatMap((visualization) => visualization.bindings || [])[0]
+          : null;
+        const selectedBinding = binding || visualizationBinding;
+        return (
+          <button
+            type="button"
+            className="answer-claim-link"
+            key={claim.claim_id}
+            onClick={() => selectedBinding && onSelectBinding(selectedBinding.binding_id)}
+            disabled={!selectedBinding}
+          >
+            <span>{claim.text}</span>
+            <small>{selectedBinding ? 'linked' : 'grounded'}</small>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function VisualizationGallery({
+  visualizations,
+  activeBindingId,
+  onSelectBinding,
+}: {
+  visualizations: Visualization[];
+  activeBindingId: string | null;
+  onSelectBinding: (bindingId: string) => void;
+}) {
+  const activeBinding = visualizations
+    .flatMap((visualization) => visualization.bindings || [])
+    .find((binding) => binding.binding_id === activeBindingId);
+
+  return (
+    <div className="answer-visualization-gallery">
+      <div className="answer-visualization-grid">
+        {visualizations.map((visualization) => (
+          <VisualizationCard
+            key={visualization.visualization_id}
+            visualization={visualization}
+            activeBindingId={activeBindingId}
+            onSelectBinding={onSelectBinding}
+          />
+        ))}
+      </div>
+      {activeBinding && (
+        <div className="visualization-link-detail" role="status">
+          <strong>Linked evidence</strong>
+          <span>{activeBinding.source_type}</span>
+          {activeBinding.evidence_id && <code>{activeBinding.evidence_id}</code>}
+          {activeBinding.locator && Object.keys(activeBinding.locator).length > 0 && (
+            <code>{JSON.stringify(activeBinding.locator)}</code>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VisualizationCard({
+  visualization,
+  activeBindingId,
+  onSelectBinding,
+}: {
+  visualization: Visualization;
+  activeBindingId: string | null;
+  onSelectBinding: (bindingId: string) => void;
+}) {
+  const rows = visualization.display_rows || visualization.rows || [];
+  const columns = visualization.columns && visualization.columns.length > 0
+    ? visualization.columns
+    : Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  const chart = visualization.chart || {};
+  const series = Array.isArray(chart.series_data) ? chart.series_data : [];
+  const xAxis = Array.isArray(chart.x_axis_data) ? chart.x_axis_data : [];
+  const isLine = visualization.visualization_type === 'chart' && series.length > 0 && xAxis.length > 0;
+
+  return (
+    <article className="answer-visualization-card">
+      <div className="answer-visualization-card-header">
+        <div>
+          <strong>{visualization.title}</strong>
+          {visualization.summary && <p>{visualization.summary}</p>}
+        </div>
+        <span>{visualization.visualization_kind}</span>
+      </div>
+      {isLine ? (
+        <LineVisualization
+          visualization={visualization}
+          xAxis={xAxis}
+          values={Array.isArray(series[0]?.data) ? series[0].data : []}
+          activeBindingId={activeBindingId}
+          onSelectBinding={onSelectBinding}
+        />
+      ) : visualization.visualization_type === 'metric_card' ? (
+        <div className="answer-fact-metric" role="group" aria-label={visualization.title}>
+          <strong>{formatCell(visualization.presentation?.value)}</strong>
+          {visualization.presentation?.unit ? <span>{formatCell(visualization.presentation.unit)}</span> : null}
+        </div>
+      ) : rows.length > 0 ? (
+        <div className="answer-visualization-table-wrap">
+          <table className="answer-data-table answer-visualization-table">
+            <thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
+            <tbody>
+              {rows.map((row, rowIndex) => {
+                const binding = visualization.bindings?.[rowIndex];
+                return (
+                  <tr
+                    key={String(row.item_id || rowIndex)}
+                    className={binding?.binding_id === activeBindingId ? 'is-linked' : ''}
+                    onClick={() => binding && onSelectBinding(binding.binding_id)}
+                    onKeyDown={(event) => {
+                      if ((event.key === 'Enter' || event.key === ' ') && binding) onSelectBinding(binding.binding_id);
+                    }}
+                    tabIndex={binding ? 0 : undefined}
+                    role={binding ? 'button' : undefined}
+                  >
+                    {columns.map((column) => <td key={column}>{formatCell(row[column])}</td>)}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="sample-note">No renderable visualization data.</p>
+      )}
+    </article>
+  );
+}
+
+function LineVisualization({
+  visualization,
+  xAxis,
+  values,
+  activeBindingId,
+  onSelectBinding,
+}: {
+  visualization: Visualization;
+  xAxis: unknown[];
+  values: unknown[];
+  activeBindingId: string | null;
+  onSelectBinding: (bindingId: string) => void;
+}) {
+  const points = values.map((value, index) => ({ index, value: Number(value) })).filter((point) => Number.isFinite(point.value));
+  if (points.length === 0) return <p className="sample-note">No numeric series data.</p>;
+  const min = Math.min(...points.map((point) => point.value));
+  const max = Math.max(...points.map((point) => point.value));
+  const width = 760;
+  const height = 220;
+  const padding = 24;
+  const x = (index: number) => padding + (index / Math.max(points.length - 1, 1)) * (width - padding * 2);
+  const y = (value: number) => height - padding - ((value - min) / Math.max(max - min, 1)) * (height - padding * 2);
+  const polyline = points.map((point) => `${x(point.index)},${y(point.value)}`).join(' ');
+  const bindings = visualization.bindings || [];
+
+  return (
+    <div className="answer-line-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={visualization.title}>
+        <polyline points={polyline} fill="none" stroke="var(--primary)" strokeWidth="2.5" />
+        {points.map((point) => {
+          const binding = bindings[point.index];
+          return (
+            <circle
+              key={point.index}
+              cx={x(point.index)}
+              cy={y(point.value)}
+              r={binding?.binding_id === activeBindingId ? 6 : 4}
+              className={binding?.binding_id === activeBindingId ? 'is-linked' : ''}
+              tabIndex={binding ? 0 : undefined}
+              role={binding ? 'button' : undefined}
+              onClick={() => binding && onSelectBinding(binding.binding_id)}
+              onKeyDown={(event) => {
+                if ((event.key === 'Enter' || event.key === ' ') && binding) onSelectBinding(binding.binding_id);
+              }}
+            >
+              <title>{`${String(xAxis[point.index] || '')}: ${formatCell(point.value)}`}</title>
+            </circle>
+          );
+        })}
+      </svg>
+      <div className="answer-line-chart-range">
+        <span>{String(xAxis[0] || '')}</span>
+        <strong>{formatCell(min)} - {formatCell(max)}</strong>
+        <span>{String(xAxis[xAxis.length - 1] || '')}</span>
+      </div>
     </div>
   );
 }

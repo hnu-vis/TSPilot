@@ -14,8 +14,9 @@ from core.report.composer import (
     ordered_sections,
 )
 from schemas.data_fact import DataFact
-from schemas.output import AnswerReference, AnswerSection, FinalAnswer
+from schemas.output import AnswerClaim, AnswerReference, AnswerSection, FinalAnswer
 from schemas.state import RequestStateModel
+from schemas.visualization import VisualizationBinding, VisualizationPayload
 from tools.base import BaseTool
 
 
@@ -304,14 +305,216 @@ class FormatAnswerTool(BaseTool):
                 or visualization.visualization_id in validated_input.include_visualization_ids
             )
         ]
+        visualizations.extend(self._fact_visualizations(data_facts))
+        visualizations = self._dedupe_visualizations(visualizations)
+        claims = self._build_claims(data_facts, analyses, visualizations, request_state)
         answer = FinalAnswer(
             title=None,
             summary=summary,
             sections=sections,
             references=references,
+            claims=claims,
             visualizations=visualizations,
         )
         return answer.model_dump(mode="json")
+
+    def _fact_visualizations(self, facts: list[DataFact]) -> list[VisualizationPayload]:
+        """Create lightweight answer visuals from collection-valued Facts."""
+
+        visualizations: list[VisualizationPayload] = []
+        for fact in facts:
+            evidence_ids = list(dict.fromkeys(
+                reference.source_id
+                for reference in fact.evidence_refs
+                if reference.source_id
+            ))
+            if not fact.items:
+                visualization_id = f"viz_fact_{fact.fact_id}"
+                binding = VisualizationBinding(
+                    binding_id=f"{fact.fact_id}:value",
+                    source_type="fact",
+                    fact_id=fact.fact_id,
+                    evidence_id=evidence_ids[0] if evidence_ids else None,
+                )
+                visualizations.append(VisualizationPayload(
+                    visualization_id=visualization_id,
+                    visualization_type="metric_card",
+                    visualization_kind="fact_value",
+                    renderer="metric",
+                    title=fact.name,
+                    summary=fact.statement,
+                    binding_fact_ids=[fact.fact_id],
+                    binding_evidence_ids=evidence_ids,
+                    bindings=[binding],
+                    presentation={"value": fact.value, "unit": fact.unit, "status": fact.status},
+                    display_priority=3,
+                ))
+                continue
+            rows = [self._fact_item_row(item) for item in fact.items]
+            bindings = [
+                VisualizationBinding(
+                    binding_id=f"{fact.fact_id}:{item.item_id}",
+                    source_type="fact_item",
+                    fact_id=fact.fact_id,
+                    item_id=item.item_id,
+                    related_item_ids=item.source_item_ids,
+                    evidence_id=(item.evidence_refs[0].source_id if item.evidence_refs else (evidence_ids[0] if evidence_ids else None)),
+                    locator=item.locator,
+                )
+                for item in fact.items
+            ]
+            timestamps = [row.get("timestamp") for row in rows]
+            numeric_values = [row.get("value") for row in rows]
+            is_series = (
+                bool(rows)
+                and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in numeric_values)
+                and all(timestamp not in (None, "") for timestamp in timestamps)
+            )
+            visualization_id = f"viz_fact_{fact.fact_id}"
+            if is_series:
+                visualization = VisualizationPayload(
+                    visualization_id=visualization_id,
+                    visualization_type="chart",
+                    visualization_kind="line",
+                    renderer="linechart",
+                    title=fact.name,
+                    summary=fact.statement,
+                    chart={
+                        "x_axis_data": timestamps,
+                        "series_data": [{"name": fact.name, "data": numeric_values}],
+                    },
+                    binding_fact_ids=[fact.fact_id],
+                    binding_evidence_ids=evidence_ids,
+                    bindings=bindings,
+                    rows=rows,
+                    columns=list(dict.fromkeys(key for row in rows for key in row)),
+                    display_rows=rows,
+                    time_column="timestamp",
+                    primary_measure="value",
+                    display_priority=3,
+                )
+            else:
+                columns = list(dict.fromkeys(key for row in rows for key in row))
+                visualization = VisualizationPayload(
+                    visualization_id=visualization_id,
+                    visualization_type="table",
+                    visualization_kind="fact_items",
+                    renderer="table",
+                    title=fact.name,
+                    summary=fact.statement,
+                    binding_fact_ids=[fact.fact_id],
+                    binding_evidence_ids=evidence_ids,
+                    bindings=bindings,
+                    rows=rows,
+                    columns=columns,
+                    display_rows=rows,
+                    display_priority=3,
+                )
+            visualizations.append(visualization)
+        return visualizations
+
+    def _build_claims(
+        self,
+        facts: list[DataFact],
+        analyses: list,
+        visualizations: list[VisualizationPayload],
+        request_state: RequestStateModel,
+    ) -> list[AnswerClaim]:
+        claims: list[AnswerClaim] = []
+        visualization_by_fact = {
+            fact_id: visualization.visualization_id
+            for visualization in visualizations
+            for fact_id in visualization.binding_fact_ids
+        }
+        for fact in facts:
+            claims.append(
+                AnswerClaim(
+                    claim_id=f"claim:{fact.fact_id}",
+                    text=fact.statement,
+                    fact_ids=[fact.fact_id],
+                    item_ids=[item.item_id for item in fact.items],
+                    evidence_ids=list(dict.fromkeys(ref.source_id for ref in fact.evidence_refs if ref.source_id)),
+                    visualization_ids=(
+                        [visualization_by_fact[fact.fact_id]]
+                        if fact.fact_id in visualization_by_fact
+                        else []
+                    ),
+                )
+            )
+        for analysis in analyses:
+            visualization_ids = [
+                visualization.visualization_id
+                for visualization in visualizations
+                if analysis.analysis_id in visualization.binding_evidence_ids
+            ]
+            claims.append(
+                AnswerClaim(
+                    claim_id=f"claim:{analysis.analysis_id}",
+                    text=analysis.summary,
+                    analysis_ids=[analysis.analysis_id],
+                    visualization_ids=visualization_ids,
+                )
+            )
+        if request_state.latest_forecast is not None:
+            forecast = request_state.latest_forecast
+            claims.append(
+                AnswerClaim(
+                    claim_id=f"claim:{forecast.forecast_id}",
+                    text=f"{forecast.model_name} forecast for {forecast.horizon} points.",
+                    artifact_type="forecast",
+                    artifact_ids=[forecast.forecast_id],
+                    visualization_ids=[
+                        visualization.visualization_id
+                        for visualization in visualizations
+                        if "forecast" in visualization.requested_capabilities
+                    ],
+                )
+            )
+        if request_state.latest_anomaly is not None:
+            anomaly = request_state.latest_anomaly
+            claims.append(
+                AnswerClaim(
+                    claim_id=f"claim:{anomaly.anomaly_id}",
+                    text=f"{anomaly.detector_name} detected {len(anomaly.anomaly_points)} anomaly points.",
+                    artifact_type="anomaly",
+                    artifact_ids=[anomaly.anomaly_id],
+                    visualization_ids=[
+                        visualization.visualization_id
+                        for visualization in visualizations
+                        if "anomaly" in visualization.requested_capabilities
+                    ],
+                )
+            )
+        return claims
+
+    def _fact_item_row(self, item) -> dict:
+        value = item.value
+        row = {"item_id": item.item_id}
+        if item.rank is not None:
+            row["rank"] = item.rank
+        if item.label:
+            row["label"] = item.label
+        if item.timestamp:
+            row["timestamp"] = item.timestamp
+        if item.source_item_ids:
+            row["source_item_ids"] = item.source_item_ids
+        if isinstance(value, dict):
+            row.update(value)
+        else:
+            row["value"] = value
+        if item.dimensions:
+            row.update(item.dimensions)
+        return row
+
+    def _dedupe_visualizations(self, visualizations: list[VisualizationPayload]) -> list[VisualizationPayload]:
+        seen: set[str] = set()
+        result: list[VisualizationPayload] = []
+        for visualization in visualizations:
+            if visualization.visualization_id in seen:
+                continue
+            seen.add(visualization.visualization_id)
+            result.append(visualization)
+        return result
 
     def _data_fact_summary(self, facts: list[DataFact], fallback_summary: str) -> str:
         statements = [fact.statement.strip() for fact in facts if fact.statement.strip()]

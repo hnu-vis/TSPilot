@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.timeseries.anomaly_registry import default_anomaly_detector_name, get_anomaly_detector
 from core.timeseries.evidence_resolution import resolve_database_evidence
@@ -11,7 +11,7 @@ from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
 from schemas.timeseries import AnomalyResult
-from schemas.visualization import VisualizationPayload
+from schemas.visualization import VisualizationBinding, VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -21,6 +21,12 @@ class AnomalyInput(BaseModel):
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
     fact_requests: list[DataFactRequest] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_fact_contracts(self):
+        if self.fact_requests:
+            raise ValueError("anomaly returns an analysis artifact; Data Fact requests must target sql_query or code_interpreter")
+        return self
 
 
 class AnomalyTool(BaseTool):
@@ -69,6 +75,23 @@ class AnomalyTool(BaseTool):
             },
             annotations=anomaly_points,
             binding_evidence_ids=[database_evidence.evidence_id],
+            bindings=[
+                VisualizationBinding(
+                    binding_id=f"anomaly:{database_evidence.evidence_id}:{index}",
+                    source_type=(
+                        "anomaly_point"
+                        if any(
+                            isinstance(anomaly, dict)
+                            and anomaly.get("timestamp") == point.timestamp
+                            for anomaly in anomaly_points
+                        )
+                        else "historical_point"
+                    ),
+                    evidence_id=database_evidence.evidence_id,
+                    locator={"timestamp": point.timestamp, "point_index": index},
+                )
+                for index, point in enumerate(series.points)
+            ],
             requested_capabilities=["anomaly"],
             time_column=series.time_field,
             primary_measure=series.value_field,

@@ -5,7 +5,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from schemas.data_fact import DataFact, FactCoverage
 from schemas.visualization import VisualizationPayload
 
 
@@ -46,9 +45,6 @@ class ForecastResult(BaseModel):
     confidence_interval: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
-    produced_facts: list[DataFact] = Field(default_factory=list)
-    rejected_facts: list[DataFact] = Field(default_factory=list)
-    fact_coverage: FactCoverage | None = None
 
 
 class AnomalyResult(BaseModel):
@@ -59,6 +55,3 @@ class AnomalyResult(BaseModel):
     scores: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
-    produced_facts: list[DataFact] = Field(default_factory=list)
-    rejected_facts: list[DataFact] = Field(default_factory=list)
-    fact_coverage: FactCoverage | None = None

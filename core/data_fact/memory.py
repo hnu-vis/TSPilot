@@ -174,6 +174,10 @@ def observe_fact_usage(
                         "fact_key": request.fact_key,
                         "name": request.name,
                         "fact_type": fact_type,
+                        "semantic_class": request.semantic_class,
+                        "derivation": request.derivation,
+                        "result_shape": request.result_shape,
+                        "expected_item_count": request.expected_item_count,
                         "derived_from": request.derived_from,
                     }
                 ]
@@ -494,6 +498,10 @@ def _output_schema_from_fact(fact: DataFact) -> dict:
     return {
         "name": fact.name,
         "fact_type": fact.fact_type,
+        "semantic_class": fact.semantic_class,
+        "derivation": fact.derivation,
+        "value_shape": fact.value_shape,
         "value_kind": type(fact.value).__name__ if fact.value is not None else "null",
+        "item_schema": "list[FactItem]" if fact.items else None,
         "quality_flags": "list[str]",
     }

@@ -399,6 +399,7 @@ def public_final_answer(answer: FinalAnswer) -> FinalAnswer:
             )
             for reference in answer.references
         ],
+        claims=answer.claims,
         visualizations=answer.visualizations,
     )
 

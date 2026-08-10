@@ -43,7 +43,50 @@ export type FinalAnswer = {
     label: string;
     evidence?: Record<string, unknown> | null;
   }>;
-  visualizations?: Array<Record<string, unknown>>;
+  claims?: AnswerClaim[];
+  visualizations?: Visualization[];
+};
+
+export type AnswerClaim = {
+  claim_id: string;
+  text: string;
+  fact_ids?: string[];
+  item_ids?: string[];
+  analysis_ids?: string[];
+  artifact_type?: string | null;
+  artifact_ids?: string[];
+  evidence_ids?: string[];
+  visualization_ids?: string[];
+};
+
+export type VisualizationBinding = {
+  binding_id: string;
+  source_type?: string;
+  fact_id?: string | null;
+  item_id?: string | null;
+  related_item_ids?: string[];
+  evidence_id?: string | null;
+  locator?: Record<string, unknown>;
+};
+
+export type Visualization = {
+  visualization_id: string;
+  visualization_type: string;
+  visualization_kind: string;
+  renderer: string;
+  title: string;
+  summary?: string | null;
+  chart?: Record<string, unknown> | null;
+  annotations?: Array<Record<string, unknown>>;
+  binding_fact_ids?: string[];
+  binding_evidence_ids?: string[];
+  bindings?: VisualizationBinding[];
+  rows?: Array<Record<string, unknown>>;
+  columns?: string[];
+  display_rows?: Array<Record<string, unknown>>;
+  time_column?: string | null;
+  primary_measure?: string | null;
+  presentation?: Record<string, unknown>;
 };
 
 export type FactStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;

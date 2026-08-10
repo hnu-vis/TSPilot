@@ -7,7 +7,7 @@ import re
 from statistics import median
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic import field_validator
 
 from core.database.dialects import dialect_for_database
@@ -17,7 +17,7 @@ from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesSeries
-from schemas.visualization import VisualizationPayload
+from schemas.visualization import VisualizationBinding, VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -70,6 +70,12 @@ class ForecastInput(BaseModel):
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
     fact_requests: list[DataFactRequest] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_fact_contracts(self):
+        if self.fact_requests:
+            raise ValueError("forecast returns an analysis artifact; Data Fact requests must target sql_query or code_interpreter")
+        return self
 
     @field_validator("horizon", mode="before")
     @classmethod
@@ -199,6 +205,26 @@ def _forecast_visualization(
             ],
         },
         binding_evidence_ids=[database_evidence.evidence_id],
+        bindings=[
+            *[
+                VisualizationBinding(
+                    binding_id=f"historical:{database_evidence.evidence_id}:{index}",
+                    source_type="historical_point",
+                    evidence_id=database_evidence.evidence_id,
+                    locator={"timestamp": point.timestamp, "point_index": index, "series": "historical"},
+                )
+                for index, point in enumerate(series.points)
+            ],
+            *[
+                VisualizationBinding(
+                    binding_id=f"forecast:{database_evidence.evidence_id}:{index}",
+                    source_type="prediction_point",
+                    evidence_id=database_evidence.evidence_id,
+                    locator={"timestamp": point.timestamp, "point_index": index, "series": "forecast"},
+                )
+                for index, point in enumerate(forecast_points, start=len(series.points))
+            ],
+        ],
         requested_capabilities=["forecast"],
         time_column=series.time_field,
         primary_measure=series.value_field,

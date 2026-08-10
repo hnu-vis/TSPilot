@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from hashlib import sha1
+import json
 from typing import Any
 
 from schemas.data_fact import (
@@ -43,10 +44,8 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
         produced.extend(_facts_from_database_evidence(full_payload, requests))
     elif tool_name == "code_interpreter":
         produced.extend(_facts_from_analysis(full_payload, requests))
-    elif tool_name == "forecast":
-        produced.extend(_facts_from_forecast(full_payload, requests))
-    elif tool_name == "anomaly":
-        produced.extend(_facts_from_anomaly(full_payload, requests))
+    # Forecast and anomaly outputs remain analysis artifacts. They can be
+    # referenced by answers and visualizations, but are not Facts by default.
 
     produced = _verify_fact_dependencies(
         _dedupe_facts([fact for fact in produced if _fact_has_evidence_or_unavailable(fact)]),
@@ -56,12 +55,13 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
     event_coverage = _coverage_for(requests, produced, rejected)
     coverage = _merge_fact_state(request_state, tool_name, requests, produced, rejected, event_coverage)
     _attach_facts_to_artifact(request_state, tool_name, full_payload, produced, rejected, event_coverage)
-    observe_fact_usage(
-        database_id=_database_id_for_memory(request_state),
-        tool_name=tool_name,
-        requests=requests,
-        facts=produced,
-    )
+    if tool_name in {"sql_query", "code_interpreter"}:
+        observe_fact_usage(
+            database_id=_database_id_for_memory(request_state),
+            tool_name=tool_name,
+            requests=requests,
+            facts=produced,
+        )
     return coverage
 
 
@@ -175,6 +175,10 @@ def _bind_fact_contract(
             "time_range": fact.time_range or request.time_range,
             "dimensions": fact.dimensions or request.dimensions,
             "derived_from": fact.derived_from if preserve_dependencies else fact.derived_from or request.derived_from,
+            "value_shape": fact.value_shape or request.result_shape,
+            "semantic_class": fact.semantic_class or request.semantic_class,
+            "derivation": fact.derivation or request.derivation,
+            "selection": fact.selection or request.selection,
         }
     )
 def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
@@ -391,16 +395,32 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
         raw_key = normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
         if requested_keys and raw_key not in requested_keys:
             continue
+        raw_payload = dict(raw)
+        if not isinstance(raw_payload.get("items"), list) and isinstance(raw_payload.get("value"), list):
+            raw_payload["items"] = _fact_items_from_value(raw_key, raw_payload["value"])
         fact = _validate_fact(
             {
-                **raw,
-                "method": raw.get("method") or "code_interpreter",
-                "evidence_refs": raw.get("evidence_refs") or [ref.model_dump(mode="json") for ref in evidence_refs],
+                **raw_payload,
+                "method": raw_payload.get("method") or "code_interpreter",
+                "evidence_refs": raw_payload.get("evidence_refs") or [ref.model_dump(mode="json") for ref in evidence_refs],
             },
             default_method="code_interpreter",
         )
-        fact = _bind_fact_contract(fact, requests, preserve_dependencies="derived_from" in raw)
+        fact = _bind_fact_contract(fact, requests, preserve_dependencies="derived_from" in raw_payload)
         if fact is not None:
+            fact = _validate_registered_fact(fact, next(
+                (request for request in requests if request.fact_key == fact.fact_key),
+                None,
+            ))
+            if fact.items:
+                fact = fact.model_copy(
+                    update={
+                        "items": [
+                            item.model_copy(update={"evidence_refs": item.evidence_refs or evidence_refs})
+                            for item in fact.items
+                        ]
+                    }
+                )
             facts.append(fact)
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
     metrics_by_key = {normalize_fact_key(key): (key, value) for key, value in metrics.items()}
@@ -409,8 +429,7 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
         metric_match = metrics_by_key.get(request.fact_key) or metrics_by_key.get(normalize_fact_key(request.name))
         if request.fact_key not in native_keys and metric_match is not None:
             metric_key, value = metric_match
-            facts.append(
-                DataFact(
+            fact = DataFact(
                     fact_id=_fact_id(analysis_id, request.name, value),
                     name=request.name,
                     fact_type=request.fact_type,
@@ -424,42 +443,73 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
                     calculation_trace={"metric_key": metric_key, "code_hash": payload.get("code_hash")},
                     derived_from=request.derived_from,
                 )
-            )
+            facts.append(_bind_fact_contract(fact, [request]) or fact)
     return facts
 
 
-def _facts_from_forecast(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
-    forecast_id = str(payload.get("forecast_id") or "")
-    points = payload.get("forecast_points") if isinstance(payload.get("forecast_points"), list) else []
-    return [
-        DataFact(
-            fact_id=_fact_id(forecast_id, "forecast_coverage", len(points)),
-            name="forecast_coverage",
-            fact_type="forecast",
-            statement=f"Forecast returned {len(points)} points with status {payload.get('status')}.",
-            value={"point_count": len(points), "status": payload.get("status")},
-            method="forecast",
-            evidence_refs=[FactEvidenceRef(source_type="forecast", source_id=forecast_id)],
-            status="verified" if points else "partial",
-            quality_flags=["requires_rolling"] if payload.get("status") == "requires_rolling" else [],
-        )
-    ]
+def _validate_registered_fact(fact: DataFact, request: DataFactRequest | None) -> DataFact:
+    """Apply the Fact contract again at registration, the final trust boundary."""
+
+    if request is None:
+        return fact
+    flags = list(fact.quality_flags)
+    expected_count = request.expected_item_count
+    requirements = request.requirements if isinstance(request.requirements, dict) else {}
+    if expected_count is None:
+        expected_count = requirements.get("expected_item_count", requirements.get("limit"))
+    try:
+        expected_count = int(expected_count) if expected_count is not None else None
+    except (TypeError, ValueError):
+        expected_count = None
+    if expected_count is not None and len(fact.items) != expected_count and "item_count_mismatch" not in flags:
+        flags.append("item_count_mismatch")
+    selection = {**requirements, **(request.selection if isinstance(request.selection, dict) else {})}
+    if request.result_shape in {"ranked_set", "ranking"}:
+        ranks = [item.rank for item in fact.items]
+        if ranks != list(range(1, len(fact.items) + 1)) and "invalid_rank_sequence" not in flags:
+            flags.append("invalid_rank_sequence")
+    order_by = str(selection.get("order_by") or "").strip()
+    direction = str(selection.get("direction") or "asc").strip().lower()
+    if order_by and len(fact.items) > 1:
+        values = [getattr(item, order_by, None) for item in fact.items]
+        values = [item.dimensions.get(order_by) if value is None else value for item, value in zip(fact.items, values)]
+        if all(value is not None for value in values):
+            try:
+                if values != sorted(values, reverse=direction == "desc") and "invalid_item_order" not in flags:
+                    flags.append("invalid_item_order")
+            except TypeError:
+                if "unorderable_item_values" not in flags:
+                    flags.append("unorderable_item_values")
+    distinct_by = str(selection.get("distinct_by") or "").strip()
+    if distinct_by and len(fact.items) > 1:
+        values = [item.dimensions.get(distinct_by, getattr(item, distinct_by, None)) for item in fact.items]
+        if len(values) != len(set(map(str, values))) and "duplicate_distinct_key" not in flags:
+            flags.append("duplicate_distinct_key")
+    item_ids = {item.item_id for item in fact.items}
+    source_ids = {source_id for item in fact.items for source_id in item.source_item_ids}
+    if not source_ids.issubset(item_ids) and "unresolved_source_item" not in flags:
+        flags.append("unresolved_source_item")
+    return fact.model_copy(update={
+        "value_shape": fact.value_shape or request.result_shape or ("collection" if fact.items else "scalar"),
+        "semantic_class": fact.semantic_class or request.semantic_class,
+        "derivation": fact.derivation or request.derivation,
+        "selection": fact.selection or request.selection,
+        "quality_flags": flags,
+        "status": "partial" if flags and fact.status == "verified" else fact.status,
+    })
 
 
-def _facts_from_anomaly(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
-    anomaly_id = str(payload.get("anomaly_id") or "")
-    points = payload.get("anomaly_points") if isinstance(payload.get("anomaly_points"), list) else []
-    return [
-        DataFact(
-            fact_id=_fact_id(anomaly_id, "anomaly_count", len(points)),
-            name="anomaly_count",
-            fact_type="anomaly",
-            statement=f"Anomaly detection returned {len(points)} anomaly points.",
-            value={"anomaly_count": len(points)},
-            method="anomaly",
-            evidence_refs=[FactEvidenceRef(source_type="anomaly", source_id=anomaly_id)],
-        )
-    ]
+def _fact_items_from_value(fact_key: str, value: list) -> list[dict]:
+    items: list[dict] = []
+    for index, item in enumerate(value):
+        payload = dict(item) if isinstance(item, dict) else {"value": item}
+        item_id = str(payload.get("item_id") or "").strip()
+        if not item_id:
+            fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            item_id = f"{fact_key}:{index}:{sha1(fingerprint.encode('utf-8')).hexdigest()[:10]}"
+        payload["item_id"] = item_id
+        items.append(payload)
+    return items
 
 
 def _unavailable_fact(request: DataFactRequest, evidence_ref: FactEvidenceRef, reason: str) -> DataFact:
@@ -568,16 +618,6 @@ def _attach_facts_to_artifact(
         if artifact is not None:
             updated = artifact.model_copy(update=updates)
             request_state.analysis_artifacts[analysis_id] = updated
-    elif tool_name == "forecast" and getattr(request_state, "latest_forecast", None) is not None:
-        forecast_id = str(payload.get("forecast_id") or "")
-        if request_state.latest_forecast.forecast_id == forecast_id:
-            request_state.latest_forecast = request_state.latest_forecast.model_copy(update=updates)
-            request_state.forecast_artifacts[forecast_id] = request_state.latest_forecast
-    elif tool_name == "anomaly" and getattr(request_state, "latest_anomaly", None) is not None:
-        anomaly_id = str(payload.get("anomaly_id") or "")
-        if request_state.latest_anomaly.anomaly_id == anomaly_id:
-            request_state.latest_anomaly = request_state.latest_anomaly.model_copy(update=updates)
-            request_state.anomaly_artifacts[anomaly_id] = request_state.latest_anomaly
 
 
 def _dedupe_facts(facts: list[DataFact]) -> list[DataFact]:

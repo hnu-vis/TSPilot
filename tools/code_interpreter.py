@@ -355,9 +355,9 @@ class CodeInterpreterTool(BaseTool):
             "when the requested answer is primarily table/list/detail output. details must be a dict/object. Prefer details "
             "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
             "values must be JSON-serializable plain Python scalars, lists, or dicts. facts must be a list with one object per "
-            "satisfied fact_contract, preserving its fact_key, name, fact_type, and derived_from. Facts calculated directly from database rows may have empty derived_from; "
+            "satisfied fact_contract, preserving its fact_key, name, fact_type, result_shape, semantic_class, derivation, selection, and derived_from. Facts calculated directly from database rows may have empty derived_from; "
             "derived_from is reserved for verified parent Facts. Each fact must include value, "
-            "statement, and calculation_trace. Use input_facts or fact_by_key for dependencies; never invent a dependency value. "
+            "statement, and calculation_trace. Collection Facts must include items with stable item_id values; preserve rank, timestamp, source_item_ids, and locator when applicable. Use input_facts or fact_by_key for dependencies; never invent a dependency value. "
             "Treat analysis_request, expected_result_schema, and repair_contract as authoritative output requirements. When a "
             "repair_contract lists required_details_fields, result.details must contain every listed field with the requested types. "
             "When the goal or analysis_request performs outlier/anomaly treatment, result.details must include outlier_rule, "
@@ -446,7 +446,7 @@ def _validate_fact_output_contract(
 ) -> dict:
     """Bind candidate facts without converting coverage gaps into code failures."""
 
-    diagnostics = {"bound": [], "missing": [], "rejected": []}
+    diagnostics = {"bound": [], "missing": [], "rejected": [], "partial": []}
     if not requests:
         return diagnostics
     facts = result.get("facts")
@@ -512,12 +512,65 @@ def _validate_fact_output_contract(
             or not candidate.get("calculation_trace")
         ) and "missing_calculation_trace" not in quality_flags:
             quality_flags.append("missing_calculation_trace")
+        value_shape = candidate.get("value_shape") or request.result_shape
+        item_payloads = candidate.get("items")
+        if not isinstance(item_payloads, list) and isinstance(candidate.get("value"), list):
+            item_payloads = candidate.get("value")
+        items = _normalize_fact_items(request.fact_key, item_payloads)
+        expected_item_count = request.expected_item_count
+        if expected_item_count is None and isinstance(request.requirements, dict):
+            expected_item_count = request.requirements.get("expected_item_count")
+        if expected_item_count is None and isinstance(request.requirements, dict):
+            expected_item_count = request.requirements.get("limit")
+        if expected_item_count is not None:
+            try:
+                expected_item_count = int(expected_item_count)
+            except (TypeError, ValueError):
+                expected_item_count = None
+        if expected_item_count is not None and len(items) != expected_item_count:
+            quality_flags.append("item_count_mismatch")
+        selection = {
+            **(request.requirements if isinstance(request.requirements, dict) else {}),
+            **(request.selection if isinstance(request.selection, dict) else {}),
+        }
+        item_ids = [item.get("item_id") for item in items if isinstance(item, dict)]
+        if len(item_ids) != len(set(item_ids)):
+            quality_flags.append("duplicate_item_id")
+        if value_shape in {"ranked_set", "ranking"}:
+            ranks = [item.get("rank") for item in items if isinstance(item, dict)]
+            if ranks != list(range(1, len(items) + 1)):
+                quality_flags.append("invalid_rank_sequence")
+        order_by = str(selection.get("order_by") or "").strip()
+        direction = str(selection.get("direction") or "asc").strip().lower()
+        if order_by and len(items) > 1 and all(isinstance(item, dict) and item.get(order_by) is not None for item in items):
+            ordered_values = [item[order_by] for item in items]
+            expected_values = sorted(ordered_values, reverse=direction == "desc")
+            if ordered_values != expected_values:
+                quality_flags.append("invalid_item_order")
+        distinct_by = str(selection.get("distinct_by") or "").strip()
+        if distinct_by and len(items) > 1:
+            distinct_values = [item.get(distinct_by) for item in items if isinstance(item, dict)]
+            if len(distinct_values) != len(set(map(str, distinct_values))) and "duplicate_distinct_key" not in quality_flags:
+                quality_flags.append("duplicate_distinct_key")
+        source_item_ids = {
+            item_id
+            for item in items
+            if isinstance(item, dict)
+            for item_id in (item.get("source_item_ids") or [])
+        }
+        if source_item_ids and not source_item_ids.issubset(set(item_ids)):
+            quality_flags.append("unresolved_source_item")
         candidate.update(
             {
                 "fact_key": request.fact_key,
                 "name": request.name,
                 "fact_type": request.fact_type,
                 "derived_from": dependencies,
+                "value_shape": value_shape or ("collection" if items else None),
+                "semantic_class": candidate.get("semantic_class") or request.semantic_class,
+                "derivation": candidate.get("derivation") or request.derivation,
+                "selection": candidate.get("selection") or request.selection,
+                "items": items,
                 "quality_flags": quality_flags,
                 "status": "partial" if quality_flags else candidate.get("status", "verified"),
             }
@@ -525,9 +578,30 @@ def _validate_fact_output_contract(
         seen.add(request.fact_key)
         bound_facts.append(candidate)
         diagnostics["bound"].append(request.fact_key)
+        if quality_flags:
+            diagnostics["partial"].append(
+                {"fact_key": request.fact_key, "quality_flags": quality_flags}
+            )
     result["facts"] = bound_facts
     diagnostics["missing"] = [request.fact_key for request in requests if request.fact_key not in seen]
     return diagnostics
+
+
+def _normalize_fact_items(fact_key: str, raw_items: Any) -> list[dict]:
+    """Normalize collection members into stable, evidence-addressable items."""
+
+    if not isinstance(raw_items, list):
+        return []
+    normalized: list[dict] = []
+    for index, raw_item in enumerate(raw_items):
+        payload = dict(raw_item) if isinstance(raw_item, dict) else {"value": raw_item}
+        item_id = str(payload.get("item_id") or "").strip()
+        if not item_id:
+            identity = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            item_id = f"{normalize_fact_key(fact_key)}:{index}:{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:10]}"
+        payload["item_id"] = item_id
+        normalized.append(payload)
+    return normalized
 
 
 def _normalize_analysis_request(value) -> dict | None:

@@ -3812,6 +3812,212 @@ details[open] > summary .collapsible-chevron {
   padding: 8px 9px;
 }
 
+.answer-visualization-gallery {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.answer-claim-links {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+}
+
+.answer-claim-link {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  padding: 5px 0;
+  color: var(--foreground);
+  text-align: left;
+}
+
+.answer-claim-link:not(:disabled) {
+  cursor: pointer;
+}
+
+.answer-claim-link:not(:disabled):hover span {
+  color: var(--primary-strong);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.answer-claim-link span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.55;
+  text-overflow: ellipsis;
+}
+
+.answer-claim-link small {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.answer-visualization-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 12px;
+}
+
+.answer-visualization-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: 12px;
+}
+
+.answer-visualization-card-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.answer-visualization-card-header strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.answer-visualization-card-header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.answer-visualization-card-header > span {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  padding: 3px 7px;
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.answer-fact-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 86px;
+  padding: 18px 20px;
+  border-top: 1px solid var(--border);
+}
+
+.answer-fact-metric strong {
+  color: var(--foreground);
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.answer-fact-metric span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.answer-visualization-table-wrap {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.answer-visualization-table {
+  min-width: 100%;
+}
+
+.answer-visualization-table tbody tr[role='button'] {
+  cursor: pointer;
+}
+
+.answer-visualization-table tbody tr[role='button']:hover,
+.answer-visualization-table tbody tr.is-linked {
+  background: var(--primary-soft);
+}
+
+.answer-line-chart {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.answer-line-chart svg {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  overflow: visible;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(to bottom, transparent 49.5%, var(--border) 50%, transparent 50.5%);
+}
+
+.answer-line-chart circle {
+  fill: var(--surface);
+  stroke: var(--primary);
+  stroke-width: 2;
+  cursor: pointer;
+  transition: r 150ms ease, fill 150ms ease;
+}
+
+.answer-line-chart circle:hover,
+.answer-line-chart circle.is-linked {
+  fill: var(--primary);
+}
+
+.answer-line-chart-range {
+  display: flex;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.answer-line-chart-range strong {
+  color: var(--muted-strong);
+  font-weight: 700;
+}
+
+.visualization-link-detail {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  border-left: 2px solid var(--primary);
+  background: var(--primary-soft);
+  padding: 8px 10px;
+  color: var(--muted-strong);
+  font-size: 11px;
+}
+
+.visualization-link-detail strong {
+  color: var(--foreground);
+}
+
+.visualization-link-detail code {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .answer-reference-list {
   display: grid;
   min-width: 0;

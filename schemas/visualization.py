@@ -6,6 +6,18 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class VisualizationBinding(BaseModel):
+    """Binds a rendered row or mark to a Fact item and its evidence."""
+
+    binding_id: str
+    source_type: str = "fact_item"
+    fact_id: str | None = None
+    item_id: str | None = None
+    related_item_ids: list[str] = Field(default_factory=list)
+    evidence_id: str | None = None
+    locator: dict = Field(default_factory=dict)
+
+
 class VisualizationPayload(BaseModel):
     """Structured visualization payload."""
 
@@ -19,6 +31,7 @@ class VisualizationPayload(BaseModel):
     annotations: list[dict] = Field(default_factory=list)
     binding_fact_ids: list[str] = Field(default_factory=list)
     binding_evidence_ids: list[str] = Field(default_factory=list)
+    bindings: list[VisualizationBinding] = Field(default_factory=list)
     requested_capabilities: list[str] = Field(default_factory=list)
     requested_fact_types: list[str] = Field(default_factory=list)
     subject: dict = Field(default_factory=dict)

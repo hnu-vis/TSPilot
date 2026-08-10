@@ -20,11 +20,20 @@ class DataFactRequest(BaseModel):
     dimensions: dict = Field(default_factory=dict)
     requirements: dict = Field(default_factory=dict)
     derived_from: list[str] = Field(default_factory=list)
+    result_shape: str | None = None
+    expected_item_count: int | None = None
+    semantic_class: str | None = None
+    derivation: str | None = None
+    selection: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def assign_semantic_key(self):
         self.fact_key = normalize_fact_key(self.fact_key or self.name)
         self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        if self.result_shape:
+            self.result_shape = str(self.result_shape).strip().lower()
+        if self.expected_item_count is not None and self.expected_item_count < 0:
+            raise ValueError("expected_item_count must be non-negative")
         return self
 
 
@@ -32,6 +41,20 @@ class FactEvidenceRef(BaseModel):
     source_type: str
     source_id: str
     label: str | None = None
+    locator: dict = Field(default_factory=dict)
+
+
+class FactItem(BaseModel):
+    """A concrete observation inside a collection-valued Fact."""
+
+    item_id: str
+    value: Any = None
+    label: str | None = None
+    rank: int | None = None
+    timestamp: str | None = None
+    source_item_ids: list[str] = Field(default_factory=list)
+    dimensions: dict = Field(default_factory=dict)
+    evidence_refs: list[FactEvidenceRef] = Field(default_factory=list)
     locator: dict = Field(default_factory=dict)
 
 
@@ -44,6 +67,11 @@ class DataFact(BaseModel):
     fact_key: str | None = None
     statement: str
     value: Any = None
+    value_shape: str | None = None
+    items: list[FactItem] = Field(default_factory=list)
+    semantic_class: str | None = None
+    derivation: str | None = None
+    selection: dict = Field(default_factory=dict)
     unit: str | None = None
     subject: str | None = None
     dimensions: dict = Field(default_factory=dict)
@@ -61,6 +89,8 @@ class DataFact(BaseModel):
     def assign_semantic_key(self):
         self.fact_key = normalize_fact_key(self.fact_key or self.name)
         self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        if self.value_shape:
+            self.value_shape = str(self.value_shape).strip().lower()
         return self
 
 
