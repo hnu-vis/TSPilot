@@ -31,7 +31,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     conversation_id: str
     request_id: str
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "partial", "failed"]
     response_kind: Literal["final_answer", "error"]
     used_tools: list[str] = Field(default_factory=list)
     answer: FinalAnswer | None = None

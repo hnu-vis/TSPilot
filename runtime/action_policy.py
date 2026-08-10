@@ -1,6 +1,7 @@
 """Runtime action contract validation."""
 from __future__ import annotations
 
+import json
 import re
 
 from core.completion import latest_gap_assessment
@@ -78,7 +79,12 @@ def validate_action(
             (constraints.get("reason") or "The current state requires a different next action.")
             + f" Required actions: {sorted(required_actions)}.",
         )
-    covered_repeat_reason = _covered_action_repeat_reason(request_state, action_name, required_actions)
+    covered_repeat_reason = _covered_action_repeat_reason(
+        request_state,
+        action_name,
+        required_actions,
+        action_input=action_input,
+    )
     if covered_repeat_reason:
         return False, covered_repeat_reason
     if action_name != "todowrite" and _requires_initial_todo_plan(request_state):
@@ -273,6 +279,8 @@ def _covered_action_repeat_reason(
     request_state: RequestStateModel,
     action_name: str,
     required_actions: set[str],
+    *,
+    action_input: dict | None,
 ) -> str | None:
     if action_name in TERMINAL_ACTIONS or action_name in required_actions:
         return None
@@ -281,7 +289,14 @@ def _covered_action_repeat_reason(
         return None
     refs = _available_artifact_refs(request_state)
     if action_name == "sql_query" and any(ref.startswith("evidence:") for ref in refs):
-        if _has_successful_action(request_state, action_name):
+        current_signature = _query_action_signature(action_input)
+        if current_signature and any(
+            step.action == "sql_query"
+            and step.observation is not None
+            and step.observation.success
+            and _query_action_signature(step.action_input) == current_signature
+            for step in request_state.react_transcript
+        ):
             return (
                 "Equivalent query evidence already exists. Reuse the available evidence artifact "
                 "and choose the next missing capability action, or terminate if the request is covered."
@@ -294,6 +309,27 @@ def _covered_action_repeat_reason(
     if action_name == "anomaly" and any(ref.startswith("anomaly:") for ref in refs):
         return "Anomaly artifact already exists. Reuse it or choose the next missing capability action."
     return None
+
+
+def _query_action_signature(action_input: dict | None) -> str | None:
+    if not isinstance(action_input, dict):
+        return None
+    database_context = action_input.get("database_context") if isinstance(action_input.get("database_context"), dict) else {}
+    payload = {
+        "database_id": database_context.get("database_id"),
+        "query": str(action_input.get("query") or "").strip(),
+        "message": " ".join(str(action_input.get("message") or "").lower().split()),
+        "purpose": " ".join(str(action_input.get("purpose") or "").lower().split()),
+        "time_range": action_input.get("time_range"),
+        "facts": sorted(
+            str(item.get("fact_key") or item.get("name") or "")
+            for item in action_input.get("fact_requests", [])
+            if isinstance(item, dict)
+        ),
+    }
+    if not any(payload[key] for key in ("query", "message", "purpose", "facts")):
+        return None
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
 
 
 def _has_successful_action(request_state: RequestStateModel, action_name: str) -> bool:

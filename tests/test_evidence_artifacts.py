@@ -11,6 +11,7 @@ from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
 from schemas.tool import ToolObservation
+from tools.base import StructuredToolError
 from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 
 
@@ -150,7 +151,7 @@ def test_code_interpreter_generation_consumes_repair_contract():
     assert llm.payload["repair_contract"] == repair_contract
     assert llm.payload["analysis_request"]["required_outputs"] == ["custom robust outlier analysis"]
     assert result["result"]["details"]["outlier_rule"] == "IQR upper fence"
-    assert result["diagnostics"]["internal_repair_attempts"] == []
+    assert result["diagnostics"]["execution_attempts"] == 1
 
 
 def test_code_interpreter_allows_fact_composition_within_one_result():
@@ -436,7 +437,7 @@ def test_code_interpreter_requires_stable_result_shape():
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
-    with pytest.raises(AnalysisCodeError, match="metrics"):
+    with pytest.raises(StructuredToolError, match="metrics"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(
@@ -493,7 +494,7 @@ def test_code_interpreter_rejects_opaque_outlier_treatment():
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
-    with pytest.raises(AnalysisCodeError, match="outlier treatment"):
+    with pytest.raises(StructuredToolError, match="outlier treatment"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(
@@ -518,7 +519,7 @@ def test_code_interpreter_rejects_text_only_outlier_treatment_note():
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
-    with pytest.raises(AnalysisCodeError, match="outlier treatment"):
+    with pytest.raises(StructuredToolError, match="outlier treatment"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(
@@ -571,6 +572,36 @@ def test_code_interpreter_allows_cleaned_input_assumption_without_claiming_new_o
     assert result["result"]["metrics"]["row_count"] == 40
 
 
+def test_code_interpreter_does_not_treat_generic_filtering_as_outlier_removal():
+    settings = get_settings()
+    request_state = build_request_state(ChatRequest(message="筛选时间范围并计算平均值"), settings)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        _build_full_evidence_payload(),
+        _ToolSpec(),
+    )
+
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="filter the requested time range and calculate an average",
+                code=(
+                    "values = [float(row['value']) for row in rows]\n"
+                    "result = {\n"
+                    "    'summary': 'filtered to the requested time range',\n"
+                    "    'metrics': {'mean': sum(values) / len(values)},\n"
+                    "    'details': {'filter': 'requested time boundary only'},\n"
+                    "}\n"
+                ),
+            ),
+            request_state=request_state,
+        )
+    )
+
+    assert result["result"]["metrics"]["mean"] == 19.5
+
+
 def test_code_interpreter_rejects_outlier_treatment_without_excluded_row_list():
     settings = get_settings()
     request = ChatRequest(message="用 code interpreter 处理异常值并计算指标")
@@ -578,7 +609,7 @@ def test_code_interpreter_rejects_outlier_treatment_without_excluded_row_list():
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
-    with pytest.raises(AnalysisCodeError, match="excluded_rows as a list"):
+    with pytest.raises(StructuredToolError, match="excluded_rows as a list"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(
@@ -611,7 +642,7 @@ def test_code_interpreter_rejects_duplicate_excluded_rows():
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
     duplicate = {"timestamp": "2023-01-01T00:00:00Z", "value": 1000001.0}
-    with pytest.raises(AnalysisCodeError, match="duplicate details.excluded_rows"):
+    with pytest.raises(StructuredToolError, match="duplicate details.excluded_rows"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(
@@ -678,7 +709,7 @@ def test_code_interpreter_rejects_result_missing_expected_detail_field():
     observation = ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={})
     apply_observation(request_state, observation, _build_full_evidence_payload(), _ToolSpec())
 
-    with pytest.raises(AnalysisCodeError, match="details\\.findings"):
+    with pytest.raises(StructuredToolError, match="details\\.findings"):
         asyncio.run(
             CodeInterpreterTool().execute(
                 CodeInterpreterInput(

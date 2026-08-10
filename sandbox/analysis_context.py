@@ -21,10 +21,13 @@ def build_canonical_analysis_context(
 
     row_items = [dict(item) for item in rows if isinstance(item, dict)]
     point_items = [dict(item) for item in points if isinstance(item, dict)]
-    source_items = point_items or row_items
+    # Rows retain dimensions that the primary points projection may omit for
+    # multi-series evidence. Prefer them whenever they are available.
+    source_items = row_items or point_items
     time_col = _first_key(source_items, [*TIME_CANDIDATES, *columns])
     value_col = _first_numeric_key(source_items, [*VALUE_CANDIDATES, *columns])
     series = _canonical_series(source_items, time_col, value_col)
+    dimension_cols = _dimension_keys(source_items, time_col=time_col, value_col=value_col)
     return {
         "schema": {
             "columns": list(columns),
@@ -33,13 +36,14 @@ def build_canonical_analysis_context(
             "row_count": len(row_items),
             "point_count": len(point_items),
             "series_count": len(series),
+            "dimension_cols": dimension_cols,
             "sample_rows": row_items[:5],
             "sample_points": point_items[:5],
             "sample_series": series[:5],
         },
         "variables": {
             "df": "pandas.DataFrame built from canonical series when pandas is available, else None",
-            "series": "list[dict] with timestamp/value plus original row fields",
+            "series": "list[dict] with timestamp/value plus every original row dimension",
             "time": "df[time_col] when available",
             "value": "df[value_col] when available",
             "time_col": time_col,
@@ -71,7 +75,7 @@ def canonical_namespace_values(payload: dict) -> dict:
     schema = context["schema"]
     series = list(schema.get("sample_series") or [])
     # Rebuild full series; the schema sample is intentionally bounded for diagnostics.
-    source_items = points or rows
+    source_items = rows or points
     series = _canonical_series(source_items, schema.get("time_col"), schema.get("value_col"))
     df = None
     time = None
@@ -141,6 +145,18 @@ def _first_numeric_key(items: list[dict], candidates: list[str] | tuple[str, ...
         if numeric:
             return candidate
     return None
+
+
+def _dimension_keys(items: list[dict], *, time_col: str | None, value_col: str | None) -> list[str]:
+    """Return non-numeric columns that can distinguish time-series groups."""
+    excluded = {key for key in (time_col, value_col, "timestamp", "value") if key}
+    available = sorted({str(key) for item in items[:50] for key in item if str(key) not in excluded})
+    dimensions: list[str] = []
+    for key in available:
+        values = [item.get(key) for item in items[:50] if item.get(key) not in (None, "")]
+        if values and not all(_as_float(value) is not None for value in values):
+            dimensions.append(key)
+    return dimensions
 
 
 def _as_float(value: Any) -> float | None:

@@ -49,16 +49,7 @@ class PrometheusConnector(DBConnector):
     Supports PromQL for time-series queries.
     """
 
-    _HIDDEN_SCHEMA_LABELS = {
-        "dataset",
-        "exported_dataset",
-        "instance",
-        "job",
-        "series",
-        "service",
-        "source",
-        "storage",
-    }
+    _HIDDEN_SCHEMA_LABELS: set[str] = set()
 
     def __init__(self, config: PrometheusConfig):
         super().__init__(config)
@@ -132,7 +123,7 @@ class PrometheusConnector(DBConnector):
         try:
             query_params = {"query": query}
             if timeout:
-                query_params["timeout"] = f"{timeout}ms"
+                query_params["timeout"] = f"{timeout}s"
 
             response = self._session.get(
                 self._get_api_url("query"),
@@ -218,10 +209,7 @@ class PrometheusConnector(DBConnector):
                             # Add only analysis-relevant labels as preview columns.
                             for key, val in series.items():
                                 if key != "__name__" and self._is_schema_label_visible(key):
-                                    columns.append(ColumnSchema(
-                                        name=f"label_{key}",
-                                        data_type="string",
-                                    ))
+                                    columns.append(ColumnSchema(name=key, data_type="string"))
 
                             schema.tables.append(TableSchema(
                                 name=labels,
@@ -316,7 +304,7 @@ class PrometheusConnector(DBConnector):
     ) -> tuple[list[str], list[dict[str, Any]]]:
         """Parse instant vector results."""
         label_columns = self._collect_label_columns(result)
-        columns = [*label_columns, "timestamp", "value"]
+        columns = ["metric_name", *(label for label in label_columns if label != "metric_name"), "timestamp", "value"]
         rows: list[dict[str, Any]] = []
 
         for item in result:
@@ -334,7 +322,7 @@ class PrometheusConnector(DBConnector):
     ) -> tuple[list[str], list[dict[str, Any]]]:
         """Parse range vector results."""
         label_columns = self._collect_label_columns(result)
-        columns = [*label_columns, "timestamp", "value"]
+        columns = ["metric_name", *(label for label in label_columns if label != "metric_name"), "timestamp", "value"]
         rows: list[dict[str, Any]] = []
 
         for item in result:

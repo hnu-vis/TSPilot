@@ -151,7 +151,7 @@ def test_code_interpreter_composes_structured_fact_from_verified_parent_facts():
     assert result["result"]["facts"][0]["value"] == pytest.approx(200.0)
 
 
-def test_code_interpreter_rejects_root_fact_when_database_evidence_is_empty():
+def test_code_interpreter_marks_root_fact_partial_when_database_evidence_is_empty():
     request = DataFactRequest(
         fact_key="price.start",
         name="start_price",
@@ -168,8 +168,37 @@ def test_code_interpreter_rejects_root_fact_when_database_evidence_is_empty():
         ]
     }
 
-    with pytest.raises(AnalysisCodeError, match="without database rows or verified parent facts"):
-        _validate_fact_output_contract(result, [request], input_row_count=0, input_facts=[])
+    diagnostics = _validate_fact_output_contract(result, [request], input_row_count=0, input_facts=[])
+
+    assert diagnostics == {"bound": ["price.start"], "missing": [], "rejected": []}
+    assert result["facts"][0]["status"] == "partial"
+    assert result["facts"][0]["quality_flags"] == ["ungrounded_candidate"]
+
+
+def test_code_interpreter_reports_missing_fact_without_failing_analysis():
+    result = asyncio.run(
+        CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence=_evidence(),
+                analysis_goal="calculate a summary while a requested fact remains unavailable",
+                code=(
+                    "result = {'summary': 'analysis completed', "
+                    "'metrics': {'row_count': len(rows)}, 'details': {}, 'facts': []}"
+                ),
+                fact_requests=[
+                    {
+                        "fact_key": "price.unsatisfied",
+                        "name": "unsatisfied fact",
+                        "fact_type": "custom",
+                    }
+                ],
+            )
+        )
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["facts"] == []
+    assert result["diagnostics"]["fact_binding"]["missing"] == ["price.unsatisfied"]
 
 
 def test_multiple_generated_analyses_accumulate_in_analysis_workspace():

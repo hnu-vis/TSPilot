@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -83,9 +84,22 @@ class SqlQueryInput(BaseModel):
 
     @model_validator(mode="after")
     def require_message_or_query(self):
-        errors = [error for request in self.fact_requests if (error := fact_request_contract_error(request, "sql_query"))]
-        if errors:
-            raise ValueError(" ".join(errors))
+        supported_fact_requests: list[DataFactRequest] = []
+        unsupported_fact_requests: list[dict] = []
+        for request in self.fact_requests:
+            error = fact_request_contract_error(request, "sql_query")
+            if error:
+                unsupported_fact_requests.append(
+                    {**request.model_dump(mode="json", exclude_none=True), "contract_error": error}
+                )
+            else:
+                supported_fact_requests.append(request)
+        self.fact_requests = supported_fact_requests
+        if unsupported_fact_requests:
+            self.constraints = {
+                **self.constraints,
+                "unsupported_fact_requests": unsupported_fact_requests,
+            }
         has_repair_contract = str(self.mode or "").strip().lower() == "repair" and isinstance(self.repair_contract, dict)
         if not has_repair_contract and not (self.query and self.query.strip()) and not (self.message and self.message.strip()):
             raise ValueError("sql_query requires either message for automatic planning or query for explicit read-only execution.")
@@ -157,9 +171,11 @@ class _ExplicitQueryExecutor(BaseTool):
                 request_state=request_state if isinstance(request_state, RequestStateModel) else None,
             )
             try:
-                result = await execute_query(
-                    connector,
-                    query,
+                result = await self._execute_connector_query(
+                    connector=connector,
+                    query=query,
+                    query_language=validated_input.query_language or self._infer_query_language(config),
+                    constraints=validated_input.constraints,
                     timeout=int(validated_input.constraints.get("timeout", config.get("query_timeout", 60))),
                 )
             except StructuredToolError:
@@ -244,6 +260,38 @@ class _ExplicitQueryExecutor(BaseTool):
             ),
         )
         return evidence.model_dump(mode="json")
+
+    async def _execute_connector_query(
+        self,
+        *,
+        connector,
+        query: str,
+        query_language: str,
+        constraints: dict,
+        timeout: int,
+    ):
+        execution = constraints.get("_query_execution") if isinstance(constraints, dict) else None
+        if (
+            query_language == "promql"
+            and isinstance(execution, dict)
+            and str(execution.get("mode") or "instant").lower() == "range"
+            and callable(getattr(connector, "get_range", None))
+        ):
+            end = self._execution_time(execution.get("end")) or datetime.now(timezone.utc)
+            start = self._execution_time(execution.get("start"))
+            if start is None:
+                start = end - timedelta(seconds=int(execution["lookback_seconds"]))
+            step_seconds = int(execution.get("step_seconds") or 15)
+            return await connector.get_range(query, start=start, end=end, step=f"{step_seconds}s")
+        return await execute_query(connector, query, timeout=timeout)
+
+    def _execution_time(self, value) -> datetime | None:
+        if value in (None, ""):
+            return None
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     async def _load_database_config(self, database_id: str) -> dict:
         await DatabaseFactory.load_databases()
@@ -724,6 +772,7 @@ class SqlQueryTool(BaseTool):
                     constraints={
                         **validated_input.constraints,
                         **({"_schema_linking_contract": schema_linking_diagnostics} if schema_linking_diagnostics else {}),
+                        "_query_execution": generated.query_execution.model_dump(mode="json", exclude_none=True),
                     },
                     fact_requests=validated_input.fact_requests,
                 ),
@@ -731,6 +780,7 @@ class SqlQueryTool(BaseTool):
                 extra_metadata={
                     "generation_mode": "llm",
                     "expected_result_type": generated.expected_result_type,
+                    "query_execution": generated.query_execution.model_dump(mode="json", exclude_none=True),
                 },
                 extra_diagnostics={
                     **self._generation_diagnostics(generation, previous_error=previous_error),
@@ -854,6 +904,7 @@ class SqlQueryTool(BaseTool):
                     if hasattr(generated.query_task_contract, "model_dump")
                     else generated.query_task_contract
                 ),
+                "query_execution": generated.query_execution.model_dump(mode="json", exclude_none=True),
                 "confidence": generated.confidence,
                 "repaired_from_query": generation.repaired_from_query,
                 "previous_error": str(previous_error) if previous_error is not None else None,

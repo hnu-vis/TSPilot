@@ -32,7 +32,7 @@ class RequestStateModel(BaseModel):
     constraints: dict = Field(default_factory=dict)
     history: list[Message] = Field(default_factory=list)
 
-    status: Literal["running", "completed", "failed"]
+    status: Literal["running", "completed", "partial", "failed"]
     current_intent: str | None = None
     intent_profile: dict = Field(default_factory=dict)
     requested_capabilities: list[str] = Field(default_factory=list)

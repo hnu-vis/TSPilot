@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import pytest
 
+from core.harness.observation_view import model_observation_view, public_observation_view
 from core.timeseries.anomaly_registry import AnomalyDetectorOutput, register_anomaly_detector
 from core.timeseries.forecast_registry import ForecastModelOutput, register_forecast_model
+from runtime.action_policy import runtime_action_constraints
+from runtime.request_state import apply_observation
 from schemas.database import DatabaseEvidence
+from schemas.database_context import DatabaseContext
 from schemas.timeseries import TimeSeriesPoint
 from schemas.state import RequestStateModel
+from schemas.tool import ToolObservation
 from tools.anomaly import AnomalyInput, AnomalyTool
 from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 from tools.forecast import ForecastInput, ForecastTool
+
+
+class _NoTargetSpec:
+    result_target = "none"
+    produces_terminal_payload = False
 
 
 def _evidence() -> DatabaseEvidence:
@@ -205,14 +215,66 @@ async def test_generated_code_execution_error_has_repair_contract():
     assert repair_contract["available_inputs"]["points"] == "list[dict]"
     assert "columns" in repair_contract["available_inputs"]
     assert "df, data" in repair_contract["instruction"]
-    assert repair_contract["available_inputs"]["canonical"] == "df, time, value, time_col, value_col, series, analysis_context"
+    assert repair_contract["available_inputs"]["canonical"].startswith(
+        "df, time, value, time_col, value_col, series, analysis_context"
+    )
+    assert "dimension_cols" in repair_contract["available_inputs"]["canonical"]
     assert repair_contract["canonical_inputs"]["value_col"] in {"value", "price", "_value"}
     assert repair_contract["failed_code_summary"]["line_count"] == 2
+    assert repair_contract["failed_code"] == "df['returns'] = df['price'].pct_change()\nresult = {}"
     assert repair_contract["error_classification"]["code"] in {
         "execution_error",
         "result_contract_error",
         "input_shape_error",
     }
+
+
+@pytest.mark.asyncio
+async def test_code_failure_returns_to_react_with_complete_failed_code():
+    evidence = _evidence()
+    failed_code = "missing = df['not_a_column']\nresult = {'summary': str(missing), 'metrics': {}, 'details': {}}"
+    request_state = RequestStateModel(
+        request_id="req_code_react_repair",
+        message="分析趋势",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["analysis"],
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+    )
+    with pytest.raises(Exception) as exc_info:
+        await CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                database_evidence="latest",
+                analysis_goal="analyze trend",
+                code=failed_code,
+            ),
+            request_state=request_state,
+        )
+
+    payload = exc_info.value.to_observation_payload()
+    observation = apply_observation(
+        request_state,
+        ToolObservation(
+            tool_name="code_interpreter",
+            success=False,
+            summary=str(exc_info.value),
+            payload=payload,
+            error=str(exc_info.value),
+        ),
+        payload,
+        _NoTargetSpec(),
+    )
+
+    model_view = model_observation_view(observation)
+    assert model_view["payload"]["validation_failure"]["repair_contract"]["failed_code"] == failed_code
+    public_view = public_observation_view(observation)
+    assert public_view["payload"]["validation_failure"]["repair_contract"]["failed_code"] == failed_code
+    constraints = runtime_action_constraints(request_state)
+    required = constraints["required_actions"][0]
+    assert required["action"] == "code_interpreter"
+    assert required["input_guidance"]["mode"] == "repair"
+    assert required["input_guidance"]["repair_contract"]["failed_code"] == failed_code
 
 
 @pytest.mark.asyncio

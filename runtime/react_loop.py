@@ -510,7 +510,8 @@ class ReActLoop:
             sync_from_request(request_state, conversation_state)
 
             if execution_result.tool_spec.produces_terminal_payload:
-                request_state.status = "completed"
+                unavailable_outputs = turn.action_input.get("unavailable_outputs") if isinstance(turn.action_input, dict) else None
+                request_state.status = "partial" if isinstance(unavailable_outputs, list) and unavailable_outputs else "completed"
                 yield append_trace(
                     request_state,
                     "final_answer",
@@ -1208,6 +1209,23 @@ class ReActLoop:
         return strategy
 
     def _failure_signature(self, tool_name: str, payload: dict) -> str:
+        validation_failure = payload.get("validation_failure") if isinstance(payload.get("validation_failure"), dict) else {}
+        retry_contract = (
+            validation_failure.get("repair_contract")
+            if isinstance(validation_failure.get("repair_contract"), dict)
+            else {}
+        )
+        if validation_failure:
+            return "|".join(
+                [
+                    str(tool_name),
+                    str(validation_failure.get("error_code") or payload.get("error_type") or "tool_failure"),
+                    str(validation_failure.get("scope") or ""),
+                    str(validation_failure.get("capability") or ""),
+                    str(retry_contract.get("mode") or ""),
+                    str(retry_contract.get("input_evidence") or ""),
+                ]
+            )
         diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
         parts = [
             str(tool_name),
@@ -1340,9 +1358,10 @@ class ReActLoop:
                 if isinstance(diagnostics.get("generated_code_preview"), dict)
                 else None
             ),
-            "internal_repair_attempts": diagnostics.get("internal_repair_attempts")
-            if isinstance(diagnostics.get("internal_repair_attempts"), list)
-            else [],
+            "execution_attempts": diagnostics.get("execution_attempts"),
+            "fact_binding": diagnostics.get("fact_binding")
+            if isinstance(diagnostics.get("fact_binding"), dict)
+            else None,
             "canonical_inputs": diagnostics.get("canonical_inputs") if isinstance(diagnostics.get("canonical_inputs"), dict) else None,
         }
 

@@ -61,14 +61,14 @@ def test_fact_memory_persists_only_verified_matching_recipes(monkeypatch):
     assert memory.definitions[0].preferred_tool == "code_interpreter"
 
 
-def test_code_interpreter_cannot_replace_atomic_database_fact_without_parents():
+def test_code_interpreter_can_produce_atomic_fact_from_database_rows():
     request = DataFactRequest(
         fact_key="price.start",
         name="start_price",
         fact_type="point_value",
     )
 
-    assert "sql_query" in fact_request_contract_error(request, "code_interpreter")
+    assert fact_request_contract_error(request, "code_interpreter") is None
 
 
 def test_memory_management_view_can_load_all_cards_without_expanding_prompt_view(monkeypatch):

@@ -4,8 +4,9 @@ import pytest
 
 from app.settings import get_settings
 from core.database.connector import ColumnSchema, DatabaseSchema, QueryResult, TableSchema
+from core.database.connectors.prometheus import PrometheusConfig, PrometheusConnector
 from core.database.engine import normalize_query_result
-from core.database.llm_query import LLMGeneratedQuery, LLMSchemaLinkingContract
+from core.database.llm_query import LLMGeneratedQuery, LLMSchemaLinkingContract, QueryExecutionContract
 from runtime.request_state import apply_observation, build_request_state
 from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
@@ -76,6 +77,25 @@ def test_sql_query_repair_contract_is_valid_without_duplicate_message():
     assert validated.repair_contract["mode"] == "query_repair"
 
 
+def test_sql_query_drops_non_scalar_fact_hints_without_blocking_evidence_query():
+    validated = SqlQueryInput(
+        message="return the requested time series",
+        database_context=DatabaseContext(database_id="prom", database_type="prometheus"),
+        fact_requests=[
+            {"name": "rate series", "fact_type": "time_series", "fact_key": "rate_series"},
+            {
+                "name": "latest rate",
+                "fact_type": "point_value",
+                "fact_key": "latest_rate",
+                "requirements": {"time_position": "end"},
+            },
+        ],
+    )
+
+    assert [request.fact_key for request in validated.fact_requests] == ["latest_rate"]
+    assert validated.constraints["unsupported_fact_requests"][0]["fact_key"] == "rate_series"
+
+
 def test_llm_generated_query_normalizes_object_required_outputs():
     generated = LLMGeneratedQuery.model_validate(
         {
@@ -103,6 +123,76 @@ def test_llm_generated_query_normalizes_object_required_outputs():
             "description": "return timestamps and values",
         }
     ]
+
+
+def test_query_execution_contract_requires_range_boundaries():
+    with pytest.raises(ValueError, match="start/end or lookback_seconds"):
+        QueryExecutionContract(mode="range")
+
+    contract = QueryExecutionContract(mode="range", lookback_seconds=900, step_seconds=15)
+
+    assert contract.mode == "range"
+    assert contract.lookback_seconds == 900
+
+
+def test_prometheus_rows_and_columns_always_expose_metric_identity():
+    connector = PrometheusConnector(PrometheusConfig())
+
+    columns, rows = connector._parse_query_payload(
+        {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": {"__name__": "requests_total", "job": "api"},
+                    "value": [1_700_000_000, "12"],
+                }
+            ],
+        }
+    )
+
+    assert columns == ["metric_name", "job", "timestamp", "value"]
+    assert rows[0]["metric_name"] == "requests_total"
+
+
+@pytest.mark.asyncio
+async def test_promql_range_execution_uses_connector_range_api():
+    from tools.sql_query import _ExplicitQueryExecutor
+
+    class _RangeConnector:
+        def __init__(self):
+            self.range_call = None
+
+        async def get_range(self, query, *, start, end, step):
+            self.range_call = {"query": query, "start": start, "end": end, "step": step}
+            return QueryResult(
+                columns=["timestamp", "value"],
+                rows=[],
+                row_count=0,
+                execution_time_ms=1,
+            )
+
+    connector = _RangeConnector()
+    executor = _ExplicitQueryExecutor(get_settings())
+
+    await executor._execute_connector_query(
+        connector=connector,
+        query="rate(process_cpu_seconds_total[5m])",
+        query_language="promql",
+        constraints={
+            "_query_execution": {
+                "mode": "range",
+                "start": "2024-01-01T00:00:00Z",
+                "end": "2024-01-01T01:00:00Z",
+                "step_seconds": 30,
+            }
+        },
+        timeout=60,
+    )
+
+    assert connector.range_call["query"] == "rate(process_cpu_seconds_total[5m])"
+    assert connector.range_call["step"] == "30s"
+    assert connector.range_call["start"].isoformat() == "2024-01-01T00:00:00+00:00"
+    assert connector.range_call["end"].isoformat() == "2024-01-01T01:00:00+00:00"
 
 
 class _FailOnceConnector(_FakeConnector):

@@ -100,7 +100,6 @@ class CodeInterpreterTool(BaseTool):
         code_text = str(validated_input.code or "").strip()
         generated_code_preview = None
         executed_code_preview = None
-        repair_attempts: list[dict] = []
         canonical_context = build_canonical_analysis_context(
             rows=rows,
             points=points,
@@ -183,7 +182,7 @@ class CodeInterpreterTool(BaseTool):
                     "code_interpreter analysis requires numeric time-series values, but the selected evidence "
                     "does not expose a usable timestamp/value pair. Query evidence with a numeric value column first."
                 )
-            sandbox_output, final_code_text = await self._execute_code_with_internal_repair(
+            sandbox_output, final_code_text = await self._execute_code_once(
                 code=code_text,
                 goal=goal,
                 database_evidence=database_evidence,
@@ -193,13 +192,10 @@ class CodeInterpreterTool(BaseTool):
                 canonical_context=canonical_context,
                 constraints=constraints,
                 request_state=request_state,
-                code_hash=code_hash,
                 required_outputs=validated_input.required_outputs,
                 analysis_request=validated_input.analysis_request,
                 expected_result_schema=validated_input.expected_result_schema or {},
-                fact_requests=validated_input.fact_requests,
                 input_facts=input_facts,
-                repair_attempts=repair_attempts,
             )
             code_hash = _code_hash(final_code_text)
             executed_code_preview = _failed_code_summary(final_code_text)
@@ -229,7 +225,7 @@ class CodeInterpreterTool(BaseTool):
             _validate_expected_result_schema(result_payload, validated_input.expected_result_schema or {})
             _validate_outlier_treatment_transparency(result_payload)
             _validate_result_has_numeric_analysis(result_payload, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
-            _validate_fact_output_contract(
+            fact_binding = _validate_fact_output_contract(
                 result_payload,
                 validated_input.fact_requests,
                 input_row_count=len(rows),
@@ -241,6 +237,7 @@ class CodeInterpreterTool(BaseTool):
                 goal=goal,
                 database_evidence=database_evidence,
                 result_payload=result_payload,
+                failed_code=final_code_text if code_text else None,
             ) from exc
         result = AnalysisResult(
             analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
@@ -261,14 +258,15 @@ class CodeInterpreterTool(BaseTool):
                 "executed_code": final_code_text if code_text else None,
                 "generated_code_preview": generated_code_preview,
                 "executed_code_preview": executed_code_preview,
-                "internal_repair_attempts": repair_attempts,
+                "execution_attempts": 1 if code_text else 0,
+                "fact_binding": fact_binding,
                 "canonical_inputs": canonical_context.get("schema"),
                 **output.get("diagnostics", {}),
             },
         )
         return result.model_dump(mode="json")
 
-    async def _execute_code_with_internal_repair(
+    async def _execute_code_once(
         self,
         *,
         code: str,
@@ -280,61 +278,39 @@ class CodeInterpreterTool(BaseTool):
         canonical_context: dict,
         constraints: dict,
         request_state,
-        code_hash: str,
         required_outputs: list[str],
         analysis_request: dict | None,
         expected_result_schema: dict,
-        fact_requests: list[DataFactRequest],
         input_facts: list[dict],
-        repair_attempts: list[dict],
     ):
-        current_code = code
-        last_error: AnalysisCodeError | None = None
-        max_internal_repairs = 0
-        for attempt in range(max_internal_repairs + 1):
-            preflight_error = _preflight_analysis_code(current_code, canonical_context)
-            if preflight_error is not None:
-                last_error = AnalysisCodeError(preflight_error)
-            else:
-                try:
-                    sandbox_output = execute_python_sandbox_v1(
-                        code=current_code,
-                        rows=rows,
-                        points=points,
-                        columns=columns,
-                        metadata=database_evidence.metadata,
-                        diagnostics=database_evidence.diagnostics,
-                        input_facts=input_facts,
-                        timeout_seconds=int(constraints.get("timeout_seconds", 5)),
-                        work_dir=_code_interpreter_work_dir(request_state, _code_hash(current_code)),
-                    )
-                    _validate_fact_output_contract(
-                        sandbox_output.result,
-                        fact_requests,
-                        input_row_count=len(rows),
-                        input_facts=input_facts,
-                    )
-                    return sandbox_output, current_code
-                except AnalysisCodeError as exc:
-                    last_error = exc
-            repair_attempts.append(
-                {
-                    "attempt": attempt,
-                    "error": str(last_error)[:800] if last_error else None,
-                    "error_classification": _classify_analysis_code_error(str(last_error or "")),
-                    "code_hash": _code_hash(current_code),
-                }
-            )
-            break
+        preflight_error = _preflight_analysis_code(code, canonical_context)
+        if preflight_error is None:
+            try:
+                sandbox_output = execute_python_sandbox_v1(
+                    code=code,
+                    rows=rows,
+                    points=points,
+                    columns=columns,
+                    metadata=database_evidence.metadata,
+                    diagnostics=database_evidence.diagnostics,
+                    input_facts=input_facts,
+                    timeout_seconds=int(constraints.get("timeout_seconds", 5)),
+                    work_dir=_code_interpreter_work_dir(request_state, _code_hash(code)),
+                )
+                return sandbox_output, code
+            except AnalysisCodeError as exc:
+                execution_error = exc
+        else:
+            execution_error = AnalysisCodeError(preflight_error)
         raise _structured_code_execution_error(
-            last_error or AnalysisCodeError("analysis_code sandbox failed."),
+            execution_error,
             goal=goal,
             database_evidence=database_evidence,
             columns=columns,
             required_outputs=required_outputs,
             analysis_request=analysis_request,
             expected_result_schema=expected_result_schema,
-            failed_code=current_code,
+            failed_code=code,
             canonical_context=canonical_context,
         )
 
@@ -372,13 +348,15 @@ class CodeInterpreterTool(BaseTool):
             "You generate Python code for TSPilot code_interpreter. Return exactly one JSON object "
             "with key code and no markdown. The sandbox already provides df, time, value, time_col, "
             "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, input_facts, fact_by_key, "
-            "math, statistics, pd, and np. Prefer value/time/df/series. Do not use pd.np or ellipsis placeholders. "
-            "Do not invent field names. The code must assign result as one dict containing the stable contract fields "
+            "math, statistics, pd, and np. Prefer value/time/df/series. For multi-series input, inspect "
+            "analysis_context['schema']['dimension_cols'] and group by an available dimension; never assume a field, metric, or series column name. "
+            "Do not use pd.np or ellipsis placeholders. Do not invent field names. The code must assign result as one dict containing the stable contract fields "
             "summary, metrics, details, and facts. summary must be a non-empty string. metrics must be a dict/object and may be empty "
             "when the requested answer is primarily table/list/detail output. details must be a dict/object. Prefer details "
             "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
             "values must be JSON-serializable plain Python scalars, lists, or dicts. facts must be a list with one object per "
-            "satisfied fact_contract, preserving its fact_key, name, fact_type, and derived_from. Each fact must include value, "
+            "satisfied fact_contract, preserving its fact_key, name, fact_type, and derived_from. Facts calculated directly from database rows may have empty derived_from; "
+            "derived_from is reserved for verified parent Facts. Each fact must include value, "
             "statement, and calculation_trace. Use input_facts or fact_by_key for dependencies; never invent a dependency value. "
             "Treat analysis_request, expected_result_schema, and repair_contract as authoritative output requirements. When a "
             "repair_contract lists required_details_fields, result.details must contain every listed field with the requested types. "
@@ -465,57 +443,91 @@ def _validate_fact_output_contract(
     *,
     input_row_count: int = 0,
     input_facts: list[dict] | None = None,
-) -> None:
+) -> dict:
+    """Bind candidate facts without converting coverage gaps into code failures."""
+
+    diagnostics = {"bound": [], "missing": [], "rejected": []}
     if not requests:
-        return
+        return diagnostics
     facts = result.get("facts")
-    if not isinstance(facts, list) or not facts:
-        raise AnalysisCodeError("analysis result must include structured facts for the requested fact contracts.")
-    requests_by_key = {request.fact_key: request for request in requests}
+    if facts is None:
+        facts = []
+    if not isinstance(facts, list):
+        diagnostics["rejected"].append({"reason": "result.facts must be a list"})
+        facts = []
+    requests_by_alias: dict[str, DataFactRequest] = {}
+    for request in requests:
+        requests_by_alias[request.fact_key] = request
+        requests_by_alias[normalize_fact_key(request.name)] = request
     verified_input_keys = {
         normalize_fact_key(fact.get("fact_key") or fact.get("fact_id") or fact.get("name") or "")
         for fact in (input_facts or [])
         if isinstance(fact, dict) and fact.get("status", "verified") == "verified"
     }
-    output_fact_keys = {
-        normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
+    candidate_keys = {
+        request.fact_key
         for raw in facts
         if isinstance(raw, dict)
+        and (request := requests_by_alias.get(normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")))
     }
+    bound_facts: list[dict] = []
     seen: set[str] = set()
     for raw in facts:
         if not isinstance(raw, dict):
-            raise AnalysisCodeError("analysis result facts must contain objects.")
-        fact_key = normalize_fact_key(raw.get("fact_key") or raw.get("name") or "")
-        request = requests_by_key.get(fact_key)
+            diagnostics["rejected"].append({"reason": "candidate fact must be an object"})
+            continue
+        candidate = dict(raw)
+        candidate_key = normalize_fact_key(candidate.get("fact_key") or candidate.get("name") or "")
+        request = requests_by_alias.get(candidate_key)
         if request is None:
-            raise AnalysisCodeError(f"analysis returned unrequested fact_key '{fact_key}'.")
-        if fact_key in seen:
-            raise AnalysisCodeError(f"analysis returned duplicate fact_key '{fact_key}'.")
-        seen.add(fact_key)
-        if request.derived_from:
-            if fact_key in request.derived_from:
-                raise AnalysisCodeError(f"analysis fact '{fact_key}' cannot depend on itself.")
-            available_parents = verified_input_keys | output_fact_keys
-            missing_parents = [key for key in request.derived_from if key not in available_parents]
-            if missing_parents:
-                raise AnalysisCodeError(
-                    f"analysis fact '{fact_key}' depends on unavailable verified input facts: {missing_parents}."
-                )
-        elif input_row_count <= 0:
-            raise AnalysisCodeError(
-                f"analysis fact '{fact_key}' cannot be created without database rows or verified parent facts."
+            diagnostics["rejected"].append({"fact_key": candidate_key, "reason": "unrequested candidate fact"})
+            continue
+        if request.fact_key in seen:
+            diagnostics["rejected"].append({"fact_key": request.fact_key, "reason": "duplicate candidate fact"})
+            continue
+        if candidate.get("value") is None or not str(candidate.get("statement") or "").strip():
+            diagnostics["rejected"].append(
+                {"fact_key": request.fact_key, "reason": "candidate fact requires value and statement"}
             )
-        raw["fact_key"] = request.fact_key
-        raw["name"] = request.name
-        raw["fact_type"] = request.fact_type
-        raw["derived_from"] = request.derived_from
-        if raw.get("value") is None:
-            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a non-null value.")
-        if not str(raw.get("statement") or "").strip():
-            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a statement.")
-        if not isinstance(raw.get("calculation_trace"), dict) or not raw["calculation_trace"]:
-            raise AnalysisCodeError(f"analysis fact '{fact_key}' must include a calculation_trace.")
+            continue
+        dependencies = [
+            normalize_fact_key(item)
+            for item in (candidate.get("derived_from") if "derived_from" in candidate else request.derived_from) or []
+            if item
+        ]
+        quality_flags = list(candidate.get("quality_flags") or [])
+        missing_parents = [
+            key
+            for key in dependencies
+            if key not in verified_input_keys and key not in candidate_keys
+        ]
+        if request.fact_key in dependencies:
+            missing_parents.append(request.fact_key)
+        if missing_parents and "unverified_dependencies" not in quality_flags:
+            quality_flags.append("unverified_dependencies")
+        if input_row_count <= 0 and not dependencies and "ungrounded_candidate" not in quality_flags:
+            quality_flags.append("ungrounded_candidate")
+        if (
+            not isinstance(candidate.get("calculation_trace"), dict)
+            or not candidate.get("calculation_trace")
+        ) and "missing_calculation_trace" not in quality_flags:
+            quality_flags.append("missing_calculation_trace")
+        candidate.update(
+            {
+                "fact_key": request.fact_key,
+                "name": request.name,
+                "fact_type": request.fact_type,
+                "derived_from": dependencies,
+                "quality_flags": quality_flags,
+                "status": "partial" if quality_flags else candidate.get("status", "verified"),
+            }
+        )
+        seen.add(request.fact_key)
+        bound_facts.append(candidate)
+        diagnostics["bound"].append(request.fact_key)
+    result["facts"] = bound_facts
+    diagnostics["missing"] = [request.fact_key for request in requests if request.fact_key not in seen]
+    return diagnostics
 
 
 def _normalize_analysis_request(value) -> dict | None:
@@ -970,16 +982,17 @@ def _structured_code_execution_error(
             "data": "dict with rows, points, and series",
             "metadata": "dict",
             "diagnostics": "dict",
-            "canonical": "df, time, value, time_col, value_col, series, analysis_context",
+            "canonical": "df, time, value, time_col, value_col, series, analysis_context; analysis_context.schema.dimension_cols lists grouping dimensions",
         },
         "canonical_inputs": canonical_context.get("schema") if isinstance(canonical_context, dict) else {},
+        "failed_code": str(failed_code or ""),
         "failed_code_summary": _failed_code_summary(failed_code),
         "error_classification": _classify_analysis_code_error(str(exc)),
         "instruction": (
             "Call code_interpreter again with corrected Python code. The sandbox provides variables "
             "df, data, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
-            "metadata, and diagnostics. Prefer the canonical variables df/time/value/series instead "
-            "of guessing raw row field names. Use pandas frequency aliases compatible with current "
+            "metadata, and diagnostics. Prefer df and inspect analysis_context['schema']['dimension_cols'] "
+            "before grouping multi-series evidence; do not assume a field/metric/series column name. Use pandas frequency aliases compatible with current "
             "pandas, for example 'h' for hourly grouping. The code must assign "
             "a dict to result with non-empty result['summary'], result['metrics'], and result['details']."
         ),
@@ -1220,6 +1233,7 @@ def _structured_analysis_validation_error(
     goal: str,
     database_evidence: DatabaseEvidence,
     result_payload: dict,
+    failed_code: str | None = None,
 ) -> StructuredToolError:
     message = str(exc)
     required_fields = [
@@ -1238,6 +1252,7 @@ def _structured_analysis_validation_error(
             "analysis_goal": goal,
             "required_details_fields": required_fields,
             "previous_result_summary": result_payload.get("summary") if isinstance(result_payload, dict) else None,
+            "failed_code": str(failed_code or ""),
             "expected_result_shape": {"summary": "string", "metrics": "object", "details": "object"},
         }
         validation_failure = {
@@ -1285,6 +1300,7 @@ def _structured_analysis_validation_error(
                 "mode": "analysis_artifact_repair",
                 "input_evidence": database_evidence.evidence_id,
                 "analysis_goal": goal,
+                "failed_code": str(failed_code or ""),
             },
             "retry_policy": {
                 "required_action": "code_interpreter",
@@ -1626,11 +1642,8 @@ def _result_indicates_outlier_treatment(result: dict) -> bool:
         "anomalous",
         "excluded",
         "exclude",
-        "filtered",
-        "filter",
         "winsor",
         "adjusted",
-        "有效",
         "剔除",
         "过滤",
         "排除",

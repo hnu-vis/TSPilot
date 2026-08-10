@@ -1,6 +1,7 @@
 from __future__ import annotations
 from core.database.engine import normalize_query_result
 from core.timeseries.normalization import normalize_timeseries_evidence
+from sandbox.analysis_context import build_canonical_analysis_context, canonical_namespace_values
 
 
 def test_normalize_timeseries_evidence_can_select_named_series():
@@ -63,3 +64,27 @@ def test_normalize_timeseries_evidence_preserves_non_numeric_result_columns():
         {"timestamp": "2023-01-01T00:00:00Z", "value": 10.0},
         {"timestamp": "2023-01-02T00:00:00Z", "value": 12.0},
     ]
+
+
+def test_analysis_context_prefers_full_rows_for_multi_series_dimensions():
+    rows = [
+        {"timestamp": "2024-01-01T00:00:00Z", "field": "load", "value": 1.0},
+        {"timestamp": "2024-01-01T00:00:00Z", "field": "generation", "value": 2.0},
+    ]
+    points = [{"timestamp": "2024-01-01T00:00:00Z", "value": 1.0}]
+
+    context = build_canonical_analysis_context(
+        rows=rows,
+        points=points,
+        columns=["timestamp", "field", "value"],
+    )
+    namespace = canonical_namespace_values(
+        {"rows": rows, "points": points, "columns": context["schema"]["columns"]}
+    )
+
+    assert context["schema"]["dimension_cols"] == ["field"]
+    assert {item["field"] for item in context["schema"]["sample_series"]} == {
+        "load",
+        "generation",
+    }
+    assert {item["field"] for item in namespace["series"]} == {"load", "generation"}

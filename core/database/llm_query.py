@@ -85,6 +85,25 @@ class QueryTaskContract(BaseModel):
         return [value]
 
 
+class QueryExecutionContract(BaseModel):
+    """Datasource execution semantics that are not encoded in query text."""
+
+    mode: str = "instant"
+    start: str | None = None
+    end: str | None = None
+    lookback_seconds: int | None = Field(default=None, gt=0)
+    step_seconds: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_range_contract(self):
+        self.mode = str(self.mode or "instant").strip().lower()
+        if self.mode not in {"instant", "range"}:
+            raise ValueError("query_execution.mode must be instant or range.")
+        if self.mode == "range" and not ((self.start and self.end) or self.lookback_seconds):
+            raise ValueError("Range query execution requires start/end or lookback_seconds.")
+        return self
+
+
 class LLMGeneratedQuery(BaseModel):
     """Structured query proposal returned by the query-generation LLM."""
 
@@ -96,6 +115,7 @@ class LLMGeneratedQuery(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     task_coverage: dict[str, Any] = Field(default_factory=dict)
     query_task_contract: QueryTaskContract | None = None
+    query_execution: QueryExecutionContract = Field(default_factory=QueryExecutionContract)
     confidence: float | None = None
 
     @model_validator(mode="after")
@@ -335,9 +355,21 @@ class LLMQueryGenerator:
             "For derived or multi-field statistics, plan from the requested output contract rather than a fixed query template. "
             "Each requested measure, dimension, grouping, comparison, time boundary, or derived quantity must either be represented by an explicit returned column/result shape, or listed in task_coverage.missing. "
             "If one compact query would require fragile dialect-specific state logic, prefer a simpler reliable evidence query and mark the still-missing contract fields instead of claiming coverage.\n"
+            "For PromQL, metric sources must be queried by metric name and must never be repeated as source/name/__name__ label matchers. "
+            "Return exactly one syntactically complete PromQL expression; never concatenate independent expressions with newlines or semicolons. "
+            "Use only grounded labels inside braces. Use native PromQL range functions for rate/increase/delta requests. "
+            "A datasource-native transformation in schema_linking.aggregate_targets is mandatory query semantics: do not defer it "
+            "to code_interpreter, and do not claim it in task_coverage unless the generated query actually applies it. "
+            "For example, a requested rate must return rate(metric[window]); downstream analysis may calculate statistics over those rate values, not reconstruct rate from raw counters. "
+            "When the user requests both a range series and summary statistics, query the requested series expression and assign the statistics to downstream analysis instead of concatenating separate aggregate expressions. "
+            "For multiple metric sources, preserve metric identity with label_replace into a metric_name label before an or union when labels may overlap.\n"
+            "For Prometheus instant/latest values set query_execution.mode=instant. For a requested time interval or recent window, "
+            "set query_execution.mode=range and provide either absolute start/end or an LLM-resolved lookback_seconds plus step_seconds. "
+            "The PromQL expression for range evaluation must be an instant-vector expression such as rate(metric[5m]), never a bare metric[15m] range vector.\n"
             "Always create query_task_contract before choosing query shape. "
             "If the user asks for derived arithmetic over database values, such as difference, ratio, change, percentage, return, spread, or any custom calculation, "
             "set query_task_contract.downstream_action=\"code_interpreter\", set preferred_evidence_shape to raw_series or simple aggregate_table, and generate the simplest reliable evidence query. "
+            "This downstream rule applies only after all explicitly requested datasource-native operations have been performed in the query. "
             "When query_task_contract.downstream_action is code_interpreter and preferred_evidence_shape is raw_series, the query must return raw evidence only; "
             "do not aggregate, rank, pivot, join, or reshape away the native value/time columns. "
             "For Flux, do not invent helper functions such as summarize() and do not use custom record-property syntax for dynamic aggregates; when multi-aggregate Flux is uncertain, return raw _time/_value evidence and put the derived output in task_coverage.missing with next_action_hint=\"code_interpreter\".\n"
@@ -363,6 +395,7 @@ class LLMQueryGenerator:
             "\"assumptions\": string[], "
             "\"task_coverage\": {\"satisfied\": string[], \"missing\": string[], \"next_action_hint\": string|null}, "
             "\"query_task_contract\": {\"intent_type\": string|null, \"required_measures\": array of strings, \"required_dimensions\": array of objects, \"required_filters\": array of objects, \"required_outputs\": array of objects or strings, \"downstream_action\": string|null, \"preferred_evidence_shape\": string|null, \"dialect_complexity_policy\": string|null, \"coverage\": object}, "
+            "\"query_execution\": {\"mode\": \"instant\"|\"range\", \"start\": string|null, \"end\": string|null, \"lookback_seconds\": integer|null, \"step_seconds\": integer|null}, "
             "\"confidence\": number"
             "}."
         )
@@ -382,6 +415,9 @@ class LLMQueryGenerator:
             "When the user mentions an entity, unit, ticker, symbol, code, label, or multilingual alias that matches a candidate value, include it in required_filters. "
             "required_filters must contain every source/dimension value that is necessary for the query to answer the specific user request, not optional filters.\n"
             "Do not put time-window boundaries in required_filters; request.time_range is the authoritative temporal contract consumed by query generation.\n"
+            "For Prometheus, never emit a metric source as selector_column/selector_value or required_filter. "
+            "A Prometheus measure uses physical_value_column=value; actual labels are dimensions or filters. "
+            "Do not put rate windows or relative time phrases in unresolved_terms because they are query semantics, not schema objects.\n"
             "If a term cannot be grounded, put it in unresolved_terms and lower confidence. Do not invent schema objects or values.\n"
             "For each filter use {\"source\": string|null, \"column\": string, \"operator\": \"=\", \"value\": string|number|boolean}.\n"
             "JSON schema: {"

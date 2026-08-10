@@ -67,7 +67,7 @@ Required fields:
 
 - `conversation_id: str`
 - `request_id: str`
-- `status: Literal["completed", "failed"]`
+- `status: Literal["completed", "partial", "failed"]`
 - `response_kind: Literal["final_answer", "error"]`
 - `used_tools: list[str]`
 

@@ -113,7 +113,15 @@ class DataAgentPromptBuilder:
         if action in {"forecast", "anomaly"}:
             return ["database_evidence", "constraints?"]
         if action == "terminate":
-            return ["result? natural-language prose", "direct_answer? natural-language prose", "summary_goal?", "include_analysis_ids?", "include_fact_ids?"]
+            return [
+                "result? natural-language prose",
+                "direct_answer? natural-language prose",
+                "summary_goal?",
+                "include_analysis_ids?",
+                "include_fact_ids?",
+                "unavailable_outputs?",
+                "unavailable_reason?",
+            ]
         return list(parameters)[:4]
 
     def _task_context(self, request_state: RequestStateModel) -> dict:

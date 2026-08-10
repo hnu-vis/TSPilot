@@ -27,7 +27,7 @@ This schema also depends on:
 
 ### Control state
 
-- `status: Literal["running", "completed", "failed"]`
+- `status: Literal["running", "completed", "partial", "failed"]`
 - `current_intent: str | null`
 - `requested_capabilities: list[str]`
 - `focus: str | null`

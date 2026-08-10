@@ -343,7 +343,7 @@ def build_final_response(request_state: RequestStateModel, trace_events: list[Tr
         return ChatResponse(
             conversation_id=request_state.conversation_id or "",
             request_id=request_state.request_id,
-            status="completed",
+            status="partial" if request_state.status == "partial" else "completed",
             response_kind="final_answer",
             used_tools=_visible_used_tools(request_state),
             answer=public_answer,

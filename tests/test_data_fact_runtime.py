@@ -118,6 +118,84 @@ def test_sql_fact_uses_query_selected_measure_when_rows_have_multiple_numeric_co
     assert request_state.fact_set.facts[-1].calculation_trace["value_key"] == "price"
 
 
+def test_sql_facts_bind_each_request_to_its_result_dimensions():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "name": "series a latest",
+                        "fact_type": "point_value",
+                        "requirements": {"time_position": "end", "metric_name": "series_a"},
+                    },
+                    {
+                        "name": "series b latest",
+                        "fact_type": "point_value",
+                        "dimensions": {"metric_name": "series_b"},
+                        "requirements": {"time_position": "end"},
+                    },
+                ]
+            },
+        )
+    )
+    payload = {
+        "evidence_id": "evi_multi_series",
+        "summary": "Loaded two series.",
+        "data": {
+            "rows": [
+                {"metric_name": "series_a", "timestamp": "2024-01-01", "value": 1.0},
+                {"metric_name": "series_b", "timestamp": "2024-01-01", "value": 9.0},
+            ]
+        },
+    }
+
+    coverage = register_data_facts_from_payload(request_state, "sql_query", payload)
+
+    facts = {fact.name: fact for fact in request_state.fact_set.facts}
+    assert coverage.verified == ["series a latest", "series b latest"]
+    assert facts["series a latest"].value == 1.0
+    assert facts["series b latest"].value == 9.0
+    assert facts["series a latest"].calculation_trace["row_selectors"] == {"metric_name": "series_a"}
+
+
+def test_sql_fact_marks_unmatched_result_dimensions_unavailable():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="sql_query",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "name": "missing series latest",
+                        "fact_type": "point_value",
+                        "requirements": {"time_position": "end", "metric_name": "series_missing"},
+                    }
+                ]
+            },
+        )
+    )
+    payload = {
+        "evidence_id": "evi_one_series",
+        "summary": "Loaded one series.",
+        "data": {
+            "rows": [
+                {"metric_name": "series_a", "timestamp": "2024-01-01", "value": 1.0},
+            ]
+        },
+    }
+
+    coverage = register_data_facts_from_payload(request_state, "sql_query", payload)
+
+    fact = request_state.fact_set.facts[-1]
+    assert coverage.unavailable == ["missing series latest"]
+    assert fact.status == "unavailable"
+    assert "metric_name='series_missing'" in (fact.unavailable_reason or "")
+
+
 def test_sql_fact_does_not_guess_between_ambiguous_numeric_columns():
     request_state = _request_state()
     request_state.tool_history.append(
@@ -239,6 +317,7 @@ def test_code_interpreter_registers_result_facts_and_conversation_memory():
                     "fact_type": "change",
                     "statement": "Bitcoin USD changed by 20%.",
                     "value": 20.0,
+                    "calculation_trace": {"formula": "(end - start) / start * 100"},
                 }
             ],
             "metrics": {},
@@ -434,3 +513,52 @@ def test_composite_fact_with_missing_parent_is_partial():
     fact = request_state.fact_set.facts[0]
     assert fact.status == "partial"
     assert "unverified_dependencies" in fact.quality_flags
+
+
+def test_code_fact_directly_computed_from_rows_does_not_inherit_planned_dependencies():
+    request_state = _request_state()
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="code_interpreter",
+            iteration=1,
+            tool_input={
+                "fact_requests": [
+                    {
+                        "fact_key": "price.change",
+                        "name": "change",
+                        "fact_type": "difference",
+                        "derived_from": ["price.start", "price.end"],
+                    }
+                ]
+            },
+        )
+    )
+
+    coverage = register_data_facts_from_payload(
+        request_state,
+        "code_interpreter",
+        {
+            "analysis_id": "ana_direct_change",
+            "input_evidence_id": "evi_prices",
+            "result": {
+                "facts": [
+                    {
+                        "fact_key": "price.change",
+                        "name": "change",
+                        "fact_type": "difference",
+                        "statement": "Change is 2.",
+                        "value": 2.0,
+                        "derived_from": [],
+                        "calculation_trace": {"formula": "last row - first row"},
+                    }
+                ],
+                "metrics": {},
+                "details": {},
+            },
+        },
+    )
+
+    fact = request_state.fact_set.facts[0]
+    assert coverage.verified == ["change"]
+    assert fact.derived_from == []
+    assert fact.status == "verified"

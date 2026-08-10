@@ -369,9 +369,19 @@ class PrometheusDialect(DatabaseDialect):
             read_only_languages=("promql",),
             generation_rules=(
                 "For Prometheus, generate PromQL. Treat metric names as sources and labels as dimensions. "
-                "Preserve user-mentioned labels as matchers when grounded by schema or candidate values."
+                "Return one complete PromQL expression per query and never join independent expressions with newline or semicolon separators. "
+                "A metric source is written directly as the PromQL selector name; never turn it into a source/name/__name__ label matcher. "
+                "Only actual label columns may appear inside braces. Preserve user-mentioned labels as matchers when grounded by schema or candidate values. "
+                "Use native PromQL functions such as rate(metric[window]) for rate requests; raw counter samples do not satisfy a rate request. "
+                "For range results, request range evaluation rather than returning a bare range vector. "
+                "When combining multiple metric sources whose label sets can overlap, preserve source identity before the or union with "
+                "label_replace(metric, \"metric_name\", \"$1\", \"__name__\", \"(.*)\")."
             ),
-            schema_linking_rules="For Prometheus, treat metric names as sources and labels as dimensions.",
+            schema_linking_rules=(
+                "For Prometheus, metric names are physical sources, never selector columns, selector values, dimensions, or required filters. "
+                "Set physical_value_column and aggregate_column to value. Only columns listed on a metric source other than timestamp/value are labels. "
+                "Rate windows and relative time ranges are temporal query semantics, not unresolved schema terms."
+            ),
         )
 
     def has_filter(self, query: str, *, column: str, value: Any) -> bool:

@@ -21,11 +21,8 @@ def fact_request_contract_error(request: DataFactRequest, tool_name: str) -> str
     """Return a precise contract error without deriving missing semantics."""
 
     if tool_name == "code_interpreter":
-        if request.fact_type in SQL_FACT_TYPES and not request.derived_from:
-            return (
-                f"Code Interpreter cannot create atomic database Fact '{request.fact_key}' without parent Facts. "
-                "Produce it with sql_query, or declare verified parent fact_key values in derived_from."
-            )
+        # Result validation requires database rows or verified Fact parents and
+        # a calculation trace, so scalar calculations remain grounded.
         return None
     if tool_name != "sql_query":
         return None

@@ -77,7 +77,7 @@ The model must treat anything outside that window as unavailable.
 - For returns, volatility, drawdown, correlation, rolling/window metrics, or ambiguous unsupported metrics, provide Python `code` in `code_interpreter`.
 - Generated `code_interpreter` Python runs with canonical variables `df`, `time`, `value`, `time_col`, `value_col`, `series`, and `analysis_context`, plus compatibility variables `data`, `rows`, `points`, `columns`, `metadata`, and `diagnostics`. It should prefer canonical variables instead of guessing raw field names, and must assign a dict named `result` with `summary`, `metrics`, and `details`.
 - `missing` is only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in `missing`.
-- Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`.
+- Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`; both fields must remain visible in the compact terminate action contract.
 
 ## Example ReAct turn
 

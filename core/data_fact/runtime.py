@@ -147,10 +147,23 @@ def _validate_fact(raw_fact: Any, *, default_method: str, default_status: str = 
         return None
 
 
-def _bind_fact_contract(fact: DataFact | None, requests: list[DataFactRequest]) -> DataFact | None:
+def _bind_fact_contract(
+    fact: DataFact | None,
+    requests: list[DataFactRequest],
+    *,
+    preserve_dependencies: bool = False,
+) -> DataFact | None:
     if fact is None or not requests:
         return fact
-    request = next((item for item in requests if item.fact_key == fact.fact_key), None)
+    aliases = {fact.fact_key, normalize_fact_key(fact.name)}
+    request = next(
+        (
+            item
+            for item in requests
+            if item.fact_key in aliases or normalize_fact_key(item.name) in aliases
+        ),
+        None,
+    )
     if request is None:
         return None
     return fact.model_copy(
@@ -161,7 +174,7 @@ def _bind_fact_contract(fact: DataFact | None, requests: list[DataFactRequest]) 
             "subject": fact.subject or request.subject,
             "time_range": fact.time_range or request.time_range,
             "dimensions": fact.dimensions or request.dimensions,
-            "derived_from": fact.derived_from or request.derived_from,
+            "derived_from": fact.derived_from if preserve_dependencies else fact.derived_from or request.derived_from,
         }
     )
 def _facts_from_database_evidence(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
@@ -200,6 +213,14 @@ def _database_fact_for_request(
     name = request.name
     fact_type = request.fact_type
     requirements = request.requirements or {}
+    rows, row_selectors = _rows_for_fact_request(request, rows)
+    if row_selectors and not rows:
+        selector_text = ", ".join(f"{key}={value!r}" for key, value in row_selectors.items())
+        return _unavailable_fact(
+            request,
+            evidence_ref,
+            f"Query rows did not contain a record matching the requested dimensions: {selector_text}.",
+        )
     normalized_name = str(name or "").strip().lower()
     if fact_type in {"count", "record_count", "row_count"} or normalized_name in {"record_count", "row_count", "count"}:
         value = len(rows)
@@ -214,7 +235,11 @@ def _database_fact_for_request(
             time_range=request.time_range,
             method="sql_query",
             evidence_refs=[evidence_ref],
-            calculation_trace={"source": "normalized_database_evidence", "count_target": requirements.get("count_target") or "rows"},
+            calculation_trace={
+                "source": "normalized_database_evidence",
+                "count_target": requirements.get("count_target") or "rows",
+                "row_selectors": row_selectors,
+            },
             derived_from=request.derived_from,
         )
     if fact_type in {"time_boundary", "boundary_time"}:
@@ -236,7 +261,12 @@ def _database_fact_for_request(
             time_range=request.time_range,
             method="sql_query",
             evidence_refs=[evidence_ref],
-            calculation_trace={"row": row, "time_key": time_key, "position": position},
+            calculation_trace={
+                "row": row,
+                "time_key": time_key,
+                "position": position,
+                "row_selectors": row_selectors,
+            },
             derived_from=request.derived_from,
         )
     if fact_type == "point_value":
@@ -259,7 +289,13 @@ def _database_fact_for_request(
             time_range=request.time_range,
             method="sql_query",
             evidence_refs=[evidence_ref],
-            calculation_trace={"row": row, "value_key": value_key, "time_key": time_key, "position": position},
+            calculation_trace={
+                "row": row,
+                "value_key": value_key,
+                "time_key": time_key,
+                "position": position,
+                "row_selectors": row_selectors,
+            },
             derived_from=request.derived_from,
         )
     if fact_type in {"extreme", "extrema", "extreme_time"}:
@@ -290,10 +326,52 @@ def _database_fact_for_request(
             time_range=request.time_range,
             method="sql_query",
             evidence_refs=[evidence_ref],
-            calculation_trace={"row": row, "value_key": value_key, "time_key": time_key, "operator": operator},
+            calculation_trace={
+                "row": row,
+                "value_key": value_key,
+                "time_key": time_key,
+                "operator": operator,
+                "row_selectors": row_selectors,
+            },
             derived_from=request.derived_from,
         )
     return None
+
+
+def _rows_for_fact_request(request: DataFactRequest, rows: list[dict]) -> tuple[list[dict], dict[str, Any]]:
+    """Bind a Fact contract to rows using dimensions grounded in result columns."""
+
+    if not rows:
+        return rows, {}
+    available_keys = set().union(*(row.keys() for row in rows[:50]))
+    requirements = request.requirements if isinstance(request.requirements, dict) else {}
+    nested_filters = requirements.get("row_filters") if isinstance(requirements.get("row_filters"), dict) else {}
+    candidates = {
+        **(request.dimensions if isinstance(request.dimensions, dict) else {}),
+        **nested_filters,
+        **requirements,
+    }
+    selectors = {
+        str(key): value
+        for key, value in candidates.items()
+        if str(key) in available_keys and not isinstance(value, (dict, list, tuple, set))
+    }
+    if not selectors:
+        return rows, {}
+    selected = [
+        row
+        for row in rows
+        if all(_dimension_value_matches(row.get(key), expected) for key, expected in selectors.items())
+    ]
+    return selected, selectors
+
+
+def _dimension_value_matches(actual: Any, expected: Any) -> bool:
+    if actual == expected:
+        return True
+    if actual is None or expected is None:
+        return False
+    return str(actual).strip() == str(expected).strip()
 
 
 def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list[DataFact]:
@@ -321,14 +399,16 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
             },
             default_method="code_interpreter",
         )
-        fact = _bind_fact_contract(fact, requests)
+        fact = _bind_fact_contract(fact, requests, preserve_dependencies="derived_from" in raw)
         if fact is not None:
             facts.append(fact)
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    metrics_by_key = {normalize_fact_key(key): (key, value) for key, value in metrics.items()}
     native_keys = {fact.fact_key for fact in facts}
     for request in requests:
-        if request.fact_key not in native_keys and request.name in metrics:
-            value = metrics[request.name]
+        metric_match = metrics_by_key.get(request.fact_key) or metrics_by_key.get(normalize_fact_key(request.name))
+        if request.fact_key not in native_keys and metric_match is not None:
+            metric_key, value = metric_match
             facts.append(
                 DataFact(
                     fact_id=_fact_id(analysis_id, request.name, value),
@@ -341,7 +421,7 @@ def _facts_from_analysis(payload: dict, requests: list[DataFactRequest]) -> list
                     time_range=request.time_range,
                     method="code_interpreter",
                     evidence_refs=evidence_refs,
-                    calculation_trace={"metric_key": request.name, "code_hash": payload.get("code_hash")},
+                    calculation_trace={"metric_key": metric_key, "code_hash": payload.get("code_hash")},
                     derived_from=request.derived_from,
                 )
             )
@@ -525,6 +605,11 @@ def _verify_fact_dependencies(produced: list[DataFact], existing: list[DataFact]
         if fact_key in resolved:
             return resolved[fact_key]
         fact = pending[fact_key]
+        if fact.method == "code_interpreter" and not fact.calculation_trace:
+            quality_flags = list(fact.quality_flags)
+            if "missing_calculation_trace" not in quality_flags:
+                quality_flags.append("missing_calculation_trace")
+            fact = fact.model_copy(update={"status": "partial", "quality_flags": quality_flags})
         if not fact.derived_from:
             resolved[fact_key] = fact
             return fact

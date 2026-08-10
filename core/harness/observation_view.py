@@ -292,7 +292,7 @@ def _generic_payload_view(payload: dict, *, consumer: str) -> dict:
         view["diagnostics"] = _diagnostics_view(diagnostics)
     validation_failure = payload.get("validation_failure") if isinstance(payload.get("validation_failure"), dict) else None
     if validation_failure:
-        view["validation_failure"] = _validation_failure_view(validation_failure, include_retry=(consumer == "model"))
+        view["validation_failure"] = _validation_failure_view(validation_failure, include_retry=True)
     return _drop_empty(view)
 
 
@@ -337,11 +337,16 @@ def _repair_contract_view(repair_contract: dict) -> dict:
         "missing_metrics",
         "required_details_fields",
         "available_inputs",
+        "canonical_inputs",
+        "error_classification",
+        "failed_code_summary",
         "instruction",
         "expected_result_shape",
     ):
         if key in repair_contract:
             view[key] = _sanitize_value(repair_contract.get(key), max_string_chars=700)
+    if "failed_code" in repair_contract:
+        view["failed_code"] = str(repair_contract.get("failed_code") or "")
     return _drop_empty(view)
 
 
