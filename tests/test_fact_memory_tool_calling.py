@@ -120,11 +120,11 @@ class FakeEmbeddingProvider:
         return vectors
 
 
-def _registry() -> ToolRegistry:
+def _registry(tool_name: str = "sql_query") -> ToolRegistry:
     return ToolRegistry(
         [
             ToolSpec(
-                tool_name="sql_query",
+                tool_name=tool_name,
                 description="echo sql",
                 input_model=EchoInput,
                 output_model=EchoOutput,
@@ -171,6 +171,24 @@ async def test_tool_executor_injects_memory_fact_requests_into_tool_call():
     ]
     assert retriever.calls[0][0] == "sql_query"
     assert request_state.completion_state["memory_context"]["tool_calls"][0]["source"] == "tool_scoped_memory_retrieval"
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_skips_fact_memory_for_analysis_artifact_tools():
+    retriever = ToolScopedRetriever()
+    executor = ToolExecutor(_registry("forecast"), memory_retriever=retriever)
+    request_state = _request_state("预测未来 7 个点")
+
+    result = await executor.execute(
+        "forecast",
+        {"message": request_state.message},
+        request_state,
+        ConversationStateModel(conversation_id="conv_memory"),
+    )
+
+    assert retriever.calls == []
+    assert result.full_payload["fact_requests"] == []
+    assert "memory_diagnostics" not in result.full_payload["constraints"]
 
 
 @pytest.mark.asyncio

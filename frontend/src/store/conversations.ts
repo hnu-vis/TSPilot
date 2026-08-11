@@ -1,6 +1,6 @@
 import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep } from '../types';
 
-const STORAGE_KEY = 'tspilot:v02:conversations';
+const STORAGE_KEY = 'tspilot:v03:conversations';
 const MAX_STORED_CONVERSATIONS = 12;
 const MAX_STORED_MESSAGES_PER_CONVERSATION = 30;
 const MAX_STORED_TRACE_STEPS = 40;

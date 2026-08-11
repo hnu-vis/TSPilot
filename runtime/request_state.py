@@ -1130,10 +1130,6 @@ def _build_prompt_safe_forecast(forecast, request_state: RequestStateModel):
         payload["diagnostics"] = diagnostics
     payload["forecast_points"] = payload.get("forecast_points", [])[:12]
     payload["confidence_interval"] = payload.get("confidence_interval", [])[:12]
-    payload["visualizations"] = [
-        _summarize_visualization_dict(item)
-        for item in payload.get("visualizations", [])[:3]
-    ]
     diagnostics = dict(payload.get("diagnostics") or {})
     diagnostics["artifact_kind"] = "forecast_result"
     diagnostics["artifact_ref"] = f"forecast:{forecast.forecast_id}"
@@ -1154,10 +1150,6 @@ def _build_prompt_safe_anomaly(anomaly, request_state: RequestStateModel):
     payload["anomaly_points"] = payload.get("anomaly_points", [])[:12]
     payload["anomaly_spans"] = payload.get("anomaly_spans", [])[:12]
     payload["scores"] = payload.get("scores", [])[:12]
-    payload["visualizations"] = [
-        _summarize_visualization_dict(item)
-        for item in payload.get("visualizations", [])[:3]
-    ]
     diagnostics = dict(payload.get("diagnostics") or {})
     diagnostics["artifact_kind"] = "anomaly_result"
     diagnostics["artifact_ref"] = f"anomaly:{anomaly.anomaly_id}"
@@ -1186,7 +1178,6 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         forecast = ForecastResult.model_validate(full_payload)
         request_state.forecast_artifacts[forecast.forecast_id] = forecast
         request_state.latest_forecast = _build_prompt_safe_forecast(forecast, request_state)
-        request_state.visualizations.extend(request_state.latest_forecast.visualizations)
         return
 
     if "anomaly_id" in full_payload:
@@ -1195,7 +1186,6 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         anomaly = AnomalyResult.model_validate(full_payload)
         request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
         request_state.latest_anomaly = _build_prompt_safe_anomaly(anomaly, request_state)
-        request_state.visualizations.extend(request_state.latest_anomaly.visualizations)
         return
 
     if "skill_name" in full_payload:

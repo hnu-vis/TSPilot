@@ -61,32 +61,64 @@ export type AnswerClaim = {
 
 export type VisualizationBinding = {
   binding_id: string;
-  source_type?: string;
+  source_type: string;
   fact_id?: string | null;
   item_id?: string | null;
   related_item_ids?: string[];
   evidence_id?: string | null;
+  source_ref?: string | null;
   locator?: Record<string, unknown>;
 };
 
+export type VisualizationPoint = {
+  x?: unknown;
+  y?: number | null;
+  lower?: number | null;
+  upper?: number | null;
+  label?: string | null;
+  binding_id?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type VisualizationSeries = {
+  series_id: string;
+  name: string;
+  role: 'historical' | 'forecast' | 'comparison' | 'ranking' | 'distribution' | 'relationship';
+  unit?: string | null;
+  points?: VisualizationPoint[];
+};
+
 export type Visualization = {
+  schema_version: '2';
   visualization_id: string;
-  visualization_type: string;
-  visualization_kind: string;
-  renderer: string;
+  template_id: string;
+  purpose: string;
+  priority: 'primary' | 'supporting';
   title: string;
   summary?: string | null;
-  chart?: Record<string, unknown> | null;
-  annotations?: Array<Record<string, unknown>>;
-  binding_fact_ids?: string[];
-  binding_evidence_ids?: string[];
+  source_refs?: string[];
+  fact_refs?: string[];
+  dataset: {
+    dimensions?: Array<{ name: string; data_type: string; role: string; unit?: string | null }>;
+    series?: VisualizationSeries[];
+    rows?: Array<Record<string, unknown>>;
+    columns?: string[];
+    metric?: Record<string, unknown> | null;
+  };
+  layers?: Array<{
+    kind: string;
+    role: string;
+    series_id?: string | null;
+    points?: VisualizationPoint[];
+    label?: string | null;
+  }>;
   bindings?: VisualizationBinding[];
-  rows?: Array<Record<string, unknown>>;
-  columns?: string[];
-  display_rows?: Array<Record<string, unknown>>;
-  time_column?: string | null;
-  primary_measure?: string | null;
-  presentation?: Record<string, unknown>;
+  layout?: 'overlay' | 'facets';
+  accessibility: {
+    description: string;
+    table_columns?: string[];
+    table_rows?: Array<Record<string, unknown>>;
+  };
 };
 
 export type FactStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;

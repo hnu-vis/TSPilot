@@ -98,20 +98,14 @@ class ToolExecutor:
 
     def _normalize_action_input(self, action_name: str, action_input: dict, request_state: RequestStateModel) -> dict:
         normalized = dict(action_input or {})
-        if normalized.get("constraints") in (None, "", False):
-            normalized["constraints"] = {}
         if action_name == "terminate":
-            for key in (
-                "include_analysis_ids",
-                "include_fact_ids",
-                "include_visualization_ids",
-                "section_plan",
-                "unavailable_outputs",
-            ):
-                if normalized.get(key) in (None, False, ""):
-                    normalized[key] = []
+            if normalized.get("unavailable_outputs") in (None, False, ""):
+                normalized["unavailable_outputs"] = []
             if isinstance(normalized.get("unavailable_reason"), (dict, list)):
                 normalized["unavailable_reason"] = str(normalized["unavailable_reason"])
+            return normalized
+        if normalized.get("constraints") in (None, "", False):
+            normalized["constraints"] = {}
         if "time_range" in normalized:
             normalized["time_range"] = self._normalize_time_range_hint(normalized.get("time_range"), normalized)
         normalized["fact_requests"] = self._normalize_fact_requests(normalized.get("fact_requests"), normalized)
@@ -329,7 +323,7 @@ class ToolExecutor:
         normalized_input: dict,
         request_state: RequestStateModel,
     ) -> dict:
-        if action_name not in {"sql_query", "code_interpreter", "forecast", "anomaly"}:
+        if action_name not in {"sql_query", "code_interpreter"}:
             return normalized_input
         if self._memory_retriever is None:
             return normalized_input

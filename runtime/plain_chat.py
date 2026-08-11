@@ -122,7 +122,26 @@ class PlainChatService:
         candidate = decoded.get("answer") if isinstance(decoded.get("answer"), dict) else decoded
         if isinstance(decoded.get("action_input"), dict):
             action_input = decoded["action_input"]
-            if isinstance(action_input.get("direct_answer"), str):
+            response_plan = action_input.get("response_plan")
+            if isinstance(response_plan, dict) and isinstance(response_plan.get("summary"), str):
+                candidate = {
+                    "title": response_plan.get("title"),
+                    "summary": response_plan["summary"],
+                    "sections": [
+                        {
+                            "section_type": section.get("section_type") or "answer",
+                            "heading": section.get("heading"),
+                            "content": section.get("content") or "",
+                            "structured_payload": {"source_refs": section.get("source_refs") or []},
+                        }
+                        for section in response_plan.get("sections") or []
+                        if isinstance(section, dict) and (section.get("source_refs") or [])
+                    ],
+                    "references": [],
+                    "claims": [],
+                    "visualizations": [],
+                }
+            elif isinstance(action_input.get("direct_answer"), str):
                 candidate = {
                     "title": None,
                     "summary": action_input["direct_answer"],

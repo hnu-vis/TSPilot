@@ -10,7 +10,7 @@ from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFact, FactItem
 from schemas.database_context import DatabaseContext
-from schemas.output import AnswerClaim, FinalAnswer
+from schemas.output import AnswerClaim, FinalAnswer, FinalResponsePlan, PlannedAnswerSection, VisualIntent
 from schemas.state import RequestStateModel
 from schemas.tool import ToolCall
 from tools.anomaly import AnomalyInput
@@ -108,12 +108,21 @@ def test_collection_fact_preserves_item_identity_and_generates_answer_visualizat
 
     answer = asyncio.run(
         FormatAnswerTool().execute(
-            FormatAnswerInput(include_fact_ids=[fact.fact_id]),
+            FormatAnswerInput(response_plan=FinalResponsePlan(
+                summary=fact.statement,
+                sections=[PlannedAnswerSection(
+                    section_type="facts", content=fact.statement, source_refs=[f"fact:{fact.fact_id}"],
+                )],
+                visual_intents=[VisualIntent(
+                    purpose="show recent observations", template_id="timeseries.highlight", title="Recent three days",
+                    source_refs=["evidence:evi_observation_viz"], fact_refs=[f"fact:{fact.fact_id}"],
+                )],
+            )),
             request_state=request_state,
         )
     )
-    visualization = next(item for item in answer["visualizations"] if item["visualization_id"] == f"viz_fact_{fact.fact_id}")
-    assert visualization["visualization_type"] == "chart"
+    visualization = next(item for item in answer["visualizations"] if f"fact:{fact.fact_id}" in item["fact_refs"])
+    assert visualization["schema_version"] == "2"
     assert len(visualization["bindings"]) == 3
     assert answer["claims"][0]["item_ids"] == ["day-1", "day-2", "day-3"]
 

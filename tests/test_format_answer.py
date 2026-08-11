@@ -2,486 +2,182 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from app.settings import get_settings
 from runtime.request_state import build_request_state
-from schemas.api import ChatRequest
 from schemas.analysis import AnalysisResult
+from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.data_fact import DataFact, FactCoverage, FactEvent, FactEvidenceRef
-from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesPoint
+from schemas.data_fact import DataFact, FactEvidenceRef
+from schemas.output import FinalResponsePlan, PlannedAnswerSection, VisualIntent
+from schemas.timeseries import ForecastResult, TimeSeriesPoint
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
 
-def test_format_answer_allows_explicit_included_fact_without_unrelated_missing_requirement():
-    request_state = build_request_state(
-        ChatRequest(message="请把价格分成高位、低位和中间区间"),
+class _ForbiddenLlm:
+    async def ainvoke(self, _messages):
+        raise AssertionError("format_answer must not invoke an LLM")
+
+
+def _state():
+    state = build_request_state(
+        ChatRequest(message="show recent prices", database_context={"database_id": "demo", "database_type": "unit"}),
         get_settings(),
     )
-    fact = DataFact(
-        fact_id="fact_bucket",
-        name="price_bucket",
-        fact_type="categorization",
-        statement="低位 <= 10，中间区间 10 到 20，高位 >= 20。",
-        value={"low_max": 10, "high_min": 20},
-        method="code_interpreter",
-        evidence_refs=[FactEvidenceRef(source_type="analysis", source_id="ana_bucket")],
-    )
-    request_state.fact_set.facts = [fact]
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="输出分类结果",
-                include_fact_ids=["fact_bucket"],
-                section_plan=["facts"],
-            ),
-            request_state=request_state,
-        )
-    )
-
-    assert result["summary"] == fact.statement
-    assert result["sections"][0]["section_type"] == "facts"
-
-
-def test_format_answer_does_not_infer_fact_selection_from_process_events():
-    request_state = build_request_state(
-        ChatRequest(message="bitcoin usd的历史最大值和最小值的差异是多少？"),
-        get_settings(),
-    )
-    current_fact = DataFact(
-        fact_id="fact_difference",
-        name="max_min_difference",
-        fact_type="difference",
-        statement="max_min_difference is 50.0.",
-        value=50.0,
-        method="code_interpreter",
-        evidence_refs=[FactEvidenceRef(source_type="analysis", source_id="ana_current")],
-    )
-    stale_fact = DataFact(
-        fact_id="fact_record_count",
-        name="record_count",
-        fact_type="count",
-        statement="record_count is 2679.",
-        value=2679,
-        method="sql_query",
-        evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_old")],
-    )
-    request_state.fact_set.facts = [stale_fact, current_fact]
-    request_state.fact_events.append(
-        FactEvent(
-            iteration=2,
-            tool_name="code_interpreter",
-            produced_fact_ids=[current_fact.fact_id],
-            coverage=FactCoverage(requested=["max_min_difference"], verified=["max_min_difference"]),
-        )
-    )
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="回答差异", section_plan=["facts"]),
-            request_state=request_state,
-        )
-    )
-
-    assert "facts" not in [section["section_type"] for section in result["sections"]]
-
-
-def test_format_answer_allows_statistics_evidence_for_count_direct_answer():
-    request_state = build_request_state(
-        ChatRequest(
-            message="总共有多少条数据？",
-            database_context={"database_id": "demo", "database_type": "influxdb"},
-        ),
-        get_settings(),
-    )
-    request_state.latest_database_evidence = DatabaseEvidence(
-        evidence_id="evi_count_stats",
-        result_type="statistics",
-        database="demo",
-        query_language="flux",
-        query='from(bucket: "demo") |> range(start: 0) |> count()',
-        summary="Computed statistics over 19735 rows.",
-        data={"statistics": {"count": 19735}},
-        columns=["metric", "value"],
-        metadata={},
-        diagnostics={},
-    )
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="回答总条数",
-                direct_answer="共有 19,735 条数据。",
-                section_plan=["conclusion"],
-            ),
-            request_state=request_state,
-        )
-    )
-
-    assert result["summary"] == "共有 19,735 条数据。"
-    assert result["references"][0]["source_id"] == "evi_count_stats"
-
-
-def test_format_answer_renders_real_query_as_fenced_code_section():
-    request_state = build_request_state(
-        ChatRequest(
-            message="查询最近的数据",
-            database_context={"database_id": "demo", "database_type": "timescaledb"},
-        ),
-        get_settings(),
-    )
-    request_state.latest_database_evidence = DatabaseEvidence(
-        evidence_id="evi_recent_rows",
-        result_type="table",
-        database="demo",
-        query_language="timescaledb",
-        query="SELECT time, value FROM metrics ORDER BY time DESC LIMIT 10",
-        summary="Loaded 10 recent rows.",
-        data={"rows": [{"time": "2026-01-01T00:00:00Z", "value": 1.0}]},
-        columns=["time", "value"],
-        metadata={"sql_query_mode": "llm"},
-        diagnostics={},
-    )
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="展示查询结果"),
-            request_state=request_state,
-        )
-    )
-
-    assert result["sections"][1]["section_type"] == "query"
-    assert result["sections"][1]["content"].startswith("```sql\nSELECT")
-    assert result["sections"][2]["section_type"] == "table"
-
-
-def test_format_answer_preserves_direct_answer_for_timeseries_query_evidence():
-    request_state = build_request_state(
-        ChatRequest(
-            message="查询当前数据源中比特币 USD 价格的最晚一条原始记录",
-            database_context={"database_id": "bitcoin", "database_type": "influxdb"},
-        ),
-        get_settings(),
-    )
-    query = (
-        'from(bucket: "bitcoin")\n'
-        "  |> range(start: 0)\n"
-        '  |> filter(fn: (r) => r._measurement == "coindesk" and r.code == "USD")\n'
-        '  |> filter(fn: (r) => r._field == "price")\n'
-        '  |> sort(columns: ["_time"], desc: true)\n'
-        "  |> limit(n: 1)"
-    )
-    request_state.latest_database_evidence = DatabaseEvidence(
-        evidence_id="evi_latest_bitcoin_price",
+    evidence = DatabaseEvidence(
+        evidence_id="evi_prices",
         result_type="timeseries",
-        database="bitcoin",
-        query_language="flux",
-        query=query,
-        summary="Loaded 1 rows across 1 series.",
+        database="demo",
+        query_language="unit",
+        query="unit:prices",
+        summary="Loaded three prices.",
         data={
-            "points": [{"timestamp": "2023-02-03T22:47:00+00:00", "value": 23428.6802}],
-            "rows": [{"timestamp": "2023-02-03T22:47:00+00:00", "value": 23428.6802}],
+            "rows": [
+                {"timestamp": "2026-01-01T00:00:00Z", "value": 10.0},
+                {"timestamp": "2026-01-02T00:00:00Z", "value": 12.0},
+                {"timestamp": "2026-01-03T00:00:00Z", "value": 15.0},
+            ],
             "time_field": "timestamp",
             "value_field": "value",
         },
         columns=["timestamp", "value"],
-        metadata={"sql_query_mode": "llm"},
-        diagnostics={},
+    )
+    state.database_evidence_artifacts[evidence.evidence_id] = evidence
+    state.latest_database_evidence = evidence
+    return state
+
+
+def test_format_answer_materializes_prose_and_visuals_without_second_llm_call():
+    state = _state()
+    plan = FinalResponsePlan(
+        title="Recent prices",
+        summary="The latest value is 15.",
+        sections=[PlannedAnswerSection(
+            section_type="analysis", heading="Trend", content="Prices rose over the observed period.",
+            source_refs=["evidence:evi_prices"],
+        )],
+        visual_intents=[VisualIntent(
+            purpose="show the observed trend", template_id="timeseries.trend", title="Price trend",
+            source_refs=["evidence:evi_prices"],
+        )],
     )
 
-    direct_answer = "最晚一条原始记录时间为 2023-02-03T22:47:00+00:00，价格为 23428.6802 USD。"
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="回答最新价格",
-                direct_answer=direct_answer,
-                section_plan=["summary", "query"],
-            ),
-            request_state=request_state,
-        )
+    result = asyncio.run(FormatAnswerTool(llm=_ForbiddenLlm()).execute(
+        FormatAnswerInput(response_plan=plan), request_state=state,
+    ))
+
+    assert result["summary"] == plan.summary
+    assert result["visualizations"][0]["schema_version"] == "2"
+    assert result["visualizations"][0]["template_id"] == "timeseries.trend"
+    assert result["references"][0]["source_id"] == "evi_prices"
+    assert result["claims"][0]["visualization_ids"] == [result["visualizations"][0]["visualization_id"]]
+
+
+def test_format_answer_rejects_unknown_grounding_reference():
+    state = _state()
+    plan = FinalResponsePlan(
+        summary="Answer",
+        sections=[PlannedAnswerSection(section_type="answer", content="Unsupported.", source_refs=["evidence:invented"])],
     )
 
-    assert result["summary"] == direct_answer
-    assert result["sections"][0]["content"] == direct_answer
-    assert result["sections"][1]["section_type"] == "query"
-    assert result["sections"][1]["content"].startswith("```flux\n")
+    with pytest.raises(ValueError, match="unknown presentation source"):
+        asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
 
 
-def test_format_answer_forecast_section_uses_full_count_from_prompt_safe_metadata():
-    request_state = build_request_state(
-        ChatRequest(
-            message="预测未来 24 小时",
-            database_context={"database_id": "demo", "database_type": "influxdb"},
-        ),
-        get_settings(),
-    )
-    points = [TimeSeriesPoint(timestamp=f"t{i}", value=float(i)) for i in range(12)]
-    request_state.latest_forecast = ForecastResult(
-        forecast_id="forecast_demo",
-        model_name="linear_regression",
-        horizon=96,
-        status="succeeded",
-        forecast_plan=ForecastPlan(
-            mode="rolling",
-            horizon_source="duration_from_user",
-            requested_steps=96,
-            resolved_steps=96,
-            sampling_interval_seconds=900,
-            forecast_duration_seconds=86400,
-            max_direct_steps=48,
-            recommended_chunk_steps=48,
-        ),
-        forecast_points=points,
-        diagnostics={
-            "forecast_point_count": 96,
-            "forecast_first_point": {"timestamp": "t0", "value": 0.0},
-            "forecast_last_point": {"timestamp": "t95", "value": 95.0},
-        },
+def test_format_answer_rejects_duplicate_primary_views_for_same_purpose():
+    state = _state()
+    plan = FinalResponsePlan(
+        summary="Answer",
+        visual_intents=[
+            VisualIntent(purpose="trend", template_id="timeseries.trend", title="A", source_refs=["evi_prices"]),
+            VisualIntent(purpose="trend", template_id="timeseries.trend", title="B", source_refs=["evi_prices"]),
+        ],
     )
 
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="总结预测", section_plan=["forecast"]),
-            request_state=request_state,
-        )
-    )
-
-    forecast_section = next(section for section in result["sections"] if section["section_type"] == "forecast")
-    assert "96 个短期预测点" in forecast_section["content"]
-    assert "前 12 个点" in forecast_section["content"]
-    assert "最后一个预测值为 95.00" in forecast_section["content"]
+    with pytest.raises(ValueError, match="multiple primary"):
+        asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
 
 
-def test_format_answer_assembles_selected_analysis_results():
-    request_state = build_request_state(
-        ChatRequest(message="汇总两个分析结果"),
-        get_settings(),
-    )
-    first = AnalysisResult(
-        analysis_id="ana_ratio",
-        analysis_goal="ratio",
-        code_hash="sha256:ratio",
-        input_evidence_id="evi",
-        input_row_count=10,
-        status="succeeded",
-        summary="比例为 60%。",
-        result={"summary": "比例为 60%。", "metrics": {"ratio": 0.6}, "details": {}},
-        diagnostics={},
-    )
-    second = AnalysisResult(
-        analysis_id="ana_bucket",
-        analysis_goal="bucket",
-        code_hash="sha256:bucket",
-        input_evidence_id="evi",
-        input_row_count=10,
-        status="succeeded",
-        summary="低位/中位/高位已划分。",
-        result={"summary": "低位/中位/高位已划分。", "metrics": {}, "details": {}},
-        diagnostics={},
-    )
-    request_state.analysis_artifacts = {
-        first.analysis_id: first,
-        second.analysis_id: second,
-    }
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="汇总",
-                include_analysis_ids=["analysis:ana_ratio", "analysis:ana_bucket"],
-                section_plan=["analysis"],
-            ),
-            request_state=request_state,
-        )
-    )
-
-    assert "比例为 60%" in result["summary"]
-    assert "低位/中位/高位已划分" in result["summary"]
-    assert result["sections"][0]["section_type"] == "analysis"
-    assert "ratio: 0.6" not in result["sections"][0]["content"]
-    assert result["sections"][0]["structured_payload"]["metrics"] == [{"ratio": 0.6}]
-    assert [ref["source_type"] for ref in result["references"]] == ["analysis", "analysis"]
-
-
-def test_format_answer_renders_outlier_transparency_details_in_analysis_section():
-    request_state = build_request_state(
-        ChatRequest(message="展示异常值处理依据"),
-        get_settings(),
-    )
+def test_analysis_result_is_a_first_class_presentation_source():
+    state = _state()
     analysis = AnalysisResult(
-        analysis_id="ana_outlier",
-        analysis_goal="outlier treatment",
-        code_hash="sha256:outlier",
-        input_evidence_id="evi",
-        input_row_count=4,
+        analysis_id="ana_distribution",
+        analysis_goal="distribution",
+        code_hash="sha256:test",
+        input_evidence_id="evi_prices",
+        input_row_count=3,
         status="succeeded",
-        summary="已计算原始和调整后指标。",
+        summary="Distribution computed.",
         result={
-            "summary": "已计算原始和调整后指标。",
-            "metrics": {"change_pct": 1.2},
-            "details": {
-                "outlier_rule": "value > 1,000,000",
-                "threshold_or_formula": "> 1,000,000",
-                "rationale": "数量级明显高于主体价格区间",
-                "excluded_rows": [{"timestamp": "t1", "value": 1000001}],
-                "raw_metrics": {"start_value": 1000001},
-                "adjusted_metrics": {"start_value": 10},
-            },
-        },
-        diagnostics={},
-    )
-    request_state.analysis_artifacts = {analysis.analysis_id: analysis}
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="汇总",
-                include_analysis_ids=["ana_outlier"],
-                section_plan=["analysis"],
-            ),
-            request_state=request_state,
-        )
-    )
-
-    content = result["sections"][0]["content"]
-    assert "outlier_rule: value > 1,000,000" in content
-    assert "threshold_or_formula: > 1,000,000" in content
-    assert "rationale: 数量级明显高于主体价格区间" in content
-    assert "excluded_rows: 1" in content
-    assert "raw_metrics: start_value: 1000001" in content
-    assert "adjusted_metrics: start_value: 10" in content
-
-
-def test_format_answer_preserves_direct_answer_when_analysis_exists():
-    request_state = build_request_state(
-        ChatRequest(message="分析趋势", database_context={"database_id": "demo", "database_type": "influxdb"}),
-        get_settings(),
-    )
-    request_state.latest_database_evidence = DatabaseEvidence(
-        evidence_id="evi_trend",
-        result_type="timeseries",
-        database="demo",
-        query_language="flux",
-        query='from(bucket: "bitcoin") |> range(start: -30d)',
-        summary="Loaded 50 points.",
-        data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
-        columns=["timestamp", "value"],
-        metadata={},
-        diagnostics={},
-    )
-    analysis = AnalysisResult(
-        analysis_id="ana_trend",
-        analysis_goal="trend",
-        code_hash="sha256:trend",
-        input_evidence_id="evi_trend",
-        input_row_count=50,
-        status="succeeded",
-        summary="趋势分析已完成。",
-        result={"summary": "趋势分析已完成。", "metrics": {"change": -0.2}, "details": {}},
-        diagnostics={},
-    )
-    request_state.analysis_artifacts = {analysis.analysis_id: analysis}
-
-    direct_answer = "整体窄幅震荡，略有回落。"
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="给出趋势结论",
-                direct_answer=direct_answer,
-                include_analysis_ids=["ana_trend"],
-                section_plan=["summary", "analysis", "query"],
-            ),
-            request_state=request_state,
-        )
-    )
-
-    assert result["summary"] == direct_answer
-    assert result["sections"][0]["content"] == direct_answer
-    assert any(section["section_type"] == "analysis" for section in result["sections"])
-
-
-def test_format_answer_summarizes_all_database_evidence_artifacts():
-    request_state = build_request_state(
-        ChatRequest(
-            message="请返回总数、最早记录和采样说明，并展示每项查询语句和实际返回行数。",
-            database_context={"database_id": "bitcoin", "database_type": "influxdb"},
-        ),
-        get_settings(),
-    )
-    count = DatabaseEvidence(
-        evidence_id="evi_count",
-        result_type="table",
-        database="bitcoin",
-        query_language="flux",
-        query='from(bucket: "bitcoin") |> range(start: 0) |> count()',
-        summary="Loaded 1 rows.",
-        data={"rows": [{"count": 2680}]},
-        columns=["count"],
-        metadata={"purpose": "返回总记录数"},
-        diagnostics={"row_count_total": 1, "artifact_ref": "evidence:evi_count"},
-    )
-    earliest = DatabaseEvidence(
-        evidence_id="evi_earliest",
-        result_type="table",
-        database="bitcoin",
-        query_language="flux",
-        query='from(bucket: "bitcoin") |> range(start: 0) |> sort(columns: ["_time"]) |> limit(n: 5)',
-        summary="Loaded 5 rows.",
-        data={
-            "rows": [
-                {"timestamp": "2023-01-01T00:00:00Z", "value": 1.0},
-                {"timestamp": "2023-01-01T00:01:00Z", "value": 2.0},
-            ]
-        },
-        columns=["timestamp", "value"],
-        metadata={"purpose": "返回最早 5 条原始记录"},
-        diagnostics={"row_count_total": 5, "artifact_ref": "evidence:evi_earliest"},
-    )
-    sampled = DatabaseEvidence(
-        evidence_id="evi_sampled",
-        result_type="timeseries",
-        database="bitcoin",
-        query_language="flux",
-        query='from(bucket: "bitcoin") |> range(start: 0)',
-        summary="Loaded 2680 points.",
-        data={"points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1.0}]},
-        columns=["timestamp", "value"],
-        metadata={"purpose": "返回原始价格序列"},
-        diagnostics={
-            "summary_stats": {"points_count": 2680},
-            "prompt_sampling": {
-                "sampled_for_prompt": True,
-                "full_counts": {"points_count": 2680},
-                "visible_counts": {"points_count": 24},
-                "full_artifact_ref": "evidence:evi_sampled",
-            },
-            "artifact_ref": "evidence:evi_sampled",
+            "summary": "Distribution computed.",
+            "metrics": {},
+            "details": {"rows": [{"value": 10.0}, {"value": 12.0}, {"value": 15.0}]},
         },
     )
-    request_state.database_evidence_artifacts = {
-        count.evidence_id: count,
-        earliest.evidence_id: earliest,
-        sampled.evidence_id: sampled,
-    }
-    request_state.latest_database_evidence = sampled
-
-    result = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(
-                summary_goal="汇总查询结果",
-                direct_answer="已完成查询。",
-                section_plan=["summary", "query_results", "conclusion"],
-            ),
-            request_state=request_state,
-        )
+    state.analysis_artifacts[analysis.analysis_id] = analysis
+    plan = FinalResponsePlan(
+        summary="Distribution computed.",
+        sections=[PlannedAnswerSection(section_type="analysis", content=analysis.summary, source_refs=["analysis:ana_distribution"])],
+        visual_intents=[VisualIntent(
+            purpose="show distribution", template_id="distribution.histogram", title="Distribution",
+            source_refs=["analysis:ana_distribution"], encodings={"value": "value"},
+        )],
     )
 
-    query_results = next(section for section in result["sections"] if section["section_type"] == "query_results")
-    assert "返回总记录数" in query_results["content"]
-    assert "返回最早 5 条原始记录" in query_results["content"]
-    assert "结果值：count = 2680" in query_results["content"]
-    assert "实际返回行数：5" in query_results["content"]
-    assert "当前展示的是采样预览" in query_results["content"]
-    assert "| timestamp | value |" in query_results["content"]
-    assert '```flux\nfrom(bucket: "bitcoin") |> range(start: 0) |> count()\n```' in query_results["content"]
-    assert [ref["source_id"] for ref in result["references"][:3]] == ["evi_count", "evi_earliest", "evi_sampled"]
+    result = asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
+    assert result["visualizations"][0]["dataset"]["series"][0]["points"]
+    assert result["references"][0]["source_type"] == "analysis"
+
+
+def test_forecast_plan_reads_full_artifact_by_reference():
+    state = _state()
+    forecast = ForecastResult(
+        forecast_id="forecast_evi_prices",
+        model_name="unit",
+        horizon=2,
+        forecast_points=[
+            TimeSeriesPoint(timestamp="2026-01-04T00:00:00Z", value=16.0),
+            TimeSeriesPoint(timestamp="2026-01-05T00:00:00Z", value=17.0),
+        ],
+        diagnostics={"coverage": {"input_evidence_refs": ["evi_prices"]}},
+    )
+    state.forecast_artifacts[forecast.forecast_id] = forecast
+    plan = FinalResponsePlan(
+        summary="The next values are 16 and 17.",
+        visual_intents=[VisualIntent(
+            purpose="show history and forecast", template_id="timeseries.forecast", title="Forecast",
+            source_refs=["forecast:forecast_evi_prices"],
+        )],
+    )
+
+    result = asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
+    visualization = result["visualizations"][0]
+    assert len(visualization["dataset"]["series"]) == 2
+    assert len(visualization["dataset"]["series"][1]["points"]) == 2
+    assert len(visualization["bindings"]) == 2
+
+
+def test_standalone_fact_can_be_rendered_as_metric_without_background_query():
+    state = _state()
+    fact = DataFact(
+        fact_id="fact_latest",
+        name="Latest price",
+        fact_type="point_value",
+        statement="Latest price is 15.",
+        value=15.0,
+        unit="USD",
+        method="sql_query",
+        evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_prices")],
+    )
+    state.fact_set.facts = [fact]
+    plan = FinalResponsePlan(
+        summary=fact.statement,
+        visual_intents=[VisualIntent(
+            purpose="show the standalone latest value", template_id="metric.single", title="Latest price",
+            source_refs=["fact:fact_latest"], fact_refs=["fact:fact_latest"],
+        )],
+    )
+
+    result = asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
+    assert result["visualizations"][0]["dataset"]["metric"]["value"] == 15.0

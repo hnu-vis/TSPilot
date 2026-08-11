@@ -1041,16 +1041,14 @@ class ReActLoop:
                 "code_preview": self._truncate_preview_text(code, 8000),
             }
         if action_name == "terminate":
-            include_analysis_ids = action_input.get("include_analysis_ids")
-            include_fact_ids = action_input.get("include_fact_ids")
-            include_visualization_ids = action_input.get("include_visualization_ids")
-            section_plan = action_input.get("section_plan")
+            response_plan = action_input.get("response_plan")
+            response_plan = response_plan if isinstance(response_plan, dict) else {}
+            sections = response_plan.get("sections")
+            visual_intents = response_plan.get("visual_intents")
             return {
-                "has_result": bool(action_input.get("result") or action_input.get("direct_answer")),
-                "include_analysis_count": len(include_analysis_ids) if isinstance(include_analysis_ids, list) else 0,
-                "include_fact_count": len(include_fact_ids) if isinstance(include_fact_ids, list) else 0,
-                "include_visualization_count": len(include_visualization_ids) if isinstance(include_visualization_ids, list) else 0,
-                "section_plan": section_plan if isinstance(section_plan, list) else [],
+                "has_summary": bool(response_plan.get("summary")),
+                "section_count": len(sections) if isinstance(sections, list) else 0,
+                "visual_intent_count": len(visual_intents) if isinstance(visual_intents, list) else 0,
             }
         if action_name == "todowrite":
             todos = action_input.get("todos")

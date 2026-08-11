@@ -56,6 +56,7 @@ async def test_forecast_resolves_explicit_steps_and_sampling_interval():
     assert len(result["forecast_points"]) == 6
     assert result["forecast_plan"]["horizon_source"] == "explicit_steps"
     assert result["forecast_plan"]["sampling_interval_seconds"] == 10800
+    assert "visualizations" not in result
 
 
 @pytest.mark.asyncio
@@ -69,6 +70,16 @@ async def test_forecast_resolves_duration_to_steps_from_input_sampling():
     assert len(result["forecast_points"]) == 8
     assert result["forecast_plan"]["horizon_source"] == "duration_from_user"
     assert result["forecast_plan"]["forecast_duration_seconds"] == 86400
+
+
+@pytest.mark.asyncio
+async def test_forecast_accepts_semantic_forecast_horizon_constraint():
+    result = await ForecastTool().execute(
+        ForecastInput(database_evidence=_bitcoin_evidence(), constraints={"forecast_horizon": 7})
+    )
+
+    assert result["horizon"] == 7
+    assert len(result["forecast_points"]) == 7
 
 
 @pytest.mark.asyncio

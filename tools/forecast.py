@@ -17,7 +17,6 @@ from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesSeries
-from schemas.visualization import VisualizationBinding, VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -138,13 +137,6 @@ class ForecastTool(BaseTool):
         else:
             model_output = model.forecast(series, horizon=horizon, params=constraints)
         forecast_points = model_output.forecast_points
-        visualization = _forecast_visualization(
-            database_evidence=database_evidence,
-            series=series,
-            forecast_points=forecast_points,
-            horizon=horizon,
-            summary=f"{series.value_field} 的未来 {horizon} 个点预测。",
-        )
         return ForecastResult(
             forecast_id=f"forecast_{database_evidence.evidence_id}",
             model_name=model.name,
@@ -172,64 +164,7 @@ class ForecastTool(BaseTool):
                 },
                 **input_policy_diagnostics,
             },
-            visualizations=[visualization],
         ).model_dump(mode="json")
-
-
-def _forecast_visualization(
-    *,
-    database_evidence: DatabaseEvidence,
-    series: TimeSeriesSeries,
-    forecast_points: list,
-    horizon: int,
-    summary: str,
-) -> VisualizationPayload:
-    return VisualizationPayload(
-        visualization_id=f"viz_forecast_{database_evidence.evidence_id}",
-        visualization_type="chart",
-        visualization_kind="line",
-        renderer="linechart",
-        title=f"{series.value_field} forecast",
-        summary=summary,
-        chart={
-            "x_axis_data": [point.timestamp for point in [*series.points, *forecast_points]],
-            "series_data": [
-                {
-                    "name": "historical",
-                    "data": [point.value for point in series.points],
-                },
-                {
-                    "name": "forecast",
-                    "data": [point.value for point in forecast_points],
-                },
-            ],
-        },
-        binding_evidence_ids=[database_evidence.evidence_id],
-        bindings=[
-            *[
-                VisualizationBinding(
-                    binding_id=f"historical:{database_evidence.evidence_id}:{index}",
-                    source_type="historical_point",
-                    evidence_id=database_evidence.evidence_id,
-                    locator={"timestamp": point.timestamp, "point_index": index, "series": "historical"},
-                )
-                for index, point in enumerate(series.points)
-            ],
-            *[
-                VisualizationBinding(
-                    binding_id=f"forecast:{database_evidence.evidence_id}:{index}",
-                    source_type="prediction_point",
-                    evidence_id=database_evidence.evidence_id,
-                    locator={"timestamp": point.timestamp, "point_index": index, "series": "forecast"},
-                )
-                for index, point in enumerate(forecast_points, start=len(series.points))
-            ],
-        ],
-        requested_capabilities=["forecast"],
-        time_column=series.time_field,
-        primary_measure=series.value_field,
-        display_priority=2,
-    )
 
 
 def _insufficient_timeseries_evidence_error(
@@ -281,7 +216,9 @@ def _resolve_forecast_plan(
     duration_seconds = _duration_seconds_from_inputs(validated_input.horizon, constraints)
     explicit_steps = _horizon_steps_from_value(validated_input.horizon)
     if explicit_steps is None:
-        explicit_steps = _horizon_steps_from_value(constraints.get("horizon"))
+        explicit_steps = _horizon_steps_from_value(
+            constraints.get("horizon") if constraints.get("horizon") is not None else constraints.get("forecast_horizon")
+        )
 
     if explicit_steps is not None:
         requested_steps = explicit_steps

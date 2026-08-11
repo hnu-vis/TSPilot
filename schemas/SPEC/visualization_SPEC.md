@@ -2,52 +2,38 @@
 
 ## Purpose
 
-Define the structured payload used to render charts and other visual artifacts.
+Define the V2 renderer-independent presentation contract used by the final
+answer boundary and the ECharts template registry.
 
-## Model
+## Contract
 
-### `VisualizationPayload`
+`VisualizationPayload` contains:
 
-Fields:
+- `schema_version: "2"`
+- a supported analytical `template_id`
+- `purpose` and `priority` (`primary` or `supporting`)
+- grounded `source_refs` and `fact_refs`
+- a typed dataset of dimensions, series, points, rows, or one metric
+- composable semantic layers (`line`, `bar`, `point`, `rule`, `area`, `band`,
+  `boxplot`, `scatter`)
+- bindings only for interactive semantic marks
+- computed `layout` (`overlay` or explicit `facets`)
+- an accessible description and bounded data table
 
-- `visualization_id: str`
-- `visualization_type: Literal["chart", "table", "metric_card", "annotation"]`
-- `visualization_kind: str`
-- `renderer: str`
-- `title: str`
-- `summary: str | null`
-- `chart: dict | null`
-- `annotations: list[dict]`
-- `binding_fact_ids: list[str]`
-- `binding_evidence_ids: list[str]`
-- `requested_capabilities: list[str]`
-- `requested_fact_types: list[str]` deprecated compatibility metadata
-- `subject: dict`
-- `presentation: dict`
-- `row_count: int | null`
-- `columns: list[str]`
-- `rows: list[dict]`
-- `display_rows: list[dict]`
-- `time_column: str | null`
-- `primary_measure: str | null`
-- `legend: list[dict]`
-- `display_priority: int`
-- `render_hints: dict`
+## Invariants
 
-## Contract notes
+- Payloads never contain ECharts options, JavaScript formatters, SVG, or model-
+  generated data arrays.
+- Every point binding must resolve to a binding entry.
+- Passive context series do not carry one binding per row.
+- Fact, anomaly, prediction, interval, and boundary marks retain provenance.
+- Source arrays are read from canonical artifacts and sampled mechanically;
+  semantic marks are never removed by sampling.
+- Incompatible or visually unreadable scales use labelled facets instead of
+  independent scales overlaid in one plot.
 
-- `renderer` should default to `linechart` when the evidence is time-indexed
-- ratio, comparison, and trend facts should prefer `linechart` when possible
-- grouped non-time evidence may render as `table`, `bar`, or another faithful view
-- `binding_fact_ids` and `binding_evidence_ids` must point to grounded facts/evidence
-- `chart` may be null for non-chart visualizations such as metric cards or tables
+## Supported templates
 
-## Responsibilities
-
-- carry chart-ready structured data
-- let the frontend render without re-inferring facts
-
-## Must not do
-
-- contain business analysis rules
-- invent evidence not present in state
+Metric, detail table, TopK ranking, time-series trend/highlight/interval,
+forecast, anomaly, category/time-series comparison, histogram, boxplot, and
+scatter.

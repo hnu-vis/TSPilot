@@ -679,6 +679,61 @@ class _FakeResponse:
 
 
 def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
+    if action == "terminate" and "response_plan" not in action_input:
+        context = _LAST_CONTEXT or {}
+        presentation = ((context.get("artifacts") or {}).get("presentation") or {})
+        presentation_sources = [
+            item for item in presentation.get("sources") or [] if isinstance(item, dict) and item.get("source_ref")
+        ]
+        source_refs: list[str] = [str(item["source_ref"]) for item in presentation_sources]
+        latest_evidence = context.get("latest_database_evidence") or {}
+        if not source_refs and latest_evidence.get("evidence_id"):
+            source_refs.append(f"evidence:{latest_evidence['evidence_id']}")
+        if not source_refs:
+            source_refs.extend(f"analysis:{analysis_id}" for analysis_id in _analysis_ids(context))
+        latest_forecast = context.get("latest_forecast") or {}
+        if not presentation_sources and latest_forecast.get("forecast_id"):
+            source_refs.append(f"forecast:{latest_forecast['forecast_id']}")
+        latest_anomaly = context.get("latest_anomaly") or {}
+        if not presentation_sources and latest_anomaly.get("anomaly_id"):
+            source_refs.append(f"anomaly:{latest_anomaly['anomaly_id']}")
+        grounded_summary = next(
+            (
+                str(item.get("summary"))
+                for item in reversed(presentation_sources)
+                if item.get("kind") in {"analysis", "forecast", "anomaly"} and item.get("summary")
+            ),
+            None,
+        )
+        summary = str(
+            action_input.get("direct_answer")
+            or grounded_summary
+            or action_input.get("summary_goal")
+            or context.get("message")
+            or "Answer assembled from the available evidence."
+        )
+        source_kinds = {str(item.get("kind")) for item in presentation_sources}
+        section_type = (
+            "forecast" if "forecast" in source_kinds or latest_forecast.get("forecast_id")
+            else "anomaly" if "anomaly" in source_kinds or latest_anomaly.get("anomaly_id")
+            else "analysis" if "analysis" in source_kinds or _analysis_ids(context)
+            else "answer"
+        )
+        action_input = {
+            "response_plan": {
+                "title": None,
+                "summary": summary,
+                "sections": [{
+                    "section_type": section_type,
+                    "heading": None,
+                    "content": summary,
+                    "source_refs": list(dict.fromkeys(source_refs)),
+                }],
+                "visual_intents": [],
+            },
+            "unavailable_outputs": action_input.get("unavailable_outputs") or [],
+            "unavailable_reason": action_input.get("unavailable_reason"),
+        }
     payload = {
         "thought": thought,
         "previous_observation_assessment": _auto_previous_observation_assessment(_LAST_CONTEXT),
@@ -830,15 +885,34 @@ def _compat_context(context: dict) -> dict:
     outputs = context.get("outputs") or {}
     artifacts = context.get("artifacts") or {}
     refs = artifacts.get("refs") if isinstance(artifacts.get("refs"), dict) else {}
+    presentation = artifacts.get("presentation") if isinstance(artifacts.get("presentation"), dict) else {}
+    presentation_sources = [item for item in presentation.get("sources") or [] if isinstance(item, dict)]
     execution = state.get("execution") or {}
     inventory = state.get("artifact_inventory") if isinstance(state.get("artifact_inventory"), dict) else {}
     observations = _observation_summaries(context)
     latest_observation = observations[-1] if observations else {}
     latest_observation_payload = latest_observation.get("payload") if isinstance(latest_observation.get("payload"), dict) else latest_observation
     latest_evidence = evidence.get("latest") or _latest_ref_payload(refs, "database_evidence") or _latest_ref_payload(refs, "evidence")
+    if not latest_evidence:
+        presentation_evidence = next((item for item in reversed(presentation_sources) if item.get("kind") == "evidence"), None)
+        if presentation_evidence:
+            source_ref = str(presentation_evidence.get("source_ref") or "")
+            latest_evidence = {
+                **presentation_evidence,
+                "evidence_id": source_ref.split(":", 1)[1] if source_ref.startswith("evidence:") else source_ref,
+            }
     if not latest_evidence and latest_observation.get("tool_name") == "sql_query" and latest_observation.get("success") is not False:
         latest_evidence = latest_observation_payload
     analyses = _ref_payloads(refs, "analysis")
+    if not analyses:
+        analyses = [
+            {
+                **item,
+                "analysis_id": str(item.get("source_ref") or "").split(":", 1)[-1],
+            }
+            for item in presentation_sources
+            if item.get("kind") == "analysis"
+        ]
     if latest_observation.get("tool_name") == "code_interpreter" and latest_observation.get("success") is not False:
         analyses.append(latest_observation_payload)
     if not analyses:

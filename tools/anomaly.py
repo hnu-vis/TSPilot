@@ -11,7 +11,6 @@ from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
 from schemas.data_fact import DataFactRequest
 from schemas.timeseries import AnomalyResult
-from schemas.visualization import VisualizationBinding, VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -60,43 +59,6 @@ class AnomalyTool(BaseTool):
         detector = get_anomaly_detector(detector_name)
         detector_output = detector.detect(series, params=constraints)
         anomaly_points = detector_output.anomaly_points
-        visualization = VisualizationPayload(
-            visualization_id=f"viz_anomaly_{database_evidence.evidence_id}",
-            visualization_type="chart",
-            visualization_kind="line",
-            renderer="linechart",
-            title=f"{series.value_field} anomalies",
-            summary=f"{series.value_field} 的异常点检测结果。",
-            chart={
-                "x_axis_data": [point.timestamp for point in series.points],
-                "series_data": [
-                    {"name": series.value_field, "data": [point.value for point in series.points]},
-                ],
-            },
-            annotations=anomaly_points,
-            binding_evidence_ids=[database_evidence.evidence_id],
-            bindings=[
-                VisualizationBinding(
-                    binding_id=f"anomaly:{database_evidence.evidence_id}:{index}",
-                    source_type=(
-                        "anomaly_point"
-                        if any(
-                            isinstance(anomaly, dict)
-                            and anomaly.get("timestamp") == point.timestamp
-                            for anomaly in anomaly_points
-                        )
-                        else "historical_point"
-                    ),
-                    evidence_id=database_evidence.evidence_id,
-                    locator={"timestamp": point.timestamp, "point_index": index},
-                )
-                for index, point in enumerate(series.points)
-            ],
-            requested_capabilities=["anomaly"],
-            time_column=series.time_field,
-            primary_measure=series.value_field,
-            display_priority=2,
-        )
         return AnomalyResult(
             anomaly_id=f"anomaly_{database_evidence.evidence_id}",
             detector_name=detector.name,
@@ -109,7 +71,6 @@ class AnomalyTool(BaseTool):
                 "series_name": series.series_name,
                 "detector_registry_name": detector.name,
             },
-            visualizations=[visualization],
         ).model_dump(mode="json")
 
 

@@ -3866,7 +3866,7 @@ details[open] > summary .collapsible-chevron {
 
 .answer-visualization-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
@@ -3878,6 +3878,49 @@ details[open] > summary .collapsible-chevron {
   border-radius: var(--radius-sm);
   background: var(--surface);
   padding: 12px;
+  box-shadow: 0 1px 2px oklch(0.2 0.02 250 / 0.04);
+}
+
+.answer-visualization-card.is-supporting {
+  margin-inline: 14px;
+  background: var(--surface-soft);
+}
+
+.answer-echart {
+  width: 100%;
+  min-width: 0;
+  min-height: 320px;
+  border-top: 1px solid var(--border);
+}
+
+.answer-echart.is-faceted {
+  min-height: 360px;
+}
+
+.visualization-data-details {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.visualization-data-details > summary {
+  cursor: pointer;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+@media (max-width: 720px) {
+  .answer-visualization-card {
+    padding: 10px;
+  }
+
+  .answer-visualization-card.is-supporting {
+    margin-inline: 0;
+  }
+
+  .answer-echart {
+    min-height: 300px;
+  }
 }
 
 .answer-visualization-card-header {
@@ -3979,9 +4022,140 @@ details[open] > summary .collapsible-chevron {
   fill: var(--primary);
 }
 
+.answer-chart-series.is-context {
+  opacity: 0.78;
+}
+
+.answer-chart-series.is-context circle {
+  opacity: 0;
+}
+
+.answer-chart-series.is-context circle:focus,
+.answer-chart-series.is-context circle:hover,
+.answer-chart-series.is-context circle.is-linked {
+  opacity: 1;
+}
+
+.answer-chart-fact-mark {
+  cursor: pointer;
+  outline: none;
+}
+
+.answer-chart-fact-mark circle {
+  fill: var(--surface);
+  stroke: var(--primary-strong);
+  stroke-width: 3;
+}
+
+.answer-chart-fact-mark:hover circle,
+.answer-chart-fact-mark:focus circle,
+.answer-chart-fact-mark.is-linked circle {
+  fill: var(--primary);
+}
+
+.answer-chart-fact-mark line {
+  stroke: var(--primary-strong);
+  stroke-dasharray: 5 4;
+  stroke-width: 1.5;
+}
+
+.answer-chart-fact-mark text {
+  fill: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+}
+
+.answer-chart-fact-band rect {
+  fill: var(--primary-soft);
+  opacity: 0.62;
+  stroke: var(--primary);
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+}
+
+.answer-chart-fact-band text {
+  fill: var(--primary-strong);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.answer-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--muted-strong);
+  font-size: 10px;
+}
+
+.answer-chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.answer-chart-legend i {
+  width: 12px;
+  height: 3px;
+  border-radius: 999px;
+}
+
+.answer-chart-legend i.is-fact {
+  width: 7px;
+  height: 7px;
+  border: 2px solid var(--primary-strong);
+  background: var(--surface);
+}
+
+.answer-bar-chart {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.answer-bar-chart svg {
+  display: block;
+  width: 100%;
+  min-width: 520px;
+}
+
+.answer-bar-row {
+  cursor: pointer;
+  outline: none;
+}
+
+.answer-bar-row rect {
+  fill: var(--primary-soft);
+  stroke: var(--primary);
+  stroke-width: 1;
+  transition: fill 150ms ease, opacity 150ms ease;
+}
+
+.answer-bar-row:hover rect,
+.answer-bar-row:focus rect,
+.answer-bar-row.is-linked rect {
+  fill: var(--primary);
+}
+
+.answer-bar-row text {
+  fill: var(--muted-strong);
+  font-size: 11px;
+}
+
+.answer-bar-row .answer-bar-value {
+  fill: var(--foreground);
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+
 .answer-line-chart-range {
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   color: var(--muted);
@@ -3990,8 +4164,24 @@ details[open] > summary .collapsible-chevron {
 }
 
 .answer-line-chart-range strong {
+  flex: 1 1 220px;
+  text-align: center;
   color: var(--muted-strong);
   font-weight: 700;
+}
+
+.answer-line-chart-range span {
+  white-space: nowrap;
+}
+
+.answer-chart-legend .is-scale-note {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 6px;
+  color: var(--muted-strong);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .visualization-link-detail {

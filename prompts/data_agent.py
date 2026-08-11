@@ -6,6 +6,7 @@ import json
 from core.harness import default_capability_registry
 from core.harness.observation_view import model_observation_view
 from core.data_fact import data_fact_prompt_view
+from core.visualization import PresentationCatalog
 from runtime.action_policy import runtime_action_constraints
 from schemas.state import ConversationStateModel, RequestStateModel
 
@@ -30,8 +31,12 @@ class DataAgentPromptBuilder:
             "Do not repeat actions listed as completed in progress_summary unless last_observation says the existing artifact is insufficient.\n"
             "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
             "Use the smallest next action that fills the current missing capability. When all requested capabilities are covered, call terminate.\n"
-            "Exact numeric claims in terminate must be grounded by database/analysis/forecast/anomaly artifacts. Never do mental arithmetic in terminate. "
-            "For terminate, result/direct_answer are user-visible natural-language prose only; do not put JSON objects, answer wrappers, or summary/prediction/basis maps there.\n"
+            "Exact numeric claims in terminate must be grounded by the presentation sources in context. Never do mental arithmetic in terminate. "
+            "For terminate, action_input must contain response_plan with title, summary, sections, and visual_intents. "
+            "Each section has section_type, heading, content, and source_refs. Each visual intent has purpose, priority, template_id, title, summary, source_refs, fact_refs, and optional encodings. "
+            "Use only listed source_ref and field names. The final formatter reads complete artifacts by reference; never copy data arrays into response_plan. "
+            "Terminate schema: {\"response_plan\":{\"title\":str|null,\"summary\":str,\"sections\":[{\"section_type\":str,\"heading\":str|null,\"content\":str,\"source_refs\":[str]}],\"visual_intents\":[{\"purpose\":str,\"priority\":\"primary\"|\"supporting\",\"template_id\":str,\"title\":str,\"summary\":str|null,\"source_refs\":[str],\"fact_refs\":[str],\"encodings\":object}]},\"unavailable_outputs\":[str],\"unavailable_reason\":str|null}. "
+            "Visualization planning is by user goal, not by Fact type: use one primary view per purpose, add Facts as semantic highlights, do not create duplicate views, and do not request extra data only for presentation.\n"
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
             "Data Fact contract: use fact_requests to name the facts a tool must produce. Give every request a stable semantic fact_key. "
@@ -83,6 +88,7 @@ class DataAgentPromptBuilder:
             },
             "artifacts": {
                 "refs": self._artifact_ref_index(request_state),
+                "presentation": self._presentation_context(request_state, action_space),
             },
             "last_observation": (
                 self._action_output_observation_context(request_state.latest_action_output)
@@ -110,18 +116,12 @@ class DataAgentPromptBuilder:
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
             return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "fact_requests?"]
-        if action in {"forecast", "anomaly"}:
+        if action == "forecast":
+            return ["database_evidence", "horizon", "constraints?"]
+        if action == "anomaly":
             return ["database_evidence", "constraints?"]
         if action == "terminate":
-            return [
-                "result? natural-language prose",
-                "direct_answer? natural-language prose",
-                "summary_goal?",
-                "include_analysis_ids?",
-                "include_fact_ids?",
-                "unavailable_outputs?",
-                "unavailable_reason?",
-            ]
+            return ["response_plan", "unavailable_outputs?", "unavailable_reason?"]
         return list(parameters)[:4]
 
     def _task_context(self, request_state: RequestStateModel) -> dict:
@@ -315,6 +315,19 @@ class DataAgentPromptBuilder:
             ),
             "visualization_count": len(request_state.visualizations),
         }
+
+    def _presentation_context(self, request_state: RequestStateModel, action_space: dict) -> dict | None:
+        required = {
+            str(item.get("action") or item.get("tool_name") or "") if isinstance(item, dict) else str(item)
+            for item in (action_space.get("required_actions") or [])
+        }
+        prohibited = {
+            str(item.get("action") or item.get("tool_name") or "") if isinstance(item, dict) else str(item)
+            for item in (action_space.get("prohibited_actions") or [])
+        }
+        if "terminate" in prohibited or (required and "terminate" not in required):
+            return None
+        return PresentationCatalog(request_state).planner_inventory()
 
     def _resource_index_context(self, request_state: RequestStateModel) -> dict:
         resources = (request_state.resource_index or {}).get("resources")

@@ -5,9 +5,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from schemas.visualization import VisualizationPayload
-
-
 class TimeSeriesPoint(BaseModel):
     timestamp: str
     value: float
@@ -44,7 +41,6 @@ class ForecastResult(BaseModel):
     forecast_points: list[TimeSeriesPoint] = Field(default_factory=list)
     confidence_interval: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
-    visualizations: list[VisualizationPayload] = Field(default_factory=list)
 
 
 class AnomalyResult(BaseModel):
@@ -54,4 +50,3 @@ class AnomalyResult(BaseModel):
     anomaly_spans: list[dict] = Field(default_factory=list)
     scores: list[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
-    visualizations: list[VisualizationPayload] = Field(default_factory=list)
