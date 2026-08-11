@@ -81,6 +81,7 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
   const isMetric = visualization.template_id === 'metric.single';
   const isTable = visualization.template_id === 'table.detail';
   const metric = visualization.dataset.metric;
+  const metricDisplay = metric ? normalizeMetricDisplay(metric) : null;
   const rows = visualization.dataset.rows || [];
   const columns = visualization.dataset.columns?.length
     ? visualization.dataset.columns
@@ -94,11 +95,25 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
         </div>
         <span>{formatTemplateLabel(visualization.template_id)}</span>
       </div>
-      {isMetric && metric ? (
+      {isMetric && metricDisplay ? (
         <div className="answer-fact-metric" role="group" aria-label={visualization.title}>
-          <strong>{formatCell(metric.value)}</strong>
-          {metric.unit ? <span>{formatCell(metric.unit)}</span> : null}
-          {metric.label ? <small>{formatCell(metric.label)}</small> : null}
+          {metricDisplay.value !== undefined && (
+            <div className="answer-fact-metric-value">
+              <strong>{formatCell(metricDisplay.value)}</strong>
+              {metricDisplay.unit ? <span>{formatCell(metricDisplay.unit)}</span> : null}
+            </div>
+          )}
+          {metricDisplay.label ? <small>{formatCell(metricDisplay.label)}</small> : null}
+          {metricDisplay.context.length > 0 && (
+            <dl className="answer-fact-metric-context">
+              {metricDisplay.context.map(([key, value]) => (
+                <div key={key}>
+                  <dt>{formatFieldLabel(key)}</dt>
+                  <dd>{formatCell(value)}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
         </div>
       ) : isTable ? (
         <AccessibleTable visualization={visualization} rows={rows} columns={columns} onSelectBinding={onSelectBinding} />
@@ -122,6 +137,36 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
       )}
     </article>
   );
+}
+
+function normalizeMetricDisplay(metric: Record<string, unknown>) {
+  const nested = isRecord(metric.value) ? metric.value : null;
+  if (!nested) {
+    return {
+      value: metric.value,
+      unit: metric.unit,
+      label: metric.label,
+      context: [] as Array<[string, unknown]>,
+    };
+  }
+
+  const entries = Object.entries(nested).filter(([, value]) => isDisplayScalar(value));
+  const numericEntries = entries.filter(([, value]) => typeof value === 'number' && Number.isFinite(value));
+  const primary = numericEntries.length === 1 ? numericEntries[0] : null;
+  return {
+    value: primary?.[1],
+    unit: metric.unit,
+    label: metric.label || (primary ? formatFieldLabel(primary[0]) : undefined),
+    context: entries.filter(([key]) => key !== primary?.[0]),
+  };
+}
+
+function isDisplayScalar(value: unknown): value is string | number | boolean | null {
+  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+}
+
+function formatFieldLabel(value: string) {
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function EChartView({ visualization, activeBindingId, onSelectBinding }: {

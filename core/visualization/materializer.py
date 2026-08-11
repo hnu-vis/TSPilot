@@ -99,10 +99,11 @@ class PresentationCatalog:
                 "Plan views around user goals, not one chart per Fact.",
                 "Use one primary view per analytical purpose; supporting views must add precision or a distinct comparison.",
                 "Use ranking.topk when only ranked rows are available. Use timeseries.highlight only when an existing full series is relevant to the question.",
+                "When the user asks to visualize one or more time series, choose a timeseries trend/comparison/highlight template as the primary view; use table.detail only when row-level detail is explicitly requested.",
                 "Use metric.single for a standalone point value; place it on a time series only when temporal position matters and that series already exists.",
                 "Use timeseries.forecast as one view combining available history, forecast boundary, forecast points, and confidence interval.",
                 "Never request extra data for presentation and never invent source refs or field names.",
-                "Encodings may select existing x, y, series, label, lower, or upper fields; omit them when the source shape is unambiguous.",
+                "Encodings may select only exact field names listed by the chosen sources; series must be a categorical field, never a numeric measure. Omit y/series encodings for wide multi-value rows when all numeric fields should be plotted.",
             ],
         }
 
@@ -279,10 +280,16 @@ class VisualizationMaterializer:
         return self._time_series_view(intent, sources, facts, add_fact_layers=False)
 
     def _time_series_view(self, intent, sources, facts, *, add_fact_layers, interval=False):
-        series = _series_from_sources(sources, intent.encodings)
+        fact_series_sources = [
+            source
+            for source in facts
+            if source.value.items or isinstance(source.value.value, list)
+        ]
+        base_sources = fact_series_sources or _lineage_distinct_sources(sources)
+        series = _series_from_sources(base_sources, intent.encodings)
         if not series:
             raise ValueError(f"{intent.template_id} requires time-series source data")
-        fact_points = _fact_layer_points(facts)
+        fact_points = _fact_layer_points(facts, intent.encodings)
         preserve_x = {point.x for point in fact_points if point.x is not None}
         sampled = [
             item.model_copy(update={"points": _sample_points(item.points, self.max_points, preserve_x)})
@@ -532,6 +539,20 @@ def _unique_sources(sources: Iterable[PresentationSource]) -> list[PresentationS
     return list({source.ref: source for source in sources}.values())
 
 
+def _lineage_distinct_sources(sources: Iterable[PresentationSource]) -> list[PresentationSource]:
+    unique = _unique_sources(sources)
+    consumed_evidence_ids = {
+        source.value.input_evidence_id
+        for source in unique
+        if source.kind == "analysis" and source.value.input_evidence_id
+    }
+    return [
+        source
+        for source in unique
+        if source.kind != "evidence" or source.value.evidence_id not in consumed_evidence_ids
+    ]
+
+
 def _rows_from_evidence(evidence) -> list[dict]:
     data = evidence.data if isinstance(evidence.data, dict) else {}
     rows = data.get("rows")
@@ -562,10 +583,19 @@ def _rows_from_analysis(result) -> list[dict]:
         return []
     details = result.get("details")
     if isinstance(details, dict):
-        for key in ("rows", "points", "items", "values", "data"):
-            value = details.get(key)
-            if isinstance(value, list):
-                return [item if isinstance(item, dict) else {"value": item} for item in value]
+        collections = [
+            [item if isinstance(item, dict) else {"value": item} for item in value]
+            for value in details.values()
+            if isinstance(value, list) and value
+        ]
+        if collections:
+            # Analysis code may give row collections domain-specific names. Select
+            # the richest collection as its primary renderable dataset; metrics
+            # remain the summary only when no row-shaped detail data is available.
+            return max(
+                collections,
+                key=lambda rows: (len(rows), len(_row_fields(rows))),
+            )
     metrics = result.get("metrics")
     if isinstance(metrics, dict):
         return [{"metric": key, "value": value} for key, value in metrics.items()]
@@ -580,6 +610,15 @@ def _series_from_sources(sources, encodings):
         elif source.kind == "analysis":
             rows = _rows_from_analysis(source.value.result)
             output.extend(_series_from_rows(rows, encodings, prefix=source.value.analysis_id))
+        elif source.kind == "fact":
+            fact: DataFact = source.value
+            if not fact.items and not isinstance(fact.value, list):
+                continue
+            rows = _rows_from_sources([source])
+            fact_series = _series_from_rows(rows, encodings, prefix=fact.fact_id)
+            if len(fact_series) == 1:
+                fact_series[0] = fact_series[0].model_copy(update={"name": fact.name})
+            output.extend(fact_series)
     return output
 
 
@@ -615,6 +654,16 @@ def _series_from_rows(rows, encodings, *, prefix):
     requested_y = encodings.get("y")
     y_fields = [requested_y] if requested_y else numeric_fields
     series_field = encodings.get("series")
+    if series_field:
+        available_fields = _row_fields(rows)
+        if series_field not in available_fields:
+            raise ValueError(
+                f"series encoding '{series_field}' is not present; available fields: {available_fields}"
+            )
+        if series_field in numeric_fields:
+            raise ValueError(
+                f"series encoding '{series_field}' is numeric; use a categorical series field or omit series for wide numeric rows"
+            )
     if not x_field or not y_fields:
         return []
     grouped: dict[tuple[str, str], list[VisualizationPoint]] = {}
@@ -634,7 +683,8 @@ def _series_from_rows(rows, encodings, *, prefix):
     return output
 
 
-def _fact_layer_points(facts):
+def _fact_layer_points(facts, encodings=None):
+    encodings = encodings or {}
     points: list[VisualizationPoint] = []
     for source in facts:
         fact: DataFact = source.value
@@ -650,8 +700,10 @@ def _fact_layer_points(facts):
             continue
         value = fact.value
         if isinstance(value, dict):
-            start = value.get("start") or value.get("start_time")
-            end = value.get("end") or value.get("end_time")
+            start_field = encodings.get("start") or _role_field(value, "start", expected="time")
+            end_field = encodings.get("end") or _role_field(value, "end", expected="time")
+            start = value.get(start_field) if start_field else None
+            end = value.get(end_field) if end_field else None
             if start is not None or end is not None:
                 points.extend([
                     VisualizationPoint(x=start, label=fact.name, binding_id=f"{source.ref}:value", metadata={"boundary": "start"}),
@@ -665,6 +717,19 @@ def _fact_layer_points(facts):
             y = _number(value)
         points.append(VisualizationPoint(x=x, y=y, label=fact.name, binding_id=f"{source.ref}:value"))
     return [point for point in points if point.x is not None or point.y is not None]
+
+
+def _role_field(values: dict, role: str, *, expected: str):
+    matches = []
+    for key, value in values.items():
+        normalized = str(key).casefold().replace("-", "_")
+        if role not in normalized:
+            continue
+        if expected == "time" and _time_value(value) is not None:
+            matches.append(key)
+        elif expected == "number" and _number(value) is not None:
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _bindings_for_fact_sources(facts):
@@ -690,7 +755,35 @@ def _bindings_for_fact_sources(facts):
 def _metric_from_source(source, encodings):
     if source.kind == "fact":
         fact = source.value
-        return {"label": fact.name, "value": fact.value, "unit": fact.unit, "statement": fact.statement}
+        if not isinstance(fact.value, dict):
+            return {"label": fact.name, "value": fact.value, "unit": fact.unit, "statement": fact.statement}
+
+        selected_field = encodings.get("value") or encodings.get("y")
+        if selected_field:
+            if selected_field not in fact.value or _number(fact.value.get(selected_field)) is None:
+                raise ValueError(
+                    f"metric.single encoding '{selected_field}' must select a numeric field from the Fact value"
+                )
+        else:
+            numeric_fields = [key for key, value in fact.value.items() if _number(value) is not None]
+            if len(numeric_fields) != 1:
+                raise ValueError(
+                    "metric.single requires one unambiguous numeric Fact value or an explicit value encoding"
+                )
+            selected_field = numeric_fields[0]
+
+        context = {
+            key: value
+            for key, value in fact.value.items()
+            if key != selected_field and isinstance(value, (str, int, float, bool))
+        }
+        return {
+            "label": fact.name,
+            "value": fact.value[selected_field],
+            "unit": fact.unit,
+            "statement": fact.statement,
+            **context,
+        }
     rows = _rows_from_sources([source])
     value_field = encodings.get("value") or encodings.get("y") or _first_field(rows, "number")
     if not rows or not value_field:

@@ -3912,7 +3912,8 @@ details[open] > summary .collapsible-chevron {
 }
 
 .answer-inline-details summary {
-  display: inline-flex;
+  display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 6px;
   padding: 8px 10px;
@@ -3923,12 +3924,30 @@ details[open] > summary .collapsible-chevron {
   list-style: none;
 }
 
+.answer-inline-details summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.answer-query-details summary > strong {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  padding: 2px 7px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
 .answer-inline-details summary::-webkit-details-marker {
   display: none;
 }
 
 .answer-inline-details pre {
-  max-height: 180px;
   overflow: auto;
   border-top: 1px solid var(--border);
   margin: 0;
@@ -3937,8 +3956,16 @@ details[open] > summary .collapsible-chevron {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+}
+
+.answer-query-code {
+  background: oklch(0.955 0.008 250);
+  tab-size: 2;
+}
+
+.answer-query-code code {
+  font: inherit;
 }
 
 .answer-metric-groups {
@@ -3966,52 +3993,6 @@ details[open] > summary .collapsible-chevron {
   display: grid;
   min-width: 0;
   gap: 10px;
-}
-
-.answer-claim-links {
-  display: grid;
-  min-width: 0;
-  gap: 6px;
-  border-left: 2px solid var(--border-strong);
-  padding-left: 10px;
-}
-
-.answer-claim-link {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  border: 0;
-  background: transparent;
-  padding: 5px 0;
-  color: var(--foreground);
-  text-align: left;
-}
-
-.answer-claim-link:not(:disabled) {
-  cursor: pointer;
-}
-
-.answer-claim-link:not(:disabled):hover span {
-  color: var(--primary-strong);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.answer-claim-link span {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 13px;
-  line-height: 1.55;
-  text-overflow: ellipsis;
-}
-
-.answer-claim-link small {
-  flex: 0 0 auto;
-  color: var(--muted);
-  font-size: 10px;
-  text-transform: uppercase;
 }
 
 .answer-visualization-grid {
@@ -4106,12 +4087,20 @@ details[open] > summary .collapsible-chevron {
 }
 
 .answer-fact-metric {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(160px, 1fr);
+  align-items: center;
+  gap: 10px 24px;
   min-height: 86px;
   padding: 18px 20px;
   border-top: 1px solid var(--border);
+}
+
+.answer-fact-metric-value {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
 }
 
 .answer-fact-metric strong {
@@ -4120,9 +4109,45 @@ details[open] > summary .collapsible-chevron {
   line-height: 1.1;
 }
 
-.answer-fact-metric span {
+.answer-fact-metric-value span,
+.answer-fact-metric small {
   color: var(--muted);
   font-size: 13px;
+}
+
+.answer-fact-metric-context {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  margin: 2px 0 0;
+}
+
+.answer-fact-metric-context > div {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.answer-fact-metric-context dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.answer-fact-metric-context dd {
+  margin: 3px 0 0;
+  color: var(--foreground);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .answer-fact-metric {
+    grid-template-columns: 1fr;
+    padding-inline: 12px;
+  }
 }
 
 .answer-visualization-table-wrap {

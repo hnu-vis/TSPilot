@@ -96,7 +96,8 @@ class FormatAnswerTool(BaseTool):
         for intent in plan.visual_intents:
             refs.extend(intent.source_refs)
             refs.extend(intent.fact_refs)
-        return [catalog.resolve(ref) for ref in dict.fromkeys(refs)]
+        referenced = [catalog.resolve(ref) for ref in refs]
+        return list({source.ref: source for source in referenced}.values())
 
     def _reference(self, source) -> AnswerReference:
         value = source.value

@@ -128,7 +128,7 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
     }
     if consumer == "public":
         view["query_language"] = payload.get("query_language")
-        view["query"] = _truncate_text(str(payload.get("query") or ""), 5000) if payload.get("query") else None
+        view["query"] = str(payload.get("query") or "") if payload.get("query") else None
     preview = view["data_preview"]
     if rows:
         preview["rows"] = [_public_row(row) for row in rows[:5]]

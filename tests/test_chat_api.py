@@ -533,6 +533,29 @@ def test_sql_tool_result_preview_exposes_query_and_samples():
     ]
 
 
+def test_sql_tool_result_preview_keeps_complete_long_query():
+    loop = ReActLoop.__new__(ReActLoop)
+    long_query = "SELECT value FROM metrics WHERE " + " OR ".join(
+        f"dimension_{index} = 'value_{index}'" for index in range(200)
+    )
+    assert len(long_query) > 5000
+
+    preview = loop._payload_preview(
+        {
+            "tool_name": "sql_query",
+            "success": True,
+            "summary": "ok",
+            "payload": {
+                "query_language": "sql",
+                "query": long_query,
+                "data": {"rows": []},
+            },
+        }
+    )
+
+    assert preview["query"] == long_query
+
+
 def test_code_interpreter_trace_preview_exposes_code_and_result():
     loop = ReActLoop.__new__(ReActLoop)
     input_preview = loop._input_preview(

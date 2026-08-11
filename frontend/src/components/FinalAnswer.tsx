@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import type { ReactNode } from 'react';
-import type { AnswerClaim, FinalAnswer as FinalAnswerType, TokenUsage, Visualization } from '../types';
+import type { FinalAnswer as FinalAnswerType, TokenUsage } from '../types';
 import { VisualizationGallery } from './VisualizationGallery';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
@@ -37,6 +37,7 @@ type AnswerCopy = {
   source: string;
   referenceCount: (count: number) => string;
   queryResult: string;
+  executedQuery: string;
   sampled: string;
   showingRows: (visible: number, total?: number | null) => string;
 };
@@ -51,6 +52,7 @@ const ANSWER_COPY: Record<AnswerLocale, AnswerCopy> = {
     source: '来源',
     referenceCount: (count) => `${count.toLocaleString()} 项依据`,
     queryResult: '查询结果',
+    executedQuery: '实际执行的查询语句',
     sampled: '采样预览',
     showingRows: (visible, total) => (
       typeof total === 'number' && total >= visible
@@ -67,6 +69,7 @@ const ANSWER_COPY: Record<AnswerLocale, AnswerCopy> = {
     source: 'Source',
     referenceCount: (count) => `${count.toLocaleString()} ${count === 1 ? 'reference' : 'references'}`,
     queryResult: 'Query result',
+    executedQuery: 'Executed query',
     sampled: 'Sampled preview',
     showingRows: (visible, total) => (
       typeof total === 'number' && total >= visible
@@ -96,7 +99,7 @@ export function FinalAnswer({
   const summary = answer.summary?.trim() || copy.emptyAnswer;
   const sections = supportingSections(answer.sections, summary);
   const evidenceItems = normalizeAnswerEvidence(answer);
-  const references = answer.references || [];
+  const references = deduplicateReferences(answer.references || []);
   const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
   const [activeBindingId, setActiveBindingId] = useState<string | null>(null);
 
@@ -136,14 +139,6 @@ export function FinalAnswer({
         <MarkdownContent content={summary} variant="summary" />
       </section>
 
-      {answer.claims && answer.claims.length > 0 && (
-        <ClaimLinks
-          claims={answer.claims}
-          visualizations={answer.visualizations || []}
-          onSelectBinding={setActiveBindingId}
-        />
-      )}
-
       {sections.length > 0 && (
         <div className="answer-sections">
           {sections.map((section, index) => (
@@ -179,54 +174,6 @@ export function FinalAnswer({
           <ReferenceList references={supportingReferences} copy={copy} />
         </section>
       )}
-    </div>
-  );
-}
-
-function ClaimLinks({
-  claims,
-  visualizations,
-  onSelectBinding,
-}: {
-  claims: AnswerClaim[];
-  visualizations: Visualization[];
-  onSelectBinding: (bindingId: string) => void;
-}) {
-  const bindings = visualizations.flatMap((visualization) => visualization.bindings || []);
-  const linkedClaims = claims.filter((claim) => (
-    claim.fact_ids?.length
-    || claim.item_ids?.length
-    || claim.analysis_ids?.length
-    || claim.artifact_ids?.length
-    || claim.visualization_ids?.length
-  ));
-  if (linkedClaims.length === 0) return null;
-  return (
-    <div className="answer-claim-links" aria-label="Grounded answer claims">
-      {linkedClaims.map((claim) => {
-        const binding = bindings.find((item) => (
-          (claim.item_ids || []).includes(item.item_id || '')
-          && (claim.fact_ids || []).includes(item.fact_id || '')
-        )) || bindings.find((item) => (claim.fact_ids || []).includes(item.fact_id || ''));
-        const visualizationBinding = !binding
-          ? visualizations
-            .filter((visualization) => (claim.visualization_ids || []).includes(visualization.visualization_id))
-            .flatMap((visualization) => visualization.bindings || [])[0]
-          : null;
-        const selectedBinding = binding || visualizationBinding;
-        return (
-          <button
-            type="button"
-            className="answer-claim-link"
-            key={claim.claim_id}
-            onClick={() => selectedBinding && onSelectBinding(selectedBinding.binding_id)}
-            disabled={!selectedBinding}
-          >
-            <span>{claim.text}</span>
-            <small>{selectedBinding ? 'linked' : 'grounded'}</small>
-          </button>
-        );
-      })}
     </div>
   );
 }
@@ -309,12 +256,16 @@ function EvidenceItemsView({
               />
             )}
             {visibleQuery(item.query) && (
-              <details className="answer-inline-details">
+              <details className="answer-inline-details answer-query-details" open>
                 <summary>
-                  <ChevronDown size={14} className="collapsible-chevron" />
-                  {queryLabel(item.query_language)}
+                  <span>
+                    <ChevronDown size={14} className="collapsible-chevron" />
+                    <Code2 size={14} />
+                    {copy.executedQuery}
+                  </span>
+                  <strong>{queryLabel(item.query_language)}</strong>
                 </summary>
-                <pre>{item.query}</pre>
+                <pre className="answer-query-code"><code>{item.query}</code></pre>
               </details>
             )}
           </article>
@@ -337,6 +288,22 @@ function ReferenceList({ references, copy }: { references: AnswerReference[]; co
       ))}
     </div>
   );
+}
+
+function deduplicateReferences(references: AnswerReference[]): AnswerReference[] {
+  const seen = new Set<string>();
+  return references.filter((reference) => {
+    const evidence = asRecord(reference.evidence);
+    const factKey = reference.source_type === 'fact' ? asString(evidence?.fact_key) : undefined;
+    const identity = factKey
+      ? `fact:${comparableText(factKey)}`
+      : reference.source_id
+        ? `${reference.source_type}:${comparableText(reference.source_id)}`
+        : `${reference.source_type}:${comparableText(reference.label)}:${comparableText(JSON.stringify(evidence || {}))}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 function ReferenceItem({ reference, index, copy }: { reference: AnswerReference; index: number; copy: AnswerCopy }) {

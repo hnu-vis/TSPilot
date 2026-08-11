@@ -44,6 +44,20 @@ def test_public_database_observation_keeps_query_and_preview_rows():
     assert "for query" not in public_view["summary"]
 
 
+def test_public_database_observation_keeps_complete_long_query():
+    observation = _database_observation()
+    long_query = 'from(bucket:"bitcoin")\n' + "\n".join(
+        f'  |> filter(fn: (r) => r["field_{index}"] != "")' for index in range(150)
+    )
+    assert len(long_query) > 5000
+    observation.payload["query"] = long_query
+
+    public_view = public_observation_view(observation)
+
+    assert public_view is not None
+    assert public_view["payload"]["query"] == long_query
+
+
 def test_model_database_observation_still_hides_query_code():
     model_view = model_observation_view(_database_observation())
 

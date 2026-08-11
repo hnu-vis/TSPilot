@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { renderToStaticMarkup } from 'react-dom/server';
 import type { Visualization } from '../types';
-import { buildVisualizationOption } from './VisualizationGallery';
+import { buildVisualizationOption, VisualizationGallery } from './VisualizationGallery';
 
 function visualization(overrides: Partial<Visualization> = {}): Visualization {
   return {
@@ -91,5 +92,30 @@ describe('buildVisualizationOption', () => {
     expect(option.grid).toHaveLength(2);
     expect(option.xAxis).toHaveLength(2);
     expect(option.series[1].xAxisIndex).toBe(1);
+  });
+
+  it('renders legacy composite metrics as a primary value with context instead of JSON', () => {
+    const markup = renderToStaticMarkup(
+      <VisualizationGallery
+        activeBindingId={null}
+        onSelectBinding={() => undefined}
+        visualizations={[visualization({
+          template_id: 'metric.single',
+          title: '最大 7 天窗口标准差',
+          dataset: {
+            metric: {
+              label: '7 天滚动样本标准差最大窗口',
+              value: { start_date: '2023-01-14', end_date: '2023-01-20', std_dev: 0.0357 },
+            },
+          },
+          accessibility: { description: '标准差窗口' },
+        })]}
+      />,
+    );
+
+    expect(markup).toContain('0.036');
+    expect(markup).toContain('2023-01-14');
+    expect(markup).toContain('2023-01-20');
+    expect(markup).not.toContain('&quot;std_dev&quot;');
   });
 });

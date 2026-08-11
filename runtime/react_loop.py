@@ -1290,7 +1290,9 @@ class ReActLoop:
 
         return {
             "query_language": visible_payload.get("query_language"),
-            "query": self._truncate_preview_text(visible_payload.get("query"), 5000),
+            # The public execution trace is the authoritative source for the query shown
+            # to users, so query text must remain complete. Result data is still sampled.
+            "query": visible_payload.get("query"),
             "columns": columns[:40],
             "row_count": row_count if row_count is not None else len(rows),
             "point_count": point_count if point_count is not None else len(points),
