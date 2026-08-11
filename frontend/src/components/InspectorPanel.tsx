@@ -34,10 +34,22 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
 
   return (
     <aside className="inspector-panel" aria-label="Run details">
-      <header>
-        <div>
-          <p>{displayStep ? `Step ${activeStepIndex + 1} of ${steps.length} · ${displayStep.category}` : 'Run detail'}</p>
-          <h2>{displayStep?.title || 'Answer'}</h2>
+      <header className="inspector-header">
+        <div className="inspector-heading">
+          <div className="inspector-kicker">
+            <span>Inspector</span>
+            {displayStep && <i aria-hidden="true" />}
+            {displayStep && <span>Step {activeStepIndex + 1} / {steps.length}</span>}
+          </div>
+          <div className="inspector-title-row">
+            <span className="inspector-title-icon" aria-hidden="true">
+              <Activity size={16} />
+            </span>
+            <div>
+              <h2>{displayStep?.title || 'Answer'}</h2>
+              <p>{displayStep?.category || 'Run detail'}</p>
+            </div>
+          </div>
         </div>
         <div className="inspector-header-actions">
           {displayStep && <span className={`status-line compact ${displayStep.status}`}>{statusLabel(displayStep.status)}</span>}
@@ -105,7 +117,7 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
     <section className="inspector-card react-step-card">
       <div className="inspector-card-title">
         <Activity size={16} />
-        <h3>ReAct</h3>
+        <h3>Execution context</h3>
       </div>
       {detail.thought && (
         <div className="react-thought">
@@ -141,7 +153,6 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 }
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
-  const queryMarkdown = fencedQueryMarkdown(detail.query || '', detail.queryLanguage);
   return (
     <details className="inspector-card sql-query-preview collapsible-card" open>
       <summary className="collapsible-summary">
@@ -167,9 +178,7 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
           </button>
         </span>
       </summary>
-      <div className="query-markdown-render">
-        <MarkdownContent content={queryMarkdown} />
-      </div>
+      <pre className="inspector-source-code"><code>{detail.query}</code></pre>
     </details>
   );
 }
@@ -231,14 +240,13 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
 
 function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']> }) {
   return (
-    <section className="inspector-card tool-detail-card">
-      <div className="inspector-card-title sql-detail-title">
-        <Code2 size={16} />
-        <h3>Code</h3>
-        {detail.codeType && <span className="query-language-badge">{detail.codeType}</span>}
-      </div>
-
-      {detail.analysisGoal && <p className="step-summary">{detail.analysisGoal}</p>}
+    <section className="inspector-card tool-detail-card code-detail-card">
+      {detail.analysisGoal && (
+        <div className="code-analysis-goal">
+          <span>Analysis goal</span>
+          <p>{detail.analysisGoal}</p>
+        </div>
+      )}
 
       <div className="query-run-facts" aria-label="Code interpreter facts">
         {detail.inputRowCount !== null && (
@@ -257,7 +265,7 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
 
       {detail.code && (
         <ToolCodeBlock
-          title="Python code"
+          title="Source"
           language="python"
           code={detail.code}
           copyLabel="Copy code"
@@ -581,32 +589,32 @@ function ToolCodeBlock({
   code: string;
   copyLabel: string;
 }) {
-  const codeMarkdown = `\`\`\`${language}\n${code}\n\`\`\``;
   return (
     <details className="answer-code-details tool-code-details" open>
       <summary>
         <span>
           <ChevronDown size={14} className="collapsible-chevron" />
           <Code2 size={14} />
-          {title}
+          <strong className="tool-code-title">{title}</strong>
         </span>
-        <button
-          type="button"
-          className="inspector-icon-button inline-copy-button"
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            void navigator.clipboard?.writeText(code);
-          }}
-          aria-label={copyLabel}
-          title={copyLabel}
-        >
-          <Clipboard size={13} />
-        </button>
+        <span className="tool-code-actions">
+          <span className="query-language-badge">{language}</span>
+          <button
+            type="button"
+            className="inspector-icon-button inline-copy-button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              void navigator.clipboard?.writeText(code);
+            }}
+            aria-label={copyLabel}
+            title={copyLabel}
+          >
+            <Clipboard size={13} />
+          </button>
+        </span>
       </summary>
-      <div className="query-markdown-render">
-        <MarkdownContent content={codeMarkdown} />
-      </div>
+      <pre className="inspector-source-code"><code>{code}</code></pre>
     </details>
   );
 }
@@ -732,18 +740,4 @@ function structuredValueKey(value: unknown) {
   } catch {
     return null;
   }
-}
-
-function fencedQueryMarkdown(query: string, queryLanguage: string | null) {
-  const language = markdownLanguage(queryLanguage);
-  return `\`\`\`${language}\n${query.trim()}\n\`\`\``;
-}
-
-function markdownLanguage(queryLanguage: string | null) {
-  const normalized = (queryLanguage || '').trim().toLowerCase();
-  if (!normalized) return '';
-  if (['postgres', 'postgresql', 'timescaledb', 'questdb', 'clickhouse'].includes(normalized)) return 'sql';
-  if (normalized === 'influxdb') return 'flux';
-  if (normalized === 'prometheus') return 'promql';
-  return normalized;
 }
