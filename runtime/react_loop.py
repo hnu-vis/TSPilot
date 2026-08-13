@@ -30,6 +30,7 @@ from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
 from schemas.tool import ToolObservation
 from tools.base import StructuredToolError
+from core.data_fact.learning import FactLearningOutbox
 
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
@@ -48,10 +49,12 @@ class ReActLoop:
         data_agent: DataAgent,
         tool_executor: ToolExecutor,
         settings: Settings,
+        fact_learning_outbox: FactLearningOutbox | None = None,
     ):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
+        self._fact_learning_outbox = fact_learning_outbox
         self._trace_logger = ConversationTraceLogger(settings)
         self._transition_engine = StateTransitionEngine()
         self._action_output_builder = ActionOutputBuilder()
@@ -512,6 +515,21 @@ class ReActLoop:
             if execution_result.tool_spec.produces_terminal_payload:
                 unavailable_outputs = turn.action_input.get("unavailable_outputs") if isinstance(turn.action_input, dict) else None
                 request_state.status = "partial" if isinstance(unavailable_outputs, list) and unavailable_outputs else "completed"
+                if self._fact_learning_outbox is not None and request_state.status == "completed":
+                    try:
+                        queued_ids = self._fact_learning_outbox.enqueue_request(request_state)
+                        if queued_ids:
+                            yield append_trace(
+                                request_state,
+                                "fact_learning_queued",
+                                {"candidate_count": len(queued_ids), "job_ids": queued_ids},
+                            )
+                    except Exception as exc:
+                        yield append_trace(
+                            request_state,
+                            "fact_learning_queue_failed",
+                            {"error": str(exc)[:500]},
+                        )
                 yield append_trace(
                     request_state,
                     "final_answer",

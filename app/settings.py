@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     memory_embedding_top_k: int = Field(default=6, alias="MEMORY_EMBEDDING_TOP_K")
     memory_embedding_score_threshold: float = Field(default=0.25, alias="MEMORY_EMBEDDING_SCORE_THRESHOLD")
     memory_embedding_cache_dir: str | None = Field(default=None, alias="MEMORY_EMBEDDING_CACHE_DIR")
+    fact_memory_learning_enabled: bool = Field(default=True, alias="FACT_MEMORY_LEARNING_ENABLED")
+    fact_memory_learning_dir: str | None = Field(default=None, alias="FACT_MEMORY_LEARNING_DIR")
+    fact_memory_learning_batch_size: int = Field(default=20, alias="FACT_MEMORY_LEARNING_BATCH_SIZE")
+    fact_memory_learning_max_wait_seconds: float = Field(default=600.0, alias="FACT_MEMORY_LEARNING_MAX_WAIT_SECONDS")
+    fact_memory_learning_poll_seconds: float = Field(default=5.0, alias="FACT_MEMORY_LEARNING_POLL_SECONDS")
+    fact_memory_learning_lease_seconds: float = Field(default=180.0, alias="FACT_MEMORY_LEARNING_LEASE_SECONDS")
+    fact_memory_learning_max_attempts: int = Field(default=3, alias="FACT_MEMORY_LEARNING_MAX_ATTEMPTS")
+    fact_memory_learning_llm_chunk_size: int = Field(default=5, alias="FACT_MEMORY_LEARNING_LLM_CHUNK_SIZE")
 
     tspilot_root: str = Field(default_factory=_default_tspilot_root, alias="TSPILOT_ROOT")
     database_config_dir: str | None = Field(default=None, alias="TSPILOT_DATABASE_CONFIG_DIR")
@@ -92,6 +100,12 @@ class Settings(BaseSettings):
         if self.memory_embedding_cache_dir:
             return Path(self.memory_embedding_cache_dir).resolve()
         return (Path(self.tspilot_root) / "cache_data" / "database" / "fact_memory_embeddings").resolve()
+
+    @property
+    def resolved_fact_memory_learning_dir(self) -> Path:
+        if self.fact_memory_learning_dir:
+            return Path(self.fact_memory_learning_dir).resolve()
+        return (Path(self.tspilot_root) / "cache_data" / "database" / "fact_memory_learning").resolve()
 
 
 @lru_cache(maxsize=1)

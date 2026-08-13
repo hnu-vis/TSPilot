@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from app.settings import get_settings
 from core.database import DatabaseFactory, metric_list_preview, schema_preview
-from core.data_fact.memory import memory_cards_view, memory_detail, prompt_fact_memory_view, read_fact_memory
+from core.data_fact.memory import (
+    database_fact_memory_summary,
+    memory_cards_view,
+    memory_detail,
+    read_persisted_fact_memory,
+    system_fact_memory,
+)
 
 router = APIRouter(prefix="/api/v1/resources", tags=["resources"])
 
@@ -188,8 +194,8 @@ async def preview_database_resource(database_id: str, refresh: bool = Query(defa
 
 @router.get("/fact-memory")
 async def get_global_fact_memory() -> dict:
-    """Return prompt-safe fact memory cards."""
-    memory = read_fact_memory(None)
+    """Return code-owned system Fact Memory only."""
+    memory = system_fact_memory()
     view = memory_cards_view(None, max_cards=None)
     return {
         "memory": {
@@ -212,12 +218,12 @@ async def get_global_fact_memory_detail(memory_id: str) -> dict:
 
 @router.get("/databases/{database_id}/fact-memory")
 async def get_database_fact_memory(database_id: str) -> dict:
-    """Return prompt-safe fact memory cards scoped to one database."""
+    """Return only Fact Memory learned for one database."""
     config = await DatabaseFactory.get_database(database_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
-    memory = read_fact_memory(database_id)
-    view = memory_cards_view(database_id, max_cards=None)
+    memory = read_persisted_fact_memory(database_id)
+    view = memory_cards_view(database_id, max_cards=None, include_system=False)
     return {
         "database": _public_database_config(database_id, config),
         "memory": {
@@ -235,7 +241,7 @@ async def get_database_fact_memory_detail(database_id: str, memory_id: str) -> d
     config = await DatabaseFactory.get_database(database_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
-    detail = memory_detail(database_id, memory_id)
+    detail = memory_detail(database_id, memory_id, include_system=False)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"Fact memory '{memory_id}' was not found.")
     return {
@@ -278,10 +284,12 @@ async def get_model_resource() -> dict:
 
 async def _list_public_databases() -> list[dict]:
     await DatabaseFactory.list_databases()
-    return [
-        _public_database_config(db_id, config)
-        for db_id, config in sorted(DatabaseFactory._databases.items())
-    ]
+    databases = []
+    for db_id, config in sorted(DatabaseFactory._databases.items()):
+        database = _public_database_config(db_id, config)
+        database["fact_memory_summary"] = database_fact_memory_summary(db_id)
+        databases.append(database)
+    return databases
 
 
 def _editable_payload_to_config(payload: dict) -> dict:

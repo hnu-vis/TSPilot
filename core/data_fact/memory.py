@@ -37,15 +37,17 @@ def fact_memory_path(database_id: str | None = None) -> Path:
     return fact_memory_dir() / f"{name}.json"
 
 
-def read_fact_memory(database_id: str | None = None) -> FactMemory:
+def read_persisted_fact_memory(database_id: str) -> FactMemory:
+    """Read only learned entries physically stored for one database."""
+
     path = fact_memory_path(database_id)
     payload = _read_json(path)
     if not isinstance(payload, dict):
         payload = {}
     memory = FactMemory.model_validate(
         {
-            "definitions": [*default_fact_definitions(), *(payload.get("definitions") or [])],
-            "recipes": [*default_fact_recipes(), *(payload.get("recipes") or [])],
+            "definitions": payload.get("definitions") or [],
+            "recipes": payload.get("recipes") or [],
             "cards": payload.get("cards") or [],
             "details": payload.get("details") or [],
             "storage_path": str(path),
@@ -55,10 +57,46 @@ def read_fact_memory(database_id: str | None = None) -> FactMemory:
     return _materialize_card_memory(_dedupe_memory(memory))
 
 
+def system_fact_memory() -> FactMemory:
+    """Return code-owned defaults without database-learned entries."""
+
+    return _materialize_card_memory(FactMemory(
+        definitions=[FactDefinition.model_validate(item) for item in default_fact_definitions()],
+        recipes=[FactRecipe.model_validate(item) for item in default_fact_recipes()],
+        storage_path=None,
+        updated_at=None,
+    ))
+
+
+def read_fact_memory(database_id: str | None = None) -> FactMemory:
+    """Return runtime-effective Memory: system defaults plus database learning."""
+
+    system = system_fact_memory()
+    if not database_id:
+        return system
+    scoped = read_persisted_fact_memory(database_id)
+    return _materialize_card_memory(_dedupe_memory(FactMemory(
+        definitions=[*system.definitions, *scoped.definitions],
+        recipes=[*system.recipes, *scoped.recipes],
+        cards=[*system.cards, *scoped.cards],
+        details=[*system.details, *scoped.details],
+        storage_path=scoped.storage_path,
+        updated_at=scoped.updated_at,
+    )))
+
+
 def write_fact_memory(memory: FactMemory, database_id: str | None = None) -> Path:
+    if not database_id:
+        raise ValueError("Fact Memory persistence requires a database scope; system defaults are code-owned.")
     path = fact_memory_path(database_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _dedupe_memory(memory).model_dump(mode="json")
+    persistable = FactMemory(
+        definitions=[item for item in memory.definitions if item.source != "system"],
+        recipes=[item for item in memory.recipes if item.source != "system"],
+        storage_path=str(path),
+        updated_at=memory.updated_at,
+    )
+    payload = _dedupe_memory(persistable).model_dump(mode="json")
     payload["updated_at"] = utc_now_iso()
     payload["storage_path"] = str(path)
     temp_path = path.with_suffix(".json.tmp")
@@ -72,19 +110,29 @@ def prompt_fact_memory_view(database_id: str | None = None) -> dict:
     return memory_cards_view(database_id)
 
 
-def memory_cards_view(database_id: str | None = None, *, max_cards: int | None = 24) -> dict:
-    global_memory = read_fact_memory(None)
-    scoped_memory = read_fact_memory(database_id) if database_id else FactMemory()
-    memory = _materialize_card_memory(_dedupe_memory(
-        FactMemory(
-            definitions=[*global_memory.definitions, *scoped_memory.definitions],
-            recipes=[*global_memory.recipes, *scoped_memory.recipes],
-            cards=[*global_memory.cards, *scoped_memory.cards],
-            details=[*global_memory.details, *scoped_memory.details],
-            storage_path=scoped_memory.storage_path or global_memory.storage_path,
-            updated_at=scoped_memory.updated_at or global_memory.updated_at,
-        )
-    ))
+def database_fact_memory_summary(database_id: str) -> dict:
+    """Return aggregate metadata for learned memory in one database scope."""
+
+    memory = read_persisted_fact_memory(database_id)
+    return {
+        "definition_count": len(memory.definitions),
+        "recipe_count": len(memory.recipes),
+        "card_count": len(memory.definitions) + len(memory.recipes),
+        "updated_at": memory.updated_at,
+    }
+
+
+def memory_cards_view(
+    database_id: str | None = None,
+    *,
+    max_cards: int | None = 24,
+    include_system: bool = True,
+) -> dict:
+    memory = (
+        read_fact_memory(database_id)
+        if include_system or not database_id
+        else read_persisted_fact_memory(database_id)
+    )
     cards = memory.cards if max_cards is None else memory.cards[:max_cards]
     definition_cards = [card for card in memory.cards if card.kind == "fact_definition"]
     recipe_cards = [card for card in memory.cards if card.kind == "fact_recipe"]
@@ -100,24 +148,32 @@ def memory_cards_view(database_id: str | None = None, *, max_cards: int | None =
     }
 
 
-def memory_detail(database_id: str | None, memory_id: str) -> MemoryDetail | None:
+def memory_detail(
+    database_id: str | None,
+    memory_id: str,
+    *,
+    include_system: bool = True,
+) -> MemoryDetail | None:
     normalized_id = _safe_id(memory_id)
-    memory = read_fact_memory(database_id)
+    memory = (
+        read_fact_memory(database_id)
+        if include_system or not database_id
+        else read_persisted_fact_memory(database_id)
+    )
     for detail in memory.details:
         if _safe_id(detail.id) == normalized_id:
             return detail
-    if database_id:
-        global_detail = memory_detail(None, memory_id)
-        if global_detail is not None:
-            return global_detail
     return None
 
 
 def memory_details(database_id: str | None, memory_ids: Iterable[str]) -> list[MemoryDetail]:
+    memory = read_fact_memory(database_id)
+    by_id = {_safe_id(detail.id): detail for detail in memory.details}
     result: list[MemoryDetail] = []
     seen: set[str] = set()
     for memory_id in memory_ids:
-        detail = memory_detail(database_id, memory_id)
+        normalized_id = _safe_id(memory_id)
+        detail = by_id.get(normalized_id)
         if detail is None or detail.id in seen:
             continue
         result.append(detail)
@@ -134,7 +190,9 @@ def observe_fact_usage(
 ) -> FactMemory:
     """Persist recipes only when a requested fact was produced and verified."""
 
-    memory = read_fact_memory(database_id)
+    if not database_id:
+        raise ValueError("Observed Fact usage may only be persisted to a database scope.")
+    memory = read_persisted_fact_memory(database_id)
     now = utc_now_iso()
     definitions = {item.fact_type: item for item in memory.definitions}
     recipes = {item.recipe_id: item for item in memory.recipes}
@@ -387,20 +445,26 @@ def _detail_from_definition(definition: FactDefinition, card: MemoryCard) -> Mem
 
 
 def _card_from_recipe(recipe: FactRecipe) -> MemoryCard:
-    preferred_tool = _safe_id(recipe.preferred_tool)
-    fact_type = _safe_id(recipe.fact_type)
-    fact_key = ""
-    if isinstance(recipe.fact_request_template, dict):
-        fact_key = str(recipe.fact_request_template.get("fact_key") or "")
-    name = _safe_component(fact_key or recipe.name)
     return MemoryCard(
-        id=f"recipe.{preferred_tool}.{fact_type}.{name}",
+        id=recipe_memory_card_id(recipe),
         kind="fact_recipe",
         title=recipe.name,
         description=_recipe_description(recipe),
         tags=[item for item in [recipe.fact_type, recipe.name, recipe.preferred_tool, recipe.scope] if item],
         updated_at=recipe.updated_at,
     )
+
+
+def recipe_memory_card_id(recipe: FactRecipe) -> str:
+    """Return the retrieval-card identity for a persisted Fact recipe."""
+
+    preferred_tool = _safe_id(recipe.preferred_tool)
+    fact_type = _safe_id(recipe.fact_type)
+    fact_key = ""
+    if isinstance(recipe.fact_request_template, dict):
+        fact_key = str(recipe.fact_request_template.get("fact_key") or "")
+    name = _safe_component(fact_key or recipe.name)
+    return f"recipe.{preferred_tool}.{fact_type}.{name}"
 
 
 def _detail_from_recipe(recipe: FactRecipe, card: MemoryCard) -> MemoryDetail:
@@ -432,6 +496,8 @@ def _stable_fact_request_template(request: DataFactRequest) -> dict:
 
 
 def _recipe_description(recipe: FactRecipe) -> str:
+    if recipe.description and recipe.description.strip():
+        return recipe.description.strip()
     name = str(recipe.name or "").replace("_", " ")
     fact_type = str(recipe.fact_type or "").replace("_", " ")
     if name and fact_type and name != fact_type:

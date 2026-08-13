@@ -142,6 +142,39 @@ class FactRecipe(BaseModel):
     scope: str = "global"
     source: str = "system"
     updated_at: str | None = None
+    description: str | None = None
+
+
+FactLearningStatus = Literal["pending", "processing", "completed", "rejected", "failed"]
+
+
+class FactLearningCandidate(BaseModel):
+    """Value-free projection of one verified Fact usage."""
+
+    candidate_id: str
+    request_id: str
+    database_id: str
+    tool_name: Literal["sql_query", "code_interpreter"]
+    fact_request: DataFactRequest
+    fact_shape: dict = Field(default_factory=dict)
+    evidence_types: list[str] = Field(default_factory=list)
+    dependency_fact_keys: list[str] = Field(default_factory=list)
+    calculation_semantics: dict = Field(default_factory=dict)
+    created_at: str
+
+
+class FactLearningJob(BaseModel):
+    job_id: str
+    status: FactLearningStatus = "pending"
+    candidate: FactLearningCandidate
+    attempt_count: int = 0
+    queued_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    lease_expires_at: str | None = None
+    failure_stage: str | None = None
+    error_summary: str | None = None
+    batch_id: str | None = None
 
 
 class MemoryCard(BaseModel):

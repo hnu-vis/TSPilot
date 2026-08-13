@@ -6,9 +6,18 @@ import pytest
 from pydantic import BaseModel, Field
 
 from core.data_fact.embedding_store import FactMemoryEmbeddingStore, memory_card_embedding_text
-from core.data_fact.retriever import EmbeddingFactMemoryRetriever, FactMemoryRetriever, MemoryHit, MemoryRetrievalResult
+from core.data_fact.retriever import (
+    EmbeddingFactMemoryRetriever,
+    FactMemoryRetriever,
+    HybridFactMemoryRetriever,
+    MemoryHit,
+    MemoryRetrievalResult,
+    _contract_anchor_details,
+    _recipe_dependency_closure,
+)
 from runtime.tool_executor import ToolExecutor
-from schemas.data_fact import DataFact, DataFactRequest, MemoryCard
+from schemas.data_fact import DataFact, DataFactRequest, MemoryCard, MemoryDetail
+from schemas.task_contract import TaskContract, TaskContractOutput
 from schemas.state import ConversationStateModel, RequestStateModel
 from tools.base import BaseTool
 from tools.registry import ToolRegistry, ToolSpec
@@ -118,6 +127,50 @@ class FakeEmbeddingProvider:
             else:
                 vectors.append([0.0, 0.0, 1.0])
         return vectors
+
+
+class HybridSelectingLLM:
+    def __init__(self, selected_card_id: str):
+        self.selected_card_id = selected_card_id
+
+    async def ainvoke(self, messages):
+        prompt = str(messages[-1][1])
+        if '"candidates"' in prompt:
+            return Message(json.dumps({
+                "selected": [{"card_id": self.selected_card_id, "reason": "matches required output", "confidence": 0.98}],
+                "needs_planning": False,
+            }))
+        return Message(json.dumps({"fact_requests": []}))
+
+
+class DomainEmbeddingProvider:
+    model = "domain-embedding"
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        return [[1.0, 0.0] if "domain_metric" in text else [0.0, 1.0] for text in texts]
+
+
+class BrokenEmbeddingProvider:
+    model = "broken-embedding"
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding unavailable")
+
+
+class FallbackPlanningLLM:
+    async def ainvoke(self, messages):
+        return Message(json.dumps({
+            "fact_requests": [{
+                "fact_key": "price.maximum",
+                "name": "maximum price",
+                "fact_type": "extreme",
+                "requirements": {"operator": "max"},
+            }]
+        }))
 
 
 def _registry(tool_name: str = "sql_query") -> ToolRegistry:
@@ -319,3 +372,195 @@ def test_embedding_store_invalidates_when_card_text_changes(tmp_path):
     changed = card.model_copy(update={"description": "Generate max value with time."})
     changed_text = memory_card_embedding_text(changed)
     assert store.load(database_id=None, model="fake", card=changed, text=changed_text) is None
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_recalls_tool_recipe_beyond_first_24(monkeypatch, tmp_path):
+    cards: list[MemoryCard] = []
+    details: dict[str, MemoryDetail] = {}
+    for index in range(30):
+        fact_key = "domain_metric" if index == 29 else f"generic_{index}"
+        card = MemoryCard(
+            id=f"recipe.sql_query.extreme.{fact_key}",
+            kind="fact_recipe",
+            title=fact_key,
+            description=f"Generate {fact_key}.",
+            tags=["extreme", fact_key, "sql_query"],
+        )
+        cards.append(card)
+        details[card.id] = MemoryDetail(
+            id=card.id,
+            card=card,
+            preferred_tool="sql_query",
+            fact_request=DataFactRequest(
+                fact_key=fact_key,
+                name=fact_key,
+                fact_type="extreme",
+                requirements={"operator": "max"},
+            ),
+        )
+
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_cards_view",
+        lambda database_id=None, max_cards=24: {
+            "cards": [card.model_dump(mode="json") for card in (cards if max_cards is None else cards[:max_cards])],
+            "updated_at": None,
+        },
+    )
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_details",
+        lambda database_id, ids: [details[item] for item in ids if item in details],
+    )
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_detail",
+        lambda database_id, memory_id: details.get(memory_id),
+    )
+    provider = DomainEmbeddingProvider()
+    retriever = HybridFactMemoryRetriever(
+        llm=HybridSelectingLLM(cards[-1].id),
+        embedding_provider=provider,
+        embedding_store=FactMemoryEmbeddingStore(tmp_path),
+        top_k=5,
+        score_threshold=0.2,
+    )
+    state = _request_state("return domain_metric maximum")
+    state.task_contract = TaskContract(
+        goal="return domain metric",
+        required_outputs=[TaskContractOutput(id="domain_metric", description="domain metric maximum")],
+    )
+
+    result = await retriever.retrieve(
+        request_state=state,
+        tool_name="sql_query",
+        action_input={"message": state.message},
+    )
+
+    assert result.diagnostics["all_card_count"] == 30
+    assert result.diagnostics["eligible_recipe_count"] == 30
+    assert result.hits[0].card_id == cards[-1].id
+    assert result.fact_requests[0].fact_key == "domain_metric"
+    assert result.fact_request_sources == {"domain_metric": [cards[-1].id]}
+    assert len(provider.calls[0]) == 30
+    assert "task_contract" in provider.calls[1][0]
+    assert "domain_metric" in provider.calls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_uses_llm_planner_when_embedding_fails(monkeypatch, tmp_path):
+    card = MemoryCard(
+        id="recipe.sql_query.extreme.max_value",
+        kind="fact_recipe",
+        title="max_value",
+        description="Generate max value.",
+        tags=["extreme", "sql_query"],
+    )
+    detail = MemoryDetail(
+        id=card.id,
+        card=card,
+        preferred_tool="sql_query",
+        fact_request=DataFactRequest(
+            fact_key="max_value",
+            name="max_value",
+            fact_type="extreme",
+            requirements={"operator": "max"},
+        ),
+    )
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_cards_view",
+        lambda database_id=None, max_cards=24: {"cards": [card.model_dump(mode="json")], "updated_at": None},
+    )
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_details",
+        lambda database_id, ids: [detail] if card.id in ids else [],
+    )
+    monkeypatch.setattr(
+        "core.data_fact.retriever.memory_detail",
+        lambda database_id, memory_id: detail if memory_id == card.id else None,
+    )
+    retriever = HybridFactMemoryRetriever(
+        llm=FallbackPlanningLLM(),
+        embedding_provider=BrokenEmbeddingProvider(),
+        embedding_store=FactMemoryEmbeddingStore(tmp_path),
+    )
+
+    result = await retriever.retrieve(
+        request_state=_request_state("maximum price"),
+        tool_name="sql_query",
+        action_input={"message": "maximum price"},
+    )
+
+    assert result.diagnostics["failure_stage"] == "embedding_recall"
+    assert result.diagnostics["planner_used"] is True
+    assert result.fact_requests[0].fact_key == "price.maximum"
+    assert result.fact_request_sources == {}
+
+
+def test_task_contract_anchors_recipe_and_expands_unverified_dependency():
+    parent_card = MemoryCard(
+        id="recipe.code_interpreter.time_series.daily_return_series",
+        kind="fact_recipe",
+        title="daily_return_series",
+        description="Generate daily returns.",
+    )
+    child_card = MemoryCard(
+        id="recipe.code_interpreter.metric.max_7d_vol_window",
+        kind="fact_recipe",
+        title="max_7d_vol_window",
+        description="Generate the maximum rolling volatility window.",
+    )
+    parent = MemoryDetail(
+        id=parent_card.id,
+        card=parent_card,
+        preferred_tool="code_interpreter",
+        fact_request=DataFactRequest(
+            fact_key="daily_return_series",
+            name="daily_return_series",
+            fact_type="time_series",
+        ),
+    )
+    child = MemoryDetail(
+        id=child_card.id,
+        card=child_card,
+        preferred_tool="code_interpreter",
+        fact_request=DataFactRequest(
+            fact_key="max_7d_vol_window",
+            name="max_7d_vol_window",
+            fact_type="metric",
+            derived_from=["daily_return_series"],
+        ),
+    )
+    state = _request_state("find maximum rolling volatility")
+    state.task_contract = TaskContract(
+        goal="rolling volatility",
+        required_outputs=[TaskContractOutput(
+            id="max_7d_vol_window",
+            description="maximum seven day volatility window",
+        )],
+    )
+
+    anchors = _contract_anchor_details(state, [parent, child])
+    expanded = _recipe_dependency_closure(anchors, [parent, child], state)
+
+    assert [detail.id for detail in anchors] == [child.id]
+    assert {detail.id for detail in expanded} == {parent.id, child.id}
+
+
+def test_tool_executor_keeps_authoritative_first_contract_for_same_fact_key():
+    executor = ToolExecutor(_registry())
+    requests = executor._dedupe_fact_requests([
+        {
+            "fact_key": "latest.value",
+            "name": "explicit latest value",
+            "fact_type": "point_value",
+            "requirements": {"time_position": "end"},
+        },
+        {
+            "fact_key": "latest.value",
+            "name": "memory last value",
+            "fact_type": "point_value",
+            "requirements": {"time_position": "end", "source": "memory"},
+        },
+    ])
+
+    assert len(requests) == 1
+    assert requests[0]["name"] == "explicit latest value"

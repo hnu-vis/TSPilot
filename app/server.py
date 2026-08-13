@@ -1,12 +1,39 @@
 """FastAPI application factory."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.settings import get_settings
 from app.routes.chat import router as chat_router
 from app.routes.resources import router as resources_router
+from app.deps import get_fact_memory_learning_worker
+from core.data_fact.learning import reset_legacy_fact_memory_once, separate_fact_memory_scopes_once
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings = get_settings()
+    worker = None
+    if settings.fact_memory_learning_enabled:
+        reset_legacy_fact_memory_once(
+            root=settings.resolved_fact_memory_learning_dir,
+            embedding_root=settings.resolved_memory_embedding_cache_dir,
+        )
+        separate_fact_memory_scopes_once(
+            root=settings.resolved_fact_memory_learning_dir,
+            embedding_root=settings.resolved_memory_embedding_cache_dir,
+        )
+        if settings.openai_api_key:
+            worker = get_fact_memory_learning_worker()
+            worker.start()
+    try:
+        yield
+    finally:
+        if worker is not None:
+            await worker.stop()
 
 
 def create_app() -> FastAPI:
@@ -16,6 +43,7 @@ def create_app() -> FastAPI:
         version=settings.app_version,
         docs_url=settings.docs_url,
         redoc_url=settings.redoc_url,
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,

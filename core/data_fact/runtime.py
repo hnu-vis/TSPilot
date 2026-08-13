@@ -13,7 +13,6 @@ from schemas.data_fact import (
     FactEvidenceRef,
     normalize_fact_key,
 )
-from core.data_fact.memory import observe_fact_usage
 
 
 def register_data_facts_from_payload(request_state, tool_name: str, full_payload: dict) -> FactCoverage:
@@ -55,13 +54,6 @@ def register_data_facts_from_payload(request_state, tool_name: str, full_payload
     event_coverage = _coverage_for(requests, produced, rejected)
     coverage = _merge_fact_state(request_state, tool_name, requests, produced, rejected, event_coverage)
     _attach_facts_to_artifact(request_state, tool_name, full_payload, produced, rejected, event_coverage)
-    if tool_name in {"sql_query", "code_interpreter"}:
-        observe_fact_usage(
-            database_id=_database_id_for_memory(request_state),
-            tool_name=tool_name,
-            requests=requests,
-            facts=produced,
-        )
     return coverage
 
 
@@ -108,15 +100,6 @@ def _latest_action_input(request_state, tool_name: str) -> dict:
         if call.tool_name == tool_name:
             return dict(call.tool_input or {})
     return {}
-
-
-def _database_id_for_memory(request_state) -> str | None:
-    selected = getattr(request_state, "selected_database", None)
-    if selected:
-        return str(selected)
-    context = getattr(request_state, "database_context", None)
-    database_id = getattr(context, "database_id", None)
-    return str(database_id) if database_id else None
 
 
 def _fact_requests(action_input: dict) -> list[DataFactRequest]:

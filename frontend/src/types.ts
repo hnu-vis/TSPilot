@@ -240,6 +240,12 @@ export type DatabaseResource = {
   config_source?: string | null;
   username?: string | null;
   ssl_enabled?: boolean;
+  fact_memory_summary?: {
+    definition_count: number;
+    recipe_count: number;
+    card_count: number;
+    updated_at?: string | null;
+  };
 };
 
 export type DatabaseConfigInput = {

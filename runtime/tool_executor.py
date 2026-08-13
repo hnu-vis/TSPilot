@@ -335,12 +335,19 @@ class ToolExecutor:
         merged = dict(normalized_input)
         explicit = self._normalize_fact_requests(merged.get("fact_requests"), merged)
         selected_card_ids = [hit.card_id for hit in retrieval.hits]
-        memory_requests = [self._memory_fact_request_payload(item, selected_card_ids) for item in retrieval.fact_requests]
-        merged["fact_requests"] = self._dedupe_fact_requests([*explicit, *memory_requests])
+        retrieved_requests = [
+            self._retrieved_fact_request_payload(
+                item,
+                retrieval.fact_request_sources.get(item.fact_key, [])
+                or (selected_card_ids if len(selected_card_ids) == len(retrieval.fact_requests) == 1 else []),
+            )
+            for item in retrieval.fact_requests
+        ]
+        merged["fact_requests"] = self._dedupe_fact_requests([*explicit, *retrieved_requests])
         diagnostics = dict(retrieval.diagnostics or {})
         diagnostics["source"] = "tool_scoped_memory_retrieval"
         diagnostics["selected_card_ids"] = selected_card_ids
-        diagnostics["fact_request_count"] = len(memory_requests)
+        diagnostics["fact_request_count"] = len(retrieved_requests)
         constraints = merged.setdefault("constraints", {})
         if isinstance(constraints, dict) and diagnostics:
             constraints["memory_diagnostics"] = diagnostics
@@ -350,19 +357,22 @@ class ToolExecutor:
             tool_calls.append({"tool_name": action_name, **diagnostics})
         return merged
 
-    def _memory_fact_request_payload(self, request, selected_card_ids: list) -> dict:
+    def _retrieved_fact_request_payload(self, request, source_card_ids: list[str]) -> dict:
         payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
+        if not source_card_ids:
+            return payload
         requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
         payload["requirements"] = {
             **requirements,
             "source": "memory",
-            "memory_card_ids": selected_card_ids,
+            "memory_card_ids": list(dict.fromkeys(source_card_ids)),
         }
         return payload
 
     def _dedupe_fact_requests(self, requests: list) -> list:
         result: list = []
         seen: set[str] = set()
+        seen_fact_keys: set[str] = set()
         for item in requests:
             if hasattr(item, "model_dump"):
                 payload = item.model_dump(mode="json", exclude_none=True)
@@ -372,13 +382,27 @@ class ToolExecutor:
                 continue
             if not payload.get("name") or not payload.get("fact_type"):
                 continue
+            fact_key = str(payload.get("fact_key") or "").strip()
+            if fact_key and fact_key in seen_fact_keys:
+                continue
+            requirements = dict(payload.get("requirements") or {})
+            for metadata_key in ("source", "memory_card_ids", "retrieval_reason", "retrieval_confidence"):
+                requirements.pop(metadata_key, None)
             key = json.dumps(
                 {
                     "fact_key": payload.get("fact_key"),
                     "name": payload.get("name"),
                     "fact_type": payload.get("fact_type"),
+                    "subject": payload.get("subject"),
+                    "time_range": payload.get("time_range"),
+                    "dimensions": payload.get("dimensions") or {},
                     "derived_from": payload.get("derived_from") or [],
-                    "requirements": payload.get("requirements") or {},
+                    "requirements": requirements,
+                    "result_shape": payload.get("result_shape"),
+                    "expected_item_count": payload.get("expected_item_count"),
+                    "semantic_class": payload.get("semantic_class"),
+                    "derivation": payload.get("derivation"),
+                    "selection": payload.get("selection") or {},
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -388,6 +412,8 @@ class ToolExecutor:
                 continue
             result.append(payload)
             seen.add(key)
+            if fact_key:
+                seen_fact_keys.add(fact_key)
         return result
 
     def _remove_evidence_refs_from_fact_dependencies(
