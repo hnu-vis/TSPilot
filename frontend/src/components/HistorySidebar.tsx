@@ -1,4 +1,4 @@
-import { BookOpen, BrainCircuit, Database, Edit3, MessageSquarePlus, Search, Trash2 } from 'lucide-react';
+import { BookOpen, BrainCircuit, Database, Edit3, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Search, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import type { Conversation } from '../types';
 
@@ -9,7 +9,9 @@ type Props = {
   activeId: string;
   activeView: WorkspaceView;
   query: string;
+  collapsed: boolean;
   onQueryChange: (value: string) => void;
+  onToggleCollapsed: () => void;
   onNew: () => void;
   onViewChange: (view: WorkspaceView) => void;
   onSelect: (id: string) => void;
@@ -22,7 +24,9 @@ export function HistorySidebar({
   activeId,
   activeView,
   query,
+  collapsed,
   onQueryChange,
+  onToggleCollapsed,
   onNew,
   onViewChange,
   onSelect,
@@ -45,15 +49,16 @@ export function HistorySidebar({
   };
 
   return (
-    <aside className="history-sidebar" aria-label="Chat history">
+    <aside className={`history-sidebar ${collapsed ? 'collapsed' : ''}`} aria-label="Chat history">
       <div className="sidebar-brand">
-        <div>
-          <div className="brand-mark">TS</div>
-        </div>
-        <div>
+        <div className="brand-mark">TS</div>
+        <div className="sidebar-brand-copy">
           <h1>TSPilot</h1>
           <p>Time-series chat</p>
         </div>
+        <button className="history-collapse-button" type="button" aria-label={collapsed ? 'Expand history sidebar' : 'Collapse history sidebar'} onClick={onToggleCollapsed}>
+          {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        </button>
       </div>
       <nav className="workspace-nav" aria-label="Workspace">
         {workspaceNavItems.map((item) => {
@@ -67,6 +72,7 @@ export function HistorySidebar({
               className={`workspace-nav-item ${isActive ? 'active' : ''}`}
               disabled={isDisabled}
               title={isDisabled ? item.hint : item.label}
+              aria-label={item.label}
               onClick={() => {
                 if (item.view) onViewChange(item.view);
               }}

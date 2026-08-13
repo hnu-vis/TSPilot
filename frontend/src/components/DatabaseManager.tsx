@@ -1,7 +1,6 @@
 import {
   AlertCircle,
-  ChevronLeft,
-  ChevronRight,
+  ArrowLeft,
   CheckCircle2,
   Columns3,
   Database,
@@ -16,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
+import { DATABASE_CATALOG, DATABASE_TYPES, databaseTypeLabel } from '../databaseCatalog';
 import {
   createDatabase,
   deleteDatabase,
@@ -47,7 +47,10 @@ type PreviewState = {
 
 type FormMode = 'create' | 'edit' | null;
 
-const DATABASE_TYPES = ['influxdb', 'timescaledb', 'prometheus', 'iotdb', 'questdb', 'clickhouse', 'openmldb', 'victoriametrics', 'm3db', 'greptimedb', 'tdengine', 'cnosdb', 'arcadedb', 'cratedb', 'druid', 'influxdb3', 'griddb', 'machbase', 'nsdb', 'axibase', 'opengemini', 'db2', 'timestream', 'riak_ts', 'dolphindb', 'kdb', 'raimadb', 'extremedb', 'ittiadb', 'irondb', 'bangdb', 'arc'];
+type TestNotice = {
+  kind: 'success' | 'error';
+  message: string;
+};
 
 const emptyForm: DatabaseConfigInput = {
   name: '',
@@ -68,13 +71,13 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   const activeDatabase = databases.find((database) => database.id === activeDatabaseId) || null;
   const [reloadToken, setReloadToken] = useState(0);
   const [formMode, setFormMode] = useState<FormMode>(null);
+  const [createStep, setCreateStep] = useState<'catalog' | 'form'>('catalog');
   const [formValue, setFormValue] = useState<DatabaseConfigInput>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [sourcesCollapsed, setSourcesCollapsed] = useState(false);
   const [refreshProfile, setRefreshProfile] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [testMessage, setTestMessage] = useState<string | null>(null);
+  const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
   const [previewState, setPreviewState] = useState<PreviewState>({
     databaseId: null,
     loading: false,
@@ -129,7 +132,6 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   const fields = preview?.fields || [];
   const labelsOrTags = preview?.labels_or_tags || [];
   const metadataEntries = objectEntries(preview?.metadata);
-  const profileRows = useMemo(() => collectDataProfileRows(preview), [preview]);
   const [selectedObjectKey, setSelectedObjectKey] = useState<string | null>(null);
   const activeObject = useMemo(() => {
     if (schemaObjects.length === 0) return null;
@@ -138,9 +140,10 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
   const openCreateForm = () => {
     setFormMode('create');
+    setCreateStep('catalog');
     setFormValue(emptyForm);
     setActionError(null);
-    setTestMessage(null);
+    setTestNotice(null);
   };
 
   const openEditForm = () => {
@@ -148,11 +151,18 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
     setFormMode('edit');
     setFormValue(databaseToForm(activeDatabase));
     setActionError(null);
-    setTestMessage(null);
+    setTestNotice(null);
   };
 
   const closeForm = () => {
     setFormMode(null);
+    setCreateStep('catalog');
+    setActionError(null);
+  };
+
+  const selectDatabaseType = (type: string) => {
+    setFormValue({ ...emptyForm, type });
+    setCreateStep('form');
     setActionError(null);
   };
 
@@ -199,19 +209,28 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
     if (!activeDatabase) return;
     setTesting(true);
     setActionError(null);
-    setTestMessage(null);
+    setTestNotice(null);
     try {
       const result = await testDatabaseConnection(activeDatabase.id);
       await onDatabasesChange();
-      setTestMessage(result.success
-        ? `Connection succeeded${result.latency_ms ? ` in ${result.latency_ms}ms` : ''}.`
-        : result.error || 'Connection failed.');
+      setTestNotice(result.success
+        ? { kind: 'success', message: `Connection succeeded${result.latency_ms ? ` in ${result.latency_ms}ms` : ''}.` }
+        : { kind: 'error', message: result.error || 'Connection failed.' });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Unable to test database connection.');
+      setTestNotice({
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'Unable to test database connection.',
+      });
     } finally {
       setTesting(false);
     }
   };
+
+  useEffect(() => {
+    if (!testNotice) return;
+    const timeout = window.setTimeout(() => setTestNotice(null), 5000);
+    return () => window.clearTimeout(timeout);
+  }, [testNotice]);
 
   useEffect(() => {
     if (schemaObjects.length === 0) {
@@ -224,87 +243,71 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   }, [schemaObjects, selectedObjectKey]);
 
   return (
-    <section className={`database-manager ${sourcesCollapsed ? 'sources-collapsed' : ''}`} aria-label="Database management">
+    <section className="database-manager" aria-label="Database management">
       <div className="database-sidebar-panel">
         <div className="database-panel-heading">
-          {!sourcesCollapsed && (
-            <>
-              <span><Database size={16} /> Sources</span>
-              <div className="database-panel-heading-actions">
-                <strong>{databases.length}</strong>
-              </div>
-            </>
-          )}
-          <button
-            type="button"
-            className="database-source-add"
-            aria-label={sourcesCollapsed ? 'Expand sources' : 'Collapse sources'}
-            onClick={() => setSourcesCollapsed((collapsed) => !collapsed)}
-          >
-            {sourcesCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+          <span><Database size={16} /> Sources</span>
+          <strong>{databases.length}</strong>
+        </div>
+        <div className="database-source-actions" aria-label="Source actions">
+          <button className="database-add-button" type="button" onClick={openCreateForm}>
+            <Plus size={14} />
+            <span>Add connection</span>
           </button>
         </div>
-        {!sourcesCollapsed && (
-          <>
-            <div className="database-source-actions" aria-label="Source actions">
-              <button className="database-action-button primary" type="button" title="Add connection" aria-label="Add connection" onClick={openCreateForm}>
-                <Plus size={14} />
-              </button>
-              <button className="database-action-button" type="button" title="Edit connection" aria-label="Edit connection" disabled={!activeDatabase} onClick={openEditForm}>
-                <Pencil size={14} />
-              </button>
-              <button className="database-action-button" type="button" title="Test connection" aria-label="Test connection" disabled={!activeDatabase || testing} onClick={handleTestConnection}>
-                <PlugZap size={14} />
-              </button>
-              <button className="database-action-button danger" type="button" title="Delete connection" aria-label="Delete connection" disabled={!activeDatabase || saving} onClick={handleDeleteConfig}>
-                <Trash2 size={14} />
-              </button>
+        <div className="database-source-list">
+          {databases.map((database) => (
+            <button
+              key={database.id}
+              type="button"
+              className={`database-source-item ${database.id === activeDatabaseId ? 'active' : ''}`}
+              onClick={() => onSelectDatabase(database.id)}
+            >
+              <span className={`database-status-dot ${statusClass(database.status)}`} />
+              <span className="database-source-copy">
+                <strong>{database.display_name || database.name}</strong>
+                <small>
+                  {database.type}{database.database ? ` / ${database.database}` : ''} · {statusLabel(database.status)}
+                </small>
+              </span>
+            </button>
+          ))}
+          {databases.length === 0 && (
+            <div className="database-empty-state">
+              <AlertCircle size={18} />
+              <span>No configured databases.</span>
             </div>
-            <div className="database-source-list">
-              {databases.map((database) => (
-                <button
-                  key={database.id}
-                  type="button"
-                  className={`database-source-item ${database.id === activeDatabaseId ? 'active' : ''}`}
-                  onClick={() => onSelectDatabase(database.id)}
-                >
-                  <span className={`database-status-dot ${statusClass(database.status)}`} />
-                  <span className="database-source-copy">
-                    <strong>{database.display_name || database.name}</strong>
-                    <small>
-                      {database.type}{database.database ? ` / ${database.database}` : ''} · {statusLabel(database.status)}
-                    </small>
-                  </span>
-                </button>
-              ))}
-              {databases.length === 0 && (
-                <div className="database-empty-state">
-                  <AlertCircle size={18} />
-                  <span>No configured databases.</span>
-                </div>
-              )}
-            </div>
-          </>
-        )}
+          )}
+        </div>
       </div>
 
       <div className="database-detail-panel">
         {activeDatabase ? (
           <>
             <div className="database-detail-header">
-              <div>
-                <span className="database-kicker">{activeDatabase.type}</span>
-                <h2>{activeDatabase.display_name || activeDatabase.name}</h2>
+              <div className="database-detail-identity">
+                <div className="database-title-line">
+                  <h2>{activeDatabase.display_name || activeDatabase.name}</h2>
+                  <span className="database-kicker">{activeDatabase.type}</span>
+                </div>
                 <div className="database-header-meta" aria-label="Database summary">
-                  <span><Server size={14} /> {formatEndpoint(activeDatabase)}</span>
+                  <span><Server size={13} /> {formatEndpoint(activeDatabase)}</span>
                   <span className={`database-status-pill ${statusClass(activeDatabase.status)}`}>
-                    <CheckCircle2 size={14} /> {statusLabel(activeDatabase.status)}
+                    <CheckCircle2 size={13} /> {statusLabel(activeDatabase.status)}
                   </span>
-                  <span><Table2 size={14} /> {schemaObjects.length} objects</span>
-                  <span><Columns3 size={14} /> {fields.length || totalColumns(schemaObjects)} fields</span>
+                  <span><Table2 size={13} /> {schemaObjects.length} objects</span>
+                  <span><Columns3 size={13} /> {fields.length || totalColumns(schemaObjects)} fields</span>
                 </div>
               </div>
               <div className="database-header-actions">
+                <button className="icon-text-button" type="button" onClick={openEditForm}>
+                  <Pencil size={14} />
+                  <span>Edit</span>
+                </button>
+                <button className="icon-text-button" type="button" disabled={testing} onClick={handleTestConnection}>
+                  <PlugZap size={14} />
+                  <span>{testing ? 'Testing' : 'Test'}</span>
+                </button>
                 <button
                   className="icon-text-button"
                   type="button"
@@ -317,33 +320,33 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                   <RefreshCw size={14} />
                   <span>{previewState.loading ? 'Loading' : 'Refresh'}</span>
                 </button>
+                <button className="icon-text-button danger" type="button" disabled={saving} onClick={handleDeleteConfig}>
+                  <Trash2 size={15} />
+                  <span>Delete</span>
+                </button>
               </div>
             </div>
 
-            {actionError && !formMode && (
-              <div className="database-inline-error">
-                <AlertCircle size={16} />
-                <span>{actionError}</span>
-              </div>
-            )}
-            {testMessage && (
-              <div className={`database-inline-status ${testMessage.includes('succeeded') ? 'complete' : 'error'}`}>
-                <PlugZap size={16} />
-                <span>{testMessage}</span>
-              </div>
-            )}
-            {previewState.error && (
-              <div className="database-inline-error">
-                <AlertCircle size={16} />
-                <span>{previewState.error}</span>
-              </div>
-            )}
-            {previewState.data?.preview_kind === 'error' && previewState.data.error && (
-              <div className="database-inline-error">
-                <AlertCircle size={16} />
-                <span>{previewState.data.error}</span>
-              </div>
-            )}
+            <div className="database-notice-stack" aria-live="polite">
+              {actionError && !formMode && (
+                <div className="database-inline-error">
+                  <AlertCircle size={16} />
+                  <span>{actionError}</span>
+                </div>
+              )}
+              {previewState.error && (
+                <div className="database-inline-error">
+                  <AlertCircle size={16} />
+                  <span>{previewState.error}</span>
+                </div>
+              )}
+              {previewState.data?.preview_kind === 'error' && previewState.data.error && (
+                <div className="database-inline-error">
+                  <AlertCircle size={16} />
+                  <span>{previewState.data.error}</span>
+                </div>
+              )}
+            </div>
 
             <div className="database-content-stack">
               <section className="database-section database-schema-browser">
@@ -363,8 +366,6 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                     fields={fields}
                     labelsOrTags={labelsOrTags}
                     metadataEntries={metadataEntries}
-                    profileRows={profileRows}
-                    profileCache={previewState.data?.profile_cache || null}
                   />
                 ) : (
                   <EmptyPreview label="Select a schema object to inspect details." />
@@ -387,25 +388,72 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
       {formMode && (
         <div className="database-modal-backdrop" role="presentation">
-          <div className="database-modal" role="dialog" aria-modal="true" aria-label={formMode === 'create' ? 'Add database connection' : 'Edit database connection'}>
+          <div className={`database-modal ${formMode === 'create' && createStep === 'catalog' ? 'database-catalog-modal' : ''}`} role="dialog" aria-modal="true" aria-label={formMode === 'create' ? 'Add database connection' : 'Edit database connection'}>
             {actionError && (
               <div className="database-inline-error">
                 <AlertCircle size={16} />
                 <span>{actionError}</span>
               </div>
             )}
-            <DatabaseConfigForm
-              mode={formMode}
-              value={formValue}
-              saving={saving}
-              onChange={setFormValue}
-              onCancel={closeForm}
-              onSubmit={handleSubmitConfig}
-            />
+            {formMode === 'create' && createStep === 'catalog' ? (
+              <DatabaseTypeCatalog onSelect={selectDatabaseType} onCancel={closeForm} />
+            ) : (
+              <DatabaseConfigForm
+                mode={formMode}
+                value={formValue}
+                saving={saving}
+                onChange={setFormValue}
+                onBack={formMode === 'create' ? () => setCreateStep('catalog') : undefined}
+                onCancel={closeForm}
+                onSubmit={handleSubmitConfig}
+              />
+            )}
           </div>
         </div>
       )}
+
+      {testNotice && (
+        <div className={`database-toast ${testNotice.kind}`} role={testNotice.kind === 'error' ? 'alert' : 'status'} aria-live="polite">
+          {testNotice.kind === 'success' ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
+          <div>
+            <strong>{testNotice.kind === 'success' ? 'Connection successful' : 'Connection failed'}</strong>
+            <span>{testNotice.message}</span>
+          </div>
+          <button type="button" aria-label="Dismiss notification" onClick={() => setTestNotice(null)}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
     </section>
+  );
+}
+
+function DatabaseTypeCatalog({ onSelect, onCancel }: { onSelect: (type: string) => void; onCancel: () => void }) {
+  return (
+    <div className="database-type-catalog">
+      <div className="database-catalog-header">
+        <div>
+          <strong>Add a database connection</strong>
+          <span>Choose a time-series database to configure.</span>
+        </div>
+        <button type="button" className="database-form-icon-button" aria-label="Close database selector" onClick={onCancel}>
+          <X size={15} />
+        </button>
+      </div>
+      <div className="database-type-grid" aria-label="Supported time-series databases">
+        {DATABASE_CATALOG.map((database) => (
+          <button key={database.type} type="button" className="database-type-card" onClick={() => onSelect(database.type)}>
+            <span className="database-type-logo" aria-hidden="true">
+              <img src={database.logoUrl} alt="" width="40" height="40" loading="lazy" decoding="async" />
+            </span>
+            <span className="database-type-copy">
+              <strong>{database.label}</strong>
+              <small>{database.type}</small>
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -423,6 +471,7 @@ function DatabaseConfigForm({
   value,
   saving,
   onChange,
+  onBack,
   onCancel,
   onSubmit,
 }: {
@@ -430,6 +479,7 @@ function DatabaseConfigForm({
   value: DatabaseConfigInput;
   saving: boolean;
   onChange: (value: DatabaseConfigInput) => void;
+  onBack?: () => void;
   onCancel: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -440,9 +490,16 @@ function DatabaseConfigForm({
   return (
     <form className="database-config-form" onSubmit={onSubmit}>
       <div className="database-config-form-header">
-        <div>
-          <strong>{mode === 'create' ? 'Add connection' : 'Edit connection'}</strong>
-          <span>{mode === 'create' ? 'Create a database source config.' : 'Update the selected database source config.'}</span>
+        <div className="database-config-title">
+          {onBack && (
+            <button type="button" className="database-form-icon-button" aria-label="Back to database types" onClick={onBack}>
+              <ArrowLeft size={15} />
+            </button>
+          )}
+          <div>
+            <strong>{mode === 'create' ? 'Add connection' : 'Edit connection'}</strong>
+            <span>{mode === 'create' ? `Configure ${databaseTypeLabel(value.type)}.` : 'Update the selected database source config.'}</span>
+          </div>
         </div>
         <button type="button" className="database-form-icon-button" aria-label="Close form" onClick={onCancel}>
           <X size={15} />
@@ -469,9 +526,13 @@ function DatabaseConfigForm({
         </label>
         <label>
           <span>Type</span>
-          <select value={value.type} onChange={(event) => updateField('type', event.target.value)}>
-            {DATABASE_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
-          </select>
+          {mode === 'create' ? (
+            <span className="database-selected-type">{databaseTypeLabel(value.type)}</span>
+          ) : (
+            <select value={value.type} onChange={(event) => updateField('type', event.target.value)}>
+              {DATABASE_TYPES.map((type) => <option key={type} value={type}>{databaseTypeLabel(type)}</option>)}
+            </select>
+          )}
         </label>
         <label>
           <span>Host</span>
@@ -591,20 +652,19 @@ function ObjectDetail({
   fields,
   labelsOrTags,
   metadataEntries,
-  profileRows,
-  profileCache,
 }: {
   item: DatabasePreviewObject;
   fields: Array<Record<string, unknown>>;
   labelsOrTags: Array<Record<string, unknown>>;
   metadataEntries: Array<[string, unknown]>;
-  profileRows: Array<Record<string, unknown>>;
-  profileCache: Record<string, unknown> | null;
 }) {
   const columns = item.columns || [];
   const fieldValues = item.field_values || [];
   const sampleRows = item.sample_rows || [];
   const relatedValues = [...fields, ...labelsOrTags].filter((value) => isRelatedSchemaValue(value, item.name));
+  const contextValues = mergeContextRecords(
+    relatedValues.length ? relatedValues : metadataEntriesToRecords(metadataEntries),
+  );
 
   return (
     <>
@@ -613,60 +673,53 @@ function ObjectDetail({
           <span>{[item.schema, item.type].filter(Boolean).join(' / ') || 'schema object'}</span>
           <h3>{item.name}</h3>
         </div>
-        {typeof item.row_count === 'number' && <strong>{item.row_count.toLocaleString()} rows</strong>}
+        {typeof item.row_count === 'number' && (
+          <div className="object-detail-stats"><strong>{item.row_count.toLocaleString()} rows</strong></div>
+        )}
       </div>
 
       <div className="object-detail-grid">
-        <div className="object-detail-block">
+        <section className="object-detail-block columns-panel">
           <SectionTitle icon={Columns3} title="Columns" count={columns.length || fieldValues.length} />
           <ColumnList columns={columns} fieldValues={fieldValues} />
-        </div>
+        </section>
 
-        <div className="object-detail-block">
+        <section className="object-detail-block samples-panel">
           <SectionTitle icon={Rows3} title="Sample Rows" count={sampleRows.length} />
           <SampleRows rows={sampleRows} />
-        </div>
+        </section>
 
-        <div className="object-detail-block compact">
-          <SectionTitle icon={RefreshCw} title="Data Profile" count={profileRows.length} />
-          <DataProfile rows={profileRows.filter((row) => String(row.measurement || row.source || '') === item.name)} cache={profileCache} />
-        </div>
-
-        {(relatedValues.length > 0 || metadataEntries.length > 0) && (
-          <div className="object-detail-block compact">
-            <SectionTitle icon={Database} title="Context" count={relatedValues.length + metadataEntries.length} />
-            <KeyValueList values={relatedValues.length ? relatedValues : metadataEntriesToRecords(metadataEntries)} />
-          </div>
-        )}
+        <section className="object-detail-block insights-panel">
+          <SectionTitle icon={Database} title="Field Metadata" count={contextValues.length} />
+          <FieldMetadataList values={contextValues} />
+        </section>
       </div>
     </>
   );
 }
 
-function DataProfile({ rows, cache }: { rows: Array<Record<string, unknown>>; cache: Record<string, unknown> | null }) {
-  const cacheText = cache
-    ? `${formatValue(cache.source)} · ${formatValue(cache.generated_at)}`
-    : 'n/a';
-  if (rows.length === 0) {
-    return (
-      <div className="database-profile-block">
-        <div className="database-profile-cache">Cache: {cacheText}</div>
-        <EmptyPreview label="No data profile returned." />
-      </div>
-    );
-  }
+function FieldMetadataList({ values }: { values: Array<Record<string, unknown>> }) {
   return (
-    <div className="database-profile-block">
-      <div className="database-profile-cache">Cache: {cacheText}</div>
-      <div className="database-profile-list">
-        {rows.slice(0, 12).map((row, index) => (
-          <div key={index} className="database-profile-row">
-            <strong>{profileSeriesLabel(row)}</strong>
-            <span>{formatValue(row.start)} → {formatValue(row.end)}</span>
-            <small>{formatValue(row.point_count)} points</small>
+    <div className="database-field-metadata-list">
+      {values.length ? values.map((value, index) => {
+        const title = String(value.name || value.column || value.field || value.tag || value.label || `Item ${index + 1}`);
+        const dataType = stringFromUnknown(value.data_type || value.type);
+        const detail = objectEntries(value)
+          .filter(([key]) => !['name', 'column', 'field', 'tag', 'label', 'data_type', 'type'].includes(key))
+          .map(([key, entryValue]) => `${key}: ${formatValue(entryValue)}`)
+          .join(' / ') || 'available';
+        return (
+          <div key={`${title}-${index}`} className="database-field-metadata-row">
+            <span className="database-tree-field-heading">
+              <strong title={title}>{title}</strong>
+              {dataType && <em title={dataType}>{dataType}</em>}
+            </span>
+            <span title={detail}>{detail}</span>
           </div>
-        ))}
-      </div>
+        );
+      }) : (
+        <div className="database-tree-empty">No field metadata returned.</div>
+      )}
     </div>
   );
 }
@@ -683,13 +736,13 @@ function ColumnList({
     <div className="object-column-list">
       {columns.map((column) => (
         <div key={column.name} className="object-column-row">
-          <strong>{column.name}</strong>
-          <span>{column.data_type || 'unknown'}</span>
+          <strong title={column.name}>{column.name}</strong>
+          <span title={column.data_type || 'unknown'}>{column.data_type || 'unknown'}</span>
         </div>
       ))}
       {columns.length === 0 && fieldValues.map((field) => (
         <div key={field} className="object-column-row">
-          <strong>{field}</strong>
+          <strong title={field}>{field}</strong>
           <span>field</span>
         </div>
       ))}
@@ -697,31 +750,9 @@ function ColumnList({
   );
 }
 
-function KeyValueList({ values }: { values: Array<Record<string, unknown>> }) {
-  if (values.length === 0) return <EmptyPreview label="No field, label, or tag details returned." />;
-  return (
-    <div className="database-kv-list">
-      {values.slice(0, 24).map((value, index) => {
-        const title = String(value.name || value.column || value.field || value.tag || value.label || `Item ${index + 1}`);
-        const detail = objectEntries(value)
-          .filter(([key]) => !['name', 'column', 'field', 'tag', 'label'].includes(key))
-          .slice(0, 3)
-          .map(([key, entryValue]) => `${key}: ${formatValue(entryValue)}`)
-          .join(' / ');
-        return (
-          <div key={`${title}-${index}`} className="database-kv-row">
-            <strong>{title}</strong>
-            <span>{detail || 'available'}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function SampleRows({ rows }: { rows: Array<Record<string, unknown>> }) {
   if (rows.length === 0) return <EmptyPreview label="No sample rows returned." />;
-  const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 8);
+  const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
   return (
     <div className="database-sample-wrap">
       <table className="sample-table database-sample-table">
@@ -729,9 +760,12 @@ function SampleRows({ rows }: { rows: Array<Record<string, unknown>> }) {
           <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
         </thead>
         <tbody>
-          {rows.slice(0, 8).map((row, index) => (
+          {rows.map((row, index) => (
             <tr key={index}>
-              {columns.map((column) => <td key={column}>{formatValue(row[column])}</td>)}
+              {columns.map((column) => {
+                const value = formatValue(row[column]);
+                return <td key={column} title={value}>{value}</td>;
+              })}
             </tr>
           ))}
         </tbody>
@@ -757,28 +791,6 @@ function schemaObjectKey(item: DatabasePreviewObject | null) {
 function collectSchemaObjects(preview: DatabasePreviewPayload | null): DatabasePreviewObject[] {
   if (!preview) return [];
   return [...(preview.tables_or_measurements || []), ...(preview.metrics || [])];
-}
-
-function collectDataProfileRows(preview: DatabasePreviewPayload | null): Array<Record<string, unknown>> {
-  const metadata = preview?.metadata;
-  if (!metadata || typeof metadata !== 'object') return [];
-  const profile = (metadata as Record<string, unknown>).data_profile;
-  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return [];
-  const sources = (profile as Record<string, unknown>).sources;
-  return Array.isArray(sources)
-    ? sources.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
-    : [];
-}
-
-function profileSeriesLabel(row: Record<string, unknown>) {
-  const field = formatValue(row.field);
-  const tags = row.tags && typeof row.tags === 'object' && !Array.isArray(row.tags)
-    ? Object.entries(row.tags as Record<string, unknown>)
-      .slice(0, 3)
-      .map(([key, value]) => `${key}=${formatValue(value)}`)
-      .join(', ')
-    : '';
-  return tags ? `${field} · ${tags}` : field;
 }
 
 function totalColumns(objects: DatabasePreviewObject[]) {
@@ -855,6 +867,59 @@ function objectEntries(value: unknown): Array<[string, unknown]> {
 
 function metadataEntriesToRecords(entries: Array<[string, unknown]>) {
   return entries.slice(0, 8).map(([name, value]) => ({ name, value }));
+}
+
+export function mergeContextRecords(records: Array<Record<string, unknown>>) {
+  const merged = new Map<string, Record<string, unknown>>();
+  records.forEach((record, index) => {
+    const identity = contextRecordIdentity(record, index);
+    const current = merged.get(identity);
+    if (!current) {
+      merged.set(identity, { ...record });
+      return;
+    }
+    const next = { ...current };
+    objectEntries(record).forEach(([key, value]) => {
+      next[key] = mergeContextValue(next[key], value);
+    });
+    merged.set(identity, next);
+  });
+  return Array.from(merged.values());
+}
+
+function contextRecordIdentity(record: Record<string, unknown>, index: number) {
+  const name = record.name || record.column || record.field || record.tag || record.label;
+  if (name !== null && name !== undefined && String(name).trim()) {
+    return String(name).trim().toLowerCase();
+  }
+  return `record-${index}`;
+}
+
+function mergeContextValue(current: unknown, incoming: unknown): unknown {
+  if (current === undefined || current === null || current === '') return incoming;
+  if (incoming === undefined || incoming === null || incoming === '') return current;
+  if (valuesEqual(current, incoming)) return current;
+  const values = [...asContextValues(current), ...asContextValues(incoming)];
+  return values.filter((value, index) => (
+    values.findIndex((candidate) => valuesEqual(candidate, value)) === index
+  ));
+}
+
+function asContextValues(value: unknown) {
+  return Array.isArray(value) ? value : [value];
+}
+
+function valuesEqual(left: unknown, right: unknown) {
+  if (left === right) return true;
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function stringFromUnknown(value: unknown) {
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
 }
 
 function isRelatedSchemaValue(value: Record<string, unknown>, objectName: string) {

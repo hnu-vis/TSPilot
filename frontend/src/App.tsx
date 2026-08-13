@@ -37,6 +37,7 @@ export default function App() {
   const [activeId, setActiveId] = useState(() => conversations[0]?.id || createConversation().id);
   const [historyQuery, setHistoryQuery] = useState('');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isHistoryCollapsed, setIsHistoryCollapsed] = useState(() => localStorage.getItem('tspilot.history-collapsed') === 'true');
   const [activeView, setActiveView] = useState<WorkspaceView>('chat');
   const [isInspectorCollapsed, setIsInspectorCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -74,6 +75,10 @@ export default function App() {
   useEffect(() => {
     saveConversations(conversations);
   }, [conversations]);
+
+  useEffect(() => {
+    localStorage.setItem('tspilot.history-collapsed', String(isHistoryCollapsed));
+  }, [isHistoryCollapsed]);
 
   const loadResources = () => Promise.all([fetchDatabases(), fetchKnowledge(), fetchModel()]);
 
@@ -472,13 +477,15 @@ export default function App() {
   }
 
   return (
-    <div className={`app-shell ${hasConversationContent ? 'inspector-open' : ''} ${isInspectorCollapsed ? 'inspector-collapsed' : ''} ${isHistoryOpen ? 'history-open' : ''}`}>
+    <div className={`app-shell ${hasConversationContent ? 'inspector-open' : ''} ${isInspectorCollapsed ? 'inspector-collapsed' : ''} ${isHistoryOpen ? 'history-open' : ''} ${isHistoryCollapsed ? 'history-collapsed' : ''}`}>
       <HistorySidebar
         conversations={sortedConversations}
         activeId={activeConversation.id}
         activeView={activeView}
         query={historyQuery}
+        collapsed={isHistoryCollapsed}
         onQueryChange={setHistoryQuery}
+        onToggleCollapsed={() => setIsHistoryCollapsed((collapsed) => !collapsed)}
         onNew={handleNewConversation}
         onViewChange={(view) => {
           setActiveView(view);
