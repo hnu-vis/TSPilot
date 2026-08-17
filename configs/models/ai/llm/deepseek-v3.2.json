@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "kind": "llm",
+  "id": "deepseek-v3.2",
+  "model": "deepseek-v3.2",
+  "api_base_env": "OPENAI_API_BASE",
+  "api_key_env": "OPENAI_API_KEY"
+}

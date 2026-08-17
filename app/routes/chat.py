@@ -4,11 +4,12 @@ from __future__ import annotations
 import json
 from typing import AsyncIterator
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.deps import get_plain_chat_service, get_react_loop
+from app.deps import get_plain_chat_service_for_model, get_react_loop_for_model
 from app.settings import get_settings
+from app.model_config import get_model_config_store
 from runtime.request_state import (
     build_conversation_state,
     build_request_state,
@@ -28,12 +29,14 @@ async def chat(request: ChatRequest):
     """Handle one chat request as JSON or SSE."""
 
     normalized = normalize_chat_request(request)
+    if normalized.model_id and get_model_config_store().connection("llm", normalized.model_id) is None:
+        raise HTTPException(status_code=422, detail=f"Unknown language model connection '{normalized.model_id}'.")
     settings = get_settings()
     request_state = build_request_state(normalized, settings)
     conversation_state = build_conversation_state(normalized, request_state.conversation_id or "")
 
     if request_state.database_context is None:
-        plain_chat = get_plain_chat_service()
+        plain_chat = get_plain_chat_service_for_model(normalized.model_id)
         response = await plain_chat.run(request_state, conversation_state)
         if not normalized.stream:
             return JSONResponse(content=response.model_dump(mode="json"))
@@ -50,7 +53,7 @@ async def chat(request: ChatRequest):
 
         return StreamingResponse(plain_event_stream(), media_type="text/event-stream")
 
-    react_loop = get_react_loop()
+    react_loop = get_react_loop_for_model(normalized.model_id)
 
     if not normalized.stream:
         response = await react_loop.run(request_state, conversation_state)

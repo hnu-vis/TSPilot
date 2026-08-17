@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "kind": "llm",
+  "id": "qwen3.5-plus",
+  "model": "qwen3.5-flash",
+  "api_key_env": "OPENAI_API_KEY",
+  "api_base": "https://aihubmix.com/v1"
+}

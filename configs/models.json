@@ -1,0 +1,8 @@
+{
+  "ai": {
+    "llm": {
+      "models": [],
+      "active_id": "llm-default"
+    }
+  }
+}

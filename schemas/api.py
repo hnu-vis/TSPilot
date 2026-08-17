@@ -19,6 +19,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
+    model_id: str | None = None
     database_context: DatabaseContext | None = None
     selected_database: str | None = None
     selected_database_type: str | None = None

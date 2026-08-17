@@ -25,4 +25,4 @@ Expose the main chat endpoint.
 
 - embed ReAct logic
 - embed tool orchestration
-- infer facts directly
+- infer insights directly

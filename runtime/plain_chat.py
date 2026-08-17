@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from runtime.token_usage import record_llm_token_usage, token_usage_summary
+from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from schemas.api import ChatResponse
 from schemas.output import FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -47,7 +48,8 @@ class PlainChatService:
                 ("assistant", content),
                 (
                     "user",
-                    "Your previous response did not match the required JSON final-answer schema. "
+                    prompt_locale_instruction(request_state.response_language)
+                    + "Your previous response did not match the required JSON final-answer schema. "
                     "Return exactly one JSON object with this shape and no extra text: "
                     "{\"title\": string|null, \"summary\": string, \"sections\": [], \"references\": [], \"visualizations\": []}. "
                     f"Parser error: {first_error}",
@@ -96,7 +98,8 @@ class PlainChatService:
         return [
             (
                 "system",
-                "You are TSPilot in plain chatbot mode. "
+                prompt_locale_instruction(request_state.response_language)
+                + "You are TSPilot in plain chatbot mode. "
                 "No database is selected, so do not claim that you queried data, used tools, or inspected local datasets. "
                 "Answer conversationally and directly. If the user asks for data analysis that requires a database, "
                 "explain that they should select a database before asking that analysis question. "
@@ -106,7 +109,12 @@ class PlainChatService:
             ),
             (
                 "user",
-                "Context JSON:\n"
+                localized_payload_label(
+                    request_state.response_language,
+                    zh="对话上下文 JSON：",
+                    en="Context JSON:",
+                )
+                + "\n"
                 + json.dumps(context, ensure_ascii=False),
             ),
         ]

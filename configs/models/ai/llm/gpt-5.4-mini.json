@@ -1,0 +1,8 @@
+{
+  "schema_version": "1",
+  "kind": "llm",
+  "id": "llm-default",
+  "model": "gpt-5.4-mini",
+  "api_base_env": "OPENAI_API_BASE",
+  "api_key_env": "OPENAI_API_KEY"
+}

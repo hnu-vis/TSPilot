@@ -7,6 +7,7 @@ from app.settings import get_settings
 from core.database.llm_query import LLMQueryGenerator
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import build_conversation_state, build_request_state
+from runtime.plain_chat import PlainChatService
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
@@ -54,10 +55,11 @@ def test_data_agent_prompt_exposes_language_policy():
     conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
 
     builder = DataAgentPromptBuilder()
-    system_prompt = builder.build_system_prompt()
+    system_prompt = builder.build_system_prompt(request_state.response_language)
     context = builder.build_context(request_state, conversation_state)
 
-    assert "task.response_language is authoritative" in system_prompt
+    assert "task.response_language controls all natural-language fields" in system_prompt
+    assert "当前查询语言：简体中文" in system_prompt
     assert context["task"]["response_language"] == "zh"
 
 
@@ -79,8 +81,42 @@ def test_llm_query_prompt_carries_response_language():
     )
 
     user_prompt = llm.messages[1][1]
-    payload = json.loads(user_prompt.split("LLM SQL Query Generation JSON:\n", 1)[1])
+    payload = json.loads(user_prompt.split("LLM 查询生成输入 JSON：\n", 1)[1])
     assert payload["request"]["response_language"] == "zh"
+    assert "所有面向用户或描述性的自然语言内容都必须使用简体中文" in llm.messages[0][1]
+
+
+def test_english_query_uses_english_prompt_locale():
+    llm = _QueryLLM()
+    request_state = build_request_state(ChatRequest(message="Analyze Bitcoin price trends"), get_settings())
+
+    asyncio.run(
+        LLMQueryGenerator(llm).generate(
+            database_id="demo",
+            database_type="timescaledb",
+            message=request_state.message,
+            schema_preview={},
+            time_range=None,
+            constraints={},
+            history=[],
+            request_state=request_state,
+        )
+    )
+
+    assert "Current query language: English" in llm.messages[0][1]
+    assert llm.messages[1][1].startswith("LLM SQL Query Generation JSON:\n")
+
+
+def test_plain_chat_prompt_uses_query_locale():
+    settings = get_settings()
+    request = ChatRequest(message="解释什么是时间序列")
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+
+    messages = PlainChatService(llm=None)._messages(request_state, conversation_state)
+
+    assert "当前查询语言：简体中文" in messages[0][1]
+    assert messages[1][1].startswith("对话上下文 JSON：\n")
 
 
 def test_format_answer_uses_chinese_templates_for_chinese_request():
@@ -106,13 +142,21 @@ def test_format_answer_uses_chinese_templates_for_chinese_request():
 
     result = asyncio.run(
         FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="展示查询结果", direct_answer="已返回最早记录。"),
+            FormatAnswerInput(response_plan={
+                "title": "结果",
+                "summary": "已返回最早记录。",
+                "sections": [
+                    {"section_type": "query", "heading": "查询", "content": "已执行查询。", "source_refs": []},
+                    {"section_type": "table", "heading": "表格结果", "content": "已返回一行。", "source_refs": []},
+                ],
+                "visualization_ids": [],
+            }),
             request_state=request_state,
         )
     )
 
-    assert result["sections"][1]["heading"] == "查询"
-    assert result["sections"][2]["heading"] == "表格结果"
+    assert result["sections"][0]["heading"] == "查询"
+    assert result["sections"][1]["heading"] == "表格结果"
 
 
 def test_format_answer_uses_english_templates_for_english_request():
@@ -138,10 +182,18 @@ def test_format_answer_uses_english_templates_for_english_request():
 
     result = asyncio.run(
         FormatAnswerTool().execute(
-            FormatAnswerInput(summary_goal="Show the query result.", direct_answer="Returned the earliest row."),
+            FormatAnswerInput(response_plan={
+                "title": "Result",
+                "summary": "Returned the earliest row.",
+                "sections": [
+                    {"section_type": "query", "heading": "Query", "content": "Executed the query.", "source_refs": []},
+                    {"section_type": "table", "heading": "Table Result", "content": "Returned one row.", "source_refs": []},
+                ],
+                "visualization_ids": [],
+            }),
             request_state=request_state,
         )
     )
 
-    assert result["sections"][1]["heading"] == "Query"
-    assert result["sections"][2]["heading"] == "Table Result"
+    assert result["sections"][0]["heading"] == "Query"
+    assert result["sections"][1]["heading"] == "Table Result"

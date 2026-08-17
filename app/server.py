@@ -7,27 +7,30 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.settings import get_settings
+from app.model_config import apply_persisted_machine_learning_defaults
 from app.routes.chat import router as chat_router
 from app.routes.resources import router as resources_router
-from app.deps import get_fact_memory_learning_worker
-from core.data_fact.learning import reset_legacy_fact_memory_once, separate_fact_memory_scopes_once
+from app.routes.visualizations import router as visualizations_router
+from app.deps import get_insight_memory_learning_worker
+from core.key_insight.learning import reset_legacy_insight_memory_once, separate_insight_memory_scopes_once
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
+    apply_persisted_machine_learning_defaults()
     worker = None
-    if settings.fact_memory_learning_enabled:
-        reset_legacy_fact_memory_once(
-            root=settings.resolved_fact_memory_learning_dir,
+    if settings.insight_memory_learning_enabled:
+        reset_legacy_insight_memory_once(
+            root=settings.resolved_insight_memory_learning_dir,
             embedding_root=settings.resolved_memory_embedding_cache_dir,
         )
-        separate_fact_memory_scopes_once(
-            root=settings.resolved_fact_memory_learning_dir,
+        separate_insight_memory_scopes_once(
+            root=settings.resolved_insight_memory_learning_dir,
             embedding_root=settings.resolved_memory_embedding_cache_dir,
         )
         if settings.openai_api_key:
-            worker = get_fact_memory_learning_worker()
+            worker = get_insight_memory_learning_worker()
             worker.start()
     try:
         yield
@@ -54,6 +57,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(chat_router)
     app.include_router(resources_router)
+    app.include_router(visualizations_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
