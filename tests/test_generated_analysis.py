@@ -14,13 +14,13 @@ from runtime.request_state import apply_observation, build_conversation_state, b
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
-from schemas.data_fact import DataFact, DataFactRequest, FactEvidenceRef
+from schemas.key_insight import KeyInsight, KeyInsightRequest, InsightEvidenceRef
 from schemas.tool import ToolObservation
 from tools.code_interpreter import (
     CodeInterpreterInput,
     CodeInterpreterTool,
     _preflight_analysis_code,
-    _validate_fact_output_contract,
+    _validate_insight_output_contract,
     _validate_result_has_numeric_analysis,
 )
 
@@ -93,37 +93,66 @@ def test_generated_analysis_executes_code_over_full_evidence():
     assert result["result"]["metrics"]["proportion"] == pytest.approx(2 / 3)
 
 
-def test_code_interpreter_composes_structured_fact_from_verified_parent_facts():
+def test_canonical_analysis_binds_extreme_insight_contract_to_metric_and_locator_row():
     request_state = _request_state()
-    request_state.fact_set.facts = [
-        DataFact(
-            fact_id="fact_start",
-            fact_key="price.start",
+
+    result = asyncio.run(CodeInterpreterTool().execute(
+        CodeInterpreterInput(
+            database_evidence="evi_generated",
+            analysis_goal="calculate the maximum value and preserve its point",
+            analysis_request={"required_outputs": ["maximum value"]},
+            required_outputs=["maximum value"],
+            insight_requests=[KeyInsightRequest(
+                insight_key="max_value_insight",
+                name="Maximum value",
+                insight_type="extreme",
+                requirements={"operator": "max"},
+            )],
+        ),
+        request_state=request_state,
+    ))
+
+    insight = result["result"]["insights"][0]
+    assert insight["insight_key"] == "max_value_insight"
+    assert insight["value"] == 30.0
+    assert insight["calculation_trace"]["operator"] == "max"
+    assert insight["calculation_trace"]["row"] == {
+        "timestamp": "2023-01-01T02:00:00Z",
+        "value": 30.0,
+    }
+
+
+def test_code_interpreter_composes_structured_insight_from_verified_parent_insights():
+    request_state = _request_state()
+    request_state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_start",
+            insight_key="price.start",
             name="start_price",
-            fact_type="point_value",
+            insight_type="point_value",
             statement="Start price is 10.",
             value=10.0,
             method="sql_query",
-            evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_generated")],
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_generated")],
         ),
-        DataFact(
-            fact_id="fact_end",
-            fact_key="price.end",
+        KeyInsight(
+            insight_id="insight_end",
+            insight_key="price.end",
             name="end_price",
-            fact_type="point_value",
+            insight_type="point_value",
             statement="End price is 30.",
             value=30.0,
             method="sql_query",
-            evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_generated")],
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_generated")],
         ),
     ]
     code = (
-        "start = float(fact_by_key['price.start']['value'])\n"
-        "end = float(fact_by_key['price.end']['value'])\n"
+        "start = float(insight_by_key['price.start']['value'])\n"
+        "end = float(insight_by_key['price.end']['value'])\n"
         "change = (end - start) / start * 100\n"
         "result = {'summary': 'price change computed', 'metrics': {'percentage_change': change}, 'details': {}, "
-        "'facts': [{'fact_key': 'price.percentage_change', 'name': 'percentage_change', "
-        "'fact_type': 'difference', 'statement': f'Price changed by {change}%.', 'value': change, "
+        "'insights': [{'insight_key': 'price.percentage_change', 'name': 'percentage_change', "
+        "'insight_type': 'difference', 'statement': f'Price changed by {change}%.', 'value': change, "
         "'derived_from': ['price.start', 'price.end'], "
         "'calculation_trace': {'formula': '(end - start) / start * 100'}}]}"
     )
@@ -134,11 +163,11 @@ def test_code_interpreter_composes_structured_fact_from_verified_parent_facts():
                 database_evidence="evi_generated",
                 analysis_goal="percentage change",
                 code=code,
-                fact_requests=[
+                insight_requests=[
                     {
-                        "fact_key": "price.percentage_change",
+                        "insight_key": "price.percentage_change",
                         "name": "percentage_change",
-                        "fact_type": "difference",
+                        "insight_type": "difference",
                         "derived_from": ["price.start", "price.end"],
                     }
                 ],
@@ -147,20 +176,20 @@ def test_code_interpreter_composes_structured_fact_from_verified_parent_facts():
         )
     )
 
-    assert result["result"]["facts"][0]["fact_key"] == "price.percentage_change"
-    assert result["result"]["facts"][0]["value"] == pytest.approx(200.0)
+    assert result["result"]["insights"][0]["insight_key"] == "price.percentage_change"
+    assert result["result"]["insights"][0]["value"] == pytest.approx(200.0)
 
 
-def test_code_interpreter_marks_root_fact_partial_when_database_evidence_is_empty():
-    request = DataFactRequest(
-        fact_key="price.start",
+def test_code_interpreter_marks_root_insight_partial_when_database_evidence_is_empty():
+    request = KeyInsightRequest(
+        insight_key="price.start",
         name="start_price",
-        fact_type="point_value",
+        insight_type="point_value",
     )
     result = {
-        "facts": [
+        "insights": [
             {
-                "fact_key": "price.start",
+                "insight_key": "price.start",
                 "value": 16838.35,
                 "statement": "Start price is 16838.35.",
                 "calculation_trace": {"source": "generated"},
@@ -168,33 +197,33 @@ def test_code_interpreter_marks_root_fact_partial_when_database_evidence_is_empt
         ]
     }
 
-    diagnostics = _validate_fact_output_contract(result, [request], input_row_count=0, input_facts=[])
+    diagnostics = _validate_insight_output_contract(result, [request], input_row_count=0, input_insights=[])
 
     assert diagnostics == {
         "bound": ["price.start"],
         "missing": [],
         "rejected": [],
-        "partial": [{"fact_key": "price.start", "quality_flags": ["ungrounded_candidate"]}],
+        "partial": [{"insight_key": "price.start", "quality_flags": ["ungrounded_candidate"]}],
     }
-    assert result["facts"][0]["status"] == "partial"
-    assert result["facts"][0]["quality_flags"] == ["ungrounded_candidate"]
+    assert result["insights"][0]["status"] == "partial"
+    assert result["insights"][0]["quality_flags"] == ["ungrounded_candidate"]
 
 
-def test_code_interpreter_reports_missing_fact_without_failing_analysis():
+def test_code_interpreter_reports_missing_insight_without_failing_analysis():
     result = asyncio.run(
         CodeInterpreterTool().execute(
             CodeInterpreterInput(
                 database_evidence=_evidence(),
-                analysis_goal="calculate a summary while a requested fact remains unavailable",
+                analysis_goal="calculate a summary while a requested insight remains unavailable",
                 code=(
                     "result = {'summary': 'analysis completed', "
-                    "'metrics': {'row_count': len(rows)}, 'details': {}, 'facts': []}"
+                    "'metrics': {'row_count': len(rows)}, 'details': {}, 'insights': []}"
                 ),
-                fact_requests=[
+                insight_requests=[
                     {
-                        "fact_key": "price.unsatisfied",
-                        "name": "unsatisfied fact",
-                        "fact_type": "custom",
+                        "insight_key": "price.unsatisfied",
+                        "name": "unsatisfied insight",
+                        "insight_type": "custom",
                     }
                 ],
             )
@@ -202,8 +231,8 @@ def test_code_interpreter_reports_missing_fact_without_failing_analysis():
     )
 
     assert result["status"] == "succeeded"
-    assert result["result"]["facts"] == []
-    assert result["diagnostics"]["fact_binding"]["missing"] == ["price.unsatisfied"]
+    assert result["result"]["insights"] == []
+    assert result["diagnostics"]["insight_binding"]["missing"] == ["price.unsatisfied"]
 
 
 def test_multiple_generated_analyses_accumulate_in_analysis_workspace():

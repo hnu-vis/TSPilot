@@ -46,7 +46,7 @@ class StructuredTerminateThenNaturalLLM:
                         "prediction": "根据已生成的线性回归预测，价格大致在24,283美元到24,368美元附近，并呈小幅上行趋势。",
                         "basis": {"forecast_model": "linear regression", "forecast_horizon": 24},
                     },
-                    "include_fact_ids": [],
+                    "include_insight_ids": [],
                     "include_visualization_ids": [],
                     "section_plan": [],
                 },
@@ -57,7 +57,7 @@ class StructuredTerminateThenNaturalLLM:
                 "action": "terminate",
                 "action_input": {
                     "direct_answer": "根据线性回归预测，从2023-01-29开始的短期BTC/USD价格约在24,283美元到24,368美元之间，整体呈小幅上行趋势。",
-                    "include_fact_ids": [],
+                    "include_insight_ids": [],
                     "include_visualization_ids": [],
                     "section_plan": [],
                 },
@@ -618,6 +618,7 @@ def test_forecast_and_anomaly_trace_previews_expose_tool_specific_outputs():
                     {"timestamp": "t1", "value": 1.0},
                     {"timestamp": "t2", "value": 2.0},
                 ],
+                "diagnostics": {"forecast_point_count": 672},
             },
         }
     )
@@ -642,6 +643,7 @@ def test_forecast_and_anomaly_trace_previews_expose_tool_specific_outputs():
         {"timestamp": "t1", "value": 1.0},
         {"timestamp": "t2", "value": 2.0},
     ]
+    assert forecast_preview["forecast_point_count"] == 672
     assert anomaly_preview["detector_name"] == "zscore"
     assert anomaly_preview["anomaly_points"] == [{"timestamp": "t1", "value": 99.0, "score": 3.1}]
     assert anomaly_preview["anomaly_scores"] == [{"timestamp": "t1", "score": 3.1}]

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from core.database.dialects import dialect_for_database
 from runtime.language import detect_response_language
+from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 
 
@@ -223,8 +224,8 @@ class LLMQueryGenerator:
             "history": history[-4:],
         }
         messages = [
-            ("system", self._schema_linking_system_prompt(database_type=database_type)),
-            ("user", "LLM Schema Linking JSON:\n" + json.dumps(payload, ensure_ascii=False, default=str)),
+            ("system", self._schema_linking_system_prompt(database_type=database_type, response_language=response_language)),
+            ("user", localized_payload_label(response_language, zh="LLM 模式映射输入 JSON：", en="LLM Schema Linking JSON:") + "\n" + json.dumps(payload, ensure_ascii=False, default=str)),
         ]
         raw_response = await self._invoke_model(
             messages,
@@ -247,7 +248,7 @@ class LLMQueryGenerator:
         time_range: dict | None,
         constraints: dict,
         history: list[dict],
-        fact_requests: list[Any] | None = None,
+        insight_requests: list[Any] | None = None,
         previous_query: str | None = None,
         error: Exception | str | None = None,
         request_state=None,
@@ -255,8 +256,8 @@ class LLMQueryGenerator:
         if self._llm is None:
             raise RuntimeError("LLM query generation requires an llm instance.")
 
-        system_prompt = self._system_prompt(database_type=database_type)
         response_language = getattr(request_state, "response_language", None) or detect_response_language(message)
+        system_prompt = self._system_prompt(database_type=database_type, response_language=response_language)
         user_prompt = self._user_prompt(
             database_id=database_id,
             database_type=database_type,
@@ -266,7 +267,7 @@ class LLMQueryGenerator:
             time_range=time_range,
             constraints=constraints,
             history=history,
-            fact_requests=fact_requests or [],
+            insight_requests=insight_requests or [],
             previous_query=previous_query,
             error=error,
         )
@@ -322,9 +323,9 @@ class LLMQueryGenerator:
             raise ValueError("LLM query generation response must be a JSON object.")
         return decoded
 
-    def _system_prompt(self, *, database_type: str) -> str:
+    def _system_prompt(self, *, database_type: str, response_language: str = "en") -> str:
         dialect = dialect_for_database(database_type)
-        return (
+        return prompt_locale_instruction(response_language) + (
             "You generate database queries for TSPilot.\n"
             "Return exactly one JSON object and no markdown.\n"
             "The query must be read-only and grounded only in the provided schema.\n"
@@ -374,16 +375,16 @@ class LLMQueryGenerator:
             "do not aggregate, rank, pivot, join, or reshape away the native value/time columns. "
             "For Flux, do not invent helper functions such as summarize() and do not use custom record-property syntax for dynamic aggregates; when multi-aggregate Flux is uncertain, return raw _time/_value evidence and put the derived output in task_coverage.missing with next_action_hint=\"code_interpreter\".\n"
             "Before returning, self-check whether this single query covers the whole user request. "
-            "If request.fact_requests is non-empty, treat it as current-tool fact output guidance. "
-            "When requested facts can be produced directly by this query, return columns or rows that make those facts verifiable from current evidence. "
-            "For point_value or time_boundary facts with requirements.time_position=start|end, the boundary means the first or last available observation inside the requested range. "
+            "If request.insight_requests is non-empty, treat it as current-tool insight output guidance. "
+            "When requested insights can be produced directly by this query, return columns or rows that make those insights verifiable from current evidence. "
+            "For point_value or time_boundary insights with requirements.time_position=start|end, the boundary means the first or last available observation inside the requested range. "
             "Query the complete applicable range and preserve native timestamp/value rows; do not require an observation to equal the range boundary timestamp exactly. "
-            "When a requested fact requires downstream calculation, preserve the necessary raw/current evidence and list that fact in task_coverage.missing with the downstream action. "
+            "When a requested insight requires downstream calculation, preserve the necessary raw/current evidence and list that insight in task_coverage.missing with the downstream action. "
             "Use request.response_language for all natural-language JSON values you generate, including purpose, assumptions, "
             "task_coverage.satisfied, task_coverage.missing, and task_coverage.next_action_hint. "
             "Use Simplified Chinese for \"zh\" and English for \"en\". Keep query code, identifiers, and data values unchanged.\n"
-            "Use task_coverage.satisfied for request constraints/facts this query is designed to satisfy, "
-            "task_coverage.missing for requested facts not directly computed by this query, and "
+            "Use task_coverage.satisfied for request constraints/insights this query is designed to satisfy, "
+            "task_coverage.missing for requested insights not directly computed by this query, and "
             "task_coverage.next_action_hint for the next sql_query needed when coverage is incomplete. "
             "Do not claim coverage for extrema, count, grouping, or ordering unless the query explicitly computes it.\n"
             "JSON schema: {"
@@ -400,9 +401,9 @@ class LLMQueryGenerator:
             "}."
         )
 
-    def _schema_linking_system_prompt(self, *, database_type: str) -> str:
+    def _schema_linking_system_prompt(self, *, database_type: str, response_language: str = "en") -> str:
         dialect = dialect_for_database(database_type)
-        return (
+        return prompt_locale_instruction(response_language) + (
             "You perform schema linking for TSPilot text-to-query.\n"
             "Return exactly one JSON object and no markdown.\n"
             "Use only schema_preview as schema evidence.\n"
@@ -445,7 +446,7 @@ class LLMQueryGenerator:
         time_range: dict | None,
         constraints: dict,
         history: list[dict],
-        fact_requests: list[Any],
+        insight_requests: list[Any],
         previous_query: str | None,
         error: Exception | str | None,
     ) -> str:
@@ -457,7 +458,7 @@ class LLMQueryGenerator:
             "schema_preview": schema_preview,
             "time_range": time_range,
             "constraints": constraints,
-            "fact_requests": fact_requests,
+            "insight_requests": insight_requests,
             "history": history[-6:],
             "previous_query": previous_query,
             "error": str(error) if error is not None else None,
@@ -469,7 +470,12 @@ class LLMQueryGenerator:
                 previous_query=previous_query,
                 error=error,
             )
-        return "LLM SQL Query Generation JSON:\n" + json.dumps(
+        label = localized_payload_label(
+            response_language,
+            zh="LLM 查询生成输入 JSON：",
+            en="LLM SQL Query Generation JSON:",
+        )
+        return label + "\n" + json.dumps(
             {"mode": mode, "request": payload},
             ensure_ascii=False,
             default=str,

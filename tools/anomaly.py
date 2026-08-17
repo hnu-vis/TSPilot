@@ -9,7 +9,7 @@ from core.timeseries.anomaly_registry import default_anomaly_detector_name, get_
 from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
-from schemas.data_fact import DataFactRequest
+from schemas.key_insight import KeyInsightRequest
 from schemas.timeseries import AnomalyResult
 from tools.base import BaseTool, StructuredToolError
 
@@ -19,12 +19,12 @@ class AnomalyInput(BaseModel):
     detector_name: str | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def reject_fact_contracts(self):
-        if self.fact_requests:
-            raise ValueError("anomaly returns an analysis artifact; Data Fact requests must target sql_query or code_interpreter")
+    def reject_insight_contracts(self):
+        if self.insight_requests:
+            raise ValueError("anomaly returns an analysis artifact; Key Insight requests must target sql_query or code_interpreter")
         return self
 
 

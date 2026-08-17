@@ -25,7 +25,7 @@ from schemas.api import ChatRequest, ChatResponse
 from schemas.database_context import DatabaseContext
 from schemas.output import AnswerSection, FinalAnswer
 from schemas.state import ConversationStateModel, RequestStateModel
-from core.data_fact import register_data_facts_from_payload
+from core.key_insight import register_key_insights_from_payload
 from core.harness import default_capability_registry
 from schemas.task_contract import TaskContract
 from schemas.tool import ReActTranscriptStep, ToolObservation
@@ -618,12 +618,38 @@ def enrich_observation_payload(
             if analysis is not None:
                 payload = _build_prompt_safe_analysis(analysis, request_state)
         elif "forecast_id" in full_payload and request_state.latest_forecast is not None:
-            payload = request_state.latest_forecast.model_dump(mode="json")
+            payload = _build_prompt_safe_forecast(
+                request_state.latest_forecast,
+                request_state,
+            ).model_dump(mode="json")
         elif "anomaly_id" in full_payload and request_state.latest_anomaly is not None:
-            payload = request_state.latest_anomaly.model_dump(mode="json")
-    elif tool_spec.result_target == "presentation" and request_state.final_answer_draft is not None:
-        payload = request_state.final_answer_draft.model_dump(mode="json")
-
+            payload = _build_prompt_safe_anomaly(
+                request_state.latest_anomaly,
+                request_state,
+            ).model_dump(mode="json")
+    elif tool_spec.result_target == "visualization":
+        visualizations = full_payload.get("visualizations", [])
+        payload = {
+            "visualization_ids": full_payload.get("visualization_ids", []),
+            "grounded_by": _outer_grounding_refs(full_payload.get("source_refs", [])),
+            "verification": _visualization_verification_receipts(visualizations),
+        }
+    elif tool_spec.result_target == "presentation":
+        payload = {
+            "title": full_payload.get("title"),
+            "summary": full_payload.get("summary"),
+            "visualization_ids": [
+                item.get("visualization_id")
+                for item in full_payload.get("visualizations", [])
+                if isinstance(item, dict) and item.get("visualization_id")
+            ],
+        }
+    latest_goal = request_state.completion_state.get("latest_goal")
+    if isinstance(payload, dict) and isinstance(latest_goal, dict):
+        payload["coverage_delta"] = {
+            "can_answer": latest_goal.get("can_answer"),
+            "missing_outputs": latest_goal.get("missing_evidence", []),
+        }
     payload = _deduplicate_observation_payload(observation, payload)
     return observation.model_copy(
         update={
@@ -631,6 +657,56 @@ def enrich_observation_payload(
             "payload_truncated": observation.payload_truncated or payload != full_payload,
         }
     )
+
+
+def _outer_grounding_refs(refs) -> list[str]:
+    """Expose only artifact refs that another outer ReAct action can consume."""
+    result: list[str] = []
+    for raw_ref in refs if isinstance(refs, list) else []:
+        ref = str(raw_ref or "").strip()
+        if ref.startswith("view:evidence:"):
+            parts = ref.split(":", 3)
+            ref = f"evidence:{parts[2]}" if len(parts) > 2 else ""
+        elif ref.startswith("view:analysis:"):
+            parts = ref.split(":", 3)
+            ref = f"analysis:{parts[2]}" if len(parts) > 2 else ""
+        if ref and ref not in result:
+            result.append(ref)
+    return result
+
+
+def _visualization_verification_receipts(visualizations) -> list[dict]:
+    receipts: list[dict] = []
+    for item in visualizations if isinstance(visualizations, list) else []:
+        if not isinstance(item, dict):
+            continue
+        datasets = item.get("datasets") if isinstance(item.get("datasets"), list) else []
+        layers = item.get("layers") if isinstance(item.get("layers"), list) else []
+        dataset_receipts = []
+        for dataset in datasets:
+            if not isinstance(dataset, dict):
+                continue
+            dataset_receipts.append({
+                "grounded_by": _outer_grounding_refs([dataset.get("source_ref")]),
+                "row_count": dataset.get("row_count"),
+                "time_range": dataset.get("time_range"),
+            })
+        receipts.append({
+            "visualization_id": item.get("visualization_id"),
+            "full_fidelity": bool(item.get("data_ref")) and bool(datasets) and all(
+                isinstance(dataset.get("row_count"), int)
+                for dataset in datasets
+                if isinstance(dataset, dict)
+            ),
+            "required_roles": item.get("required_roles", []),
+            "materialized_roles": list(dict.fromkeys(
+                str(layer.get("role"))
+                for layer in layers
+                if isinstance(layer, dict) and layer.get("role")
+            )),
+            "datasets": dataset_receipts,
+        })
+    return receipts
 
 
 def _build_prompt_safe_failure_observation(observation: ToolObservation) -> ToolObservation:
@@ -896,6 +972,8 @@ def _state_ref_for_todo_type(request_state: RequestStateModel, task_type: str) -
     if capability == "skill" and request_state.latest_skill:
         skill_name = request_state.latest_skill.get("skill_name") or "latest"
         return f"skill:{skill_name}"
+    if capability == "visualization" and request_state.visualizations:
+        return f"visualization:{request_state.visualizations[-1].visualization_id}"
     if capability in {"generic", ""}:
         if request_state.latest_analysis_id:
             return f"analysis:{request_state.latest_analysis_id}"
@@ -1013,7 +1091,7 @@ def _build_prompt_safe_evidence(evidence):
                 item["points_count"] = len(series.get("points", []))
             summarized_series.append(item)
         data["series"] = summarized_series
-    diagnostics = dict(evidence.diagnostics)
+    diagnostics = _prompt_safe_evidence_diagnostics(evidence.diagnostics)
     diagnostics["artifact_kind"] = "database_evidence"
     diagnostics["artifact_ref"] = f"evidence:{evidence.evidence_id}"
     diagnostics["summary_stats"] = {key: value for key, value in summary_stats.items() if value is not None}
@@ -1035,12 +1113,6 @@ def _build_prompt_safe_evidence(evidence):
         "visible_counts": {key: value for key, value in visible_counts.items() if value is not None},
         "full_artifact_ref": f"evidence:{evidence.evidence_id}",
     }
-    if "query_trace" in diagnostics and isinstance(diagnostics["query_trace"], dict):
-        query_trace = dict(diagnostics["query_trace"])
-        raw_result_summary = dict(query_trace.get("raw_result_summary") or {})
-        raw_result_summary.pop("columns", None)
-        query_trace["raw_result_summary"] = raw_result_summary
-        diagnostics["query_trace"] = query_trace
     return DatabaseEvidence(
         evidence_id=evidence.evidence_id,
         result_type=evidence.result_type,
@@ -1052,10 +1124,49 @@ def _build_prompt_safe_evidence(evidence):
         columns=evidence.columns,
         metadata=dict(evidence.metadata),
         diagnostics=diagnostics,
-        produced_facts=list(getattr(evidence, "produced_facts", []) or []),
-        rejected_facts=list(getattr(evidence, "rejected_facts", []) or []),
-        fact_coverage=getattr(evidence, "fact_coverage", None),
+        produced_insights=list(getattr(evidence, "produced_insights", []) or []),
+        rejected_insights=list(getattr(evidence, "rejected_insights", []) or []),
+        insight_coverage=getattr(evidence, "insight_coverage", None),
     )
+
+
+def _prompt_safe_evidence_diagnostics(raw_diagnostics: dict | None) -> dict:
+    """Keep only SQL diagnostics that can change the next ReAct action."""
+    source = raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
+    diagnostics = {
+        key: source.get(key)
+        for key in (
+            "row_count_total",
+            "row_count_materialized",
+            "is_full_fidelity",
+            "truncated",
+            "series_count",
+            "series_dimension",
+        )
+        if source.get(key) is not None
+    }
+    task_coverage = source.get("task_coverage") if isinstance(source.get("task_coverage"), dict) else {}
+    compact_coverage = {
+        key: task_coverage.get(key)
+        for key in (
+            "satisfied",
+            "missing",
+            "runtime_missing",
+            "next_action_hint",
+            "requires_followup",
+            "runtime_requires_followup",
+            "query_task_contract",
+        )
+        if task_coverage.get(key) is not None
+    }
+    if compact_coverage:
+        diagnostics["task_coverage"] = compact_coverage
+    if "query_task_contract" not in compact_coverage:
+        generation = source.get("llm_query_generation") if isinstance(source.get("llm_query_generation"), dict) else {}
+        contract = generation.get("query_task_contract")
+        if isinstance(contract, dict):
+            diagnostics["llm_query_generation"] = {"query_task_contract": contract}
+    return diagnostics
 
 
 def _sample_edges(items: list[dict], limit: int) -> list[dict]:
@@ -1094,26 +1205,67 @@ def _summarize_visualization_dict(payload: dict) -> dict:
 
 
 def _build_prompt_safe_analysis(analysis, request_state: RequestStateModel):
-    from schemas.analysis import AnalysisResult
-
     payload = analysis.model_dump(mode="json")
-    result = dict(payload.get("result") or {})
-    if isinstance(result.get("details"), list):
-        result["details"] = _sample_edges([item for item in result["details"] if isinstance(item, dict)], limit=12)
-    if isinstance(result.get("rows"), list):
-        result["rows"] = _sample_edges([item for item in result["rows"] if isinstance(item, dict)], limit=12)
-    payload["result"] = result
-    diagnostics = dict(payload.get("diagnostics") or {})
-    diagnostics["artifact_kind"] = "analysis_result"
-    diagnostics["artifact_ref"] = f"analysis:{analysis.analysis_id}"
-    diagnostics["snapshot_ref"] = persist_json_artifact(
+    persist_json_artifact(
         artifact_id=analysis.analysis_id,
         artifact_kind="analysis_result",
         payload=analysis.model_dump(mode="json"),
         directory=_artifact_directory(request_state, "analysis"),
     )
-    payload["diagnostics"] = diagnostics
-    return AnalysisResult.model_validate(payload).model_dump(mode="json")
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    data_views = payload.get("data_views") if isinstance(payload.get("data_views"), list) else []
+    return {
+        "analysis_id": payload.get("analysis_id"),
+        "status": payload.get("status"),
+        "analysis_goal": payload.get("analysis_goal"),
+        "summary": payload.get("summary"),
+        "input_evidence_id": payload.get("input_evidence_id"),
+        "input_row_count": payload.get("input_row_count"),
+        "code_type": payload.get("code_type"),
+        "code_hash": payload.get("code_hash"),
+        "result": {
+            "metrics": _compact_analysis_value(result.get("metrics", {})),
+            "details": _compact_analysis_value(result.get("details", {})),
+        },
+        "data_views": [
+            {
+                "view_id": view.get("view_id"),
+                "name": view.get("name"),
+                "shape": view.get("shape"),
+                "row_count": len(view.get("rows", [])) if isinstance(view.get("rows"), list) else int(view.get("scalar") is not None),
+                "schema_fields": view.get("schema_fields", []),
+                "lineage": view.get("lineage", []),
+            }
+            for view in data_views
+            if isinstance(view, dict)
+        ],
+        "insight_coverage": payload.get("insight_coverage"),
+        "diagnostics": {"artifact_ref": f"analysis:{analysis.analysis_id}"},
+    }
+
+
+def _compact_analysis_value(value, *, key: str = "", depth: int = 0):
+    """Preserve decision scalars while replacing row collections with receipts."""
+    if depth >= 5:
+        return "[depth limit]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _compact_analysis_value(item, key=str(item_key), depth=depth + 1)
+            for item_key, item in list(value.items())[:24]
+        }
+    if isinstance(value, list):
+        if len(value) > 3 and any(
+            marker in key.lower()
+            for marker in ("row", "point", "series", "timeseries", "data", "records")
+        ):
+            return {"item_count": len(value), "available_in_artifact": True}
+        return [
+            _compact_analysis_value(item, key=key, depth=depth + 1)
+            for item in value[:8]
+        ]
+    if isinstance(value, str) and len(value) > 900:
+        return _truncate_text(value, 900)
+    return value
 
 
 def _build_prompt_safe_forecast(forecast, request_state: RequestStateModel):
@@ -1176,16 +1328,24 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
         from schemas.timeseries import ForecastResult
 
         forecast = ForecastResult.model_validate(full_payload)
-        request_state.forecast_artifacts[forecast.forecast_id] = forecast
-        request_state.latest_forecast = _build_prompt_safe_forecast(forecast, request_state)
+        prompt_view = _build_prompt_safe_forecast(forecast, request_state)
+        authoritative = forecast.model_copy(
+            update={"diagnostics": prompt_view.diagnostics},
+        )
+        request_state.forecast_artifacts[forecast.forecast_id] = authoritative
+        request_state.latest_forecast = authoritative
         return
 
     if "anomaly_id" in full_payload:
         from schemas.timeseries import AnomalyResult
 
         anomaly = AnomalyResult.model_validate(full_payload)
-        request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
-        request_state.latest_anomaly = _build_prompt_safe_anomaly(anomaly, request_state)
+        prompt_view = _build_prompt_safe_anomaly(anomaly, request_state)
+        authoritative = anomaly.model_copy(
+            update={"diagnostics": prompt_view.diagnostics},
+        )
+        request_state.anomaly_artifacts[anomaly.anomaly_id] = authoritative
+        request_state.latest_anomaly = authoritative
         return
 
     if "skill_name" in full_payload:
@@ -1198,6 +1358,20 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
 def _apply_presentation_payload(request_state: RequestStateModel, full_payload: dict) -> None:
     request_state.final_answer_draft = FinalAnswer.model_validate(full_payload)
+
+
+def _apply_visualization_payload(request_state: RequestStateModel, full_payload: dict) -> None:
+    from schemas.visualization import VisualizationPayload
+
+    incoming = [
+        VisualizationPayload.model_validate(item)
+        for item in full_payload.get("visualizations", [])
+        if isinstance(item, dict)
+    ]
+    by_id = {item.visualization_id: item for item in request_state.visualizations}
+    for item in incoming:
+        by_id[item.visualization_id] = item
+    request_state.visualizations = list(by_id.values())
 
 
 def _has_final_answer_payload(payload: dict) -> bool:

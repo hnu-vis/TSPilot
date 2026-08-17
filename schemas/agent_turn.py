@@ -12,10 +12,10 @@ class PreviousObservationAssessment(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     covered: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
-    covered_facts: list[str] = Field(default_factory=list)
-    missing_facts: list[str] = Field(default_factory=list)
-    unavailable_facts: list[str] = Field(default_factory=list)
-    next_fact_need: str | None = None
+    covered_insights: list[str] = Field(default_factory=list)
+    missing_insights: list[str] = Field(default_factory=list)
+    unavailable_insights: list[str] = Field(default_factory=list)
+    next_insight_need: str | None = None
     completed_todos: list[int | str] = Field(default_factory=list)
     next_active_todo: int | str | None = None
     next_action_reason: str | None = None

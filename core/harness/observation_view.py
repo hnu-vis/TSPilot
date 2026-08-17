@@ -55,11 +55,17 @@ def _observation_view(observation: ToolObservation | dict | None, *, consumer: s
         return None
     tool_name = str(payload.get("tool_name") or "")
     visible_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    rendered_payload = _payload_view(tool_name, visible_payload, consumer=consumer)
+    if isinstance(visible_payload.get("coverage_delta"), dict):
+        rendered_payload["coverage_delta"] = _sanitize_value(
+            visible_payload["coverage_delta"],
+            max_string_chars=700,
+        )
     view = {
         "tool_name": tool_name,
         "success": bool(payload.get("success", False)),
         "summary": _strip_query_code(payload.get("summary")),
-        "payload": _payload_view(tool_name, visible_payload, consumer=consumer),
+        "payload": rendered_payload,
     }
     if view["success"] is False:
         failure = _generic_payload_view(visible_payload, consumer=consumer)
@@ -98,6 +104,8 @@ def _payload_view(tool_name: str, payload: dict, *, consumer: str) -> dict:
         return _forecast_payload_view(payload)
     if tool_name == "anomaly":
         return _anomaly_payload_view(payload)
+    if tool_name == "visualization":
+        return _visualization_payload_view(payload)
     if tool_name == "todowrite":
         return _todo_payload_view(payload)
     if tool_name == "terminate":
@@ -126,26 +134,40 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
         "data_preview": {},
         "diagnostics": _diagnostics_view(diagnostics),
     }
+    if consumer == "model":
+        # ReAct needs the shape and integrity of the produced artifact, not
+        # three overlapping representations of its rows. Exact values and
+        # full data remain available through evidence/insight state.
+        view.pop("data_preview", None)
+        view["full_fidelity"] = _full_fidelity(diagnostics)
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        if isinstance(metadata.get("time_range"), dict):
+            view["time_range"] = metadata["time_range"]
+        if isinstance(payload.get("insight_coverage"), dict):
+            view["insight_coverage"] = _insight_coverage_receipt(payload["insight_coverage"])
+        view["diagnostics"] = _react_diagnostics_view(diagnostics)
     if consumer == "public":
         view["query_language"] = payload.get("query_language")
         view["query"] = str(payload.get("query") or "") if payload.get("query") else None
-    preview = view["data_preview"]
-    if rows:
-        preview["rows"] = [_public_row(row) for row in rows[:5]]
-    if points:
-        preview["points"] = [_public_row(point) for point in points[:6]]
-    if series:
-        preview["series"] = [_series_view(item) for item in series[:2] if isinstance(item, dict)]
+    if consumer == "public":
+        preview = view["data_preview"]
+        if rows:
+            preview["rows"] = [_public_row(row) for row in rows[:5]]
+        if points:
+            preview["points"] = [_public_row(point) for point in points[:6]]
+        if series:
+            preview["series"] = [_series_view(item) for item in series[:2] if isinstance(item, dict)]
     artifact_ref = _artifact_ref(payload)
     if artifact_ref:
         view["artifact_ref"] = artifact_ref
-        view["raw_available_in_artifact"] = True
-    produced = payload.get("produced_facts")
+        if consumer == "public":
+            view["raw_available_in_artifact"] = True
+    produced = payload.get("produced_insights")
     if consumer == "public" and isinstance(produced, list):
-        view["produced_fact_count"] = len(produced)
-        view["produced_facts_preview"] = [_fact_view(item) for item in produced[:6] if isinstance(item, dict)]
-    if consumer == "public" and isinstance(payload.get("fact_coverage"), dict):
-        view["fact_coverage"] = payload["fact_coverage"]
+        view["produced_insight_count"] = len(produced)
+        view["produced_insights_preview"] = [_insight_view(item) for item in produced[:6] if isinstance(item, dict)]
+    if consumer == "public" and isinstance(payload.get("insight_coverage"), dict):
+        view["insight_coverage"] = payload["insight_coverage"]
     return _drop_empty(view)
 
 
@@ -163,6 +185,10 @@ def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
         "code_hash": payload.get("code_hash"),
         "metrics_preview": _bounded_value(result.get("metrics") if isinstance(result.get("metrics"), dict) else {}, max_dict_items=16),
         "details_preview": _bounded_value(result.get("details") if isinstance(result.get("details"), dict) else {}, max_dict_items=12),
+        "data_views": _bounded_value(
+            payload.get("data_views") if isinstance(payload.get("data_views"), list) else [],
+            max_dict_items=12,
+        ),
         "diagnostics": _diagnostics_view(diagnostics),
     }
     executed_code = diagnostics.get("executed_code_preview") if isinstance(diagnostics.get("executed_code_preview"), dict) else {}
@@ -180,25 +206,28 @@ def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
     artifact_ref = _artifact_ref(payload)
     if artifact_ref:
         view["artifact_ref"] = artifact_ref
-    produced = payload.get("produced_facts")
+    produced = payload.get("produced_insights")
     if consumer == "public" and isinstance(produced, list):
-        view["produced_fact_count"] = len(produced)
-        view["produced_facts_preview"] = [_fact_view(item) for item in produced[:6] if isinstance(item, dict)]
-    if consumer == "public" and isinstance(payload.get("fact_coverage"), dict):
-        view["fact_coverage"] = payload["fact_coverage"]
+        view["produced_insight_count"] = len(produced)
+        view["produced_insights_preview"] = [_insight_view(item) for item in produced[:6] if isinstance(item, dict)]
+    if consumer == "public" and isinstance(payload.get("insight_coverage"), dict):
+        view["insight_coverage"] = payload["insight_coverage"]
     return _drop_empty(view)
 
 
 def _forecast_payload_view(payload: dict) -> dict:
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
     points = payload.get("forecast_points") if isinstance(payload.get("forecast_points"), list) else []
+    point_count = diagnostics.get("forecast_point_count")
+    if not isinstance(point_count, int) or point_count < len(points):
+        point_count = len(points)
     view = {
         "forecast_id": payload.get("forecast_id"),
         "status": payload.get("status"),
         "model_name": payload.get("model_name"),
         "horizon": payload.get("horizon"),
         "summary": _strip_query_code(payload.get("summary")),
-        "forecast_point_count": len(points),
+        "forecast_point_count": point_count,
         "forecast_points_preview": [_public_row(point) for point in _sample_edges(points, limit=6)],
         "diagnostics": _diagnostics_view(diagnostics),
     }
@@ -260,6 +289,48 @@ def _terminate_payload_view(payload: dict) -> dict:
             "section_count": len(answer.get("sections", [])) if isinstance(answer.get("sections"), list) else None,
         }
     )
+
+
+def _visualization_payload_view(payload: dict) -> dict:
+    visualizations = payload.get("visualizations") if isinstance(payload.get("visualizations"), list) else []
+    return _drop_empty({
+        "visualization_ids": payload.get("visualization_ids") or [
+            item.get("visualization_id") for item in visualizations if isinstance(item, dict)
+        ],
+        "grounded_by": payload.get("grounded_by", []),
+        "verification": payload.get("verification", []),
+        "coverage_delta": payload.get("coverage_delta"),
+    })
+
+
+def _full_fidelity(diagnostics: dict) -> bool | None:
+    value = diagnostics.get("is_full_fidelity")
+    if isinstance(value, bool):
+        return value
+    sampling = diagnostics.get("prompt_sampling")
+    if isinstance(sampling, dict):
+        value = sampling.get("is_full_fidelity")
+        if isinstance(value, bool):
+            return value
+        if sampling.get("full_artifact_ref"):
+            return True
+    return None
+
+
+def _insight_coverage_receipt(coverage: dict) -> dict:
+    return _drop_empty({
+        key: coverage.get(key)
+        for key in ("requested", "verified", "missing", "unavailable", "rejected", "partial")
+    })
+
+
+def _react_diagnostics_view(diagnostics: dict) -> dict:
+    """Keep only diagnostics that can change the next ReAct action."""
+    return _drop_empty({
+        "coverage": diagnostics.get("coverage"),
+        "recommended_downstream_action": diagnostics.get("recommended_downstream_action"),
+        "next_action_hint": diagnostics.get("next_action_hint"),
+    })
 
 
 def _generic_payload_view(payload: dict, *, consumer: str) -> dict:
@@ -369,20 +440,20 @@ def _series_view(series: dict) -> dict:
     return _drop_empty(view)
 
 
-def _fact_view(fact: dict) -> dict:
-    evidence_refs = fact.get("evidence_refs") if isinstance(fact.get("evidence_refs"), list) else []
+def _insight_view(insight: dict) -> dict:
+    evidence_refs = insight.get("evidence_refs") if isinstance(insight.get("evidence_refs"), list) else []
     return _drop_empty(
         {
-            "fact_id": fact.get("fact_id"),
-            "fact_key": fact.get("fact_key"),
-            "name": fact.get("name"),
-            "fact_type": fact.get("fact_type"),
-            "statement": _strip_query_code(fact.get("statement")),
-            "value": _sanitize_value(fact.get("value"), max_string_chars=300),
-            "unit": fact.get("unit"),
-            "method": fact.get("method"),
-            "status": fact.get("status"),
-            "derived_from": _sanitize_value(fact.get("derived_from"), max_string_chars=160),
+            "insight_id": insight.get("insight_id"),
+            "insight_key": insight.get("insight_key"),
+            "name": insight.get("name"),
+            "insight_type": insight.get("insight_type"),
+            "statement": _strip_query_code(insight.get("statement")),
+            "value": _sanitize_value(insight.get("value"), max_string_chars=300),
+            "unit": insight.get("unit"),
+            "method": insight.get("method"),
+            "status": insight.get("status"),
+            "derived_from": _sanitize_value(insight.get("derived_from"), max_string_chars=160),
             "evidence_refs": [
                 _drop_empty(
                     {
@@ -394,8 +465,8 @@ def _fact_view(fact: dict) -> dict:
                 for item in evidence_refs[:6]
                 if isinstance(item, dict)
             ],
-            "calculation_trace": _sanitize_value(fact.get("calculation_trace"), max_string_chars=300),
-            "unavailable_reason": _sanitize_value(fact.get("unavailable_reason"), max_string_chars=300),
+            "calculation_trace": _sanitize_value(insight.get("calculation_trace"), max_string_chars=300),
+            "unavailable_reason": _sanitize_value(insight.get("unavailable_reason"), max_string_chars=300),
         }
     )
 

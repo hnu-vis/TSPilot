@@ -15,8 +15,8 @@ from core.database.query_errors import classify_query_error
 from core.database.schema import schema_preview
 from schemas.state import RequestStateModel
 from schemas.database_context import DatabaseContext
-from schemas.data_fact import DataFactRequest
-from core.data_fact.contracts import fact_request_contract_error
+from schemas.key_insight import KeyInsightRequest
+from core.key_insight.contracts import insight_request_contract_error
 from tools.base import BaseTool, StructuredToolError
 
 
@@ -26,7 +26,7 @@ class _ExplicitQueryInput(BaseModel):
     query_language: str | None = None
     purpose: str | None = None
     constraints: dict = Field(default_factory=dict)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
 
 
 class SqlQueryInput(BaseModel):
@@ -40,7 +40,7 @@ class SqlQueryInput(BaseModel):
     selected_database: str | None = None
     selected_database_type: str | None = None
     history: list[dict] = Field(default_factory=list)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
     query: str | None = None
     query_language: str | None = None
     purpose: str | None = None
@@ -64,41 +64,41 @@ class SqlQueryInput(BaseModel):
             normalized.setdefault("message", text)
         return normalized
 
-    @field_validator("fact_requests", mode="before")
+    @field_validator("insight_requests", mode="before")
     @classmethod
-    def keep_only_valid_fact_request_hints(cls, value):
+    def keep_only_valid_insight_request_hints(cls, value):
         if value in (None, ""):
             return []
         if not isinstance(value, list):
             return []
         normalized: list = []
         for item in value:
-            if isinstance(item, DataFactRequest):
+            if isinstance(item, KeyInsightRequest):
                 normalized.append(item)
                 continue
             if not isinstance(item, dict):
                 continue
-            if item.get("name") and item.get("fact_type"):
+            if item.get("name") and item.get("insight_type"):
                 normalized.append(item)
         return normalized
 
     @model_validator(mode="after")
     def require_message_or_query(self):
-        supported_fact_requests: list[DataFactRequest] = []
-        unsupported_fact_requests: list[dict] = []
-        for request in self.fact_requests:
-            error = fact_request_contract_error(request, "sql_query")
+        supported_insight_requests: list[KeyInsightRequest] = []
+        unsupported_insight_requests: list[dict] = []
+        for request in self.insight_requests:
+            error = insight_request_contract_error(request, "sql_query")
             if error:
-                unsupported_fact_requests.append(
+                unsupported_insight_requests.append(
                     {**request.model_dump(mode="json", exclude_none=True), "contract_error": error}
                 )
             else:
-                supported_fact_requests.append(request)
-        self.fact_requests = supported_fact_requests
-        if unsupported_fact_requests:
+                supported_insight_requests.append(request)
+        self.insight_requests = supported_insight_requests
+        if unsupported_insight_requests:
             self.constraints = {
                 **self.constraints,
-                "unsupported_fact_requests": unsupported_fact_requests,
+                "unsupported_insight_requests": unsupported_insight_requests,
             }
         has_repair_contract = str(self.mode or "").strip().lower() == "repair" and isinstance(self.repair_contract, dict)
         if not has_repair_contract and not (self.query and self.query.strip()) and not (self.message and self.message.strip()):
@@ -477,7 +477,7 @@ class _ExplicitQueryExecutor(BaseTool):
             satisfied.append(f"executed query for: {validated_input.purpose}")
         next_action_hint = self._optional_string((base or {}).get("next_action_hint"))
         if missing and not next_action_hint:
-            next_action_hint = "Use the latest query, schema linking, and result summary to issue another focused sql_query for the missing facts."
+            next_action_hint = "Use the latest query, schema linking, and result summary to issue another focused sql_query for the missing insights."
         return {
             "source": (base or {}).get("source") or "sql_query_runtime",
             "user_request": validated_input.purpose,
@@ -603,7 +603,7 @@ class SqlQueryTool(BaseTool):
                     query_language=validated_input.query_language,
                     purpose=validated_input.purpose,
                     constraints=validated_input.constraints,
-                    fact_requests=validated_input.fact_requests,
+                    insight_requests=validated_input.insight_requests,
                 ),
                 mode="explicit",
                 **kwargs,
@@ -675,7 +675,7 @@ class SqlQueryTool(BaseTool):
                 time_range=validated_input.time_range,
                 constraints=validated_input.constraints,
                 history=validated_input.history,
-                fact_requests=[item.model_dump(mode="json", exclude_none=True) for item in validated_input.fact_requests],
+                insight_requests=[item.model_dump(mode="json", exclude_none=True) for item in validated_input.insight_requests],
                 previous_query=repair_contract.get("previous_query") if repair_contract else None,
                 error=repair_failure or {"repair_contract": repair_contract} if repair_contract else None,
                 request_state=request_state,
@@ -774,7 +774,7 @@ class SqlQueryTool(BaseTool):
                         **({"_schema_linking_contract": schema_linking_diagnostics} if schema_linking_diagnostics else {}),
                         "_query_execution": generated.query_execution.model_dump(mode="json", exclude_none=True),
                     },
-                    fact_requests=validated_input.fact_requests,
+                    insight_requests=validated_input.insight_requests,
                 ),
                 mode="llm",
                 extra_metadata={

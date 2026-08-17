@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.settings import get_settings
+from core.harness.observation_view import public_observation_view
 from runtime.request_state import apply_observation, build_request_state
 from runtime.request_state import enrich_observation_payload
 from schemas.api import ChatRequest
@@ -87,7 +88,7 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
         tool_spec,
     )
     assert "an_demo" in request_state.anomaly_artifacts
-    assert len(request_state.latest_anomaly.anomaly_points) == 12
+    assert len(request_state.latest_anomaly.anomaly_points) == 20
     assert Path(request_state.latest_anomaly.diagnostics["snapshot_ref"]["uri"]).exists()
     enriched_anomaly = enrich_observation_payload(
         request_state,
@@ -95,6 +96,7 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
         anomaly_payload,
         tool_spec,
     )
+    assert len(enriched_anomaly.payload["anomaly_points"]) == 12
     assert enriched_anomaly.payload["diagnostics"]["snapshot_ref"]["artifact_kind"] == "anomaly_result"
 
     forecast_payload = {
@@ -113,7 +115,7 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
         tool_spec,
     )
     assert "fc_demo" in request_state.forecast_artifacts
-    assert len(request_state.latest_forecast.forecast_points) == 12
+    assert len(request_state.latest_forecast.forecast_points) == 20
     assert Path(request_state.latest_forecast.diagnostics["snapshot_ref"]["uri"]).exists()
     enriched_forecast = enrich_observation_payload(
         request_state,
@@ -121,4 +123,9 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
         forecast_payload,
         tool_spec,
     )
+    assert len(enriched_forecast.payload["forecast_points"]) == 12
+    assert enriched_forecast.payload["diagnostics"]["forecast_point_count"] == 20
     assert enriched_forecast.payload["diagnostics"]["snapshot_ref"]["artifact_kind"] == "forecast_result"
+    public_forecast = public_observation_view(enriched_forecast)
+    assert public_forecast["payload"]["forecast_point_count"] == 20
+    assert len(public_forecast["payload"]["forecast_points_preview"]) == 6

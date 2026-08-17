@@ -65,8 +65,25 @@ def default_anomaly_detector_name() -> str:
     return _DEFAULT_ANOMALY_DETECTOR
 
 
+def set_default_anomaly_detector(name: str) -> None:
+    """Select the default from the currently registered anomaly detectors."""
+    normalized = str(name).strip().lower()
+    if normalized not in _ANOMALY_DETECTORS:
+        available = ", ".join(available_anomaly_detectors()) or "none"
+        raise ValueError(f"Unknown anomaly detector '{normalized}'. Available anomaly detectors: {available}.")
+    global _DEFAULT_ANOMALY_DETECTOR
+    _DEFAULT_ANOMALY_DETECTOR = normalized
+
+
 def available_anomaly_detectors() -> list[str]:
     return sorted(_ANOMALY_DETECTORS)
+
+
+def unregister_anomaly_detector(name: str) -> None:
+    normalized = str(name).strip().lower()
+    if normalized == "zscore":
+        raise ValueError("The built-in zscore detector cannot be unregistered.")
+    _ANOMALY_DETECTORS.pop(normalized, None)
 
 
 class ZScoreAnomalyDetector:

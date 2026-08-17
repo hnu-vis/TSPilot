@@ -30,7 +30,7 @@ from runtime.tool_executor import ToolExecutor
 from agents.data_agent import DataAgent
 from schemas.tool import ToolObservation
 from tools.base import StructuredToolError
-from core.data_fact.learning import FactLearningOutbox
+from core.key_insight.learning import InsightLearningOutbox
 
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
@@ -49,12 +49,12 @@ class ReActLoop:
         data_agent: DataAgent,
         tool_executor: ToolExecutor,
         settings: Settings,
-        fact_learning_outbox: FactLearningOutbox | None = None,
+        insight_learning_outbox: InsightLearningOutbox | None = None,
     ):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
-        self._fact_learning_outbox = fact_learning_outbox
+        self._insight_learning_outbox = insight_learning_outbox
         self._trace_logger = ConversationTraceLogger(settings)
         self._transition_engine = StateTransitionEngine()
         self._action_output_builder = ActionOutputBuilder()
@@ -515,19 +515,19 @@ class ReActLoop:
             if execution_result.tool_spec.produces_terminal_payload:
                 unavailable_outputs = turn.action_input.get("unavailable_outputs") if isinstance(turn.action_input, dict) else None
                 request_state.status = "partial" if isinstance(unavailable_outputs, list) and unavailable_outputs else "completed"
-                if self._fact_learning_outbox is not None and request_state.status == "completed":
+                if self._insight_learning_outbox is not None and request_state.status == "completed":
                     try:
-                        queued_ids = self._fact_learning_outbox.enqueue_request(request_state)
+                        queued_ids = self._insight_learning_outbox.enqueue_request(request_state)
                         if queued_ids:
                             yield append_trace(
                                 request_state,
-                                "fact_learning_queued",
+                                "insight_learning_queued",
                                 {"candidate_count": len(queued_ids), "job_ids": queued_ids},
                             )
                     except Exception as exc:
                         yield append_trace(
                             request_state,
-                            "fact_learning_queue_failed",
+                            "insight_learning_queue_failed",
                             {"error": str(exc)[:500]},
                         )
                 yield append_trace(
@@ -720,7 +720,7 @@ class ReActLoop:
         }
 
     def _coverage_updated_payload(self, request_state: RequestStateModel, action_output) -> dict:
-        coverage = getattr(request_state, "fact_coverage", None)
+        coverage = getattr(request_state, "insight_coverage", None)
         latest_goal = request_state.completion_state.get("latest_goal")
         latest_step = request_state.completion_state.get("latest_step")
         if coverage is None and not isinstance(latest_goal, dict) and not isinstance(latest_step, dict):
@@ -731,7 +731,7 @@ class ReActLoop:
             "resource_ref": action_output.resource_ref,
         }
         if coverage is not None:
-            payload["fact_coverage"] = coverage.model_dump(mode="json") if hasattr(coverage, "model_dump") else coverage
+            payload["insight_coverage"] = coverage.model_dump(mode="json") if hasattr(coverage, "model_dump") else coverage
         if isinstance(latest_goal, dict):
             payload["goal_coverage"] = latest_goal
         if isinstance(latest_step, dict):
@@ -1007,6 +1007,7 @@ class ReActLoop:
         mapping = {
             "sql_query": "tool_selection",
             "code_interpreter": "analysis",
+            "visualization": "visualization",
             "terminate": "answer_assembly",
             "forecast": "analysis",
             "anomaly": "analysis",
@@ -1020,6 +1021,7 @@ class ReActLoop:
         mapping = {
             "sql_query": "正在查询数据源。",
             "code_interpreter": "正在执行数据分析。",
+            "visualization": "正在生成完整数据可视化。",
             "terminate": "正在结束并组装最终回答。",
             "forecast": "正在执行趋势预测。",
             "anomaly": "正在检测异常。",
@@ -1062,11 +1064,16 @@ class ReActLoop:
             response_plan = action_input.get("response_plan")
             response_plan = response_plan if isinstance(response_plan, dict) else {}
             sections = response_plan.get("sections")
-            visual_intents = response_plan.get("visual_intents")
+            visualization_ids = response_plan.get("visualization_ids")
             return {
                 "has_summary": bool(response_plan.get("summary")),
                 "section_count": len(sections) if isinstance(sections, list) else 0,
-                "visual_intent_count": len(visual_intents) if isinstance(visual_intents, list) else 0,
+                "visualization_count": len(visualization_ids) if isinstance(visualization_ids, list) else 0,
+            }
+        if action_name == "visualization":
+            return {
+                "message": action_input.get("message"),
+                "source_ref_count": len(action_input.get("source_refs") or []),
             }
         if action_name == "todowrite":
             todos = action_input.get("todos")
@@ -1138,14 +1145,14 @@ class ReActLoop:
             preview["result_preview"] = visible_payload["result"]
         if "visualizations" in visible_payload:
             preview["visualization_count"] = len(visible_payload.get("visualizations", []))
-        if "produced_facts" in visible_payload:
-            produced_facts = visible_payload.get("produced_facts", [])
-            preview["produced_facts"] = produced_facts[:8] if isinstance(produced_facts, list) else []
-            preview["verified_fact_count"] = len(preview["produced_facts"])
-        if "fact_coverage" in visible_payload:
-            preview["fact_coverage"] = visible_payload.get("fact_coverage")
-        if "data_fact_context" in visible_payload:
-            preview["data_fact_context"] = visible_payload.get("data_fact_context")
+        if "produced_insights" in visible_payload:
+            produced_insights = visible_payload.get("produced_insights", [])
+            preview["produced_insights"] = produced_insights[:8] if isinstance(produced_insights, list) else []
+            preview["verified_insight_count"] = len(preview["produced_insights"])
+        if "insight_coverage" in visible_payload:
+            preview["insight_coverage"] = visible_payload.get("insight_coverage")
+        if "key_insight_context" in visible_payload:
+            preview["key_insight_context"] = visible_payload.get("key_insight_context")
         if "todos" in visible_payload:
             todos = visible_payload.get("todos", [])
             preview["todo_total"] = len(todos)
@@ -1377,8 +1384,8 @@ class ReActLoop:
                 else None
             ),
             "execution_attempts": diagnostics.get("execution_attempts"),
-            "fact_binding": diagnostics.get("fact_binding")
-            if isinstance(diagnostics.get("fact_binding"), dict)
+            "insight_binding": diagnostics.get("insight_binding")
+            if isinstance(diagnostics.get("insight_binding"), dict)
             else None,
             "canonical_inputs": diagnostics.get("canonical_inputs") if isinstance(diagnostics.get("canonical_inputs"), dict) else None,
         }
@@ -1393,7 +1400,11 @@ class ReActLoop:
             "forecast_status": visible_payload.get("status"),
             "forecast_plan": plan,
             "forecast_points": points[:12],
-            "forecast_point_count": len(points),
+            "forecast_point_count": (
+                diagnostics.get("forecast_point_count")
+                if isinstance(diagnostics.get("forecast_point_count"), int)
+                else len(points)
+            ),
             "model_name": visible_payload.get("model_name"),
             "horizon": visible_payload.get("horizon"),
         }

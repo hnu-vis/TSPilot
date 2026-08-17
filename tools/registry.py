@@ -19,6 +19,8 @@ from tools.skill import SkillInput, SkillTool
 from tools.sql_query import SqlQueryInput, SqlQueryTool
 from tools.terminate import TerminateInput, TerminateTool
 from tools.todowrite import TodoWriteInput, TodoWriteResult, TodoWriteTool
+from tools.visualization import VisualizationInput, VisualizationResult, VisualizationTool
+from core.visualization import VisualizationArtifactStore
 
 
 @dataclass
@@ -58,7 +60,14 @@ class ToolRegistry:
         return self._specs[action_name]
 
 
-def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
+def build_tool_registry(
+    settings: Settings,
+    llm=None,
+    visualization_artifact_store: VisualizationArtifactStore | None = None,
+) -> ToolRegistry:
+    visualization_artifact_store = visualization_artifact_store or VisualizationArtifactStore(
+        settings.resolved_visualization_artifact_dir
+    )
     specs = [
         ToolSpec(
             tool_name="todowrite",
@@ -148,6 +157,22 @@ def build_tool_registry(settings: Settings, llm=None) -> ToolRegistry:
             prompt_visible=True,
             runtime_access="request_state_read",
             result_target="analysis",
+            produces_terminal_payload=False,
+            supports_streaming=False,
+        ),
+        ToolSpec(
+            tool_name="visualization",
+            description=(
+                "Plan and materialize grounded visualizations from complete evidence artifacts. "
+                "If the available evidence is aggregate, preview-only, or lacks a locatable highlight point, "
+                "the tool requests an additional full-fidelity sql_query."
+            ),
+            input_model=VisualizationInput,
+            output_model=VisualizationResult,
+            tool=VisualizationTool(llm=llm, artifact_store=visualization_artifact_store),
+            prompt_visible=True,
+            runtime_access="request_state_read",
+            result_target="visualization",
             produces_terminal_payload=False,
             supports_streaming=False,
         ),

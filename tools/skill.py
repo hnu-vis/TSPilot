@@ -33,12 +33,21 @@ class SkillTool(BaseTool):
                     else None
                 ),
                 "latest_forecast": (
-                    request_state.latest_forecast.model_dump(mode="json")
+                    {
+                        "forecast_id": request_state.latest_forecast.forecast_id,
+                        "model_name": request_state.latest_forecast.model_name,
+                        "horizon": request_state.latest_forecast.horizon,
+                        "status": request_state.latest_forecast.status,
+                    }
                     if request_state.latest_forecast
                     else None
                 ),
                 "latest_anomaly": (
-                    request_state.latest_anomaly.model_dump(mode="json")
+                    {
+                        "anomaly_id": request_state.latest_anomaly.anomaly_id,
+                        "detector_name": request_state.latest_anomaly.detector_name,
+                        "anomaly_point_count": len(request_state.latest_anomaly.anomaly_points),
+                    }
                     if request_state.latest_anomaly
                     else None
                 ),

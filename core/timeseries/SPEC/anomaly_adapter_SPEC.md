@@ -12,5 +12,5 @@ Bridge normalized series to an anomaly detector backend.
 
 ## Must not do
 
-- infer facts
+- infer insights
 - write final answer text

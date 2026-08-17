@@ -16,5 +16,5 @@ Provide the stable result contract and validation errors for Python row analysis
 
 - Must not access request state.
 - Must not decide user intent.
-- Must not register facts or assemble presentation output.
+- Must not register insights or assemble presentation output.
 - Must keep the result shape compatible with `tools/code_interpreter.py`.

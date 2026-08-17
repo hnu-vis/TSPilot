@@ -17,7 +17,7 @@ class TerminateInput(BaseModel):
 
 
 class TerminateTool(BaseTool):
-    """The final model action carries prose and semantic visualization intents."""
+    """The final action carries prose plus ids of existing visual artifacts."""
 
     def __init__(self, formatter: FormatAnswerTool | None = None, *, llm=None):
         self._formatter = formatter or FormatAnswerTool(llm=llm)

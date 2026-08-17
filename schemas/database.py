@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from schemas.data_fact import DataFact, FactCoverage
+from schemas.key_insight import KeyInsight, InsightCoverage
 
 
 class DatabaseEvidence(BaseModel):
@@ -21,6 +21,6 @@ class DatabaseEvidence(BaseModel):
     columns: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     diagnostics: dict = Field(default_factory=dict)
-    produced_facts: list[DataFact] = Field(default_factory=list)
-    rejected_facts: list[DataFact] = Field(default_factory=list)
-    fact_coverage: FactCoverage | None = None
+    produced_insights: list[KeyInsight] = Field(default_factory=list)
+    rejected_insights: list[KeyInsight] = Field(default_factory=list)
+    insight_coverage: InsightCoverage | None = None

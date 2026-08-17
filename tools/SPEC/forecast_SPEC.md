@@ -41,7 +41,7 @@ Run forecast analysis on normalized time-series evidence.
 - reject raw limited evidence when it does not cover the requested time range
 - return `requires_rolling` plus a plan when the requested horizon exceeds the direct forecast window
 - forecast model implementations must be selected through the registry
-- do not infer unrelated facts
+- do not infer unrelated insights
 
 ## Must not do
 

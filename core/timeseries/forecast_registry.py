@@ -64,8 +64,25 @@ def default_forecast_model_name() -> str:
     return _DEFAULT_FORECAST_MODEL
 
 
+def set_default_forecast_model(name: str) -> None:
+    """Select the default from the currently registered forecast models."""
+    normalized = str(name).strip().lower()
+    if normalized not in _FORECAST_MODELS:
+        available = ", ".join(available_forecast_models()) or "none"
+        raise ValueError(f"Unknown forecast model '{normalized}'. Available forecast models: {available}.")
+    global _DEFAULT_FORECAST_MODEL
+    _DEFAULT_FORECAST_MODEL = normalized
+
+
 def available_forecast_models() -> list[str]:
     return sorted(_FORECAST_MODELS)
+
+
+def unregister_forecast_model(name: str) -> None:
+    normalized = str(name).strip().lower()
+    if normalized == "linear_regression":
+        raise ValueError("The built-in linear_regression model cannot be unregistered.")
+    _FORECAST_MODELS.pop(normalized, None)
 
 
 class LinearRegressionForecastModel:

@@ -366,10 +366,77 @@ def test_terminate_requires_anomaly_tool_when_contract_requires_anomaly_evidence
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["anomaly"]
 
 
-def test_terminate_allows_code_outlier_analysis_without_anomaly_artifact_when_contract_requires_analysis():
+def test_open_vocabulary_anomaly_detection_contract_requires_anomaly_action():
+    request_state = RequestStateModel(
+        request_id="req-open-anomaly-contract",
+        message="排除异常后分析",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        task_contract=TaskContract.model_validate({
+            "source": "llm",
+            "goal": "排除异常后分析",
+            "required_outputs": [
+                {"id": "market_evidence", "description": "原始时序", "evidence_kind": "time_series"},
+                {"id": "anomaly_set", "description": "识别并排除异常点", "evidence_kind": "anomaly_detection"},
+                {"id": "metric", "description": "派生指标", "evidence_kind": "custom_analysis"},
+            ],
+        }),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series", result_type="timeseries", database="demo",
+            summary="Loaded series.", data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+        ),
+    )
+
+    constraints = runtime_action_constraints(request_state)
+    assert constraints["required_actions"][0]["action"] == "anomaly"
+
+
+def test_llm_contract_describing_excluded_anomaly_points_requires_authoritative_anomaly():
+    request_state = RequestStateModel(
+        request_id="req-described-anomaly-contract",
+        message="排除异常点后计算最优交易并绘图",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm",
+            "goal": "计算最优交易并绘图",
+            "required_outputs": [
+                {
+                    "id": "cleaned_price_series",
+                    "description": "清洗后的行情及被排除异常点所需证据",
+                    "output_type": "data_view",
+                    "evidence_kind": "database",
+                },
+                {
+                    "id": "trade_analysis",
+                    "description": "最优交易",
+                    "output_type": "analysis",
+                    "evidence_kind": "analysis",
+                },
+            ],
+        }),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_series",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded series.",
+            data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+        ),
+    )
+
+    constraints = runtime_action_constraints(request_state)
+    allowed, reason = validate_action(request_state, "terminate")
+
+    assert constraints["required_actions"][0]["action"] == "anomaly"
+    assert allowed is False
+    assert reason is not None
+    assert "anomaly" in reason
+
+
+def test_terminate_requires_authoritative_anomaly_artifact_for_outlier_contract():
     request_state = RequestStateModel(
         request_id="req-outlier-analysis-contract",
         message="计算指标，如果发现明显异常值，请说明规则、剔除行和剔除前后指标。",
@@ -437,9 +504,9 @@ def test_terminate_allows_code_outlier_analysis_without_anomaly_artifact_when_co
 
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "基于 code 结果回答。"})
 
-    assert allowed is True
-    assert reason is None
-    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+    assert allowed is False
+    assert reason is not None
+    assert "anomaly" in reason
 
 
 def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():

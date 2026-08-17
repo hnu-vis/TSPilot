@@ -12,5 +12,5 @@ Normalize time-series evidence into adapter-friendly series.
 
 ## Must not do
 
-- infer facts
+- infer insights
 - create final answer text

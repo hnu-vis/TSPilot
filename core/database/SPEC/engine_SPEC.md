@@ -14,5 +14,5 @@ Provide single-attempt connector execution and backend-result normalization for 
 
 - decide user intent
 - generate, repair, or retry queries
-- narrate facts
+- narrate insights
 - assemble final answers

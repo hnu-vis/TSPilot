@@ -11,6 +11,7 @@ from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
 from schemas.tool import ToolObservation
+from schemas.timeseries import AnomalyResult
 from tools.base import StructuredToolError
 from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool
 
@@ -36,7 +37,7 @@ class _CapturingCodeLLM:
             "'excluded_rows': [], "
             "'raw_metrics': {'mean': float(value.mean()) if hasattr(value, 'mean') else 0.0}, "
             "'adjusted_metrics': {'mean': float(value.mean()) if hasattr(value, 'mean') else 0.0}}, "
-            "'facts': []}"
+            "'insights': []}"
         )
         return type("_Response", (), {"content": json.dumps({"code": code})})()
 
@@ -150,34 +151,35 @@ def test_code_interpreter_generation_consumes_repair_contract():
     assert llm.payload["mode"] == "repair"
     assert llm.payload["repair_contract"] == repair_contract
     assert llm.payload["analysis_request"]["required_outputs"] == ["custom robust outlier analysis"]
+    assert llm.payload["available_lineage_refs"] == ["evidence:evi_demo_full"]
     assert result["result"]["details"]["outlier_rule"] == "IQR upper fence"
     assert result["diagnostics"]["execution_attempts"] == 1
 
 
-def test_code_interpreter_allows_fact_composition_within_one_result():
-    facts = [
+def test_code_interpreter_allows_insight_composition_within_one_result():
+    insights = [
         {
-            "fact_key": "trend",
+            "insight_key": "trend",
             "name": "trend",
-            "fact_type": "analysis",
+            "insight_type": "analysis",
             "value": "down",
             "statement": "trend is down",
             "calculation_trace": {"method": "slope"},
             "derived_from": [],
         },
         {
-            "fact_key": "anomalies",
+            "insight_key": "anomalies",
             "name": "anomalies",
-            "fact_type": "analysis",
+            "insight_type": "analysis",
             "value": 2,
             "statement": "two anomalies",
             "calculation_trace": {"method": "iqr"},
             "derived_from": [],
         },
         {
-            "fact_key": "conclusion",
+            "insight_key": "conclusion",
             "name": "conclusion",
-            "fact_type": "analysis",
+            "insight_type": "analysis",
             "value": "down with two anomalies",
             "statement": "series declines with two anomalies",
             "calculation_trace": {"method": "composition"},
@@ -189,7 +191,7 @@ def test_code_interpreter_allows_fact_composition_within_one_result():
             "summary": "computed",
             "metrics": {"anomaly_count": 2},
             "details": {},
-            "facts": facts,
+            "insights": insights,
         }
     )
 
@@ -197,17 +199,17 @@ def test_code_interpreter_allows_fact_composition_within_one_result():
         CodeInterpreterTool().execute(
             CodeInterpreterInput(
                 database_evidence=_build_full_evidence_payload(),
-                analysis_goal="compose analysis facts",
+                analysis_goal="compose analysis insights",
                 code=code,
-                fact_requests=[
-                    {key: value for key, value in fact.items() if key in {"fact_key", "name", "fact_type", "derived_from"}}
-                    for fact in facts
+                insight_requests=[
+                    {key: value for key, value in insight.items() if key in {"insight_key", "name", "insight_type", "derived_from"}}
+                    for insight in insights
                 ],
             )
         )
     )
 
-    assert [fact["fact_key"] for fact in result["result"]["facts"]] == ["trend", "anomalies", "conclusion"]
+    assert [insight["insight_key"] for insight in result["result"]["insights"]] == ["trend", "anomalies", "conclusion"]
 
 
 def _build_rows_only_price_evidence_payload():
@@ -700,6 +702,146 @@ def test_code_interpreter_allows_transparent_outlier_treatment():
     )
 
     assert result["result"]["details"]["excluded_rows"] == _build_full_evidence_payload()["data"]["rows"][:2]
+
+
+def test_code_interpreter_uses_authoritative_anomaly_points_and_publishes_clean_view():
+    settings = get_settings()
+    request_state = build_request_state(ChatRequest(message="排除异常点后计算指标并绘图"), settings)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        _build_full_evidence_payload(),
+        _ToolSpec(),
+    )
+    anomaly = AnomalyResult(
+        anomaly_id="anomaly_evi_demo_full", detector_name="unit",
+        anomaly_points=_build_full_evidence_payload()["data"]["rows"][:2],
+        diagnostics={"resolved_evidence_id": "evi_demo_full"},
+    )
+    request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
+    request_state.latest_anomaly = anomaly
+
+    result = asyncio.run(CodeInterpreterTool().execute(
+        CodeInterpreterInput(
+            database_evidence="anomaly:anomaly_evi_demo_full",
+            analysis_goal="exclude authoritative anomalies and compute metrics",
+            code=(
+                "excluded = analysis_context['anomaly_context']['anomaly_points']\n"
+                "excluded_keys = {(item['timestamp'], item['value']) for item in excluded}\n"
+                "clean = [row for row in rows if (row['timestamp'], row['value']) not in excluded_keys]\n"
+                "result = {\n"
+                "  'summary': 'computed on the authoritative clean series',\n"
+                "  'metrics': {'used_point_count': len(clean)},\n"
+                "  'details': {\n"
+                "    'outlier_rule': 'authoritative anomaly artifact',\n"
+                "    'threshold_or_formula': 'artifact membership',\n"
+                "    'rationale': 'single source of truth',\n"
+                "    'excluded_rows': excluded,\n"
+                "    'raw_metrics': {'row_count': len(rows)},\n"
+                "    'adjusted_metrics': {'row_count': len(clean)},\n"
+                "  },\n"
+                "  'data_views': [{\n"
+                "    'view_id': 'clean', 'name': 'Clean series', 'shape': 'timeseries', 'rows': clean,\n"
+                "    'schema_fields': [{'name': 'timestamp', 'data_type': 'time'}, {'name': 'value', 'data_type': 'number'}],\n"
+                "    'lineage': ['evidence:evi_demo_full', analysis_context['anomaly_context']['source_ref']],\n"
+                "    'transform_summary': 'Excluded authoritative anomalies',\n"
+                "  }],\n"
+                "}\n"
+            ),
+        ),
+        request_state=request_state,
+    ))
+
+    assert result["result"]["details"]["excluded_rows"] == anomaly.anomaly_points
+    assert result["data_views"][0]["lineage"][-1] == "anomaly:anomaly_evi_demo_full"
+
+
+def test_code_interpreter_rejects_analysis_that_disagrees_with_authoritative_anomaly_points():
+    settings = get_settings()
+    request_state = build_request_state(ChatRequest(message="排除异常点后计算指标"), settings)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        _build_full_evidence_payload(),
+        _ToolSpec(),
+    )
+    anomaly = AnomalyResult(
+        anomaly_id="anomaly_evi_demo_full", detector_name="unit",
+        anomaly_points=_build_full_evidence_payload()["data"]["rows"][:2],
+        diagnostics={"resolved_evidence_id": "evi_demo_full"},
+    )
+    request_state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
+
+    with pytest.raises(StructuredToolError, match="exactly match"):
+        asyncio.run(CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="exclude a different anomaly set",
+                code=(
+                    "excluded = rows[1:3]\n"
+                    "result = {'summary': 'wrong exclusions', 'metrics': {}, 'details': {"
+                    "'outlier_rule': 'local detector', 'threshold_or_formula': 'local', 'rationale': 'local', "
+                    "'excluded_rows': excluded, 'raw_metrics': {}, 'adjusted_metrics': {}}, 'data_views': [{"
+                    "'view_id': 'clean', 'name': 'Clean', 'shape': 'timeseries', 'rows': rows[3:], "
+                    "'schema_fields': [], 'lineage': ['anomaly:anomaly_evi_demo_full']}] }\n"
+                ),
+            ),
+            request_state=request_state,
+        ))
+
+
+def test_code_interpreter_returns_structured_repair_for_invalid_data_view_contract():
+    settings = get_settings()
+    request_state = build_request_state(ChatRequest(message="计算并绘图"), settings)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        _build_full_evidence_payload(),
+        _ToolSpec(),
+    )
+    with pytest.raises(StructuredToolError) as caught:
+        asyncio.run(CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="publish a typed view",
+                code=(
+                    "result = {'summary': 'view', 'metrics': {}, 'details': {}, 'data_views': [{"
+                    "'view_id': 'bad', 'name': 'Bad', 'shape': 'timeseries', 'rows': rows, "
+                    "'schema_fields': ['timestamp', 'value'], 'lineage': {'source': 'rows'}}]}\n"
+                ),
+            ),
+            request_state=request_state,
+        ))
+    assert caught.value.error_type == "analysis_data_view_invalid"
+    assert caught.value.validation_failure["repair_contract"]["data_view_contract"]
+
+
+def test_code_interpreter_rejects_unknown_data_view_lineage_before_artifact_registration():
+    settings = get_settings()
+    request_state = build_request_state(ChatRequest(message="计算并绘图"), settings)
+    apply_observation(
+        request_state,
+        ToolObservation(tool_name="sql_query", success=True, summary="ok", payload={}),
+        _build_full_evidence_payload(),
+        _ToolSpec(),
+    )
+
+    with pytest.raises(StructuredToolError) as caught:
+        asyncio.run(CodeInterpreterTool().execute(
+            CodeInterpreterInput(
+                analysis_goal="publish a grounded typed view",
+                code=(
+                    "result = {'summary': 'view', 'metrics': {}, 'details': {}, 'data_views': [{"
+                    "'view_id': 'returns', 'name': 'Returns', 'shape': 'timeseries', 'rows': rows, "
+                    "'lineage': ['evidence:invented_alias']}] }\n"
+                ),
+            ),
+            request_state=request_state,
+        ))
+
+    failure = caught.value.validation_failure
+    assert caught.value.error_type == "analysis_data_view_invalid"
+    assert failure["retry_policy"]["required_action"] == "code_interpreter"
+    assert failure["repair_contract"]["allowed_lineage_refs"] == ["evidence:evi_demo_full"]
+    assert "evidence:invented_alias" in str(caught.value)
 
 
 def test_code_interpreter_rejects_result_missing_expected_detail_field():

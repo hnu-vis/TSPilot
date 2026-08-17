@@ -44,10 +44,10 @@ class ToolExecutor:
     ) -> ExecutionResult:
         tool_spec = self._registry.resolve(action_name)
         normalized_input = self._normalize_action_input(action_name, action_input, request_state)
-        normalized_input = await self._apply_fact_memory(action_name, normalized_input, request_state)
+        normalized_input = await self._apply_insight_memory(action_name, normalized_input, request_state)
         if action_name == "code_interpreter":
-            normalized_input["fact_requests"] = self._remove_evidence_refs_from_fact_dependencies(
-                normalized_input.get("fact_requests"),
+            normalized_input["insight_requests"] = self._remove_evidence_refs_from_insight_dependencies(
+                normalized_input.get("insight_requests"),
                 request_state,
             )
         validated = tool_spec.input_model.model_validate(normalized_input)
@@ -104,11 +104,29 @@ class ToolExecutor:
             if isinstance(normalized.get("unavailable_reason"), (dict, list)):
                 normalized["unavailable_reason"] = str(normalized["unavailable_reason"])
             return normalized
+        if action_name == "visualization":
+            normalized.setdefault("message", request_state.message)
+            constraints = normalized.get("constraints") if isinstance(normalized.get("constraints"), dict) else {}
+            next_constraints = runtime_action_constraints(request_state)
+            for item in next_constraints.get("required_actions", []) or []:
+                if not isinstance(item, dict) or item.get("action") != "visualization":
+                    continue
+                guidance = item.get("input_guidance") if isinstance(item.get("input_guidance"), dict) else {}
+                if isinstance(guidance.get("repair_contract"), dict):
+                    constraints = {**constraints, "repair_contract": guidance["repair_contract"]}
+                if isinstance(guidance.get("constraints"), dict):
+                    constraints = {**constraints, **guidance["constraints"]}
+            normalized["constraints"] = constraints
+            return {
+                key: value
+                for key, value in normalized.items()
+                if key in {"message", "source_refs", "constraints"}
+            }
         if normalized.get("constraints") in (None, "", False):
             normalized["constraints"] = {}
         if "time_range" in normalized:
             normalized["time_range"] = self._normalize_time_range_hint(normalized.get("time_range"), normalized)
-        normalized["fact_requests"] = self._normalize_fact_requests(normalized.get("fact_requests"), normalized)
+        normalized["insight_requests"] = self._normalize_insight_requests(normalized.get("insight_requests"), normalized)
         normalized = self._apply_runtime_input_guidance(action_name, normalized, request_state)
         if action_name == "anomaly":
             self._drop_unselected_optional_choice(normalized, "detector_name")
@@ -290,19 +308,19 @@ class ToolExecutor:
             return None
         return None
 
-    def _normalize_fact_requests(self, value, normalized_input: dict) -> list:
+    def _normalize_insight_requests(self, value, normalized_input: dict) -> list:
         if value in (None, "", False):
             return []
         if not isinstance(value, list):
             constraints = normalized_input.setdefault("constraints", {})
             if isinstance(constraints, dict):
-                constraints.setdefault("fact_request_hints", []).append(value)
+                constraints.setdefault("insight_request_hints", []).append(value)
             return []
         normalized: list = []
         hints: list = []
         for item in value:
             if isinstance(item, dict):
-                if item.get("name") and item.get("fact_type"):
+                if item.get("name") and item.get("insight_type"):
                     normalized.append(item)
                 else:
                     hints.append(item)
@@ -312,12 +330,12 @@ class ToolExecutor:
         if hints:
             constraints = normalized_input.setdefault("constraints", {})
             if isinstance(constraints, dict):
-                existing = constraints.setdefault("fact_request_hints", [])
+                existing = constraints.setdefault("insight_request_hints", [])
                 if isinstance(existing, list):
                     existing.extend(hints)
         return normalized
 
-    async def _apply_fact_memory(
+    async def _apply_insight_memory(
         self,
         action_name: str,
         normalized_input: dict,
@@ -333,21 +351,21 @@ class ToolExecutor:
             action_input=normalized_input,
         )
         merged = dict(normalized_input)
-        explicit = self._normalize_fact_requests(merged.get("fact_requests"), merged)
+        explicit = self._normalize_insight_requests(merged.get("insight_requests"), merged)
         selected_card_ids = [hit.card_id for hit in retrieval.hits]
         retrieved_requests = [
-            self._retrieved_fact_request_payload(
+            self._retrieved_insight_request_payload(
                 item,
-                retrieval.fact_request_sources.get(item.fact_key, [])
-                or (selected_card_ids if len(selected_card_ids) == len(retrieval.fact_requests) == 1 else []),
+                retrieval.insight_request_sources.get(item.insight_key, [])
+                or (selected_card_ids if len(selected_card_ids) == len(retrieval.insight_requests) == 1 else []),
             )
-            for item in retrieval.fact_requests
+            for item in retrieval.insight_requests
         ]
-        merged["fact_requests"] = self._dedupe_fact_requests([*explicit, *retrieved_requests])
+        merged["insight_requests"] = self._dedupe_insight_requests([*explicit, *retrieved_requests])
         diagnostics = dict(retrieval.diagnostics or {})
         diagnostics["source"] = "tool_scoped_memory_retrieval"
         diagnostics["selected_card_ids"] = selected_card_ids
-        diagnostics["fact_request_count"] = len(retrieved_requests)
+        diagnostics["insight_request_count"] = len(retrieved_requests)
         constraints = merged.setdefault("constraints", {})
         if isinstance(constraints, dict) and diagnostics:
             constraints["memory_diagnostics"] = diagnostics
@@ -357,7 +375,7 @@ class ToolExecutor:
             tool_calls.append({"tool_name": action_name, **diagnostics})
         return merged
 
-    def _retrieved_fact_request_payload(self, request, source_card_ids: list[str]) -> dict:
+    def _retrieved_insight_request_payload(self, request, source_card_ids: list[str]) -> dict:
         payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
         if not source_card_ids:
             return payload
@@ -369,10 +387,10 @@ class ToolExecutor:
         }
         return payload
 
-    def _dedupe_fact_requests(self, requests: list) -> list:
+    def _dedupe_insight_requests(self, requests: list) -> list:
         result: list = []
         seen: set[str] = set()
-        seen_fact_keys: set[str] = set()
+        seen_insight_keys: set[str] = set()
         for item in requests:
             if hasattr(item, "model_dump"):
                 payload = item.model_dump(mode="json", exclude_none=True)
@@ -380,19 +398,19 @@ class ToolExecutor:
                 payload = dict(item)
             else:
                 continue
-            if not payload.get("name") or not payload.get("fact_type"):
+            if not payload.get("name") or not payload.get("insight_type"):
                 continue
-            fact_key = str(payload.get("fact_key") or "").strip()
-            if fact_key and fact_key in seen_fact_keys:
+            insight_key = str(payload.get("insight_key") or "").strip()
+            if insight_key and insight_key in seen_insight_keys:
                 continue
             requirements = dict(payload.get("requirements") or {})
             for metadata_key in ("source", "memory_card_ids", "retrieval_reason", "retrieval_confidence"):
                 requirements.pop(metadata_key, None)
             key = json.dumps(
                 {
-                    "fact_key": payload.get("fact_key"),
+                    "insight_key": payload.get("insight_key"),
                     "name": payload.get("name"),
-                    "fact_type": payload.get("fact_type"),
+                    "insight_type": payload.get("insight_type"),
                     "subject": payload.get("subject"),
                     "time_range": payload.get("time_range"),
                     "dimensions": payload.get("dimensions") or {},
@@ -412,11 +430,11 @@ class ToolExecutor:
                 continue
             result.append(payload)
             seen.add(key)
-            if fact_key:
-                seen_fact_keys.add(fact_key)
+            if insight_key:
+                seen_insight_keys.add(insight_key)
         return result
 
-    def _remove_evidence_refs_from_fact_dependencies(
+    def _remove_evidence_refs_from_insight_dependencies(
         self,
         requests: list | None,
         request_state: RequestStateModel,
@@ -425,6 +443,23 @@ class ToolExecutor:
         if request_state.latest_database_evidence is not None:
             evidence_ids.add(request_state.latest_database_evidence.evidence_id)
         evidence_refs = evidence_ids | {f"evidence:{evidence_id}" for evidence_id in evidence_ids}
+        # An LLM may first describe the raw query result as a semantic Insight
+        # dependency. SQL correctly rejects row collections as Insights, while the
+        # same rows remain valid direct evidence for code_interpreter. Treat
+        # those explicitly rejected SQL Insight keys as evidence aliases rather
+        # than unresolved parent Insights.
+        for call in reversed(request_state.tool_history):
+            if call.tool_name != "sql_query":
+                continue
+            constraints = call.tool_input.get("constraints") if isinstance(call.tool_input, dict) else {}
+            unsupported = constraints.get("unsupported_insight_requests") if isinstance(constraints, dict) else []
+            for item in unsupported if isinstance(unsupported, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                insight_key = str(item.get("insight_key") or "").strip()
+                if insight_key:
+                    evidence_refs.add(insight_key)
+            break
         normalized: list = []
         for request in requests or []:
             payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
@@ -445,8 +480,8 @@ class ToolExecutor:
             return payload, False
 
         visible = dict(payload)
-        if isinstance(visible.get("rejected_facts"), list):
-            visible["rejected_facts"] = visible["rejected_facts"][:6]
+        if isinstance(visible.get("rejected_insights"), list):
+            visible["rejected_insights"] = visible["rejected_insights"][:6]
         if isinstance(visible.get("forecast_points"), list):
             visible["forecast_points"] = visible["forecast_points"][:12]
         if isinstance(visible.get("anomaly_points"), list):

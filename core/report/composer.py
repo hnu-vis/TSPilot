@@ -7,7 +7,7 @@ from schemas.state import RequestStateModel
 
 def build_summary(
     request_state: RequestStateModel,
-    facts: list,
+    insights: list,
     fallback: str,
     *,
     prefer_fallback: bool = False,
@@ -15,20 +15,20 @@ def build_summary(
     subject = subject_label(request_state)
     parts: list[str] = []
 
-    trend_fact = next((fact for fact in facts if fact.fact_type == "trend"), None)
-    extrema_fact = next((fact for fact in facts if fact.fact_type in {"extreme", "extrema"}), None)
+    trend_insight = next((insight for insight in insights if insight.insight_type == "trend"), None)
+    extrema_insight = next((insight for insight in insights if insight.insight_type in {"extreme", "extrema"}), None)
 
-    if trend_fact is not None:
-        parts.append(trend_fact.statement)
-    elif facts:
-        parts.append(facts[0].statement)
+    if trend_insight is not None:
+        parts.append(trend_insight.statement)
+    elif insights:
+        parts.append(insights[0].statement)
     elif prefer_fallback and fallback:
         parts.append(fallback)
     elif request_state.latest_database_evidence is not None:
         parts.append(request_state.latest_database_evidence.summary)
 
-    if extrema_fact is not None:
-        parts.append(extrema_fact.statement)
+    if extrema_insight is not None:
+        parts.append(extrema_insight.statement)
 
     if request_state.latest_anomaly is not None:
         anomaly_points = request_state.latest_anomaly.anomaly_points
@@ -142,7 +142,7 @@ def ordered_sections(sections_by_type: dict[str, AnswerSection], section_plan: l
         "query_results",
         "plan",
         "analysis",
-        "facts",
+        "insights",
         "statistics",
         "metric_list",
         "schema",

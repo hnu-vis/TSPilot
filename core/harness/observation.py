@@ -14,7 +14,7 @@ class ArtifactInventory:
     has_anomaly: bool = False
     has_rag: bool = False
     has_skill: bool = False
-    verified_fact_count: int = 0
+    verified_insight_count: int = 0
     visualization_count: int = 0
     analysis_count: int = 0
 
@@ -26,7 +26,7 @@ class ArtifactInventory:
             "has_anomaly": self.has_anomaly,
             "has_rag": self.has_rag,
             "has_skill": self.has_skill,
-            "verified_fact_count": self.verified_fact_count,
+            "verified_insight_count": self.verified_insight_count,
             "visualization_count": self.visualization_count,
             "analysis_count": self.analysis_count,
         }
@@ -79,7 +79,7 @@ def build_observation_frame(
     completion_reason: str | None = None,
 ) -> ObservationFrame:
     latest_failure = _active_repair_failure(request_state)
-    requested_capabilities = _state_capabilities(request_state)
+    requested_capabilities = state_capabilities(request_state)
     return ObservationFrame(
         message=request_state.message,
         requested_capabilities=tuple(requested_capabilities),
@@ -93,8 +93,8 @@ def build_observation_frame(
             has_anomaly=request_state.latest_anomaly is not None,
             has_rag=request_state.latest_rag is not None,
             has_skill=request_state.latest_skill is not None,
-            verified_fact_count=sum(
-                1 for fact in request_state.fact_set.facts if fact.status == "verified"
+            verified_insight_count=sum(
+                1 for insight in request_state.insight_set.insights if insight.status == "verified"
             ),
             visualization_count=len(request_state.visualizations),
             analysis_count=len(request_state.analysis_artifacts),
@@ -133,12 +133,41 @@ def _active_repair_failure(request_state: RequestStateModel):
     return latest
 
 
-def _state_capabilities(request_state: RequestStateModel) -> list[str]:
+def state_capabilities(request_state: RequestStateModel) -> list[str]:
+    """Resolve runtime capabilities from LLM-authored intent and task contract."""
     values: list[str] = [
         str(item).strip().lower()
         for item in (request_state.requested_capabilities or [])
         if str(item).strip()
     ]
+    contract = request_state.task_contract
+    for output in getattr(contract, "required_outputs", []) if contract is not None else []:
+        if not getattr(output, "required", False):
+            continue
+        evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+        if any(token in evidence_kind for token in ("anomaly", "outlier", "spike")):
+            values.append("anomaly")
+        elif any(token in evidence_kind for token in ("forecast", "predict")):
+            values.append("forecast")
+        elif any(token in evidence_kind for token in ("analysis", "derived", "statistical", "computed", "calculated", "custom")):
+            values.append("analysis")
+        elif any(token in evidence_kind for token in ("query", "database", "sql", "raw", "time_series", "timeseries")):
+            values.append("query")
+        elif evidence_kind in {"rag", "skill"}:
+            values.append(evidence_kind)
+        contract_text = " ".join(
+            str(value or "")
+            for value in (
+                getattr(output, "id", None),
+                getattr(output, "description", None),
+                getattr(output, "success_criteria", None),
+                getattr(output, "output_type", None),
+            )
+        ).lower()
+        if any(token in contract_text for token in ("outlier", "anomaly", "spike", "excluded_rows", "异常", "离群", "剔除")):
+            values.append("anomaly")
+        if any(token in contract_text for token in ("visualization", "visual", "chart", "plot", "graph", "可视化", "图表", "曲线")):
+            values.append("visualization")
     result: list[str] = []
     for value in values:
         if value not in result:

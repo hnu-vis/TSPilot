@@ -136,24 +136,26 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
         for item in (request_state.requested_capabilities or [])
         if str(item).strip()
     }
+    if _contract_requires_outlier_treatment(request_state):
+        requirements.add("anomaly")
     missing: list[str] = []
     if (
         _requires_specialized_capability(request_state, requirements, "forecast")
         and not _latest_forecast_is_usable(request_state)
-        and not _data_facts_cover_specialized_capability(request_state, "forecast")
+        and not _key_insights_cover_specialized_capability(request_state, "forecast")
     ):
         missing.append("forecast")
     if (
         _requires_specialized_capability(request_state, requirements, "anomaly")
         and request_state.latest_anomaly is None
-        and not _data_facts_cover_specialized_capability(request_state, "anomaly")
+        and not _key_insights_cover_specialized_capability(request_state, "anomaly")
     ):
         missing.append("anomaly")
     if (
         _requires_code_analysis(request_state)
         and request_state.latest_analysis_id is None
         and not _latest_database_evidence_is_empty(request_state)
-        and not _data_facts_cover_required_analysis(request_state)
+        and not _key_insights_cover_required_analysis(request_state)
     ):
         missing.append("analysis")
     return missing
@@ -190,11 +192,39 @@ def _requires_specialized_capability(
     contract = request_state.task_contract
     if contract is None:
         return True
+    if capability == "anomaly":
+        return _contract_requires_outlier_treatment(request_state)
     return any(
         output.required
-        and str(output.evidence_kind or "").strip().lower() == capability
+        and capability in _contract_output_specialized_capabilities(output)
         for output in contract.required_outputs
     )
+
+
+def _contract_output_specialized_capabilities(output) -> set[str]:
+    """Interpret the LLM-authored contract without requiring a closed enum value.
+
+    The contract intentionally permits open-vocabulary evidence kinds. Runtime
+    enforcement therefore considers the whole required-output description,
+    rather than silently dropping a specialized requirement merely because the
+    model called it ``analysis`` or ``data_view``.
+    """
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(output, "id", None),
+            getattr(output, "description", None),
+            getattr(output, "success_criteria", None),
+            getattr(output, "evidence_kind", None),
+            getattr(output, "output_type", None),
+        )
+    ).lower()
+    capabilities: set[str] = set()
+    if any(token in text for token in ("forecast", "prediction", "predict", "预测", "预报")):
+        capabilities.add("forecast")
+    if any(token in text for token in ("outlier", "anomaly", "spike", "excluded_rows", "异常", "离群", "剔除")):
+        capabilities.add("anomaly")
+    return capabilities
 
 
 def _requires_code_analysis(request_state: RequestStateModel) -> bool:
@@ -207,22 +237,22 @@ def _requires_code_analysis(request_state: RequestStateModel) -> bool:
     for output in contract.required_outputs:
         if not output.required:
             continue
-        if _contract_output_requires_code_analysis(output) and not _contract_output_is_covered_by_verified_fact(request_state, output):
+        if _contract_output_requires_code_analysis(output) and not _contract_output_is_covered_by_verified_insight(request_state, output):
             return True
     return False
 
 
-def _data_facts_cover_required_analysis(request_state: RequestStateModel) -> bool:
-    """Return whether current verified facts already ground the requested answer.
+def _key_insights_cover_required_analysis(request_state: RequestStateModel) -> bool:
+    """Return whether current verified insights already ground the requested answer.
 
     Specialized tools should be required because the answer contract has an
     uncovered derived output, not merely because intent classification labeled
     the request as analytical. A database aggregate or point lookup represented
-    as a verified DataFact is valid evidence for precise numeric answers.
+    as a verified KeyInsight is valid evidence for precise numeric answers.
     """
 
     contract = request_state.task_contract
-    verified = _verified_data_facts(request_state)
+    verified = _verified_key_insights(request_state)
     if not verified:
         return False
     if contract is None:
@@ -237,39 +267,39 @@ def _data_facts_cover_required_analysis(request_state: RequestStateModel) -> boo
     ]
     if not analysis_outputs:
         return True
-    return all(_contract_output_is_covered_by_verified_fact(request_state, output) for output in analysis_outputs)
+    return all(_contract_output_is_covered_by_verified_insight(request_state, output) for output in analysis_outputs)
 
 
-def _data_facts_cover_specialized_capability(request_state: RequestStateModel, capability: str) -> bool:
+def _key_insights_cover_specialized_capability(request_state: RequestStateModel, capability: str) -> bool:
     allowed_sources = {capability.strip().lower()}
-    return any(_fact_has_allowed_source(fact, allowed_sources) for fact in _verified_data_facts(request_state))
+    return any(_insight_has_allowed_source(insight, allowed_sources) for insight in _verified_key_insights(request_state))
 
 
-def _verified_data_facts(request_state: RequestStateModel) -> list:
-    facts = list(getattr(getattr(request_state, "fact_set", None), "facts", []) or [])
+def _verified_key_insights(request_state: RequestStateModel) -> list:
+    insights = list(getattr(getattr(request_state, "insight_set", None), "insights", []) or [])
     verified = []
-    for fact in facts:
-        if getattr(fact, "status", None) != "verified":
+    for insight in insights:
+        if getattr(insight, "status", None) != "verified":
             continue
-        if getattr(fact, "fact_type", None) == "data_coverage":
+        if getattr(insight, "insight_type", None) == "data_coverage":
             continue
-        if not getattr(fact, "evidence_refs", None):
+        if not getattr(insight, "evidence_refs", None):
             continue
-        verified.append(fact)
+        verified.append(insight)
     return verified
 
 
-def _contract_output_is_covered_by_verified_fact(request_state: RequestStateModel, output) -> bool:
-    facts = _verified_data_facts(request_state)
-    if not facts:
+def _contract_output_is_covered_by_verified_insight(request_state: RequestStateModel, output) -> bool:
+    insights = _verified_key_insights(request_state)
+    if not insights:
         return False
     output_keys = _contract_output_keys(output)
     allowed_sources = _contract_allowed_source_types(output)
-    for fact in facts:
-        if output_keys and _fact_keys(fact) & output_keys:
-            if not allowed_sources or _fact_has_allowed_source(fact, allowed_sources):
+    for insight in insights:
+        if output_keys and _insight_keys(insight) & output_keys:
+            if not allowed_sources or _insight_has_allowed_source(insight, allowed_sources):
                 return True
-        if not output_keys and allowed_sources and _fact_has_allowed_source(fact, allowed_sources):
+        if not output_keys and allowed_sources and _insight_has_allowed_source(insight, allowed_sources):
             return True
     return False
 
@@ -284,28 +314,28 @@ def _contract_output_keys(output) -> set[str]:
     return {key for key in keys if key}
 
 
-def _fact_keys(fact) -> set[str]:
+def _insight_keys(insight) -> set[str]:
     keys = {
-        str(getattr(fact, "fact_id", "") or "").strip().lower(),
-        str(getattr(fact, "fact_key", "") or "").strip().lower(),
-        str(getattr(fact, "name", "") or "").strip().lower(),
-        str(getattr(fact, "fact_type", "") or "").strip().lower(),
-        str(getattr(fact, "subject", "") or "").strip().lower(),
-        str(getattr(fact, "unit", "") or "").strip().lower(),
+        str(getattr(insight, "insight_id", "") or "").strip().lower(),
+        str(getattr(insight, "insight_key", "") or "").strip().lower(),
+        str(getattr(insight, "name", "") or "").strip().lower(),
+        str(getattr(insight, "insight_type", "") or "").strip().lower(),
+        str(getattr(insight, "subject", "") or "").strip().lower(),
+        str(getattr(insight, "unit", "") or "").strip().lower(),
     }
-    dimensions = getattr(fact, "dimensions", None)
+    dimensions = getattr(insight, "dimensions", None)
     if isinstance(dimensions, dict):
         for key, value in dimensions.items():
             keys.add(str(key).strip().lower())
             if isinstance(value, (str, int, float, bool)):
                 keys.add(str(value).strip().lower())
-    trace = getattr(fact, "calculation_trace", None)
+    trace = getattr(insight, "calculation_trace", None)
     if isinstance(trace, dict):
         for key in ("value_key", "metric_key", "operator", "operation", "measure", "field"):
             value = trace.get(key)
             if isinstance(value, (str, int, float, bool)):
                 keys.add(str(value).strip().lower())
-    keys.update(str(item or "").strip().lower() for item in getattr(fact, "derived_from", []) or [])
+    keys.update(str(item or "").strip().lower() for item in getattr(insight, "derived_from", []) or [])
     return {key for key in keys if key}
 
 
@@ -324,11 +354,11 @@ def _contract_allowed_source_types(output) -> set[str]:
     return {evidence_kind}
 
 
-def _fact_has_allowed_source(fact, allowed_sources: set[str]) -> bool:
-    method = str(getattr(fact, "method", "") or "").strip().lower()
+def _insight_has_allowed_source(insight, allowed_sources: set[str]) -> bool:
+    method = str(getattr(insight, "method", "") or "").strip().lower()
     if method in allowed_sources:
         return True
-    for ref in getattr(fact, "evidence_refs", []) or []:
+    for ref in getattr(insight, "evidence_refs", []) or []:
         if str(getattr(ref, "source_type", "") or "").strip().lower() in allowed_sources:
             return True
     return False
@@ -336,6 +366,9 @@ def _fact_has_allowed_source(fact, allowed_sources: set[str]) -> bool:
 
 def _contract_output_requires_code_analysis(output) -> bool:
     evidence_kind = str(output.evidence_kind or "").strip().lower()
+    output_type = str(output.output_type or "").strip().lower()
+    if output_type in {"visualization", "visual", "chart", "plot", "graph"}:
+        return False
     if evidence_kind in {"derived", "analysis", "statistical", "computed", "calculated"}:
         return True
 
@@ -452,32 +485,60 @@ def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None
 
 
 def _contract_output_is_covered_by_state(request_state: RequestStateModel, output) -> bool:
-    if _contract_output_is_covered_by_verified_fact(request_state, output):
-        return True
-    evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
     if _contract_output_is_terminal_answer(output):
         return request_state.final_answer_draft is not None
-    if not evidence_kind:
-        inferred = _contract_output_inferred_capabilities(output)
-        if "forecast" in inferred and _latest_forecast_is_usable(request_state):
-            return True
-        if "anomaly" in inferred and request_state.latest_anomaly is not None:
-            return True
-        if "analysis" in inferred and request_state.latest_analysis_id is not None:
-            return True
-        if "query" in inferred and request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state):
-            return True
-        if not inferred:
-            return bool(_all_answer_refs(request_state))
-    if evidence_kind in {"query", "database", "database_evidence", "sql", "raw"}:
-        return request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state)
-    if evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
-        return request_state.latest_analysis_id is not None
-    if evidence_kind == "forecast":
+
+    capabilities = _contract_output_semantic_capabilities(output)
+    # Presentation deliverables are distinct from their source evidence. A
+    # database row or derived scalar cannot satisfy a requested chart merely
+    # because it has the same measure or time-series semantics.
+    if "visualization" in capabilities:
+        return bool(request_state.visualizations)
+    if "forecast" in capabilities:
         return _latest_forecast_is_usable(request_state)
-    if evidence_kind == "anomaly":
+    if "anomaly" in capabilities:
         return request_state.latest_anomaly is not None
+    if "analysis" in capabilities:
+        return request_state.latest_analysis_id is not None
+    if "query" in capabilities:
+        return request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state)
+    if _contract_output_is_covered_by_verified_insight(request_state, output):
+        return True
+    if not capabilities:
+        return bool(_all_answer_refs(request_state))
     return False
+
+
+def _contract_output_semantic_capabilities(output) -> set[str]:
+    """Resolve a contract output by both data semantics and delivery form."""
+    inferred = _contract_output_inferred_capabilities(output)
+    evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
+    output_type = str(getattr(output, "output_type", "") or "").strip().lower()
+
+    presentation_aliases = {"visualization", "visual", "chart", "plot", "graph"}
+    if output_type in presentation_aliases or evidence_kind in presentation_aliases:
+        return {"visualization"}
+
+    if evidence_kind in {
+        "query",
+        "database",
+        "database_evidence",
+        "sql",
+        "raw",
+        "time_series",
+        "timeseries",
+        "series",
+        "dataset",
+        "records",
+    }:
+        inferred.add("query")
+    elif evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
+        inferred.add("analysis")
+    elif evidence_kind == "forecast":
+        inferred.add("forecast")
+    elif evidence_kind == "anomaly":
+        inferred.add("anomaly")
+    return inferred
 
 
 def _contract_output_inferred_capabilities(output) -> set[str]:
@@ -500,6 +561,7 @@ def _contract_output_inferred_capabilities(output) -> set[str]:
         "anomaly": ("anomaly", "outlier", "spike", "异常", "离群"),
         "analysis": ("analysis", "metric", "statistics", "statistical", "计算", "指标", "统计", "分析"),
         "query": ("query", "evidence", "data", "rows", "points", "查询", "数据"),
+        "visualization": ("visualization", "visual", "chart", "plot", "graph", "可视化", "图表", "曲线"),
     }
     for capability, terms in capability_terms.items():
         if any(term in text for term in terms):
@@ -676,12 +738,36 @@ def _gap_missing_is_covered_by_artifacts(request_state: RequestStateModel, missi
     structured_coverage = {
         "forecast": _latest_forecast_is_usable(request_state),
         "anomaly": request_state.latest_anomaly is not None,
-        "analysis": request_state.latest_analysis_id is not None or _data_facts_cover_required_analysis(request_state),
+        "analysis": request_state.latest_analysis_id is not None or _key_insights_cover_required_analysis(request_state),
         "database_evidence": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
         "query": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
+        "visualization": bool(request_state.visualizations),
     }
-    known_missing_keys = set(structured_coverage)
-    return all(key in known_missing_keys and structured_coverage[key] for key in missing_keys)
+    for key in missing_keys:
+        if key in structured_coverage:
+            if not structured_coverage[key]:
+                return False
+            continue
+        capabilities = _gap_item_semantic_capabilities(key)
+        if not capabilities or not all(structured_coverage.get(item, False) for item in capabilities):
+            return False
+    return True
+
+
+def _gap_item_semantic_capabilities(text: str) -> set[str]:
+    value = str(text or "").strip().lower()
+    terms = {
+        "forecast": ("forecast", "prediction", "predict", "未来", "预测", "预报"),
+        "anomaly": ("anomaly", "outlier", "spike", "异常", "离群"),
+        "analysis": ("analysis", "computed", "derived", "metric", "分析", "计算", "指标"),
+        "database_evidence": ("database", "query", "evidence", "timeseries", "time_series", "数据", "时序", "证据"),
+        "visualization": ("visualization", "visual", "chart", "plot", "graph", "可视化", "图表", "曲线"),
+    }
+    return {
+        capability
+        for capability, markers in terms.items()
+        if any(marker in value for marker in markers)
+    }
 
 
 def _hard_gate_previous_assessment(
@@ -767,7 +853,7 @@ def _hard_gate_previous_assessment(
                 missing_evidence=["database_evidence"],
                 next_action_hint="Run a grounded sql_query.",
             )
-    elif tool_name in {"code_interpreter", "anomaly", "forecast", "rag", "skill"}:
+    elif tool_name in {"code_interpreter", "anomaly", "forecast", "visualization", "rag", "skill"}:
         if not refs and not _has_non_empty_payload(payload):
             return CompletionEvaluation(
                 False,
@@ -1015,6 +1101,8 @@ def _artifact_ref_for_todo(request_state: RequestStateModel, task_type: str) -> 
     if task_type == "anomaly":
         anomaly = request_state.latest_anomaly
         return f"anomaly:{anomaly.anomaly_id}" if anomaly is not None else None
+    if task_type in {"visualization", "visual", "chart", "plot"}:
+        return f"visualization:{request_state.visualizations[-1].visualization_id}" if request_state.visualizations else None
     if task_type == "rag" and request_state.latest_rag:
         return "rag:latest"
     if task_type == "skill" and request_state.latest_skill:
@@ -1037,7 +1125,7 @@ def _invalid_evidence_refs(request_state: RequestStateModel, refs: list[str]) ->
         valid_refs.add(request_state.latest_forecast.forecast_id)
     if request_state.latest_anomaly is not None:
         valid_refs.add(request_state.latest_anomaly.anomaly_id)
-    valid_refs.update(f"fact:{fact.fact_id}" for fact in _verified_data_facts(request_state))
+    valid_refs.update(f"insight:{insight.insight_id}" for insight in _verified_key_insights(request_state))
     for observation in request_state.observations:
         if observation.payload_ref:
             valid_refs.add(observation.payload_ref)
@@ -1190,6 +1278,11 @@ def evidence_refs_for_payload(payload: dict) -> list[str]:
             refs.append(f"{prefix}:{value}")
     if payload.get("results") is not None:
         refs.append("rag:latest")
+    refs.extend(
+        f"visualization:{item}"
+        for item in payload.get("visualization_ids", [])
+        if str(item).strip()
+    )
     return refs
 
 
@@ -1198,11 +1291,12 @@ def _all_answer_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_database_evidence is not None:
         refs.append(f"evidence:{request_state.latest_database_evidence.evidence_id}")
     refs.extend(f"analysis:{analysis_id}" for analysis_id in request_state.analysis_artifacts)
-    refs.extend(f"fact:{fact.fact_id}" for fact in _verified_data_facts(request_state))
+    refs.extend(f"insight:{insight.insight_id}" for insight in _verified_key_insights(request_state))
     if _latest_forecast_is_usable(request_state):
         refs.append(f"forecast:{request_state.latest_forecast.forecast_id}")
     if request_state.latest_anomaly is not None:
         refs.append(f"anomaly:{request_state.latest_anomaly.anomaly_id}")
+    refs.extend(f"visualization:{item.visualization_id}" for item in request_state.visualizations)
     if request_state.latest_rag:
         refs.append("rag:latest")
     if request_state.latest_skill:
@@ -1252,8 +1346,10 @@ def _contract_requires_outlier_treatment(request_state: RequestStateModel) -> bo
                 "outlier_treatment",
                 "adjusted_metrics",
                 "excluded_rows",
-                "异常值处理",
-                "异常处理",
+                "anomaly_set",
+                "anomaly_detection",
+                "异常",
+                "离群",
                 "剔除",
             )
         ):
@@ -1265,13 +1361,23 @@ def _analysis_conflicts_with_detected_anomalies(request_state: RequestStateModel
     input_evidence_id = str(getattr(analysis, "input_evidence_id", "") or "").strip()
     if not input_evidence_id:
         return False
-    if _analysis_has_transparent_outlier_treatment(analysis):
-        return False
     for anomaly in request_state.anomaly_artifacts.values():
-        if not _anomaly_has_points(anomaly):
-            continue
         if _anomaly_matches_evidence(anomaly, input_evidence_id):
-            return True
+            if not _analysis_has_transparent_outlier_treatment(analysis):
+                return _anomaly_has_points(anomaly)
+            result = getattr(analysis, "result", None)
+            details = result.get("details") if isinstance(result, dict) else {}
+            actual = {
+                _anomaly_row_identity(item)
+                for item in details.get("excluded_rows", [])
+                if isinstance(item, dict)
+            }
+            expected = {
+                _anomaly_row_identity(item)
+                for item in getattr(anomaly, "anomaly_points", []) or []
+                if isinstance(item, dict)
+            }
+            return actual != expected
     return False
 
 
@@ -1294,6 +1400,12 @@ def _analysis_has_transparent_outlier_treatment(analysis) -> bool:
 def _anomaly_has_points(anomaly) -> bool:
     points = getattr(anomaly, "anomaly_points", None)
     return isinstance(points, list) and len(points) > 0
+
+
+def _anomaly_row_identity(row: dict) -> tuple[str, str]:
+    timestamp = row.get("timestamp") or row.get("time") or row.get("date")
+    value = row.get("value") if "value" in row else row.get("y")
+    return str(timestamp or ""), str(value)
 
 
 def _anomaly_matches_evidence(anomaly, evidence_id: str) -> bool:

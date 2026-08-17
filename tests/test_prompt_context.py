@@ -3,6 +3,7 @@ from __future__ import annotations
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
+from schemas.action_output import ActionOutput
 from schemas.task_contract import TaskContract
 from schemas.tool import ReActTranscriptStep, ToolObservation
 from schemas.visualization import VisualizationPayload
@@ -83,6 +84,50 @@ def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():
     assert "completion_state" not in context["state"]
     assert "requested_capabilities" not in context["state"]
     assert "semantic_repair_directive" not in context["state"]
+
+
+def test_outer_react_context_omits_internal_presentation_inventory_and_compacts_history():
+    settings = get_settings()
+    request = ChatRequest(message="展示完整趋势", database_context={"database_id": "demo", "database_type": "unit"})
+    request_state = build_request_state(request, settings)
+    conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
+    request_state.memory_fragments = [{
+        "iteration": 1,
+        "action": "sql_query",
+        "action_input": {"message": "repeat the full user request"},
+        "observation": {
+            "tool": "sql_query",
+            "success": True,
+            "summary": "Loaded 2680 rows.",
+            "resource_ref": "evidence:evi_full",
+            "data_preview": {"rows": [{"timestamp": "t0", "value": 1.0}]},
+            "coverage_delta": {"can_answer": False, "missing_outputs": ["visualization"]},
+        },
+        "resource_ref": "evidence:evi_full",
+        "status": "succeeded",
+    }]
+    request_state.latest_action_output = ActionOutput(
+        tool_name="visualization",
+        success=True,
+        content="Created visualization.",
+        observations={"tool": "visualization", "success": True, "visualization_ids": ["viz_1"]},
+        meta={"iteration": 2},
+    )
+
+    context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
+
+    assert set(context["artifacts"]) == {"refs"}
+    history = context["recent_trajectory"][0]
+    assert history == {
+        "iteration": 1,
+        "action": "sql_query",
+        "status": "succeeded",
+        "resource_ref": "evidence:evi_full",
+        "summary": "Loaded 2680 rows.",
+        "coverage_delta": {"can_answer": False, "missing_outputs": ["visualization"]},
+    }
+    assert "action_input" not in history
+    assert "data_preview" not in str(history)
 
 
 def test_prompt_context_exposes_task_contract_as_state():

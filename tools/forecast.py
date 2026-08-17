@@ -15,7 +15,7 @@ from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.forecast_registry import default_forecast_model_name, get_forecast_model
 from core.timeseries.normalization import normalize_timeseries_evidence
 from schemas.database import DatabaseEvidence
-from schemas.data_fact import DataFactRequest
+from schemas.key_insight import KeyInsightRequest
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesSeries
 from tools.base import BaseTool, StructuredToolError
 
@@ -68,12 +68,12 @@ class ForecastInput(BaseModel):
     model_name: str | None = None
     series_name: str | None = None
     constraints: dict | None = Field(default_factory=dict)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def reject_fact_contracts(self):
-        if self.fact_requests:
-            raise ValueError("forecast returns an analysis artifact; Data Fact requests must target sql_query or code_interpreter")
+    def reject_insight_contracts(self):
+        if self.insight_requests:
+            raise ValueError("forecast returns an analysis artifact; Key Insight requests must target sql_query or code_interpreter")
         return self
 
     @field_validator("horizon", mode="before")

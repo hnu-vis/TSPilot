@@ -183,10 +183,10 @@ def validate_analysis_result_payload(result) -> dict:
     normalized["summary"] = summary.strip()
     normalized["metrics"] = _json_safe_value(dict(metrics), path="metrics")
     normalized["details"] = _json_safe_value(dict(details), path="details")
-    facts = result.get("facts", [])
-    if not isinstance(facts, list) or any(not isinstance(fact, dict) for fact in facts):
-        raise AnalysisCodeError("analysis result field 'facts' must be a list of objects when provided.")
-    normalized["facts"] = _json_safe_value(facts, path="facts")
+    insights = result.get("insights", [])
+    if not isinstance(insights, list) or any(not isinstance(insight, dict) for insight in insights):
+        raise AnalysisCodeError("analysis result field 'insights' must be a list of objects when provided.")
+    normalized["insights"] = _json_safe_value(insights, path="insights")
     try:
         json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except TypeError as exc:

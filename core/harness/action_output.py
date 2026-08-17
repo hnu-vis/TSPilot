@@ -49,7 +49,7 @@ class ActionOutputBuilder:
             observations=observations,
             view=view,
             resource_type=self._resource_type(item),
-            resource_value=item.full_payload,
+            resource_value=self._resource_receipt(item, resource_ref),
             resource_ref=resource_ref,
             memory_fragment=memory_fragment,
             error=item.error,
@@ -140,6 +140,11 @@ class ActionOutputBuilder:
 
     def _observation_payload(self, model_view: dict, resource_ref: str | None) -> dict:
         payload = dict(model_view.get("payload") or {})
+        # resource_ref is the single outer-ReAct handle. artifact_ref and
+        # resource_ref aliases inside the payload only create competing paths
+        # to the same state object.
+        payload.pop("artifact_ref", None)
+        payload.pop("resource_ref", None)
         result = {
             "tool": model_view.get("tool_name"),
             "success": model_view.get("success"),
@@ -151,6 +156,19 @@ class ActionOutputBuilder:
         if model_view.get("error"):
             result["error"] = model_view.get("error")
         return _drop_empty(result)
+
+    def _resource_receipt(self, item: ActionOutputBuildInput, resource_ref: str | None) -> dict | None:
+        """Persist a pointer receipt; canonical full artifacts live in request state."""
+        receipt = {"resource_ref": resource_ref} if resource_ref else {}
+        if item.tool_name == "visualization":
+            ids = item.full_payload.get("visualization_ids")
+            if isinstance(ids, list) and ids:
+                receipt["visualization_ids"] = ids
+        if not item.success:
+            for key in ("error_type", "recommended_next_action", "failure_signature"):
+                if item.full_payload.get(key) not in (None, "", [], {}):
+                    receipt[key] = item.full_payload.get(key)
+        return receipt or None
 
     def _public_payload(self, public_view: dict, resource_ref: str | None, item: ActionOutputBuildInput) -> dict:
         result = dict(public_view)
@@ -245,6 +263,10 @@ class ActionOutputBuilder:
             return f"forecast:{payload['forecast_id']}"
         if item.tool_name == "anomaly" and payload.get("anomaly_id"):
             return f"anomaly:{payload['anomaly_id']}"
+        if item.tool_name == "visualization":
+            visualization_ids = payload.get("visualization_ids")
+            if isinstance(visualization_ids, list) and visualization_ids:
+                return f"visualization:{visualization_ids[0]}"
         if item.result_target == "presentation":
             return f"final_answer:{item.request_id}"
         return None

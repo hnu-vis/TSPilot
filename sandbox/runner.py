@@ -30,7 +30,8 @@ def execute_python_sandbox_v1(
     columns: list[str],
     metadata: dict,
     diagnostics: dict,
-    input_facts: list[dict] | None = None,
+    input_insights: list[dict] | None = None,
+    analysis_context: dict | None = None,
     timeout_seconds: int = 5,
     work_dir: str | Path | None = None,
 ) -> ExecutionOutput:
@@ -48,15 +49,12 @@ def execute_python_sandbox_v1(
         "columns": list(columns),
         "metadata": dict(metadata),
         "diagnostics": dict(diagnostics),
-        "input_facts": [dict(fact) for fact in input_facts or [] if isinstance(fact, dict)],
+        "input_insights": [dict(insight) for insight in input_insights or [] if isinstance(insight, dict)],
     }
-    payload["analysis_context"] = build_canonical_analysis_context(
-        rows=payload["rows"],
-        points=payload["points"],
-        columns=payload["columns"],
-        metadata=payload["metadata"],
-        diagnostics=payload["diagnostics"],
-    )
+    payload["analysis_context"] = dict(analysis_context or build_canonical_analysis_context(
+        rows=payload["rows"], points=payload["points"], columns=payload["columns"],
+        metadata=payload["metadata"], diagnostics=payload["diagnostics"],
+    ))
     try:
         try:
             paths.input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

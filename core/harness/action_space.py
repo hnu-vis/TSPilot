@@ -13,6 +13,7 @@ VALID_ACTIONS = {
     "code_interpreter",
     "forecast",
     "anomaly",
+    "visualization",
     "rag",
     "skill",
     "terminate",
@@ -126,6 +127,20 @@ class ActionSpaceBuilder:
             )
             missing.append("analysis")
 
+        if not required and "visualization" in capabilities and frame.artifacts.visualization_count == 0:
+            required.append(
+                RequiredAction(
+                    action="visualization" if has_evidence else "sql_query",
+                    reason="A grounded visualization is required before final answer assembly.",
+                    input_guidance=(
+                        {"message": frame.message}
+                        if has_evidence
+                        else {"constraints": {"evidence_shape": "raw_timeseries", "full_fidelity": True}}
+                    ),
+                )
+            )
+            missing.append("visualization")
+
         if not required and frame.shape_recovery_request:
             recovery = frame.shape_recovery_request
             action = "sql_query"
@@ -221,7 +236,7 @@ class ActionSpaceBuilder:
             for item in frame.completion_missing_outputs
             if str(item).strip()
         ]
-        for capability_id in ("analysis", "anomaly", "forecast"):
+        for capability_id in ("analysis", "anomaly", "forecast", "visualization"):
             if capability_id not in missing:
                 continue
             action = self._registry.actions_for_capability(capability_id)[0]
@@ -242,6 +257,7 @@ class ActionSpaceBuilder:
                             if capability_id == "analysis"
                             else {}
                         ),
+                        **({"message": frame.message} if capability_id == "visualization" else {}),
                     }
                     if has_evidence
                     else {"constraints": {"evidence_shape": "raw_timeseries"}}

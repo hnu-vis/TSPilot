@@ -45,11 +45,11 @@ def _execute(payload: dict) -> dict:
     columns = list(payload.get("columns") or [])
     metadata = dict(payload.get("metadata") or {})
     diagnostics = dict(payload.get("diagnostics") or {})
-    input_facts = [dict(fact) for fact in payload.get("input_facts") or [] if isinstance(fact, dict)]
-    fact_by_key = {
-        str(fact.get("fact_key") or fact.get("fact_id") or fact.get("name")): fact
-        for fact in input_facts
-        if fact.get("fact_key") or fact.get("fact_id") or fact.get("name")
+    input_insights = [dict(insight) for insight in payload.get("input_insights") or [] if isinstance(insight, dict)]
+    insight_by_key = {
+        str(insight.get("insight_key") or insight.get("insight_id") or insight.get("name")): insight
+        for insight in input_insights
+        if insight.get("insight_key") or insight.get("insight_id") or insight.get("name")
     }
     canonical_values = canonical_namespace_values(
         {
@@ -60,6 +60,9 @@ def _execute(payload: dict) -> dict:
             "diagnostics": diagnostics,
         }
     )
+    supplied_context = payload.get("analysis_context")
+    if isinstance(supplied_context, dict):
+        canonical_values["analysis_context"] = supplied_context
     database_evidence = {
         "rows": rows,
         "points": points,
@@ -71,8 +74,8 @@ def _execute(payload: dict) -> dict:
         "columns": columns,
         "metadata": metadata,
         "diagnostics": diagnostics,
-        "input_facts": input_facts,
-        "fact_by_key": fact_by_key,
+        "input_insights": input_insights,
+        "insight_by_key": insight_by_key,
     }
     data = dict(database_evidence["data"])
     df = canonical_values.get("df")
@@ -100,8 +103,8 @@ def _execute(payload: dict) -> dict:
         "data": data,
         "metadata": metadata,
         "diagnostics": diagnostics,
-        "input_facts": input_facts,
-        "fact_by_key": fact_by_key,
+        "input_insights": input_insights,
+        "insight_by_key": insight_by_key,
         "math": math,
         "statistics": statistics,
         "mean": statistics.mean,

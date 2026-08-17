@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import re
 
-from core.completion import latest_gap_assessment
+from core.completion import _requires_code_analysis, latest_gap_assessment
 from core.harness import build_action_space, build_observation_frame
 from core.harness.action_space import VALID_ACTIONS
+from core.harness.observation import state_capabilities
 from runtime.output_selection import select_outputs_for_action
 from schemas.state import RequestStateModel
 from schemas.tool import ToolObservation
@@ -234,8 +235,14 @@ def _missing_explicit_terminal_capabilities(request_state: RequestStateModel) ->
         missing.append("forecast")
     if "anomaly" in capabilities and request_state.latest_anomaly is None:
         missing.append("anomaly")
-    if "analysis" in capabilities and request_state.latest_analysis_id is None:
+    if (
+        "analysis" in capabilities
+        and request_state.latest_analysis_id is None
+        and _requires_code_analysis(request_state)
+    ):
         missing.append("analysis")
+    if "visualization" in capabilities and not request_state.visualizations:
+        missing.append("visualization")
     if "query" in capabilities or "database_evidence" in capabilities or "database" in capabilities:
         if request_state.latest_database_evidence is None or _latest_database_evidence_is_empty(request_state):
             missing.append("database_evidence")
@@ -308,7 +315,48 @@ def _covered_action_repeat_reason(
         return "Forecast artifact already exists. Reuse it or terminate if the request is covered."
     if action_name == "anomaly" and any(ref.startswith("anomaly:") for ref in refs):
         return "Anomaly artifact already exists. Reuse it or choose the next missing capability action."
+    if action_name == "visualization" and request_state.visualizations:
+        latest_visualization_iteration = _latest_successful_action_iteration(request_state, "visualization")
+        latest_source_iteration = max(
+            (_latest_successful_action_iteration(request_state, tool) for tool in ("sql_query", "code_interpreter", "forecast", "anomaly")),
+            default=-1,
+        )
+        requested_refs = {
+            _outer_artifact_ref(ref)
+            for ref in (action_input or {}).get("source_refs", [])
+            if _outer_artifact_ref(ref)
+        }
+        covered_refs = {
+            _outer_artifact_ref(ref)
+            for visualization in request_state.visualizations
+            for ref in visualization.source_refs
+            if _outer_artifact_ref(ref)
+        }
+        if latest_visualization_iteration >= latest_source_iteration and (
+            not requested_refs or requested_refs.issubset(covered_refs)
+        ):
+            return "A current visualization artifact already covers these grounded sources. Reuse its visualization_id or terminate."
     return None
+
+
+def _latest_successful_action_iteration(request_state: RequestStateModel, action_name: str) -> int:
+    iterations = [
+        int((output.meta or {}).get("iteration") or -1)
+        for output in request_state.action_outputs
+        if output.tool_name == action_name and output.success
+    ]
+    return max(iterations, default=-1)
+
+
+def _outer_artifact_ref(ref) -> str | None:
+    value = str(ref or "").strip()
+    if value.startswith("view:evidence:"):
+        parts = value.split(":", 3)
+        return f"evidence:{parts[2]}" if len(parts) > 2 else None
+    if value.startswith("view:analysis:"):
+        parts = value.split(":", 3)
+        return f"analysis:{parts[2]}" if len(parts) > 2 else None
+    return value or None
 
 
 def _query_action_signature(action_input: dict | None) -> str | None:
@@ -321,13 +369,13 @@ def _query_action_signature(action_input: dict | None) -> str | None:
         "message": " ".join(str(action_input.get("message") or "").lower().split()),
         "purpose": " ".join(str(action_input.get("purpose") or "").lower().split()),
         "time_range": action_input.get("time_range"),
-        "facts": sorted(
-            str(item.get("fact_key") or item.get("name") or "")
-            for item in action_input.get("fact_requests", [])
+        "insights": sorted(
+            str(item.get("insight_key") or item.get("name") or "")
+            for item in action_input.get("insight_requests", [])
             if isinstance(item, dict)
         ),
     }
-    if not any(payload[key] for key in ("query", "message", "purpose", "facts")):
+    if not any(payload[key] for key in ("query", "message", "purpose", "insights")):
         return None
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
 
@@ -478,11 +526,7 @@ def runtime_action_constraints(request_state: RequestStateModel) -> dict:
 
 
 def _effective_capabilities(request_state: RequestStateModel) -> set[str]:
-    values = {
-        str(item).strip().lower()
-        for item in (request_state.requested_capabilities or [])
-        if str(item).strip()
-    }
+    values = set(state_capabilities(request_state))
     if "rag" in values:
         values.add("external_knowledge")
     return values
@@ -614,4 +658,5 @@ def _available_artifact_refs(request_state: RequestStateModel) -> list[str]:
     if request_state.latest_skill is not None:
         skill_name = request_state.latest_skill.get("skill_name") if isinstance(request_state.latest_skill, dict) else None
         refs.append(f"skill:{skill_name}" if skill_name else "skill:latest")
+    refs.extend(f"visualization:{item.visualization_id}" for item in request_state.visualizations)
     return refs

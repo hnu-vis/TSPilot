@@ -49,7 +49,7 @@ class FakeLLM:
             return _turn(
                 "No datasource is available, so I can only attempt final assembly and let the runtime fail closed.",
                 "terminate",
-                {"summary_goal": context["message"], "include_fact_ids": [], "include_visualization_ids": [], "section_plan": []},
+                {"summary_goal": context["message"], "include_insight_ids": [], "include_visualization_ids": [], "section_plan": []},
             )
 
         if context.get("latest_database_evidence") is None:
@@ -62,14 +62,14 @@ class FakeLLM:
                 "selected_database_type": context.get("selected_database_type"),
                 "history": context.get("history", []),
             }
-            return _turn("I need evidence before producing facts.", "sql_query", action_input)
+            return _turn("I need evidence before producing insights.", "sql_query", action_input)
 
         latest_evidence = context.get("latest_database_evidence") or {}
         result_type = latest_evidence.get("result_type")
         if result_type in {"schema", "metric_list", "statistics", "table"}:
             action_input = {
                 "summary_goal": context["message"],
-                "include_fact_ids": [],
+                "include_insight_ids": [],
                 "include_visualization_ids": [
                     visualization["visualization_id"]
                     for visualization in context.get("visualizations", [])
@@ -94,7 +94,7 @@ class FakeLLM:
         action_input = {
             "summary_goal": context["message"],
             "include_analysis_ids": analysis_ids,
-            "include_fact_ids": [],
+            "include_insight_ids": [],
             "include_visualization_ids": [
                 visualization["visualization_id"]
                 for visualization in context.get("visualizations", [])
@@ -127,7 +127,7 @@ class SandboxAnalysisLLM:
                 {
                     "summary_goal": context["message"],
                     "include_analysis_ids": _analysis_ids(context),
-                    "include_fact_ids": [],
+                    "include_insight_ids": [],
                     "include_visualization_ids": [],
                     "section_plan": ["summary", "analysis"],
                 },
@@ -192,7 +192,7 @@ class SandboxAnalysisLLM:
             {
                 "summary_goal": context["message"],
                 "include_analysis_ids": _analysis_ids(context),
-                "include_fact_ids": [],
+                "include_insight_ids": [],
                 "include_visualization_ids": [],
                 "section_plan": ["summary", "analysis"],
             },
@@ -216,7 +216,7 @@ class CasualLLM:
             {
                 "summary_goal": "Answer the user's conversational request.",
                 "direct_answer": "你好！我是 TSPilot，可以帮你查询和分析时序数据。你可以选择数据库后直接问趋势、异常、预测或指标解释。",
-                "include_fact_ids": [],
+                "include_insight_ids": [],
                 "include_visualization_ids": [],
                 "section_plan": ["summary"],
             },
@@ -242,7 +242,7 @@ class CodeRequiredRepairLLM:
                 {
                     "summary_goal": context["message"],
                     "include_analysis_ids": _analysis_ids(context),
-                    "include_fact_ids": [],
+                    "include_insight_ids": [],
                     "section_plan": ["summary", "analysis"],
                 },
             )
@@ -310,7 +310,7 @@ class ComplexReActLLM:
             return _turn(
                 "No datasource is available, so I can only attempt final assembly and let the runtime fail closed.",
                 "terminate",
-                {"summary_goal": context["message"], "include_fact_ids": [], "include_visualization_ids": [], "section_plan": []},
+                {"summary_goal": context["message"], "include_insight_ids": [], "include_visualization_ids": [], "section_plan": []},
             )
 
         if not context.get("todo_list"):
@@ -380,7 +380,7 @@ class ComplexReActLLM:
         action_input = {
             "summary_goal": context["message"],
             "include_analysis_ids": _analysis_ids(context),
-            "include_fact_ids": [],
+            "include_insight_ids": [],
             "include_visualization_ids": [
                 visualization["visualization_id"]
                 for visualization in context.get("visualizations", [])
@@ -466,7 +466,7 @@ class RepeatingTodoLLM:
             {
                 "summary_goal": context["message"],
                 "include_analysis_ids": _analysis_ids(context),
-                "include_fact_ids": [],
+                "include_insight_ids": [],
                 "include_visualization_ids": [
                     viz["visualization_id"] for viz in context.get("visualizations", [])
                 ],
@@ -552,12 +552,12 @@ class TodoScopeLLM:
 
         if _analysis_count(context) > 0 and context.get("latest_anomaly") is not None:
             return _turn(
-                "I have enough facts to answer.",
+                "I have enough insights to answer.",
                 "terminate",
                 {
                     "summary_goal": context["message"],
                     "include_analysis_ids": _analysis_ids(context),
-                    "include_fact_ids": [],
+                    "include_insight_ids": [],
                     "include_visualization_ids": [
                         viz["visualization_id"] for viz in context.get("visualizations", [])
                     ],
@@ -666,7 +666,7 @@ class BitcoinMultiQueryLLM:
             {
                 "summary_goal": "汇总比特币 USD 价格多分项查询结果",
                 "direct_answer": "已完成全部分项查询，以下结果均来自实际数据库查询 evidence。",
-                "include_fact_ids": [],
+                "include_insight_ids": [],
                 "include_visualization_ids": [],
                 "section_plan": ["summary", "query_results", "conclusion"],
             },
@@ -729,7 +729,11 @@ def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
                     "content": summary,
                     "source_refs": list(dict.fromkeys(source_refs)),
                 }],
-                "visual_intents": [],
+                "visualization_ids": [
+                    item.get("visualization_id")
+                    for item in (context.get("outputs") or {}).get("visualizations", [])
+                    if isinstance(item, dict) and item.get("visualization_id")
+                ],
             },
             "unavailable_outputs": action_input.get("unavailable_outputs") or [],
             "unavailable_reason": action_input.get("unavailable_reason"),

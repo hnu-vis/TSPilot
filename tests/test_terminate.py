@@ -29,11 +29,17 @@ def test_terminate_rejects_renderer_level_visualization_fields():
         TerminateInput.model_validate({
             "response_plan": {
                 "summary": "Answer",
-                "visual_intents": [{
+                "visual_goals": [{
                     "purpose": "trend",
-                    "template_id": "timeseries.trend",
                     "title": "Trend",
-                    "source_refs": ["evidence:evi"],
+                    "required_roles": ["series"],
+                    "layers": [{
+                        "role": "series",
+                        "source_ref": "evidence:evi",
+                        "mark": "line",
+                        "encoding": {"x": "timestamp", "y": "value"},
+                        "echarts_option": {"series": []},
+                    }],
                     "echarts_option": {"series": []},
                 }],
             }

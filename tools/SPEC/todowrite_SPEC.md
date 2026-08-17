@@ -33,5 +33,5 @@ Each todo item should minimally support:
 ## Must not do
 
 - query databases
-- infer facts
+- infer insights
 - write final answer text

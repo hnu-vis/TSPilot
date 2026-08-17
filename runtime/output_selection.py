@@ -92,6 +92,8 @@ def _contract_output_is_covered(request_state: RequestStateModel, output: Any) -
         return True
     if "skill" in capabilities and request_state.latest_skill is not None:
         return True
+    if "visualization" in capabilities and request_state.visualizations:
+        return True
     if "answer" in capabilities and request_state.final_answer_draft is not None:
         return True
     return False
@@ -181,6 +183,7 @@ def _infer_capabilities_from_text(text: str) -> set[str]:
             "差值",
         ),
         "query": ("query", "evidence", "data", "rows", "points", "fetch", "load", "查询", "数据", "记录", "序列"),
+        "visualization": ("visualization", "visual", "chart", "plot", "graph", "可视化", "图表", "曲线"),
         "answer": ("conclusion", "answer", "summary", "final", "结论", "回答", "总结", "汇总"),
     }
     inferred = set()

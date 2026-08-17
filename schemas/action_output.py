@@ -10,8 +10,9 @@ class ActionOutput(BaseModel):
     """Separated tool output views for ReAct, UI, and internal resources.
 
     `observations` is the only tool result view intended for the outer model.
-    `view` is the public/UI view. `resource_value` keeps full validated tool
-    output for internal state transition and artifact persistence.
+    `view` is the public/UI view. `resource_value` is a compact artifact
+    receipt; canonical full data lives in request state or durable artifact
+    storage and is addressed by `resource_ref`.
     """
 
     tool_name: str

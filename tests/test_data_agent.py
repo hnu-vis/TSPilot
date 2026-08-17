@@ -61,7 +61,7 @@ def test_parse_turn_rejects_bare_terminal_input():
     bare_input = {
         "summary_goal": "Answer the seasonality question.",
         "direct_answer": "No clear daily or weekly seasonality was found.",
-        "include_fact_ids": ["fact_1"],
+        "include_insight_ids": ["insight_1"],
         "include_visualization_ids": ["viz_1"],
         "section_plan": ["summary"],
     }
@@ -125,7 +125,7 @@ def test_repair_prompt_requires_explicit_action_and_action_input():
     repair_prompt = llm.messages[1][-1][1]
     assert "action field is mandatory" in repair_prompt
     assert "action_input field is mandatory" in repair_prompt
-    assert "todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate" in repair_prompt
+    assert "todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate" in repair_prompt
     assert "Do not return only thought, task_contract, action_intention, or action_reason" in repair_prompt
     repairs = request_state.completion_state["llm_diagnostics"]["react_turn_repairs"]
     assert repairs[0]["source"] == "data_agent.next_turn"
@@ -138,7 +138,7 @@ def test_repair_prompt_requires_explicit_action_and_action_input():
 def test_next_turn_allows_second_llm_repair_attempt_without_guessing_action_locally():
     llm = _TwoBadThenGoodLLM()
 
-    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(None, None))
+    turn = asyncio.run(DataAgent(prompt_builder=_PromptBuilder(), llm=llm).next_turn(_RequestState(), None))
 
     assert turn.action == "sql_query"
     assert llm.calls == 3
@@ -185,7 +185,7 @@ def test_next_turn_repairs_invalid_first_model_output_once():
         "action_input": {
             "summary_goal": "Answer",
             "direct_answer": "Done.",
-            "include_fact_ids": [],
+            "include_insight_ids": [],
             "include_visualization_ids": [],
             "section_plan": [],
         },
@@ -193,7 +193,7 @@ def test_next_turn_repairs_invalid_first_model_output_once():
     repeated = f"{json.dumps(valid_turn)} {json.dumps(valid_turn)}"
     agent = DataAgent(prompt_builder=_PromptBuilder(), llm=_BadThenGoodLLM(repeated, json.dumps(valid_turn)))
 
-    turn = asyncio.run(agent.next_turn(request_state=None, conversation_state=None))
+    turn = asyncio.run(agent.next_turn(request_state=_RequestState(), conversation_state=None))
 
     assert turn.action == "terminate"
     assert turn.action_input["direct_answer"] == "Done."
@@ -211,7 +211,7 @@ def test_next_turn_uses_structured_output_when_available():
 
 
 class _PromptBuilder:
-    def build_system_prompt(self):
+    def build_system_prompt(self, response_language="en"):
         return "system"
 
     def build_user_prompt(self, request_state, conversation_state):
@@ -221,6 +221,7 @@ class _PromptBuilder:
 class _RequestState:
     def __init__(self):
         self.completion_state = {}
+        self.response_language = "en"
 
 
 class _BadThenGoodLLM:

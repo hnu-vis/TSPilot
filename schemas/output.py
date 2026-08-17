@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from schemas.visualization import VisualizationPayload, VisualizationTemplateId
+from schemas.visualization import VisualizationPayload, VisualizationMark
 
 
 class PlannedAnswerSection(BaseModel):
@@ -16,19 +16,54 @@ class PlannedAnswerSection(BaseModel):
     source_refs: list[str] = Field(default_factory=list)
 
 
-class VisualIntent(BaseModel):
-    """LLM-selected presentation semantics; no renderer mechanics or data arrays."""
+class VisualFieldEncoding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    field: str
+    data_type: Literal["time", "number", "category", "string", "boolean", "object"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_type_alias(cls, value):
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "type" in normalized and "data_type" not in normalized:
+            normalized["data_type"] = normalized.pop("type")
+        semantic_types = {
+            "quantitative": "number",
+            "temporal": "time",
+            "nominal": "category",
+            "ordinal": "category",
+        }
+        data_type = str(normalized.get("data_type") or "").strip().lower()
+        if data_type in semantic_types:
+            normalized["data_type"] = semantic_types[data_type]
+        return normalized
+
+
+class VisualLayerPlan(BaseModel):
+    """One grounded semantic layer selected by the response-planning LLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    source_ref: str
+    mark: VisualizationMark
+    encoding: dict[str, str | VisualFieldEncoding | list[str | VisualFieldEncoding]] = Field(default_factory=dict)
+    label: str | None = None
+
+
+class VisualGoal(BaseModel):
+    """A user-visible visual purpose and the roles required to satisfy it."""
 
     model_config = ConfigDict(extra="forbid")
 
     purpose: str
-    priority: Literal["primary", "supporting"] = "primary"
-    template_id: VisualizationTemplateId
     title: str
+    priority: Literal["primary", "supporting"] = "primary"
     summary: str | None = None
-    source_refs: list[str] = Field(default_factory=list)
-    fact_refs: list[str] = Field(default_factory=list)
-    encodings: dict[str, str] = Field(default_factory=dict)
+    required_roles: list[str] = Field(default_factory=list)
+    layers: list[VisualLayerPlan] = Field(default_factory=list)
 
 
 class FinalResponsePlan(BaseModel):
@@ -36,7 +71,7 @@ class FinalResponsePlan(BaseModel):
     title: str | None = None
     summary: str
     sections: list[PlannedAnswerSection] = Field(default_factory=list)
-    visual_intents: list[VisualIntent] = Field(default_factory=list)
+    visualization_ids: list[str] = Field(default_factory=list)
 
 
 class AnswerSection(BaseModel):
@@ -47,7 +82,7 @@ class AnswerSection(BaseModel):
 
 
 class AnswerReference(BaseModel):
-    source_type: Literal["query", "statistics", "fact", "analysis", "forecast", "anomaly", "rag", "skill"]
+    source_type: Literal["query", "statistics", "insight", "analysis", "forecast", "anomaly", "rag", "skill"]
     source_id: str | None = None
     label: str
     evidence: dict | None = None
@@ -58,7 +93,7 @@ class AnswerClaim(BaseModel):
 
     claim_id: str
     text: str
-    fact_ids: list[str] = Field(default_factory=list)
+    insight_ids: list[str] = Field(default_factory=list)
     item_ids: list[str] = Field(default_factory=list)
     analysis_ids: list[str] = Field(default_factory=list)
     artifact_type: str | None = None

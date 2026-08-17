@@ -74,6 +74,8 @@ class StateTransitionEngine:
             request_state_runtime._apply_evidence_payload(request_state, full_payload)
         elif tool_spec.result_target == "analysis":
             request_state_runtime._apply_analysis_payload(request_state, full_payload)
+        elif tool_spec.result_target == "visualization":
+            request_state_runtime._apply_visualization_payload(request_state, full_payload)
         elif tool_spec.result_target == "presentation":
             request_state_runtime._apply_presentation_payload(request_state, full_payload)
             request_state_runtime._complete_answer_todo_after_terminal(
@@ -82,8 +84,8 @@ class StateTransitionEngine:
                 full_payload,
             )
 
-        if tool_spec.result_target in {"evidence", "analysis"}:
-            request_state_runtime.register_data_facts_from_payload(
+        if tool_spec.result_target in {"evidence", "analysis", "visualization"}:
+            request_state_runtime.register_key_insights_from_payload(
                 request_state,
                 observation.tool_name,
                 full_payload,

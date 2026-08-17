@@ -25,7 +25,7 @@ class DataAgent(BaseAgent):
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
     ) -> ReActTurn:
-        system_prompt = self._prompt_builder.build_system_prompt()
+        system_prompt = self._prompt_builder.build_system_prompt(request_state.response_language)
         user_prompt = self._prompt_builder.build_user_prompt(request_state, conversation_state)
         content, structured_turn = await self._invoke_turn(
             [
@@ -104,7 +104,7 @@ class DataAgent(BaseAgent):
             "\"action_intention\": str|null, \"action_reason\": str|null, "
             "\"action\": str, \"action_input\": object}. "
             "The top-level action field is mandatory and must be exactly one of: "
-            "todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate. "
+            "todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate. "
             "The top-level action_input field is mandatory and must be an object matching that action. "
             "Do not return only thought, task_contract, action_intention, or action_reason. "
             "If you already know the next step from your thought/intention, put the corresponding tool name in action and its input in action_input. "

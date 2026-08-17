@@ -1,11 +1,38 @@
 """Generated-code analysis result models."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from schemas.data_fact import DataFact, FactCoverage
+from schemas.key_insight import KeyInsight, InsightCoverage
+
+
+class DataViewField(BaseModel):
+    name: str
+    data_type: Literal["time", "number", "category", "string", "boolean", "object"]
+
+
+class AnalysisDataView(BaseModel):
+    """A named, lineage-preserving dataset produced by an analysis."""
+
+    view_id: str
+    name: str
+    shape: Literal["timeseries", "records", "scalar", "intervals"]
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    scalar: dict[str, Any] | None = None
+    schema_fields: list[DataViewField] = Field(default_factory=list)
+    lineage: list[str] = Field(min_length=1)
+    transform_summary: str | None = None
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if self.shape == "scalar":
+            if not isinstance(self.scalar, dict) or not self.scalar:
+                raise ValueError("scalar data view requires a non-empty scalar object")
+        elif not self.rows:
+            raise ValueError(f"{self.shape} data view requires non-empty rows")
+        return self
 
 
 class AnalysisResult(BaseModel):
@@ -18,10 +45,11 @@ class AnalysisResult(BaseModel):
     status: Literal["succeeded", "failed"]
     summary: str
     result: dict = Field(default_factory=dict)
+    data_views: list[AnalysisDataView] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
-    produced_facts: list[DataFact] = Field(default_factory=list)
-    rejected_facts: list[DataFact] = Field(default_factory=list)
-    fact_coverage: FactCoverage | None = None
+    produced_insights: list[KeyInsight] = Field(default_factory=list)
+    rejected_insights: list[KeyInsight] = Field(default_factory=list)
+    insight_coverage: InsightCoverage | None = None
 
     @model_validator(mode="after")
     def validate_succeeded_result_contract(self):
@@ -40,5 +68,10 @@ class AnalysisResult(BaseModel):
             "metrics": dict(self.result["metrics"]),
             "details": dict(self.result["details"]),
         }
+        raw_views = self.result.get("data_views")
+        if raw_views is not None:
+            if not isinstance(raw_views, list):
+                raise ValueError("result.data_views must be a list")
+            self.data_views = [AnalysisDataView.model_validate(item) for item in raw_views]
         self.summary = result_summary.strip()
         return self

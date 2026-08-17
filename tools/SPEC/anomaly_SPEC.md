@@ -36,7 +36,7 @@ Run anomaly detection on normalized time-series evidence.
 
 - fail fast when input evidence is not `timeseries`
 - anomaly detector implementations must be selected through the registry
-- do not infer unrelated facts
+- do not infer unrelated insights
 
 ## Must not do
 

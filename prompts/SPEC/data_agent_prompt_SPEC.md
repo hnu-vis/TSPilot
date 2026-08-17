@@ -29,7 +29,7 @@ The prompt builder may expose only a bounded view of runtime state:
 - current todo list
 - latest observation summaries
 - latest evidence / analysis payloads
-- verified facts
+- verified insights
 - visualizations
 - `prompt_context_summary` when older context has been compacted
 
@@ -61,7 +61,7 @@ The model must treat anything outside that window as unavailable.
 - describe the allowed action space
 - provide the action input contract for each action
 - instruct the model to prefer evidence-grounded output
-- instruct the model to rely on verified facts only
+- instruct the model to rely on verified insights only
 - instruct the model to prefer deterministic recovery over guessing
 - instruct the model to identify user-visible task outputs before choosing tools
 - prevent fixed tool-chain templates for database-computable statistics
@@ -82,7 +82,7 @@ The model must treat anything outside that window as unavailable.
 ## Example ReAct turn
 
 ```text
-Thought: I need evidence before deciding the facts.
+Thought: I need evidence before deciding the insights.
 Action: sql_query
 Action Input: {"message":"最近7天CPU有什么趋势？","database_context":{"database_id":"prometheus-prod","database_type":"prometheus","display_name":"Prometheus Prod"},"time_range":{"start":"2026-07-07T00:00:00Z","end":"2026-07-14T00:00:00Z"},"constraints":{"max_points":100},"history":[]}
 ```
@@ -184,7 +184,7 @@ Optional fields:
 - `result`
 - `summary_goal`
 - `direct_answer`
-- `include_fact_ids`
+- `include_insight_ids`
 - `include_analysis_ids`
 - `include_visualization_ids`
 - `section_plan`
@@ -228,8 +228,8 @@ The prompt must explicitly expose these fields to the model:
 - `latest_anomaly`
 - `latest_rag`
 - `latest_skill`
-- `fact_set`
-- `fact_events`
+- `insight_set`
+- `insight_events`
 - `visualizations`
 - `prompt_context_summary`
 
@@ -297,8 +297,8 @@ The prompt should guide the model with this order:
 - `Observation` is not model output
 - prefer deterministic recovery or a failed observation over guessing when required fields are missing
 - treat `sql_query` output as evidence, not as a final answer
-- use only selected `fact_set` facts from the current request flow in final narration
-- prefer `linechart` for time-indexed or ratio/comparison facts when the evidence supports it
+- use only selected `insight_set` insights from the current request flow in final narration
+- prefer `linechart` for time-indexed or ratio/comparison insights when the evidence supports it
 - do not emit hidden state changes outside the structured block
 - do not emit `Observation`
 - treat `terminate` as the final model-visible action

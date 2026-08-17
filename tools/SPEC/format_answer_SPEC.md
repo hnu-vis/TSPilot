@@ -2,32 +2,30 @@
 
 ## Purpose
 
-Validate and materialize the structured `FinalResponsePlan` authored by the
-outer ReAct model's terminal call.
+Validate and assemble the structured `FinalResponsePlan` authored by the outer
+ReAct model's terminal call. Visualization planning and materialization are not
+part of this tool.
 
 ## Input
 
-- `response_plan.title`
-- grounded prose in `summary` and `sections[]`
-- semantic `visual_intents[]` containing template IDs, source refs, Fact refs,
-  and optional source-field encodings
+- `response_plan.title`, summary, and grounded sections
+- `visualization_ids[]` returned by successful `visualization` tool calls
 
 ## Pipeline
 
-1. Resolve every referenced Fact, Evidence, Analysis, Forecast, and Anomaly
-   against the request-scoped `PresentationCatalog`.
-2. Reject invented references, incompatible templates, and duplicate primary
-   views for one purpose.
-3. Read complete canonical artifacts at this final boundary.
-4. Materialize typed V2 datasets, semantic layers, sampling, bindings, and
-   scale/facet layout without invoking an LLM.
-5. Assemble sections, references, claims, and visualizations into `FinalAnswer`.
+1. Resolve every section reference against the request-scoped
+   `PresentationCatalog` or the selected visualization ids.
+2. Select only existing visualization descriptors and validate their durable
+   `data_ref` and source lineage.
+3. Expand Data View lineage into answer references and claim-to-visual links.
+4. Assemble the final answer without invoking an internal LLM.
+5. Route a missing/broken visualization artifact to `visualization`; input-only
+   response-plan errors remain terminal-plan repairs.
 
 ## Invariants
 
-- No database query, analysis execution, or internal LLM call.
-- No silent visualization fallback or swallowed materialization error.
-- No tool-produced forecast/anomaly chart is reused; those tools produce data
-  artifacts and the final formatter owns presentation.
-- The outer model decides what the user needs to see; deterministic code only
-  performs renderer mechanics such as sampling and legibility.
+- No database query, analysis execution, visualization planning/materialization,
+  or internal LLM call.
+- No deterministic visualization fallback.
+- The formatter never truncates, copies, or recomputes visualization data.
+- Full visualization data remains behind the descriptor's `data_ref`.

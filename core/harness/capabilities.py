@@ -135,6 +135,8 @@ class CapabilityRegistry:
             return "rag:latest"
         if action == "skill" and payload.get("skill_name"):
             return f"skill:{payload['skill_name']}"
+        if action == "visualization" and payload.get("visualization_ids"):
+            return f"visualization:{payload['visualization_ids'][0]}"
         return None
 
     def hint_for_task_type(self, task_type: str) -> str | None:
@@ -144,6 +146,7 @@ class CapabilityRegistry:
             "analysis": "Run code_interpreter over the full evidence artifact.",
             "anomaly": "Run anomaly after time-series evidence is available.",
             "forecast": "Run forecast after time-series evidence is available.",
+            "visualization": "Create a grounded visualization artifact after complete evidence is available.",
             "external_knowledge": "Call rag only if external knowledge is required.",
             "skill": "Invoke the requested packaged skill.",
             "answer": "Terminate only after final answer verification can pass.",
@@ -156,9 +159,10 @@ _ACTION_ORDER = {
     "code_interpreter": 2,
     "anomaly": 3,
     "forecast": 4,
-    "rag": 5,
-    "skill": 6,
-    "terminate": 7,
+    "visualization": 5,
+    "rag": 6,
+    "skill": 7,
+    "terminate": 8,
 }
 
 
@@ -188,7 +192,7 @@ def default_capability_registry() -> CapabilityRegistry:
                         "Need grounded database evidence. Describe the evidence needed in natural language; "
                         "schema linking, query generation, dialect handling, and validation happen inside the tool."
                     ),
-                    parameters=("message", "purpose?", "time_range?", "constraints?", "fact_requests?"),
+                    parameters=("message", "purpose?", "time_range?", "constraints?", "insight_requests?"),
                 ),
                 aliases=("database_query", "database", "sql"),
                 task_types=("query", "database", "database_evidence", "sql"),
@@ -202,7 +206,7 @@ def default_capability_registry() -> CapabilityRegistry:
                 card=ActionParameterCard(
                     action="code_interpreter",
                     use_when="Existing evidence needs derived metrics, statistics, ratios, windows, or user-requested custom computation.",
-                    parameters=("database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "fact_requests?"),
+                    parameters=("database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "insight_requests?"),
                     input_defaults={"database_evidence": "latest", "analysis_request": {"mode": "canonical_timeseries_metrics"}},
                 ),
                 aliases=("derived_metric", "statistics", "statistical_summary", "calculation"),
@@ -218,7 +222,7 @@ def default_capability_registry() -> CapabilityRegistry:
                 card=ActionParameterCard(
                     action="anomaly",
                     use_when="Need anomaly/spike/outlier detection on time-series evidence.",
-                    parameters=("database_evidence", "detector_name?", "series_name?", "constraints?", "fact_requests?"),
+                    parameters=("database_evidence", "detector_name?", "series_name?", "constraints?", "insight_requests?"),
                     input_defaults={"database_evidence": "latest"},
                 ),
                 aliases=("outlier", "spike"),
@@ -234,7 +238,7 @@ def default_capability_registry() -> CapabilityRegistry:
                 card=ActionParameterCard(
                     action="forecast",
                     use_when="Need prediction/forecast on time-series evidence.",
-                    parameters=("database_evidence", "horizon", "model_name?", "series_name?", "constraints?", "fact_requests?"),
+                    parameters=("database_evidence", "horizon", "model_name?", "series_name?", "constraints?", "insight_requests?"),
                     input_defaults={"database_evidence": "latest"},
                 ),
                 aliases=("prediction", "predict"),
@@ -267,17 +271,32 @@ def default_capability_registry() -> CapabilityRegistry:
                 task_types=("skill",),
             ),
             CapabilitySpec(
+                capability_id="visualization",
+                required_actions=("visualization",),
+                produced_artifact_kinds=("visualization",),
+                evidence_kinds=("visualization",),
+                terminal_output_names=("visualization",),
+                card=ActionParameterCard(
+                    action="visualization",
+                    use_when="The user requests a chart or needs a visual pattern over complete time-series evidence.",
+                    parameters=("message", "source_refs?", "constraints?"),
+                ),
+                aliases=("visual", "chart", "plot", "graph"),
+                task_types=("visualization", "visual", "chart", "plot"),
+                prerequisite_actions=("sql_query", "code_interpreter", "anomaly", "forecast"),
+            ),
+            CapabilitySpec(
                 capability_id="answer",
                 required_actions=("terminate",),
                 produced_artifact_kinds=("final_answer",),
                 card=ActionParameterCard(
                     action="terminate",
-                    use_when="Evidence covers the request, or task cannot proceed; author the grounded prose and visual semantics together.",
+                    use_when="Evidence and any requested visualization artifacts cover the request; assemble the grounded final answer.",
                     parameters=("response_plan", "unavailable_outputs", "unavailable_reason?"),
                 ),
                 aliases=("conclusion", "final"),
                 task_types=("answer",),
-                prerequisite_actions=("sql_query", "code_interpreter", "anomaly", "forecast"),
+                prerequisite_actions=("sql_query", "code_interpreter", "anomaly", "forecast", "visualization"),
             ),
         ]
     )

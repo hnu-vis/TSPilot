@@ -3,6 +3,7 @@ from __future__ import annotations
 from core.harness.observation_view import model_observation_view, public_observation_view
 from core.harness.action_output import ActionOutputBuilder, ActionOutputBuildInput
 from runtime.request_state import public_final_answer
+from runtime.request_state import _compact_analysis_value
 from schemas.output import AnswerReference, AnswerSection, FinalAnswer
 from schemas.tool import ToolObservation
 
@@ -66,6 +67,114 @@ def test_model_database_observation_still_hides_query_code():
     assert "query" not in payload
     assert "query_language" not in payload
     assert "for query" not in model_view["summary"]
+    assert "data_preview" not in payload
+    assert "raw_available_in_artifact" not in payload
+    assert payload["row_count"] == 1
+    assert payload["point_count"] == 1
+
+
+def test_prompt_safe_evidence_drops_snapshot_paths_and_planning_diagnostics():
+    from runtime.request_state import _build_prompt_safe_evidence
+    from schemas.database import DatabaseEvidence
+
+    safe = _build_prompt_safe_evidence(
+        DatabaseEvidence(
+            evidence_id="evi_safe",
+            result_type="timeseries",
+            database="demo",
+            summary="Loaded rows.",
+            data={"rows": [{"timestamp": "t0", "value": 1.0}]},
+            diagnostics={
+                "is_full_fidelity": True,
+                "snapshot_ref": {"uri": "/private/request/artifact.json"},
+                "schema_linking_generation": {"internal": "large"},
+                "task_coverage": {
+                    "missing": ["maximum"],
+                    "next_action_hint": "code_interpreter",
+                    "query_task_contract": {"downstream_action": "code_interpreter"},
+                    "executed_query": "select secret",
+                },
+            },
+        )
+    )
+
+    assert safe.diagnostics["is_full_fidelity"] is True
+    assert safe.diagnostics["task_coverage"]["missing"] == ["maximum"]
+    assert "snapshot_ref" not in safe.diagnostics
+    assert "schema_linking_generation" not in safe.diagnostics
+    assert "executed_query" not in safe.diagnostics["task_coverage"]
+
+
+def test_terminal_observation_keeps_receipt_not_full_visualization_descriptor():
+    from runtime.request_state import enrich_observation_payload
+
+    class _PresentationSpec:
+        result_target = "presentation"
+
+    observation = ToolObservation(tool_name="terminate", success=True, summary="done", payload={})
+    enriched = enrich_observation_payload(
+        type("State", (), {"completion_state": {}})(),
+        observation,
+        {
+            "title": "Result",
+            "summary": "done",
+            "visualizations": [
+                {
+                    "visualization_id": "viz_demo",
+                    "source_refs": ["view:evidence:evi_demo:default"],
+                    "datasets": [{"row_count": 2680}],
+                }
+            ],
+        },
+        _PresentationSpec(),
+    )
+
+    assert enriched.payload == {
+        "title": "Result",
+        "visualization_ids": ["viz_demo"],
+    }
+
+
+def test_action_output_keeps_only_canonical_resource_receipt():
+    payload = _database_observation().payload
+    output = ActionOutputBuilder().build(ActionOutputBuildInput(
+        tool_name="sql_query",
+        success=True,
+        summary="Loaded 1 row.",
+        full_payload=payload,
+        result_target="evidence",
+        action_input={"message": "load data"},
+        iteration=1,
+        request_id="req_receipt",
+    ))
+
+    assert output.resource_ref == "evidence:evi_demo"
+    assert output.resource_value == {"resource_ref": "evidence:evi_demo"}
+    assert output.observations["resource_ref"] == "evidence:evi_demo"
+    assert "artifact_ref" not in output.observations
+    assert "data_preview" not in output.observations
+
+
+def test_analysis_observation_compacts_long_timeseries_but_keeps_small_extreme_locator():
+    details = {
+        "timeseries_data": [
+            {"timestamp": f"2023-01-01T00:{index:02d}:00Z", "value": index}
+            for index in range(20)
+        ],
+        "max_value_points": [
+            {"timestamp": "2023-01-01T00:19:00Z", "value": 19}
+        ],
+    }
+
+    compact = _compact_analysis_value(details)
+
+    assert compact["timeseries_data"] == {
+        "item_count": 20,
+        "available_in_artifact": True,
+    }
+    assert compact["max_value_points"] == [
+        {"timestamp": "2023-01-01T00:19:00Z", "value": 19}
+    ]
 
 
 def test_public_final_answer_preserves_query_evidence_fields():
@@ -220,7 +329,7 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
     assert "analysis_code" not in action_output.memory_fragment["action_input"]
 
 
-def test_refresh_after_transition_exposes_registered_code_facts_and_keeps_artifact():
+def test_refresh_after_transition_exposes_registered_code_insights_and_keeps_artifact():
     builder = ActionOutputBuilder()
     initial = builder.build(
         ActionOutputBuildInput(
@@ -242,12 +351,12 @@ def test_refresh_after_transition_exposes_registered_code_facts_and_keeps_artifa
             "analysis_id": "ana_demo",
             "status": "succeeded",
             "result": {},
-            "produced_facts": [
+            "produced_insights": [
                 {
-                    "fact_id": "fact_demo",
-                    "fact_key": "mean_value",
+                    "insight_id": "insight_demo",
+                    "insight_key": "mean_value",
                     "name": "Mean value",
-                    "fact_type": "aggregate",
+                    "insight_type": "aggregate",
                     "statement": "Mean value is 1.5.",
                     "value": 1.5,
                     "method": "code_interpreter",
@@ -257,7 +366,7 @@ def test_refresh_after_transition_exposes_registered_code_facts_and_keeps_artifa
                     "derived_from": [],
                 }
             ],
-            "fact_coverage": {
+            "insight_coverage": {
                 "requested": ["Mean value"],
                 "verified": ["Mean value"],
                 "missing": [],
@@ -276,9 +385,9 @@ def test_refresh_after_transition_exposes_registered_code_facts_and_keeps_artifa
     )
 
     payload = refreshed.view["payload"]
-    assert payload["produced_fact_count"] == 1
-    assert payload["produced_facts_preview"][0]["fact_key"] == "mean_value"
-    assert payload["fact_coverage"]["verified"] == ["Mean value"]
+    assert payload["produced_insight_count"] == 1
+    assert payload["produced_insights_preview"][0]["insight_key"] == "mean_value"
+    assert payload["insight_coverage"]["verified"] == ["Mean value"]
     assert payload["code_preview"] == "result = {}"
     assert refreshed.resource_value == initial.resource_value
     assert refreshed.resource_ref == initial.resource_ref

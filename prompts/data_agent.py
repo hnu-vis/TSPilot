@@ -5,17 +5,17 @@ import json
 
 from core.harness import default_capability_registry
 from core.harness.observation_view import model_observation_view
-from core.data_fact import data_fact_prompt_view
-from core.visualization import PresentationCatalog
+from core.key_insight import key_insight_prompt_view
 from runtime.action_policy import runtime_action_constraints
+from runtime.prompt_locale import prompt_locale_instruction
 from schemas.state import ConversationStateModel, RequestStateModel
 
 
 class DataAgentPromptBuilder:
     """Build the bounded model-visible context."""
 
-    def build_system_prompt(self) -> str:
-        return self._compact_system_prompt()
+    def build_system_prompt(self, response_language: str = "en") -> str:
+        return prompt_locale_instruction(response_language) + self._compact_system_prompt()
 
     def _compact_system_prompt(self) -> str:
         return (
@@ -25,29 +25,29 @@ class DataAgentPromptBuilder:
             "Output schema: {\"thought\": str, \"task_contract\": object|null, "
             "\"previous_observation_assessment\": object|null, \"action_intention\": str|null, "
             "\"action_reason\": str|null, \"action\": str, \"action_input\": object}.\n"
-            "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate.\n"
+            "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate.\n"
             "Language policy: task.response_language controls all natural-language fields; keep JSON keys, action names, identifiers, and database values unchanged.\n"
             "Core ReAct rule: Thought_n selects Action_n; runtime provides Observation_n; Thought_n+1 must use Observation_n and progress_summary before choosing the next action.\n"
             "Do not repeat actions listed as completed in progress_summary unless last_observation says the existing artifact is insufficient.\n"
             "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
             "Use the smallest next action that fills the current missing capability. When all requested capabilities are covered, call terminate.\n"
-            "Exact numeric claims in terminate must be grounded by the presentation sources in context. Never do mental arithmetic in terminate. "
-            "For terminate, action_input must contain response_plan with title, summary, sections, and visual_intents. "
-            "Each section has section_type, heading, content, and source_refs. Each visual intent has purpose, priority, template_id, title, summary, source_refs, fact_refs, and optional encodings. "
-            "Use only listed source_ref and field names. The final formatter reads complete artifacts by reference; never copy data arrays into response_plan. "
-            "Terminate schema: {\"response_plan\":{\"title\":str|null,\"summary\":str,\"sections\":[{\"section_type\":str,\"heading\":str|null,\"content\":str,\"source_refs\":[str]}],\"visual_intents\":[{\"purpose\":str,\"priority\":\"primary\"|\"supporting\",\"template_id\":str,\"title\":str,\"summary\":str|null,\"source_refs\":[str],\"fact_refs\":[str],\"encodings\":object}]},\"unavailable_outputs\":[str],\"unavailable_reason\":str|null}. "
-            "Visualization planning is by user goal, not by Fact type: use one primary view per purpose, add Facts as semantic highlights, do not create duplicate views, and do not request extra data only for presentation.\n"
+            "Exact numeric claims in terminate must be grounded by artifact refs and verified insight state in context. Never do mental arithmetic in terminate. "
+            "Use visualization after evidence/analysis is ready whenever the user requests a chart or a visual pattern. Its action_input contains message, optional source_refs, and optional constraints; never author marks, layers, renderer options, or data arrays in the outer action. "
+            "The visualization tool owns semantic planning and requires full-range time-series data. If it reports incomplete data, follow its sql_query repair contract before retrying visualization. "
+            "For terminate, action_input must contain response_plan with title, summary, sections, and visualization_ids. Each section has section_type, heading, content, and source_refs. "
+            "Use only visualization_ids returned by successful visualization observations. In section source_refs, cite evidence/insight/view refs; a visualization section may also cite a selected visualization as visualization:<id> or its returned bare id. The final formatter only assembles existing artifacts and never creates charts or queries data. "
+            "Terminate schema: {\"response_plan\":{\"title\":str|null,\"summary\":str,\"sections\":[{\"section_type\":str,\"heading\":str|null,\"content\":str,\"source_refs\":[str]}],\"visualization_ids\":[str]},\"unavailable_outputs\":[str],\"unavailable_reason\":str|null}. "
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
-            "Data Fact contract: use fact_requests to name the facts a tool must produce. Give every request a stable semantic fact_key. "
-            "For a fact computed from earlier facts, list their fact_key values in derived_from. Reuse fact keys from state.fact_state; "
-            "do not put Evidence IDs, artifact refs, or metric labels in derived_from. An analytical Fact computed directly from the "
+            "Key Insight contract: use insight_requests to name the key insights a tool must produce. Give every request a stable semantic insight_key. "
+            "For an insight computed from earlier insights, list their insight_key values in derived_from. Reuse insight keys from state.insight_state; "
+            "do not put Evidence IDs, artifact refs, or metric labels in derived_from. An analytical Key Insight computed directly from the "
             "selected database Evidence may leave derived_from empty because the analysis artifact records that evidence dependency. "
-            "SQL should produce evidence-backed atomic facts; code_interpreter should produce derived or analytical facts.\n"
-            "SQL Fact contracts support point_value or time_boundary with requirements.time_position=start|end, extreme with "
+            "SQL should produce evidence-backed atomic key insights; code_interpreter should produce derived or analytical key insights.\n"
+            "SQL Key Insight contracts support point_value or time_boundary with requirements.time_position=start|end, extreme with "
             "requirements.operator=min|max, and count. Use time_boundary for timestamps and point_value only for scalar measure values. "
-            "Use count only when the requested fact is a row/record count. Tables, detail lists, and complete time series are query Evidence "
-            "Artifacts, not scalar Facts, so leave fact_requests empty for those outputs. Do not request change, ratio, trend, or other derived Fact types from sql_query.\n"
+            "Use count only when the requested insight is a row/record count. Tables, detail lists, and complete time series are query Evidence "
+            "Artifacts, not scalar Key Insights, so leave insight_requests empty for those outputs. Do not request change, ratio, trend, or other derived Key Insight types from sql_query.\n"
             "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
             "If requested analysis metrics require custom formulas, sequence/window calculations, returns, volatility, drawdown, correlation, or any metric not clearly template-covered, call code_interpreter with Python code.\n"
             "Code interpreter sandbox contract: generated Python code receives canonical variables df, time, value, "
@@ -55,8 +55,11 @@ class DataAgentPromptBuilder:
             "metadata, and diagnostics. Prefer value/time/df/series; do not guess business field names or index raw "
             "rows/points unless canonical inputs are unavailable. data supports both original rows/points and column arrays. "
             "Use pandas-compatible frequency aliases such as 'h' for hourly grouping. "
-            "The code must assign a dict named result with a non-empty summary string, a metrics dict, a details dict, and a facts list. "
-            "When fact_requests is non-empty, facts must preserve each satisfied request's fact_key, name, fact_type, and derived_from and include value, statement, and calculation_trace.\n"
+            "The code must assign a dict named result with a non-empty summary string, a metrics dict, a details dict, a data_views list, and an insights list. "
+            "When a requested answer or visualization depends on filtered or derived rows, data_views must contain the complete named dataset with schema_fields, lineage, and transform_summary; never return only a preview. "
+            "For code_interpreter tasks that select semantic events or decision points, analysis_request must ask for the complete filtered base Data View and separate one-row Data Views for roles that need distinct visual marks, in addition to any combined summary view. "
+            "When the user requires anomaly exclusion and no rule is supplied, call anomaly before code_interpreter. The Anomaly Artifact is authoritative; code_interpreter and visualization must use that exact anomaly set rather than detecting a second set. Do not author deterministic fallback branches for a missing artifact or failed business calculation; return a structured unavailable output after the allowed repair path instead. "
+            "When insight_requests is non-empty, insights must preserve each satisfied request's insight_key, name, insight_type, and derived_from and include value, statement, and calculation_trace.\n"
             "Tool-internal rules live inside tools. Do not recreate schema linking, query generation, validation, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
             "If a tool returns structured failure diagnostics, choose the recommended next action or a materially different action that addresses the diagnostics.\n"
             "Do not output markdown fences."
@@ -83,13 +86,11 @@ class DataAgentPromptBuilder:
                 "next_action_constraints": action_space,
                 "progress_summary": self._progress_summary(request_state, conversation_state),
                 "todo_progress": self._todo_progress_context(request_state, conversation_state),
+                "task_contract": self._task_contract_context(request_state),
                 "artifact_inventory": self._artifact_inventory(request_state),
-                "fact_state": data_fact_prompt_view(request_state),
+                "insight_state": key_insight_prompt_view(request_state),
             },
-            "artifacts": {
-                "refs": self._artifact_ref_index(request_state),
-                "presentation": self._presentation_context(request_state, action_space),
-            },
+            "artifacts": {"refs": self._artifact_ref_index(request_state)},
             "last_observation": (
                 self._action_output_observation_context(request_state.latest_action_output)
                 if request_state.latest_action_output
@@ -111,17 +112,19 @@ class DataAgentPromptBuilder:
 
     def _minimal_parameters(self, action: str | None, parameters: list[str]) -> list[str]:
         if action == "sql_query":
-            return ["message", "purpose?", "fact_requests?"]
+            return ["message", "purpose?", "insight_requests?"]
         if action == "todowrite":
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
-            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "fact_requests?"]
+            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "insight_requests?"]
         if action == "forecast":
             return ["database_evidence", "horizon", "constraints?"]
         if action == "anomaly":
             return ["database_evidence", "constraints?"]
         if action == "terminate":
             return ["response_plan", "unavailable_outputs?", "unavailable_reason?"]
+        if action == "visualization":
+            return ["message", "source_refs?", "constraints?"]
         return list(parameters)[:4]
 
     def _task_context(self, request_state: RequestStateModel) -> dict:
@@ -270,39 +273,39 @@ class DataAgentPromptBuilder:
         conversation_state: ConversationStateModel,
     ) -> dict:
         memory = []
-        for fact in list(conversation_state.recent_fact_memory or [])[-6:]:
+        for insight in list(conversation_state.recent_insight_memory or [])[-6:]:
             memory.append(
                 {
-                    "fact_id": fact.fact_id,
-                    "name": fact.name,
-                    "fact_type": fact.fact_type,
-                    "status": fact.status,
-                    "statement": self._truncate_text(fact.statement, 500),
+                    "insight_id": insight.insight_id,
+                    "name": insight.name,
+                    "insight_type": insight.insight_type,
+                    "status": insight.status,
+                    "statement": self._truncate_text(insight.statement, 500),
                 }
             )
         return {"artifact_refs": self._artifact_ref_index(request_state)}
 
-    def _facts_from_action_outputs(self, request_state: RequestStateModel) -> list[dict]:
-        facts: list[dict] = []
+    def _insights_from_action_outputs(self, request_state: RequestStateModel) -> list[dict]:
+        insights: list[dict] = []
         for action_output in request_state.action_outputs[-6:]:
             observation = action_output.observations
             if not isinstance(observation, dict):
                 continue
-            for key in ("facts", "produced_facts_preview"):
-                raw_facts = observation.get(key)
-                if not isinstance(raw_facts, list):
+            for key in ("insights", "produced_insights_preview"):
+                raw_insights = observation.get(key)
+                if not isinstance(raw_insights, list):
                     continue
-                for fact in raw_facts:
-                    if not isinstance(fact, dict):
+                for insight in raw_insights:
+                    if not isinstance(insight, dict):
                         continue
-                    facts.append(
+                    insights.append(
                         {
-                            item_key: self._bounded_value(fact.get(item_key), max_string_chars=500, max_list_items=4, max_dict_items=6)
-                            for item_key in ("fact_id", "name", "fact_type", "statement", "value", "status")
-                            if fact.get(item_key) not in (None, "", [], {})
+                            item_key: self._bounded_value(insight.get(item_key), max_string_chars=500, max_list_items=4, max_dict_items=6)
+                            for item_key in ("insight_id", "name", "insight_type", "statement", "value", "status")
+                            if insight.get(item_key) not in (None, "", [], {})
                         }
                     )
-        return facts[-12:]
+        return insights[-12:]
 
     def _artifact_inventory(self, request_state: RequestStateModel) -> dict:
         return {
@@ -310,24 +313,11 @@ class DataAgentPromptBuilder:
             "analysis_count": len(request_state.analysis_artifacts),
             "has_forecast": request_state.latest_forecast is not None,
             "has_anomaly": request_state.latest_anomaly is not None,
-            "verified_fact_count": sum(
-                1 for fact in request_state.fact_set.facts if fact.status == "verified"
+            "verified_insight_count": sum(
+                1 for insight in request_state.insight_set.insights if insight.status == "verified"
             ),
             "visualization_count": len(request_state.visualizations),
         }
-
-    def _presentation_context(self, request_state: RequestStateModel, action_space: dict) -> dict | None:
-        required = {
-            str(item.get("action") or item.get("tool_name") or "") if isinstance(item, dict) else str(item)
-            for item in (action_space.get("required_actions") or [])
-        }
-        prohibited = {
-            str(item.get("action") or item.get("tool_name") or "") if isinstance(item, dict) else str(item)
-            for item in (action_space.get("prohibited_actions") or [])
-        }
-        if "terminate" in prohibited or (required and "terminate" not in required):
-            return None
-        return PresentationCatalog(request_state).planner_inventory()
 
     def _resource_index_context(self, request_state: RequestStateModel) -> dict:
         resources = (request_state.resource_index or {}).get("resources")
@@ -367,7 +357,7 @@ class DataAgentPromptBuilder:
         fragments = fragments[-3:]
         if fragments:
             return [
-                self._bounded_value(fragment, max_string_chars=900, max_list_items=8, max_dict_items=24)
+                self._trajectory_receipt(fragment)
                 for fragment in fragments
                 if isinstance(fragment, dict)
             ]
@@ -378,15 +368,39 @@ class DataAgentPromptBuilder:
                 if not isinstance(output.meta, dict) or output.meta.get("iteration") != latest_iteration
             ]
         return [
-            {
+            self._trajectory_receipt({
                 "iteration": output.meta.get("iteration") if isinstance(output.meta, dict) else None,
                 "action": output.tool_name,
-                "observation": self._action_output_observation_context(output),
+                "observation": output.observations,
                 "resource_ref": output.resource_ref,
                 "status": "succeeded" if output.success else "failed",
-            }
+            })
             for output in outputs[-3:]
         ]
+
+    def _trajectory_receipt(self, fragment: dict) -> dict:
+        observation = fragment.get("observation") if isinstance(fragment.get("observation"), dict) else {}
+        status = fragment.get("status")
+        receipt = {
+            "iteration": fragment.get("iteration"),
+            "action": fragment.get("action"),
+            "status": status,
+            "resource_ref": fragment.get("resource_ref") or observation.get("resource_ref"),
+            "summary": self._truncate_text(observation.get("summary"), 400),
+            "coverage_delta": observation.get("coverage_delta"),
+        }
+        if status == "failed" or observation.get("success") is False:
+            receipt["failure"] = self._bounded_value(
+                observation,
+                max_string_chars=900,
+                max_list_items=8,
+                max_dict_items=20,
+            )
+        return {
+            key: value
+            for key, value in receipt.items()
+            if value not in (None, "", [], {})
+        }
 
     def _artifact_ref_index(self, request_state: RequestStateModel) -> dict:
         evidence_refs = [f"evidence:{item}" for item in list(request_state.database_evidence_artifacts.keys())[-8:]]
@@ -394,22 +408,12 @@ class DataAgentPromptBuilder:
         return {
             "database_evidence": evidence_refs,
             "analysis": analysis_refs,
-            "latest_database_evidence": (
-                f"evidence:{request_state.latest_database_evidence.evidence_id}"
-                if request_state.latest_database_evidence
-                else None
-            ),
-            "latest_analysis": f"analysis:{request_state.latest_analysis_id}" if request_state.latest_analysis_id else None,
-            "latest_forecast": (
-                f"forecast:{request_state.latest_forecast.forecast_id}"
-                if request_state.latest_forecast
-                else None
-            ),
-            "latest_anomaly": (
-                f"anomaly:{request_state.latest_anomaly.anomaly_id}"
-                if request_state.latest_anomaly
-                else None
-            ),
+            "forecast": [f"forecast:{item}" for item in list(request_state.forecast_artifacts.keys())[-8:]],
+            "anomaly": [f"anomaly:{item}" for item in list(request_state.anomaly_artifacts.keys())[-8:]],
+            "visualization": [
+                f"visualization:{item.visualization_id}"
+                for item in request_state.visualizations[-8:]
+            ],
         }
 
     def build_user_prompt(
@@ -968,7 +972,7 @@ class DataAgentPromptBuilder:
             "renderer": payload.get("renderer"),
             "title": payload.get("title"),
             "summary": payload.get("summary"),
-            "binding_fact_ids": payload.get("binding_fact_ids", [])[:6],
+            "binding_insight_ids": payload.get("binding_insight_ids", [])[:6],
             "binding_evidence_ids": payload.get("binding_evidence_ids", [])[:6],
             "time_column": payload.get("time_column"),
             "primary_measure": payload.get("primary_measure"),

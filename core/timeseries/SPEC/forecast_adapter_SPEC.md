@@ -12,5 +12,5 @@ Bridge normalized series to a forecast backend.
 
 ## Must not do
 
-- infer facts
+- infer insights
 - write final answer text

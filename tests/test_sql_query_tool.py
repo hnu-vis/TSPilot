@@ -77,23 +77,23 @@ def test_sql_query_repair_contract_is_valid_without_duplicate_message():
     assert validated.repair_contract["mode"] == "query_repair"
 
 
-def test_sql_query_drops_non_scalar_fact_hints_without_blocking_evidence_query():
+def test_sql_query_drops_non_scalar_insight_hints_without_blocking_evidence_query():
     validated = SqlQueryInput(
         message="return the requested time series",
         database_context=DatabaseContext(database_id="prom", database_type="prometheus"),
-        fact_requests=[
-            {"name": "rate series", "fact_type": "time_series", "fact_key": "rate_series"},
+        insight_requests=[
+            {"name": "rate series", "insight_type": "time_series", "insight_key": "rate_series"},
             {
                 "name": "latest rate",
-                "fact_type": "point_value",
-                "fact_key": "latest_rate",
+                "insight_type": "point_value",
+                "insight_key": "latest_rate",
                 "requirements": {"time_position": "end"},
             },
         ],
     )
 
-    assert [request.fact_key for request in validated.fact_requests] == ["latest_rate"]
-    assert validated.constraints["unsupported_fact_requests"][0]["fact_key"] == "rate_series"
+    assert [request.insight_key for request in validated.insight_requests] == ["latest_rate"]
+    assert validated.constraints["unsupported_insight_requests"][0]["insight_key"] == "rate_series"
 
 
 def test_llm_generated_query_normalizes_object_required_outputs():
