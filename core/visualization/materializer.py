@@ -40,6 +40,17 @@ class PresentationSource:
     ref: str
     kind: str
     value: Any
+    reference: "ReferencePresentation | None" = None
+
+
+@dataclass(frozen=True)
+class ReferencePresentation:
+    """Storage-independent, bounded projection for final-answer references."""
+
+    source_type: str
+    source_id: str
+    label: str
+    evidence: dict | None
 
 
 class InvalidPresentationLineageError(ValueError):
@@ -56,7 +67,10 @@ class PresentationCatalog:
         self.request_state = request_state
         self._sources: dict[str, PresentationSource] = {}
         for evidence_id, evidence in request_state.database_evidence_artifacts.items():
-            self._register_artifact("evidence", evidence_id, evidence)
+            self._register_artifact(
+                "evidence", evidence_id, evidence,
+                source_type="query", label=evidence.summary or evidence.result_type,
+            )
             rows = _rows_from_evidence(evidence)
             self._register_view(
                 f"view:evidence:{evidence_id}:default",
@@ -67,16 +81,25 @@ class PresentationCatalog:
                 lineage=[f"evidence:{evidence_id}"],
             )
         for analysis_id, analysis in request_state.analysis_artifacts.items():
-            self._register_artifact("analysis", analysis_id, analysis)
+            self._register_artifact(
+                "analysis", analysis_id, analysis,
+                source_type="analysis", label=analysis.analysis_goal,
+            )
         for evidence_id, evidence in request_state.derived_evidence_artifacts.items():
-            self._register_artifact("derived_evidence", evidence_id, evidence)
+            self._register_artifact(
+                "derived_evidence", evidence_id, evidence,
+                source_type="derived_evidence", label=evidence.name,
+            )
             self._register_view(
                 f"view:derived_evidence:{evidence_id}", name=evidence.name, shape=evidence.shape,
                 rows=[dict(row) for row in evidence.rows], scalar=evidence.scalar,
                 lineage=[f"derived_evidence:{evidence_id}", *evidence.lineage],
             )
         for forecast_id, forecast in request_state.forecast_artifacts.items():
-            self._register_artifact("forecast", forecast_id, forecast)
+            self._register_artifact(
+                "forecast", forecast_id, forecast,
+                source_type="forecast", label=forecast.model_name,
+            )
             rows = [{"timestamp": point.timestamp, "value": point.value} for point in forecast.forecast_points]
             self._register_view(
                 f"view:forecast:{forecast_id}:points", name="Forecast", shape="timeseries", rows=rows,
@@ -92,7 +115,10 @@ class PresentationCatalog:
                     rows=interval_rows, scalar=None, lineage=[f"forecast:{forecast_id}"],
                 )
         for anomaly_id, anomaly in request_state.anomaly_artifacts.items():
-            self._register_artifact("anomaly", anomaly_id, anomaly)
+            self._register_artifact(
+                "anomaly", anomaly_id, anomaly,
+                source_type="anomaly", label=anomaly.detector_name,
+            )
             rows = [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)]
             if rows:
                 lineage = [f"anomaly:{anomaly_id}"]
@@ -104,7 +130,10 @@ class PresentationCatalog:
                     rows=rows, scalar=None, lineage=lineage,
                 )
         for insight in request_state.insight_set.insights:
-            self._register_artifact("insight", insight.insight_id, insight)
+            self._register_artifact(
+                "insight", insight.insight_id, insight,
+                source_type="insight", label=insight.name,
+            )
             insight_source = self._sources[f"insight:{insight.insight_id}"]
             # The outer ReAct model reasons with semantic insight keys while the
             # presentation layer persists canonical insight ids. Resolve either
@@ -114,11 +143,44 @@ class PresentationCatalog:
                 self._sources.setdefault(insight.insight_key, insight_source)
             for item in insight.items:
                 ref = f"insight:{insight.insight_id}#{item.item_id}"
-                self._sources[ref] = PresentationSource(ref, "insight_item", (insight, item))
+                self._sources[ref] = PresentationSource(
+                    ref,
+                    "insight_item",
+                    (insight, item),
+                    ReferencePresentation(
+                        source_type="insight",
+                        source_id=insight.insight_id,
+                        label=item.label or insight.name,
+                        evidence=_bounded_presentation_value({
+                            "parent_ref": f"insight:{insight.insight_id}",
+                            "parent": insight.model_dump(mode="json", exclude={"items"}),
+                            "item": item.model_dump(mode="json"),
+                        }),
+                    ),
+                )
 
-    def _register_artifact(self, kind: str, source_id: str, value: Any) -> None:
+    def _register_artifact(
+        self,
+        kind: str,
+        source_id: str,
+        value: Any,
+        *,
+        source_type: str,
+        label: str,
+    ) -> None:
         ref = f"{kind}:{source_id}"
-        source = PresentationSource(ref, kind, value)
+        payload = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+        source = PresentationSource(
+            ref,
+            kind,
+            value,
+            ReferencePresentation(
+                source_type=source_type,
+                source_id=source_id,
+                label=str(label or ref),
+                evidence=_bounded_presentation_value(payload),
+            ),
+        )
         self._sources[ref] = source
         self._sources.setdefault(source_id, source)
 
@@ -137,6 +199,12 @@ class PresentationCatalog:
             available = sorted(key for key in self._sources if ":" in key)
             raise ValueError(f"unknown presentation source '{ref}'. Available source_refs: {available}")
         return source
+
+    def reference_presentation(self, ref_or_source: str | PresentationSource) -> ReferencePresentation:
+        source = self.resolve(ref_or_source) if isinstance(ref_or_source, str) else ref_or_source
+        if source.reference is None:
+            raise ValueError(f"presentation source '{source.ref}' is not an answer reference")
+        return source.reference
 
     def canonical_refs(self) -> list[str]:
         return sorted(key for key, source in self._sources.items() if key == source.ref and ":" in key)
@@ -432,7 +500,8 @@ def _source_data(source: PresentationSource) -> tuple[list[dict], dict | None]:
             return [_insight_item_row(item) for item in insight.items], None
         locator_row = _insight_locator_row(insight)
         if locator_row:
-            return [locator_row], None
+            metric = dict(insight.value) if isinstance(insight.value, dict) else None
+            return [locator_row], metric
         if isinstance(insight.value, list):
             return [dict(item) if isinstance(item, dict) else {"value": item} for item in insight.value], None
         if isinstance(insight.value, dict):
@@ -664,6 +733,30 @@ def _render_capabilities(schema_fields: list[dict], *, scalar: bool) -> dict:
         "scalar_only": scalar,
         "supported_marks": marks,
     }
+
+
+def _bounded_presentation_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound arbitrary typed artifact payloads without interpreting their fields."""
+
+    if depth >= 6:
+        return "[depth limit]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        bounded = {
+            str(key): _bounded_presentation_value(item, depth=depth + 1)
+            for key, item in items[:40]
+        }
+        if len(items) > 40:
+            bounded["_truncated_field_count"] = len(items) - 40
+        return bounded
+    if isinstance(value, (list, tuple)):
+        bounded = [_bounded_presentation_value(item, depth=depth + 1) for item in value[:20]]
+        if len(value) > 20:
+            bounded.append({"_truncated_item_count": len(value) - 20})
+        return bounded
+    if isinstance(value, str) and len(value) > 2000:
+        return value[:2000] + f"… [truncated {len(value) - 2000} chars]"
+    return value
 
 
 def _query_context(source: PresentationSource) -> dict | None:

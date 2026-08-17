@@ -246,6 +246,60 @@ async def test_audit_can_verify_scalar_conclusion_with_context_series_without_ne
     assert complete.datasets[1].metric["value"] == 0.24
 
 
+@pytest.mark.asyncio
+async def test_structured_insight_supports_located_and_metric_projections(tmp_path):
+    state = _state(25)
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_trade",
+            insight_key="max_trade_return",
+            name="maximum single-trade return",
+            insight_type="optimization",
+            statement="Buy at 10 and sell at 25 for a profit of 15.",
+            value={
+                "max_profit_amount": 15.0,
+                "max_profit_ratio": 1.5,
+                "buy_time": "2026-01-01T00:00:00Z",
+                "sell_time": "2026-01-02T00:00:00Z",
+                "buy_price": 10.0,
+                "sell_price": 25.0,
+            },
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "sell_price-buy_price"},
+        )
+    ]
+    plan = (
+        '{"visual_goals":[{"purpose":"verify the optimal trade","title":"Optimal trade",'
+        '"priority":"primary","summary":null,"required_roles":["series","buy","sell","return"],"layers":['
+        '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"buy","source_ref":"insight:insight_trade","mark":"point",'
+        '"encoding":{"x":"buy_time","y":"buy_price"},"label":"Buy"},'
+        '{"role":"sell","source_ref":"insight:insight_trade","mark":"point",'
+        '"encoding":{"x":"sell_time","y":"sell_price"},"label":"Sell"},'
+        '{"role":"return","source_ref":"insight:insight_trade","mark":"text",'
+        '"encoding":{},"label":"Maximum return"}]}],"required_data_request":null}'
+    )
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(
+        llm=_PlannerLlm(plan), artifact_store=store,
+    ).execute(
+        VisualizationInput(
+            message="Exclude anomalies and verify the maximum single-trade return.",
+            source_refs=["evidence:evi_full", "insight:insight_trade"],
+        ),
+        request_state=state,
+    )
+
+    complete = store.get(result["visualization_ids"][0])
+    assert complete is not None
+    assert complete.datasets[1].series[0].points[0].x == "2026-01-01T00:00:00Z"
+    assert complete.datasets[2].series[0].points[0].x == "2026-01-02T00:00:00Z"
+    assert complete.datasets[3].metric["max_profit_amount"] == 15.0
+
+
 def test_direct_timestamp_value_insight_is_a_renderable_locator():
     state = _state(25)
     state.insight_set.insights = [

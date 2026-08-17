@@ -75,7 +75,7 @@ class FormatAnswerTool(BaseTool):
             )
             for section in plan.sections
         ]
-        references = [self._reference(source) for source in referenced]
+        references = [self._reference(source, catalog) for source in referenced]
         claims = self._claims(
             plan,
             catalog,
@@ -150,86 +150,13 @@ class FormatAnswerTool(BaseTool):
                 referenced.append(source)
         return list({source.ref: source for source in referenced}.values())
 
-    def _reference(self, source) -> AnswerReference:
-        value = source.value
-        if source.kind == "evidence":
-            return AnswerReference(
-                source_type="query",
-                source_id=value.evidence_id,
-                label=value.summary or value.result_type,
-                evidence={
-                    "result_type": value.result_type,
-                    "database": value.database,
-                    "query_language": value.query_language,
-                    "query": value.query,
-                    "columns": value.columns,
-                    "metadata": value.metadata,
-                },
-            )
-        if source.kind == "insight":
-            return AnswerReference(
-                source_type="insight",
-                source_id=value.insight_id,
-                label=value.name,
-                evidence={
-                    "insight_key": value.insight_key,
-                    "insight_type": value.insight_type,
-                    "statement": value.statement,
-                    "value": value.value,
-                    "unit": value.unit,
-                    "status": value.status,
-                    "evidence_refs": [item.model_dump(mode="json") for item in value.evidence_refs],
-                },
-            )
-        if source.kind == "analysis":
-            return AnswerReference(
-                source_type="analysis",
-                source_id=value.analysis_id,
-                label=value.analysis_goal,
-                evidence={
-                    "summary": value.summary,
-                    "computed_insights": [
-                        {
-                            "insight_key": item.insight_key,
-                            "value": _bounded_json(item.value),
-                            "item_count": len(item.items),
-                            "calculation_trace": _bounded_json(item.calculation_trace),
-                        }
-                        for item in value.computed_insights
-                    ],
-                    "derived_evidence_refs": [
-                        f"derived_evidence:{item.evidence_id}" for item in value.derived_evidence
-                    ],
-                    "input_evidence_id": value.input_evidence_id,
-                    "input_row_count": value.input_row_count,
-                    "code_hash": value.code_hash,
-                    "code_type": value.code_type,
-                },
-            )
-        if source.kind == "derived_evidence":
-            return AnswerReference(
-                source_type="derived_evidence",
-                source_id=value.evidence_id,
-                label=value.name,
-                evidence={
-                    "shape": value.shape,
-                    "row_count": len(value.rows) or int(value.scalar is not None),
-                    "lineage": value.lineage,
-                    "transform_summary": value.transform_summary,
-                },
-            )
-        if source.kind == "forecast":
-            return AnswerReference(
-                source_type="forecast",
-                source_id=value.forecast_id,
-                label=value.model_name,
-                evidence={"horizon": value.horizon, "status": value.status, "diagnostics": value.diagnostics},
-            )
+    def _reference(self, source, catalog: PresentationCatalog) -> AnswerReference:
+        presentation = catalog.reference_presentation(source)
         return AnswerReference(
-            source_type="anomaly",
-            source_id=value.anomaly_id,
-            label=value.detector_name,
-            evidence={"anomaly_count": len(value.anomaly_points), "diagnostics": value.diagnostics},
+            source_type=presentation.source_type,
+            source_id=presentation.source_id,
+            label=presentation.label,
+            evidence=presentation.evidence,
         )
 
     def _claims(self, plan, catalog, visualization_ids_by_ref, selected_visualization_ids):
@@ -246,14 +173,39 @@ class FormatAnswerTool(BaseTool):
                 if not _selected_visualization_id(ref, selected_visualization_ids)
             ]
             canonical = [source.ref for source in sources]
+            presentations = [
+                (source, catalog.reference_presentation(source))
+                for source in sources
+                if source.reference is not None
+            ]
             claims.append(AnswerClaim(
                 claim_id=f"claim_section_{index + 1}",
                 text=section.content,
-                insight_ids=[source.value.insight_id for source in sources if source.kind == "insight"],
-                item_ids=[item.item_id for source in sources if source.kind == "insight" for item in source.value.items],
-                analysis_ids=[source.value.analysis_id for source in sources if source.kind == "analysis"],
-                artifact_ids=[source.ref.split(":", 1)[1] for source in sources if source.kind in {"forecast", "anomaly", "derived_evidence"}],
-                evidence_ids=[source.value.evidence_id for source in sources if source.kind in {"evidence", "derived_evidence"}],
+                insight_ids=list(dict.fromkeys(
+                    presentation.source_id
+                    for _source, presentation in presentations
+                    if presentation.source_type == "insight"
+                )),
+                item_ids=list(dict.fromkeys(
+                    source.ref.rsplit("#", 1)[1]
+                    for source, _presentation in presentations
+                    if "#" in source.ref
+                )),
+                analysis_ids=[
+                    presentation.source_id
+                    for _source, presentation in presentations
+                    if presentation.source_type == "analysis"
+                ],
+                artifact_ids=[
+                    presentation.source_id
+                    for _source, presentation in presentations
+                    if presentation.source_type in {"forecast", "anomaly", "derived_evidence"}
+                ],
+                evidence_ids=[
+                    presentation.source_id
+                    for _source, presentation in presentations
+                    if presentation.source_type in {"query", "derived_evidence"}
+                ],
                 visualization_ids=list(dict.fromkeys(
                     explicit_visualization_ids
                     + [
@@ -272,34 +224,6 @@ def _selected_visualization_id(ref: str, selected_ids: set[str]) -> str | None:
     if candidate.startswith("visualization:"):
         candidate = candidate.split(":", 1)[1]
     return candidate if candidate in selected_ids else None
-
-
-def _bounded_json(value, *, depth: int = 0):
-    """Keep answer references auditable without copying analysis-sized datasets.
-
-    Independent Derived Evidence artifacts are the canonical transport for
-    row-level calculated data. Analysis references carry only bounded
-    computation receipts so large artifacts cannot inflate final responses.
-    """
-    if depth >= 5:
-        return "[depth limit]"
-    if isinstance(value, dict):
-        items = list(value.items())
-        bounded = {
-            str(key): _bounded_json(item, depth=depth + 1)
-            for key, item in items[:30]
-        }
-        if len(items) > 30:
-            bounded["_truncated_field_count"] = len(items) - 30
-        return bounded
-    if isinstance(value, list):
-        bounded = [_bounded_json(item, depth=depth + 1) for item in value[:20]]
-        if len(value) > 20:
-            bounded.append({"_truncated_item_count": len(value) - 20})
-        return bounded
-    if isinstance(value, str) and len(value) > 2000:
-        return value[:2000] + f"… [truncated {len(value) - 2000} chars]"
-    return value
 
 
 def _visualization_reference_error(exc: ValueError, request_state: RequestStateModel) -> StructuredToolError:

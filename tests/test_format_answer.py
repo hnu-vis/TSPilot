@@ -10,7 +10,7 @@ from runtime.request_state import build_request_state
 from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.key_insight import KeyInsight, InsightEvidenceRef
+from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
 from schemas.output import FinalResponsePlan, PlannedAnswerSection, VisualGoal, VisualLayerPlan
 from tools.base import StructuredToolError
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
@@ -96,6 +96,64 @@ def test_format_answer_accepts_selected_visualization_as_section_source(tmp_path
         f"visualization:{descriptor.visualization_id}"
     ]
     assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
+
+
+def test_format_answer_supports_visualizations_grounded_by_insight_items(tmp_path):
+    state = _state()
+    insight = KeyInsight(
+        insight_id="insight_trade",
+        insight_key="max_trade",
+        name="Maximum trade",
+        insight_type="optimization",
+        statement="Buy at 10.",
+        value={"profit": 5.0},
+        items=[InsightItem(
+            item_id="buy",
+            timestamp="2026-01-01T00:00:00Z",
+            value=10.0,
+            label="Buy",
+            dimensions={"role": "buy"},
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
+        )],
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
+        calculation_trace={"formula": "sell-buy"},
+    )
+    state.insight_set.insights = [insight]
+    goal = VisualGoal(
+        purpose="verify trade", title="Trade", required_roles=["series", "buy"],
+        layers=[
+            VisualLayerPlan(
+                role="series", source_ref="view:evidence:evi_prices:default", mark="line",
+                encoding={"x": "timestamp", "y": "value"},
+            ),
+            VisualLayerPlan(
+                role="buy", source_ref="insight:insight_trade#buy", mark="point",
+                encoding={"x": "timestamp", "y": "value"},
+            ),
+        ],
+    )
+    descriptor = VisualizationArtifactStore(tmp_path).put(VisualizationMaterializer(state).materialize(goal))
+    state.visualizations = [descriptor]
+    plan = FinalResponsePlan(
+        summary="Buy at 10.",
+        sections=[PlannedAnswerSection(
+            section_type="analysis", content="Buy at 10.", source_refs=["insight:insight_trade#buy"],
+        )],
+        visualization_ids=[descriptor.visualization_id],
+    )
+
+    result = asyncio.run(FormatAnswerTool().execute(
+        FormatAnswerInput(response_plan=plan), request_state=state,
+    ))
+
+    item_reference = next(
+        reference for reference in result["references"]
+        if reference["evidence"].get("item", {}).get("item_id") == "buy"
+    )
+    assert item_reference["source_type"] == "insight"
+    assert result["claims"][0]["insight_ids"] == ["insight_trade"]
+    assert result["claims"][0]["item_ids"] == ["buy"]
 
 
 def test_planner_inventory_contains_marks_views_and_no_renderer_templates():
@@ -189,7 +247,7 @@ def test_analysis_and_derived_evidence_are_separate_answer_sources():
     assert result["references"][0]["source_type"] == "analysis"
     assert [item["source_type"] for item in result["references"]] == ["analysis", "derived_evidence"]
     assert result["references"][0]["evidence"]["computed_insights"][0]["value"] == 0.25
-    assert result["references"][1]["evidence"]["row_count"] == 2
+    assert len(result["references"][1]["evidence"]["rows"]) == 2
 
 
 def test_format_answer_routes_poisoned_analysis_lineage_back_to_code_interpreter():
