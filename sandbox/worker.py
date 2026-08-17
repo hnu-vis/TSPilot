@@ -1,6 +1,8 @@
 """Subprocess worker for generated Python analysis code."""
 from __future__ import annotations
 
+import collections
+import datetime
 import json
 import math
 import statistics
@@ -8,6 +10,11 @@ import sys
 import time
 from pathlib import Path
 
+from core.analysis.code_policy import (
+    prepare_analysis_code,
+    resolve_import_bindings,
+    safe_analysis_builtins,
+)
 from core.analysis.python_runner import validate_analysis_result_payload
 from sandbox.analysis_context import canonical_namespace_values
 
@@ -40,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _execute(payload: dict) -> dict:
     code = str(payload.get("code") or "")
+    prepared = prepare_analysis_code(code)
     rows = [dict(row) for row in payload.get("rows") or [] if isinstance(row, dict)]
     points = [dict(point) for point in payload.get("points") or [] if isinstance(point, dict)]
     columns = list(payload.get("columns") or [])
@@ -96,6 +104,7 @@ def _execute(payload: dict) -> dict:
     except Exception:
         np = None
     namespace = {
+        "__builtins__": safe_analysis_builtins(),
         "rows": rows,
         "points": points,
         "columns": columns,
@@ -116,7 +125,18 @@ def _execute(payload: dict) -> dict:
         "np": np,
         **canonical_values,
     }
-    exec(compile(code, "<sandbox_analysis_code>", "exec"), namespace, namespace)
+    namespace.update(resolve_import_bindings(
+        prepared.imports,
+        {
+            "collections": collections,
+            "datetime": datetime,
+            "math": math,
+            "statistics": statistics,
+            "pandas": pd,
+            "numpy": np,
+        },
+    ))
+    exec(compile(prepared.code, "<sandbox_analysis_code>", "exec"), namespace, namespace)
     return validate_analysis_result_payload(namespace.get("result"))
 
 

@@ -1,7 +1,6 @@
 """Restricted Python execution for generated row analysis."""
 from __future__ import annotations
 
-import ast
 import collections
 import datetime
 import decimal
@@ -16,6 +15,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from .code_policy import (
+    AnalysisPolicyError,
+    prepare_analysis_code,
+    resolve_import_bindings,
+    safe_analysis_builtins,
+)
+
 
 class AnalysisCodeError(ValueError):
     """Raised when generated analysis code is unsafe or invalid."""
@@ -26,67 +32,6 @@ class ExecutionOutput:
     result: dict
     runtime_ms: int
 
-
-_BLOCKED_NAMES = {
-    "__builtins__",
-    "__import__",
-    "breakpoint",
-    "compile",
-    "eval",
-    "exec",
-    "globals",
-    "help",
-    "input",
-    "locals",
-    "open",
-    "quit",
-    "exit",
-    "vars",
-}
-
-_SAFE_BUILTINS = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "filter": filter,
-    "float": float,
-    "hasattr": hasattr,
-    "int": int,
-    "isinstance": isinstance,
-    "len": len,
-    "list": list,
-    "map": map,
-    "max": max,
-    "min": min,
-    "pow": pow,
-    "range": range,
-    "round": round,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
-}
-
-_BLOCKED_NODE_TYPES = (
-    ast.AsyncFor,
-    ast.AsyncFunctionDef,
-    ast.AsyncWith,
-    ast.Await,
-    ast.ClassDef,
-    ast.Delete,
-    ast.Global,
-    ast.Nonlocal,
-    ast.Raise,
-    ast.Try,
-    ast.With,
-    ast.Yield,
-    ast.YieldFrom,
-)
 
 _SAFE_IMPORT_MODULES = {
     "collections": collections,
@@ -108,12 +53,18 @@ def execute_python_rows_v1(
 ) -> ExecutionOutput:
     """Execute generated analysis code over normalized evidence rows."""
 
-    code, imported_names = _prepare_code(code)
-    _validate_code(code)
+    try:
+        prepared = prepare_analysis_code(
+            code,
+            allowed_import_modules=frozenset(_SAFE_IMPORT_MODULES),
+        )
+        imported_names = resolve_import_bindings(prepared.imports, _SAFE_IMPORT_MODULES)
+    except AnalysisPolicyError as exc:
+        raise AnalysisCodeError(str(exc)) from exc
     safe_metadata = _safe_mapping(metadata)
     safe_diagnostics = _safe_mapping(diagnostics)
     globals_dict = {
-        "__builtins__": _SAFE_BUILTINS,
+        "__builtins__": safe_analysis_builtins(),
         "math": math,
         "statistics": statistics,
     }
@@ -145,7 +96,7 @@ def execute_python_rows_v1(
     started = time.perf_counter()
     try:
         with _time_limit(timeout_seconds):
-            exec(compile(code, "<analysis_code>", "exec"), globals_dict, locals_dict)
+            exec(compile(prepared.code, "<analysis_code>", "exec"), globals_dict, locals_dict)
     except TimeoutError as exc:
         raise AnalysisCodeError(f"analysis_code exceeded {timeout_seconds}s timeout") from exc
     except AnalysisCodeError:
@@ -277,79 +228,6 @@ def _library_container(value: Any) -> Any:
         except Exception:
             return _UNHANDLED
     return _UNHANDLED
-
-
-def _prepare_code(code: str) -> tuple[str, dict[str, Any]]:
-    if not code or not code.strip():
-        raise AnalysisCodeError("analysis_code cannot be empty.")
-    try:
-        tree = ast.parse(code, mode="exec")
-    except SyntaxError as exc:
-        raise AnalysisCodeError(f"analysis_code syntax error: {exc}") from exc
-
-    imported_names: dict[str, Any] = {}
-    sanitized_body = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            _collect_safe_import(node, imported_names)
-            continue
-        if isinstance(node, ast.ImportFrom):
-            _collect_safe_import_from(node, imported_names)
-            continue
-        sanitized_body.append(node)
-    tree.body = sanitized_body
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree), imported_names
-
-
-def _collect_safe_import(node: ast.Import, imported_names: dict[str, Any]) -> None:
-    for alias in node.names:
-        module_name = alias.name
-        if module_name not in _SAFE_IMPORT_MODULES:
-            raise AnalysisCodeError(f"analysis_code imports unsupported module: {module_name}.")
-        imported_names[alias.asname or module_name] = _SAFE_IMPORT_MODULES[module_name]
-
-
-def _collect_safe_import_from(node: ast.ImportFrom, imported_names: dict[str, Any]) -> None:
-    module_name = node.module or ""
-    if node.level or module_name not in _SAFE_IMPORT_MODULES:
-        raise AnalysisCodeError(f"analysis_code imports unsupported module: {module_name}.")
-    module = _SAFE_IMPORT_MODULES[module_name]
-    for alias in node.names:
-        if alias.name == "*":
-            raise AnalysisCodeError("analysis_code cannot use wildcard imports.")
-        if not hasattr(module, alias.name):
-            raise AnalysisCodeError(f"analysis_code imports unsupported name: {module_name}.{alias.name}.")
-        imported_names[alias.asname or alias.name] = getattr(module, alias.name)
-
-
-def _validate_code(code: str) -> None:
-    if not code or not code.strip():
-        raise AnalysisCodeError("analysis_code cannot be empty.")
-    try:
-        tree = ast.parse(code, mode="exec")
-    except SyntaxError as exc:
-        raise AnalysisCodeError(f"analysis_code syntax error: {exc}") from exc
-    for node in ast.walk(tree):
-        if isinstance(node, _BLOCKED_NODE_TYPES):
-            raise AnalysisCodeError(f"analysis_code uses blocked syntax: {type(node).__name__}.")
-        if isinstance(node, ast.Name) and (node.id in _BLOCKED_NAMES or node.id.startswith("__")):
-            raise AnalysisCodeError(f"analysis_code uses blocked name: {node.id}.")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            raise AnalysisCodeError(f"analysis_code uses blocked attribute: {node.attr}.")
-        if isinstance(node, ast.Call):
-            _validate_call(node)
-
-
-def _validate_call(node: ast.Call) -> None:
-    func = node.func
-    if isinstance(func, ast.Name) and (func.id in _BLOCKED_NAMES or func.id.startswith("__")):
-        raise AnalysisCodeError(f"analysis_code calls blocked function: {func.id}.")
-    if isinstance(func, ast.Attribute):
-        if func.attr.startswith("__"):
-            raise AnalysisCodeError(f"analysis_code calls blocked attribute: {func.attr}.")
-        if isinstance(func.value, ast.Name) and func.value.id not in {"math", "statistics"}:
-            return
 
 
 @contextmanager

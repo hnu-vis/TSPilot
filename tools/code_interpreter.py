@@ -1,7 +1,6 @@
 """Computation-only Code Interpreter over grounded evidence."""
 from __future__ import annotations
 
-import ast
 import asyncio
 import hashlib
 import json
@@ -11,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.analysis.code_policy import AnalysisPolicyError, prepare_analysis_code
 from core.analysis.python_runner import AnalysisCodeError
 from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
@@ -389,22 +389,10 @@ def _preflight_analysis_code(
     *,
     require_grounded_computation: bool = False,
 ) -> str | None:
-    text = str(code or "")
     try:
-        tree = ast.parse(text)
-    except SyntaxError as exc:
-        return f"analysis code is invalid Python: {exc}"
-    if not any(isinstance(node, (ast.Assign, ast.AnnAssign)) and _assigns_result(node) for node in ast.walk(tree)):
-        return "analysis code must assign a dict to result"
-    blocked_nodes = (ast.Import, ast.ImportFrom, ast.With, ast.AsyncWith, ast.Try, ast.Raise, ast.Global, ast.Nonlocal)
-    blocked_calls = {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint"}
-    for node in ast.walk(tree):
-        if isinstance(node, blocked_nodes):
-            return f"analysis code contains blocked syntax: {type(node).__name__}"
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in blocked_calls:
-            return f"analysis code calls blocked function: {node.func.id}"
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            return "analysis code cannot access dunder attributes"
+        prepared = prepare_analysis_code(str(code or ""))
+    except AnalysisPolicyError as exc:
+        return str(exc)
     if require_grounded_computation:
         grounded_inputs = {
             "df",
@@ -416,22 +404,12 @@ def _preflight_analysis_code(
             "insight_by_key",
             "analysis_context",
         }
-        loaded_names = {
-            node.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-        }
-        if not loaded_names.intersection(grounded_inputs):
+        if not prepared.loaded_names.intersection(grounded_inputs):
             return (
                 "generated analysis code must compute from grounded sandbox inputs; "
                 "hardcoded result literals are not accepted"
             )
     return None
-
-
-def _assigns_result(node: ast.Assign | ast.AnnAssign) -> bool:
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    return any(isinstance(target, ast.Name) and target.id == "result" for target in targets)
 
 
 def _llm_content(response) -> str:

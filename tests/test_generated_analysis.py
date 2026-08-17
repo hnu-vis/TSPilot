@@ -12,6 +12,7 @@ from core.analysis.python_runner import AnalysisCodeError, validate_analysis_res
 from core.visualization.materializer import PresentationCatalog
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
+from sandbox import execute_python_sandbox_v1
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsightRequest
@@ -304,8 +305,16 @@ def test_generated_derived_evidence_validation_failure_is_repaired_by_llm():
     assert result["derived_evidence"][0]["shape"] == "timeseries"
 
 
-def test_preflight_blocks_imports_and_requires_result_assignment():
-    assert "blocked syntax" in (_preflight_analysis_code("import os\nresult = {}") or "")
+def test_preflight_allows_runtime_modules_but_blocks_unsafe_imports():
+    assert _preflight_analysis_code("import math\nresult = {}") is None
+    assert _preflight_analysis_code("import pandas as pd\nimport numpy as np\nresult = {}") is None
+    assert "unsupported module" in (_preflight_analysis_code("import os\nresult = {}") or "")
+    assert "top-level" in (
+        _preflight_analysis_code("if True:\n    import math\nresult = {}") or ""
+    )
+
+
+def test_preflight_requires_result_assignment_and_grounded_computation():
     assert "assign" in (_preflight_analysis_code("x = 1") or "")
     assert _preflight_analysis_code("result = {'computed_insights': [], 'derived_evidence': []}") is None
     assert "grounded sandbox inputs" in (
@@ -319,6 +328,47 @@ def test_preflight_blocks_imports_and_requires_result_assignment():
         "result = {'computed_insights': [{'value': float(value.iloc[0])}], 'derived_evidence': []}",
         require_grounded_computation=True,
     ) is None
+
+
+def test_code_interpreter_executes_redundant_safe_dataframe_imports_without_repair():
+    code = """
+import pandas as pd
+import numpy as np
+result = {
+    'computed_insights': [{
+        'insight_key': 'period_change',
+        'value': float(np.asarray(value)[-1] - np.asarray(value)[0]),
+        'calculation_trace': {'formula': 'last-first'},
+    }],
+    'derived_evidence': [],
+}
+"""
+    llm = _QueueLLM(_binding())
+
+    result = asyncio.run(CodeInterpreterTool(llm=llm).execute(
+        CodeInterpreterInput(
+            database_evidence=_evidence(), analysis_goal="calculate period change",
+            code=code, insight_requests=[_request()],
+        )
+    ))
+
+    assert result["computed_insights"][0]["value"] == 15.0
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "code,error",
+    [
+        ("import os\nresult = {}", "unsupported module"),
+        ("result = open('/tmp/blocked')", "blocked function"),
+        ("result = __builtins__", "blocked name"),
+    ],
+)
+def test_subprocess_worker_enforces_the_shared_policy_without_tool_preflight(code, error):
+    with pytest.raises(AnalysisCodeError, match=error):
+        execute_python_sandbox_v1(
+            code=code, rows=[], points=[], columns=[], metadata={}, diagnostics={},
+        )
 
 
 def test_analysis_workspace_exposes_latest_analysis_and_computed_receipts():
