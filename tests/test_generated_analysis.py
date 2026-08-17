@@ -371,6 +371,31 @@ def test_subprocess_worker_enforces_the_shared_policy_without_tool_preflight(cod
         )
 
 
+def test_subprocess_worker_exposes_authoritative_anomaly_context_as_promised():
+    code = """
+result = {
+    'computed_insights': [{
+        'insight_key': 'anomaly_count',
+        'value': len(anomaly_context['anomaly_points']),
+        'calculation_trace': {'source_ref': anomaly_context['source_ref']},
+    }],
+    'derived_evidence': [],
+}
+"""
+
+    output = execute_python_sandbox_v1(
+        code=code, rows=[], points=[], columns=[], metadata={}, diagnostics={},
+        analysis_context={
+            "anomaly_context": {
+                "source_ref": "anomaly:demo",
+                "anomaly_points": [{"timestamp": "2023-01-01T00:00:00Z", "value": 99.0}],
+            },
+        },
+    )
+
+    assert output.result["computed_insights"][0]["value"] == 1
+
+
 def test_analysis_workspace_exposes_latest_analysis_and_computed_receipts():
     state = _state()
     result = asyncio.run(CodeInterpreterTool(llm=_QueueLLM(_binding())).execute(

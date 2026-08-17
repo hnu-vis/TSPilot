@@ -403,6 +403,7 @@ def _preflight_analysis_code(
             "input_insights",
             "insight_by_key",
             "analysis_context",
+            "anomaly_context",
         }
         if not prepared.loaded_names.intersection(grounded_inputs):
             return (
