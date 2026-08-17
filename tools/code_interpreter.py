@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from core.analysis.python_runner import AnalysisCodeError
 from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
+from core.timeseries.evidence_resolution import resolve_database_evidence
 from runtime.prompt_locale import prompt_locale_instruction
 from sandbox import execute_python_sandbox_v1
 from sandbox.analysis_context import build_canonical_analysis_context
@@ -35,6 +36,9 @@ class CodeInterpreterInput(BaseModel):
     def normalize_aliases(cls, data):
         if isinstance(data, dict):
             data = dict(data)
+            evidence = data.get("database_evidence")
+            if isinstance(evidence, list) and len(evidence) == 1:
+                data["database_evidence"] = evidence[0]
             if not data.get("code") and data.get("analysis_code"):
                 data["code"] = data["analysis_code"]
             if not isinstance(data.get("constraints"), dict):
@@ -90,42 +94,60 @@ class CodeInterpreterTool(BaseTool):
 
         response_language = getattr(request_state, "response_language", "en")
         code = str(validated_input.code or "").strip()
-        if not code:
+        generated_code = not code
+        if generated_code:
             code = await self._generate_code(
                 goal=validated_input.analysis_goal,
                 requests=validated_input.insight_requests,
                 context=context,
                 response_language=response_language,
             )
-        preflight_error = _preflight_analysis_code(code)
-        if preflight_error:
-            raise AnalysisCodeError(preflight_error)
-
-        code_hash = _code_hash(code)
-        sandbox_output = execute_python_sandbox_v1(
-            code=code,
-            rows=rows,
-            points=points,
-            columns=columns,
-            metadata=evidence.metadata,
-            diagnostics=evidence.diagnostics,
-            input_insights=input_insights,
-            analysis_context=context,
-            timeout_seconds=int(validated_input.constraints.get("timeout_seconds", 5)),
-            work_dir=_work_dir(request_state, code_hash),
-        )
-        analysis_id = _analysis_id(evidence.evidence_id, validated_input.analysis_goal, code_hash)
-        derived_evidence, derived_name_map = _materialize_derived_evidence(
-            sandbox_output.result.get("derived_evidence", []),
-            analysis_id=analysis_id,
-            input_evidence_id=evidence.evidence_id,
-            input_insights=input_insights,
-        )
-        computed = _validate_computed_insights(
-            sandbox_output.result.get("computed_insights", []),
-            requests=validated_input.insight_requests,
-            derived_name_map=derived_name_map,
-        )
+        repair_attempts = 0
+        while True:
+            try:
+                preflight_error = _preflight_analysis_code(
+                    code,
+                    require_grounded_computation=generated_code,
+                )
+                if preflight_error:
+                    raise AnalysisCodeError(preflight_error)
+                code_hash = _code_hash(code)
+                sandbox_output = execute_python_sandbox_v1(
+                    code=code,
+                    rows=rows,
+                    points=points,
+                    columns=columns,
+                    metadata=evidence.metadata,
+                    diagnostics=evidence.diagnostics,
+                    input_insights=input_insights,
+                    analysis_context=context,
+                    timeout_seconds=int(validated_input.constraints.get("timeout_seconds", 5)),
+                    work_dir=_work_dir(request_state, code_hash),
+                )
+                analysis_id = _analysis_id(evidence.evidence_id, validated_input.analysis_goal, code_hash)
+                derived_evidence, derived_name_map = _materialize_derived_evidence(
+                    sandbox_output.result.get("derived_evidence", []),
+                    analysis_id=analysis_id,
+                    input_evidence_id=evidence.evidence_id,
+                    input_insights=input_insights,
+                )
+                computed = _validate_computed_insights(
+                    sandbox_output.result.get("computed_insights", []),
+                    requests=validated_input.insight_requests,
+                    derived_name_map=derived_name_map,
+                )
+                break
+            except AnalysisCodeError as exc:
+                if not generated_code or repair_attempts >= 2:
+                    raise
+                repair_attempts += 1
+                code = await self._generate_code(
+                    goal=validated_input.analysis_goal,
+                    requests=validated_input.insight_requests,
+                    context=context,
+                    response_language=response_language,
+                    repair_context={"validation_error": str(exc), "rejected_code": code},
+                )
         produced = await self._binder.bind(
             requests=validated_input.insight_requests,
             computed=computed,
@@ -163,6 +185,7 @@ class CodeInterpreterTool(BaseTool):
         requests: list[KeyInsightRequest],
         context: dict,
         response_language: str,
+        repair_context: dict | None = None,
     ) -> str:
         if self._llm is None:
             raise AnalysisCodeError("code_interpreter requires code or an LLM code generator")
@@ -170,14 +193,21 @@ class CodeInterpreterTool(BaseTool):
             "You generate Python for a computation-only Code Interpreter. Return exactly one JSON object with key code. "
             "The sandbox provides df, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
             "metadata, diagnostics, input_insights, insight_by_key, pd, np, math, and statistics. Do not import or access files, "
-            "network, processes, environment variables, or clocks. Assign one dict to result with exactly two keys: "
+            "network, processes, environment variables, or clocks. All computed values must be produced by the Python program from the "
+            "provided sandbox inputs. Generated code must read at least one grounded "
+            "data input (for example df, rows, points, input_insights, or analysis_context); never hardcode computed answers or merely copy "
+            "answer values from this prompt. Preserve temporal and other ordering constraints expressed by the requested calculation. "
+            "Assign one dict to result with exactly two keys: "
             "computed_insights and derived_evidence. computed_insights must contain exactly one object per requested insight_key. "
             "Each object contains insight_key, value or items, a non-empty calculation_trace describing formula/inputs as concise text or JSON, and optional "
             "unavailable_reason only when the grounded inputs make the requested calculation impossible. Never invent a placeholder value. "
+            "When an Insight contains concrete timestamped observations or decisions that can be visually verified, preserve the summary in value and also emit one item per locator. "
+            "Each item must carry its JSON-native value, timestamp, and semantic dimensions such as role; buy/sell points, extrema, boundaries, and similar multi-point results must not exist only as timestamps nested inside one value object. "
             "derived_evidence_names. Do not produce statements, names, semantic classes, display roles, Key Insight objects, Data Views, "
             "charts, summaries, repair policies, or final-answer prose. derived_evidence is normally empty; include a named artifact only "
-            "when a complete calculated table or series is needed to verify or reuse an Insight. Each artifact contains name, shape, rows "
-            "or scalar, and transform_summary. Use exact authoritative anomaly_context points when present; do not run another detector. "
+            "when a complete calculated table or series is needed to verify or reuse an Insight. Each artifact contains name, either rows as a list of JSON objects "
+            "or scalar as a JSON object, and transform_summary. Do not emit a shape field; the tool derives artifact shape from its data. "
+            "Never use DataFrame.shape or values.tolist() as artifact rows; use df.to_dict(orient='records'). Use exact authoritative anomaly_context points when present; do not run another detector. "
             "When anomaly_context is used, include its exact source_ref in every affected calculation_trace. "
             "Convert numpy/pandas values and timestamps to JSON-native scalars and ISO strings. Never return NaN or Infinity."
         )
@@ -187,19 +217,39 @@ class CodeInterpreterTool(BaseTool):
             "canonical_inputs": context.get("schema", {}),
             "input_insights": context.get("input_insights", []),
             "anomaly_context": context.get("anomaly_context"),
+            "repair_context": repair_context,
         }
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
-        try:
-            if hasattr(self._llm, "with_structured_output"):
-                runnable = self._llm.with_structured_output(_GeneratedCode, method="json_schema")
-                response = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
-                generated = response if isinstance(response, _GeneratedCode) else _GeneratedCode.model_validate(response)
-            else:
-                response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
-                generated = _GeneratedCode.model_validate_json(_llm_content(response))
-        except Exception as exc:
-            raise AnalysisCodeError(f"code generation LLM violated its output contract: {exc}") from exc
-        return generated.code.strip()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            raw_content = ""
+            try:
+                if hasattr(self._llm, "with_structured_output"):
+                    runnable = self._llm.with_structured_output(
+                        _GeneratedCode, method="json_schema", include_raw=True,
+                    )
+                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    if isinstance(bundle, dict):
+                        raw_content = _llm_content(bundle.get("raw"))
+                        parsed = bundle.get("parsed")
+                        if parsed is None:
+                            raise ValueError(bundle.get("parsing_error") or "structured output was not parsed")
+                        generated = parsed if isinstance(parsed, _GeneratedCode) else _GeneratedCode.model_validate(parsed)
+                    else:
+                        generated = bundle if isinstance(bundle, _GeneratedCode) else _GeneratedCode.model_validate(bundle)
+                else:
+                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    raw_content = _llm_content(response)
+                    generated = _GeneratedCode.model_validate_json(raw_content)
+                return generated.code.strip()
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.extend([
+                        ("assistant", raw_content),
+                        ("human", f"Your output violated the required schema: {exc}. Return one corrected schema-valid object only."),
+                    ])
+        raise AnalysisCodeError(f"code generation LLM violated its output contract: {last_error}") from last_error
 
 
 def _validate_computed_insights(raw: Any, *, requests: list[KeyInsightRequest], derived_name_map: dict[str, str]) -> list[ComputedInsight]:
@@ -257,8 +307,11 @@ def _materialize_derived_evidence(
         if not name or name in name_map:
             raise AnalysisCodeError("derived evidence names must be non-empty and unique")
         evidence_id = f"dev_{analysis_id}_{_slug(name)}"
+        payload = dict(item)
+        payload.pop("shape", None)
+        payload["shape"] = _derived_evidence_shape(payload)
         try:
-            artifact = DerivedEvidence.model_validate({**item, "evidence_id": evidence_id, "lineage": lineage})
+            artifact = DerivedEvidence.model_validate({**payload, "evidence_id": evidence_id, "lineage": lineage})
         except Exception as exc:
             raise AnalysisCodeError(f"invalid derived evidence '{name}': {exc}") from exc
         result.append(artifact)
@@ -266,19 +319,32 @@ def _materialize_derived_evidence(
     return result, name_map
 
 
+def _derived_evidence_shape(payload: dict) -> str:
+    scalar = payload.get("scalar")
+    if isinstance(scalar, dict) and scalar:
+        return "scalar"
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+        return "records"
+    fields = {str(key).lower() for row in rows for key in row}
+    if {"lower", "upper"}.issubset(fields):
+        return "intervals"
+    if fields & {"timestamp", "time", "datetime", "date"}:
+        return "timeseries"
+    return "records"
+
+
 def _resolve_database_evidence(value, request_state) -> DatabaseEvidence | None:
-    if isinstance(value, DatabaseEvidence):
-        if request_state is None:
-            return value
-        return request_state.database_evidence_artifacts.get(value.evidence_id, value)
-    if isinstance(value, dict):
-        return DatabaseEvidence.model_validate(value)
     if request_state is None:
+        if isinstance(value, DatabaseEvidence):
+            return value
+        if isinstance(value, dict):
+            return DatabaseEvidence.model_validate(value)
         return None
-    if value in (None, "", "latest", "latest_database_evidence", "current"):
-        return request_state.latest_database_evidence
-    ref = str(value).removeprefix("evidence:")
-    return request_state.database_evidence_artifacts.get(ref)
+    try:
+        return resolve_database_evidence(value, request_state, tool_label="Code Interpreter")
+    except ValueError as exc:
+        raise ValueError(f"code_interpreter requires grounded database_evidence: {exc}") from exc
 
 
 def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict], list[str]]:
@@ -318,7 +384,11 @@ def _authoritative_anomaly_context(request_state, evidence_id: str) -> dict | No
     return None
 
 
-def _preflight_analysis_code(code: str | None) -> str | None:
+def _preflight_analysis_code(
+    code: str | None,
+    *,
+    require_grounded_computation: bool = False,
+) -> str | None:
     text = str(code or "")
     try:
         tree = ast.parse(text)
@@ -335,6 +405,27 @@ def _preflight_analysis_code(code: str | None) -> str | None:
             return f"analysis code calls blocked function: {node.func.id}"
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             return "analysis code cannot access dunder attributes"
+    if require_grounded_computation:
+        grounded_inputs = {
+            "df",
+            "time",
+            "value",
+            "rows",
+            "points",
+            "input_insights",
+            "insight_by_key",
+            "analysis_context",
+        }
+        loaded_names = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        if not loaded_names.intersection(grounded_inputs):
+            return (
+                "generated analysis code must compute from grounded sandbox inputs; "
+                "hardcoded result literals are not accepted"
+            )
     return None
 
 

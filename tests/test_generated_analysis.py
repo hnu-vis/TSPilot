@@ -110,6 +110,35 @@ def test_input_requires_explicit_insight_contract():
         CodeInterpreterInput(database_evidence=_evidence(), analysis_goal="calculate", insight_requests=[])
 
 
+def test_input_normalizes_a_single_evidence_reference_list():
+    payload = CodeInterpreterInput.model_validate({
+        "database_evidence": ["evidence:evi_generated"],
+        "analysis_goal": "calculate",
+        "insight_requests": [_request().model_dump(mode="json")],
+    })
+    assert payload.database_evidence == "evidence:evi_generated"
+
+
+def test_embedded_prompt_preview_resolves_to_full_state_artifact_before_execution():
+    state = _state()
+    preview = _evidence().model_copy(update={"data": {"rows": [_evidence().data["rows"][0]]}})
+    code = (
+        "result = {'computed_insights': [{'insight_key': 'row_count', 'value': int(len(df)), "
+        "'calculation_trace': 'len(df)'}], 'derived_evidence': []}"
+    )
+
+    result = asyncio.run(CodeInterpreterTool(llm=_QueueLLM(_binding("row_count", "Three rows."))).execute(
+        CodeInterpreterInput(
+            database_evidence=preview.model_dump(mode="json"), analysis_goal="count full rows",
+            code=code, insight_requests=[_request("row_count")],
+        ),
+        request_state=state,
+    ))
+
+    assert result["input_row_count"] == 3
+    assert result["computed_insights"][0]["value"] == 3
+
+
 def test_code_interpreter_computes_then_llm_binds_without_value_mutation():
     code = """
 result = {
@@ -184,7 +213,7 @@ result = {
         'derived_evidence_names': ['doubled_series'],
     }],
     'derived_evidence': [{
-        'name': 'doubled_series', 'shape': 'timeseries', 'rows': derived_rows,
+        'name': 'doubled_series', 'rows': derived_rows,
         'transform_summary': 'Each source value multiplied by two.',
     }],
 }
@@ -204,12 +233,13 @@ result = {
     )
     derived_id = result["derived_evidence"][0]["evidence_id"]
     assert derived_id in state.derived_evidence_artifacts
+    assert result["derived_evidence"][0]["shape"] == "timeseries"
     assert result["computed_insights"][0]["derived_evidence_ids"] == [derived_id]
     assert f"view:derived_evidence:{derived_id}" in PresentationCatalog(state).canonical_refs()
 
 
 def test_code_generation_and_binding_are_separate_llm_calls():
-    code = "result = {'computed_insights': [{'insight_key': 'period_change', 'value': 15.0, 'calculation_trace': {'formula': 'last-first'}}], 'derived_evidence': []}"
+    code = "result = {'computed_insights': [{'insight_key': 'period_change', 'value': float(value.iloc[-1] - value.iloc[0]), 'calculation_trace': {'formula': 'last-first'}}], 'derived_evidence': []}"
     llm = _QueueLLM({"code": code}, _binding())
     result = asyncio.run(CodeInterpreterTool(llm=llm).execute(
         CodeInterpreterInput(database_evidence=_evidence(), analysis_goal="calculate", insight_requests=[_request()])
@@ -220,10 +250,75 @@ def test_code_generation_and_binding_are_separate_llm_calls():
     assert result["computed_insights"][0]["value"] == 15.0
 
 
+def test_generated_code_preflight_failure_is_repaired_by_llm_before_execution():
+    invalid = {"code": "import pandas as pd\nresult = {}"}
+    repaired_code = "result = {'computed_insights': [{'insight_key': 'period_change', 'value': float(value.iloc[-1] - value.iloc[0]), 'calculation_trace': 'last minus first'}], 'derived_evidence': []}"
+    llm = _QueueLLM(invalid, {"code": repaired_code}, _binding())
+
+    result = asyncio.run(CodeInterpreterTool(llm=llm).execute(
+        CodeInterpreterInput(database_evidence=_evidence(), analysis_goal="calculate", insight_requests=[_request()])
+    ))
+
+    assert len(llm.calls) == 3
+    assert result["computed_insights"][0]["value"] == 15.0
+
+
+def test_binder_schema_failure_is_repaired_by_llm_without_recomputing_value():
+    code = "result = {'computed_insights': [{'insight_key': 'period_change', 'value': 15.0, 'calculation_trace': 'last minus first'}], 'derived_evidence': []}"
+    llm = _QueueLLM(
+        {"bindings": [{"insight_key": "period_change", "statement": ""}]},
+        _binding(),
+    )
+
+    result = asyncio.run(CodeInterpreterTool(llm=llm).execute(
+        CodeInterpreterInput(
+            database_evidence=_evidence(), analysis_goal="calculate", code=code,
+            insight_requests=[_request()],
+        )
+    ))
+
+    assert len(llm.calls) == 2
+    assert result["produced_insights"][0]["value"] == 15.0
+
+
+def test_generated_derived_evidence_validation_failure_is_repaired_by_llm():
+    invalid_code = (
+        "result = {'computed_insights': [{'insight_key': 'period_change', 'value': float(value.iloc[-1] - value.iloc[0]), "
+        "'calculation_trace': 'last minus first'}], 'derived_evidence': [{"
+        "'name': 'decision_points', 'rows': [['buy', 10.0]], 'transform_summary': 'bad rows'}]}"
+    )
+    repaired_code = (
+        "result = {'computed_insights': [{'insight_key': 'period_change', 'value': float(value.iloc[-1] - value.iloc[0]), "
+        "'calculation_trace': 'last minus first', 'derived_evidence_names': ['decision_points']}], "
+        "'derived_evidence': [{'name': 'decision_points', 'rows': [{"
+        "'timestamp': str(time.iloc[0]), 'value': 10.0, 'role': 'buy'}], "
+        "'transform_summary': 'one decision point'}]}"
+    )
+    llm = _QueueLLM({"code": invalid_code}, {"code": repaired_code}, _binding())
+
+    result = asyncio.run(CodeInterpreterTool(llm=llm).execute(
+        CodeInterpreterInput(database_evidence=_evidence(), analysis_goal="calculate", insight_requests=[_request()])
+    ))
+
+    assert len(llm.calls) == 3
+    assert result["derived_evidence"][0]["shape"] == "timeseries"
+
+
 def test_preflight_blocks_imports_and_requires_result_assignment():
     assert "blocked syntax" in (_preflight_analysis_code("import os\nresult = {}") or "")
     assert "assign" in (_preflight_analysis_code("x = 1") or "")
     assert _preflight_analysis_code("result = {'computed_insights': [], 'derived_evidence': []}") is None
+    assert "grounded sandbox inputs" in (
+        _preflight_analysis_code(
+            "result = {'computed_insights': [], 'derived_evidence': []}",
+            require_grounded_computation=True,
+        )
+        or ""
+    )
+    assert _preflight_analysis_code(
+        "result = {'computed_insights': [{'value': float(value.iloc[0])}], 'derived_evidence': []}",
+        require_grounded_computation=True,
+    ) is None
 
 
 def test_analysis_workspace_exposes_latest_analysis_and_computed_receipts():

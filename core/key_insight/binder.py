@@ -123,17 +123,36 @@ class LLMInsightBinder:
             "item_annotations may identify an item by zero-based index and add label only; preserve item order."
         )
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
-        try:
-            if hasattr(self._llm, "with_structured_output"):
-                runnable = self._llm.with_structured_output(_BindingResponse, method="json_schema")
-                response = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
-                parsed = response if isinstance(response, _BindingResponse) else _BindingResponse.model_validate(response)
-            else:
-                response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
-                parsed = _BindingResponse.model_validate_json(_llm_content(response))
-        except Exception as exc:
-            raise InsightBindingError(f"Insight Binder violated its output contract: {exc}") from exc
-        return parsed.bindings
+        last_error: Exception | None = None
+        for attempt in range(2):
+            raw_content = ""
+            try:
+                if hasattr(self._llm, "with_structured_output"):
+                    runnable = self._llm.with_structured_output(
+                        _BindingResponse, method="json_schema", include_raw=True,
+                    )
+                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    if isinstance(bundle, dict):
+                        raw_content = _llm_content(bundle.get("raw"))
+                        parsed = bundle.get("parsed")
+                        if parsed is None:
+                            raise ValueError(bundle.get("parsing_error") or "structured output was not parsed")
+                        parsed = parsed if isinstance(parsed, _BindingResponse) else _BindingResponse.model_validate(parsed)
+                    else:
+                        parsed = bundle if isinstance(bundle, _BindingResponse) else _BindingResponse.model_validate(bundle)
+                else:
+                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    raw_content = _llm_content(response)
+                    parsed = _BindingResponse.model_validate_json(raw_content)
+                return parsed.bindings
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.extend([
+                        ("assistant", raw_content),
+                        ("human", f"Your binding output violated the required schema: {exc}. Return one corrected schema-valid object only."),
+                    ])
+        raise InsightBindingError(f"Insight Binder violated its output contract: {last_error}") from last_error
 
 
 def _bind_items(raw_items: list[dict[str, Any]], annotations: Any) -> list[InsightItem]:
