@@ -68,7 +68,7 @@ from(bucket: "bitcoin")
 
 ### 2. `insight`
 
-请求的 fact type：
+请求的 insight type：
 
 ```json
 ["seasonality"]
@@ -78,7 +78,7 @@ from(bucket: "bitcoin")
 
 ```json
 {
-  "fact_type": "seasonality",
+  "insight_type": "seasonality",
   "statement": "value 在该时间范围内没有明显周期性。",
   "evidence": {
     "has_seasonality": false,

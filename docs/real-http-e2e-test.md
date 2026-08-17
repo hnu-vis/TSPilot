@@ -104,14 +104,14 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
 
 `sections` 包含：
 
-- `facts`
+- `insights`
 - `forecast`
 - `anomaly`
 
 `references` 包含：
 
 - `query`
-- `fact`
+- `insight`
 - `forecast`
 - `anomaly`
 
@@ -146,7 +146,7 @@ Action Input：
 {
   "message": "先规划任务：1) 拉取 appliances_energy_wh 在 2016-01-11 到 2016-01-12 的时间序列数据；2) 基于数据分析趋势、涨跌幅和极值；3) 检查异常点；4) 做短期预测；5) 汇总结论。",
   "current_intent": "分析 appliances_energy_wh 在指定时间范围内的趋势、异常与短期预测，并输出结论",
-  "requested_fact_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
+  "requested_insight_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
   "focus": "appliances_energy_wh, 2016-01-11 到 2016-01-12",
   "todos": [
     {"content": "查询 appliances_energy_wh 指定时间范围内的时间序列数据", "status": "pending", "priority": 1},
@@ -245,7 +245,7 @@ Action Input：
 ```json
 {
   "evidence_id": "evi_influxdb2-energydata_appliances_energy_wh",
-  "requested_fact_types": ["trend", "change_percent", "extrema"],
+  "requested_insight_types": ["trend", "change_percent", "extrema"],
   "focus": "分析 appliances_energy_wh 在 2016-01-11 到 2016-01-12 的整体趋势、日内波动、峰谷与主要变化幅度",
   "database_context": {
     "database_id": "influxdb2-energydata",
@@ -265,8 +265,8 @@ Observation Payload 关键字段：
 ```json
 {
   "insight_id": "ins_evi_influxdb2-energydata_appliances_energy_wh",
-  "verified_fact_count": 2,
-  "verified_facts": [
+  "verified_insight_count": 2,
+  "verified_insights": [
     "appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。",
     "appliances_energy_wh 的最高值为 430.00，最低值为 30.00。"
   ],
@@ -391,7 +391,7 @@ Action Input：
 {
   "message": "请基于已验证结果，输出 appliances_energy_wh 在 2016-01-11 17:00 到 2016-01-12 16:30 的趋势、异常、短期预测与总结结论。",
   "current_intent": "总结分析结果并回答用户",
-  "requested_fact_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
+  "requested_insight_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
   "focus": "先规划一下，然后分析 appliances_energy_wh 在 2016-01-11 到 2016-01-12 的趋势，检查异常，再给一个短期预测，最后总结结论。",
   "evidence_summary": "已获得并验证趋势、极值、异常点和12步短期预测结果，可直接汇总输出。",
   "todos": [
@@ -416,8 +416,8 @@ Observation Payload 关键字段：
 {
   "title": "TSPilot v0.2 Analysis",
   "summary": "appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。",
-  "section_types": ["facts", "forecast", "anomaly"],
-  "reference_types": ["query", "fact", "forecast", "anomaly"],
+  "section_types": ["insights", "forecast", "anomaly"],
+  "reference_types": ["query", "insight", "forecast", "anomaly"],
   "visualization_count": 3
 }
 ```

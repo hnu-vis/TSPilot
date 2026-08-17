@@ -31,7 +31,7 @@ Define how runtime reads and mutates one request's state.
 
 - status
 - current intent
-- requested fact types
+- requested insight types
 - focus
 - todo list
 - latest evidence / analysis / presentation payloads

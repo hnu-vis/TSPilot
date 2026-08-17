@@ -84,14 +84,14 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
 
 最终回答包含：
 
-- `facts`
+- `insights`
 - `forecast`
 - `anomaly`
 
 引用包含：
 
 - `query`
-- `fact`
+- `insight`
 - `forecast`
 - `anomaly`
 
@@ -113,7 +113,7 @@ Action Input：
 {
   "message": "为 appliances_energy_wh 在 2016-01-11 到 2016-01-12 的分析建立任务清单：先获取时序数据，再做趋势与变化幅度分析、异常检查、短期预测，最后汇总结论。",
   "current_intent": "分析 appliances_energy_wh 的趋势、异常和短期预测并总结",
-  "requested_fact_types": ["trend", "change_percent", "extrema"],
+  "requested_insight_types": ["trend", "change_percent", "extrema"],
   "focus": "appliances_energy_wh, 2016-01-11 至 2016-01-12",
   "todos": [
     {"content": "获取 appliances_energy_wh 指定时间范围内的时序数据", "status": "pending", "priority": 1},
@@ -202,16 +202,16 @@ Action Input：
     "max_points": 48
   },
   "focus": "appliances_energy_wh 在 2016-01-11 到 2016-01-12 的趋势分析",
-  "requested_fact_types": ["trend", "change_percent", "extrema"]
+  "requested_insight_types": ["trend", "change_percent", "extrema"]
 }
 ```
 
 Observation 关键输出：
 
 - `insight_id=ins_evi_influxdb2-energydata_appliances_energy_wh`
-- verified fact 1：
+- verified insight 1：
   - `appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。`
-- verified fact 2：
+- verified insight 2：
   - `appliances_energy_wh 的最高值为 430.00，最低值为 30.00。`
 
 ### 第 4 轮
@@ -284,7 +284,7 @@ Action Input：
 {
   "message": "请基于已验证证据，按用户要求先给出简短规划/结果，再分析 appliances_energy_wh 在 2016-01-11 到 2016-01-12 的趋势、异常、短期预测，并总结结论。",
   "current_intent": "总结已完成的趋势、异常和预测分析结果",
-  "requested_fact_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
+  "requested_insight_types": ["trend", "change_percent", "extrema", "anomaly", "forecast"],
   "focus": "appliances_energy_wh 在 2016-01-11 到 2016-01-12 的时序分析",
   "todos": [
     {"content": "获取 appliances_energy_wh 指定时间范围内的时序数据", "status": "completed", "priority": 1},
@@ -300,7 +300,7 @@ Observation 关键输出：
 
 - 成功产出 `FinalAnswer`
 - sections：
-  - `facts`
+  - `insights`
   - `forecast`
   - `anomaly`
 

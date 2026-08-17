@@ -56,8 +56,8 @@ This schema also depends on:
 - `latest_anomaly: AnomalyResult | null`
 - `latest_rag: dict | null`
 - `latest_skill: dict | null`
-- `fact_set: FactSet`
-- `fact_events: list[FactEvent]`
+- `insight_set: InsightSet`
+- `insight_events: list[InsightEvent]`
 
 ### Presentation state
 

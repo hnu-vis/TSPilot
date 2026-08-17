@@ -14,7 +14,7 @@ Result: 2 passed, 2 failed by timeout.
 
 | Case | Mode | Result | Time | Notes |
 |---|---|---:|---:|---|
-| `btc_multi_fact_sse` | SSE | Failed | `150.846s` | 21 ReAct rounds; no `final_answer`/`error`; repeated `required_filter_missing` for `code='USD'`. |
+| `btc_multi_insight_sse` | SSE | Failed | `150.846s` | 21 ReAct rounds; no `final_answer`/`error`; repeated `required_filter_missing` for `code='USD'`. |
 | `btc_anomaly_sse` | SSE | Failed | `150.128s` | 21 ReAct rounds; no `final_answer`/`error`; repeated `code_interpreter` failure about missing transparent outlier details. |
 | `btc_forecast_sse` | SSE | Passed | `26.985s` | final answer reached; 3 ReAct rounds: `sql_query -> code_interpreter -> terminate`. |
 | `btc_schema_explain_json` | JSON | Passed | `20.508s` | HTTP 200; status `completed`; used tools `["sql_query"]`; answer included measurement/field/tag and Flux example. |
@@ -22,12 +22,12 @@ Result: 2 passed, 2 failed by timeout.
 Artifacts:
 
 - `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/summary.json`
-- `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/btc_multi_fact_sse.json`
+- `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/btc_multi_insight_sse.json`
 - `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/btc_anomaly_sse.json`
 - `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/btc_forecast_sse.json`
 - `cache_data/e2e_runs/real_http_broader_regression_2026-07-30/btc_schema_explain_json.json`
 
-## Failure 1: Multi-Fact Query
+## Failure 1: Multi-Insight Query
 
 Request asked for:
 
@@ -142,7 +142,7 @@ Do not patch individual requests.
 Recommended next fixes:
 
 1. Explicit query repair should preserve required filters through structured repair context and avoid repeated explicit query attempts with the same missing-filter signature.
-2. Multi-fact tasks should use a query-batch/task-plan contract so each required output has its own evidence slot and required filters.
+2. Multi-insight tasks should use a query-batch/task-plan contract so each required output has its own evidence slot and required filters.
 3. Analysis/code-interpreter artifacts should expose a repairable schema contract for required transparency fields instead of relying on repeated free-form retries.
 4. Repeated failure transition should be terminal-aware: after repeated equivalent failures, either force a materially different valid action or return a final answer with explicitly unavailable outputs.
 

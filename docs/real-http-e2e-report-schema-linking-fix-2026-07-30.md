@@ -69,4 +69,4 @@ Returned value:
 168249475888010.0
 ```
 
-This value is grounded in the real query result and registered facts, not computed in `terminate`.
+This value is grounded in the real query result and registered insights, not computed in `terminate`.

@@ -79,10 +79,10 @@ Each model turn must be parsed as one `ReActTurn` with:
 - one loop iteration may emit at most one `ToolCall` and one `ToolObservation`
 - a failed parse or validation must not create a partial `ToolCall`
 
-## Current fact-routing behavior
+## Current insight-routing behavior
 
-The outer agent does not yet plan fact execution at the level of
-"query-native fact" versus "analysis-native fact".
+The outer agent does not yet plan insight execution at the level of
+"query-native insight" versus "analysis-native insight".
 
 Current practical routing is:
 
@@ -94,13 +94,13 @@ Current practical routing is:
    `forecast` only when the current ReAct gap assessment requires them, then `terminate`
 
 This means the main routing boundary for many requests currently depends on the
-evidence family selected by `sql_query`, not on a dedicated fact execution
+evidence family selected by `sql_query`, not on a dedicated insight execution
 plan.
 
 Design note:
 
 - mixed requests such as "先给均值，再分析趋势" should eventually be split by a
-  dedicated planning layer into query-native facts and analysis-native facts
+  dedicated planning layer into query-native insights and analysis-native insights
 - that planning layer is not yet implemented in the current runtime contract
 - the future planning layer must remain backend-agnostic: runtime should reason
   over logical query plans and evidence shapes, not over SQL-only assumptions
@@ -142,7 +142,7 @@ The runtime must not truncate:
 - `tool_name`
 - `success`
 - `summary`
-- stable ids needed for follow-up actions, such as `evidence_id`, `fact_id`,
+- stable ids needed for follow-up actions, such as `evidence_id`, `insight_id`,
   `visualization_id`, `forecast_id`, and `anomaly_id`
 
 ## Prompt budget alignment

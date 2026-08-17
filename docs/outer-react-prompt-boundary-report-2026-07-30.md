@@ -113,7 +113,7 @@ First tool call occurred at about `6.8s`. The `sql_query` action input was natur
   "purpose": "获取比特币的历史价格数据以确定其最大值",
   "time_range": null,
   "constraints": {},
-  "fact_requests": null
+  "insight_requests": null
 }
 ```
 

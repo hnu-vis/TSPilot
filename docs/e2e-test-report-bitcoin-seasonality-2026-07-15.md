@@ -155,7 +155,7 @@ Content-Type: application/json
   },
   "constraints": {
     "max_points": 240,
-    "requested_fact_types": ["seasonality"],
+    "requested_insight_types": ["seasonality"],
     "focus": "判断是否存在明显每天或每周重复的周期性波动"
   }
 }
@@ -197,7 +197,7 @@ Content-Type: application/json
   },
   "constraints": {
     "max_points": 240,
-    "requested_fact_types": ["seasonality"],
+    "requested_insight_types": ["seasonality"],
     "focus": "请判断 Bitcoin USD 在 2023 年 1 月 4 日 23:04:00 UTC 到 2023 年 2 月 3 日 22:47:00 UTC这个历史数据集内有没有明显每天或每周重复的周期性波动。请严格基于数据库数据分析，并展示执行过程。"
   }
 }

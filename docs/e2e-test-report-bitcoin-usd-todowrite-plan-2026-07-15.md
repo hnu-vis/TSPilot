@@ -64,7 +64,7 @@
 - 已经先执行 `todowrite`
 - todo plan 收口为 3 步：`query -> insight -> answer`
 - 没有越权调用 `forecast`
-- 最终结论基于 `seasonality` fact，而不是趋势/预测模板
+- 最终结论基于 `seasonality` insight，而不是趋势/预测模板
 
 ## 执行过程
 
@@ -76,7 +76,7 @@
 {
   "message": "建立针对 Bitcoin USD 在指定时间范围内的季节性分析计划，严格基于数据库数据判断是否存在明显每日或每周重复周期。",
   "current_intent": "判断是否存在明显每天或每周重复的周期性波动",
-  "requested_fact_types": [
+  "requested_insight_types": [
     "seasonality"
   ],
   "focus": "Bitcoin USD 在 2023-01-04T23:04:00Z 到 2023-02-03T22:47:00Z 区间内的日/周周期性",
@@ -164,7 +164,7 @@ Loaded 2679 rows across 1 series for query 'from(bucket: "bitcoin")
 - `result_type = "timeseries"`
 - `row_count = 2679`
 - `series_count = 1`
-- `requested_fact_families = ["seasonality"]`
+- `requested_insight_families = ["seasonality"]`
 
 查询快照：
 
@@ -180,7 +180,7 @@ Loaded 2679 rows across 1 series for query 'from(bucket: "bitcoin")
   "evidence_refs": [
     "latest_database_evidence"
   ],
-  "requested_fact_types": [
+  "requested_insight_types": [
     "seasonality"
   ],
   "focus": "检查日内与周内重复模式，确认是否存在明显周期性波动",
@@ -196,14 +196,14 @@ Loaded 2679 rows across 1 series for query 'from(bucket: "bitcoin")
 
 ```json
 {
-  "requested_fact_types": [
+  "requested_insight_types": [
     "seasonality"
   ],
-  "supported_fact_types": [
+  "supported_insight_types": [
     "seasonality"
   ],
-  "verified_fact": {
-    "fact_type": "seasonality",
+  "verified_insight": {
+    "insight_type": "seasonality",
     "statement": "value 在该时间范围内没有明显周期性。",
     "evidence": {
       "period": null,
@@ -239,16 +239,16 @@ value 在该时间范围内没有明显周期性。
 
 最终答复状态：
 
-- `has_facts = true`
+- `has_insights = true`
 - `has_anomaly = false`
 - `has_forecast = false`
 
 ## 最终结论
 
-基于这次真实数据库查询和后续确定性 fact 验证：
+基于这次真实数据库查询和后续确定性 insight 验证：
 
 - 在 `2023-01-04T23:04:00Z` 到 `2023-02-03T22:47:00Z` 这段 `Bitcoin USD` 历史数据中，**没有发现明显的每日或每周重复周期性波动**
-- 结论直接来自 `seasonality` fact：
+- 结论直接来自 `seasonality` insight：
   - `has_seasonality = false`
   - `period = null`
   - `autocorrelation = 0.0`

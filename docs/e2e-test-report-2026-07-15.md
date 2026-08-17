@@ -106,7 +106,7 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
 {
   "message": "先规划：1) 查询 appliances_energy_wh 在 2016-01-11 17:00 到 2016-01-12 23:00 的时间序列数据；2) 基于已取回数据分析趋势、变化幅度和极值；3) 检查异常点；4) 做短期预测；5) 汇总结论。",
   "current_intent": "分析 appliances_energy_wh 在指定时间范围内的趋势、异常与短期预测并总结结论",
-  "requested_fact_types": ["trend", "change_percent", "extrema"],
+  "requested_insight_types": ["trend", "change_percent", "extrema"],
   "focus": "appliances_energy_wh 2016-01-11 到 2016-01-12",
   "todos": [
     {"content": "查询 appliances_energy_wh 指标在指定时间范围内的数据", "status": "pending", "priority": 1},
@@ -190,7 +190,7 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
   "evidence_ids": [
     "evi_influxdb2-energydata_appliances_energy_wh"
   ],
-  "requested_fact_types": [
+  "requested_insight_types": [
     "trend",
     "change_percent",
     "extrema"
@@ -204,8 +204,8 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
 ```json
 [
   {
-    "fact_id": "fact_evi_influxdb2-energydata_appliances_energy_wh_trend",
-    "fact_type": "trend",
+    "insight_id": "insight_evi_influxdb2-energydata_appliances_energy_wh_trend",
+    "insight_type": "trend",
     "statement": "appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。",
     "confidence": 0.95,
     "evidence": {
@@ -217,8 +217,8 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
     "verification_status": "verified"
   },
   {
-    "fact_id": "fact_evi_influxdb2-energydata_appliances_energy_wh_extrema",
-    "fact_type": "extrema",
+    "insight_id": "insight_evi_influxdb2-energydata_appliances_energy_wh_extrema",
+    "insight_type": "extrema",
     "statement": "appliances_energy_wh 的最高值为 430.00，最低值为 30.00。",
     "confidence": 0.93,
     "evidence": {
@@ -366,15 +366,15 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
   "section_types": [
     "summary",
     "plan",
-    "facts",
+    "insights",
     "anomaly",
     "forecast",
     "conclusion"
   ],
   "reference_types": [
     "query",
-    "fact",
-    "fact",
+    "insight",
+    "insight",
     "forecast",
     "anomaly"
   ]

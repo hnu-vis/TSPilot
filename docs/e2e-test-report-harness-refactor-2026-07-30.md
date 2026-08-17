@@ -21,8 +21,8 @@ The tested changes include:
 - registry-driven action/task/artifact mapping
 - `StateTransitionEngine` as the runtime state transition boundary
 - conservative intent fallback without keyword-based capability guessing
-- DataFact-backed completion behavior
-- final answer reference behavior that avoids expanding all DataFacts when `include_fact_ids=[]`
+- KeyInsight-backed completion behavior
+- final answer reference behavior that avoids expanding all KeyInsights when `include_insight_ids=[]`
 
 Multi-database behavior was intentionally out of scope for this run.
 

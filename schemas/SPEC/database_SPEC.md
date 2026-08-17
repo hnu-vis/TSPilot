@@ -101,7 +101,7 @@ Use when the question requires time-indexed points, trend analysis, forecast inp
 ## Contract notes
 
 - `result_type` must always be present
-- `evidence_id` must be stable within one request and usable by references, verified facts, and visualizations
+- `evidence_id` must be stable within one request and usable by references, verified insights, and visualizations
 - `summary` must always be human-readable
 - `data` must match the chosen evidence family
 - `sql_query` should return the smallest evidence family that answers the request

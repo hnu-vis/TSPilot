@@ -126,7 +126,7 @@ TSPilot 原问题:
 
 ```text
 /home/feilvvl/TSPilot/tspilot_env/bin/python -m py_compile tools/insight.py core/insight/verification.py
-/home/feilvvl/TSPilot/tspilot_env/bin/python -m pytest tests/test_insight_fact_types.py tests/test_tool_evidence_refs.py tests/test_query_flow.py -q
+/home/feilvvl/TSPilot/tspilot_env/bin/python -m pytest tests/test_insight_insight_types.py tests/test_tool_evidence_refs.py tests/test_query_flow.py -q
 ```
 
 结果:

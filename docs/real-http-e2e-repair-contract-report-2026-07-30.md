@@ -63,7 +63,7 @@ Result:
   - Repair contract guided the next analysis action.
   - Final answer passed grounded-output checks.
 
-### Case B — complex multi-fact/todo query before latest fix
+### Case B — complex multi-insight/todo query before latest fix
 
 User request:
 
@@ -71,7 +71,7 @@ User request:
 
 Artifact:
 
-- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_fact_todowrite_fresh_sse.json`
+- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_insight_todowrite_fresh_sse.json`
 
 Result:
 
@@ -82,11 +82,11 @@ Result:
   - The initial todo plan collapsed the five user-visible deliverables into one giant todo.
   - The ReAct loop repeatedly queried broad evidence because state progress had no per-deliverable structure.
 
-### Case C — complex multi-fact/todo query after todo/action-guidance fix, before SSE-preview fix
+### Case C — complex multi-insight/todo query after todo/action-guidance fix, before SSE-preview fix
 
 Artifact:
 
-- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_fact_contract_sse.json`
+- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_insight_contract_sse.json`
 
 Result:
 
@@ -101,11 +101,11 @@ Result:
   - SSE mapping crashed on `len(action_input.get("todos", []))` when the model emitted `todos: null` for a `todowrite` action.
   - This caused backend stream termination without a user-visible final/error event.
 
-### Case D — complex multi-fact/todo query after all fixes
+### Case D — complex multi-insight/todo query after all fixes
 
 Artifact:
 
-- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_fact_sse_preview_fix.json`
+- `cache_data/e2e_runs/real_http_repair_contract_2026-07-30/btc_multi_insight_sse_preview_fix.json`
 
 Result:
 
