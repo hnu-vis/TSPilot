@@ -65,17 +65,21 @@ VisualizationPlan.model_rebuild()
 class VisualizationPlanAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    approved: bool
+    decision: Literal["approve", "revise", "need_data"]
     revised_visual_goals: list[VisualGoal] = Field(default_factory=list)
     required_data_request: VisualizationEvidenceRequest | None = None
 
     @model_validator(mode="after")
     def validate_resolution(self):
-        if self.approved:
-            if self.revised_visual_goals or self.required_data_request is not None:
-                raise ValueError("approved audit cannot include a revision or dependency request")
-        elif bool(self.revised_visual_goals) == (self.required_data_request is not None):
-            raise ValueError("rejected audit requires exactly one revised plan or dependency request")
+        has_revision = bool(self.revised_visual_goals)
+        has_request = self.required_data_request is not None
+        expected = {
+            "approve": (False, False),
+            "revise": (True, False),
+            "need_data": (False, True),
+        }[self.decision]
+        if (has_revision, has_request) != expected:
+            raise ValueError(f"audit decision '{self.decision}' has inconsistent payload")
         return self
 
 
@@ -102,32 +106,35 @@ class VisualizationTool(BaseTool):
     ) -> dict:
         catalog = PresentationCatalog(request_state)
         inventory = catalog.planner_inventory()
-        plan = await self._plan(validated_input, inventory, request_state)
-        if plan.required_data_request:
-            raise _missing_evidence_required(plan.required_data_request, inventory)
-        audit = await self._audit_plan(validated_input, plan, inventory, request_state)
-        if audit.required_data_request:
-            raise _missing_evidence_required(audit.required_data_request, inventory)
-        if audit.revised_visual_goals:
-            plan = plan.model_copy(update={"visual_goals": audit.revised_visual_goals})
-        try:
-            complete = VisualizationMaterializer(request_state).materialize_all(plan.visual_goals)
-        except ValueError as exc:
-            repaired_plan = await self._plan(
-                validated_input,
-                inventory,
-                request_state,
-                repair_context={
-                    "validation_error": str(exc),
-                    "rejected_plan": plan.model_dump(mode="json"),
-                },
+        source_preferences, unknown = catalog.expand_preferences(validated_input.source_refs)
+        if unknown:
+            raise _semantic_error(ValueError(f"unknown requested source refs: {sorted(unknown)}"), inventory)
+        plan = await self._plan(
+            validated_input, inventory, request_state, source_preferences=source_preferences,
+        )
+        complete = None
+        for materialization_attempt in range(3):
+            plan = await self._audit_until_approved(
+                validated_input, plan, inventory, request_state,
             )
-            if repaired_plan.required_data_request:
-                raise _missing_evidence_required(repaired_plan.required_data_request, inventory)
             try:
-                complete = VisualizationMaterializer(request_state).materialize_all(repaired_plan.visual_goals)
-            except ValueError as repair_exc:
-                raise _semantic_error(repair_exc, inventory) from repair_exc
+                complete = VisualizationMaterializer(request_state).materialize_all(plan.visual_goals)
+                break
+            except ValueError as exc:
+                if materialization_attempt >= 2:
+                    raise _semantic_error(exc, inventory) from exc
+                plan = await self._plan(
+                    validated_input,
+                    inventory,
+                    request_state,
+                    source_preferences=source_preferences,
+                    repair_context={
+                        "validation_error": str(exc),
+                        "rejected_plan": plan.model_dump(mode="json"),
+                    },
+                )
+        if complete is None:
+            raise _semantic_error(ValueError("visualization did not materialize a verified plan"), inventory)
         descriptors = [self._artifact_store.put(item) for item in complete]
         source_refs = list(dict.fromkeys(ref for item in descriptors for ref in item.source_refs))
         return VisualizationResult(
@@ -136,6 +143,22 @@ class VisualizationTool(BaseTool):
             visualizations=descriptors,
             source_refs=source_refs,
         ).model_dump(mode="json")
+
+    async def _audit_until_approved(
+        self,
+        request: VisualizationInput,
+        plan: VisualizationPlan,
+        inventory: dict,
+        request_state: RequestStateModel,
+    ) -> VisualizationPlan:
+        if plan.required_data_request:
+            raise _missing_evidence_required(plan.required_data_request, inventory)
+        audit = await self._audit_plan(request, plan, inventory, request_state)
+        if audit.decision == "need_data":
+            raise _missing_evidence_required(audit.required_data_request, inventory)
+        if audit.decision == "approve":
+            return plan
+        return plan.model_copy(update={"visual_goals": audit.revised_visual_goals})
 
     async def _audit_plan(
         self,
@@ -147,17 +170,26 @@ class VisualizationTool(BaseTool):
     ) -> VisualizationPlanAudit:
         prompt = prompt_locale_instruction(request_state.response_language) + (
             "You independently audit a grounded visualization plan against the full user request. "
-            "Return exactly one JSON object with approved, revised_visual_goals, and required_data_request. "
-            "Approve only if every explicitly requested base series, anomaly, decision point, comparison, and annotation has a grounded layer. "
-            "A point or rule layer is grounded only when its selected source inventory exposes a timestamp and numeric value through item_refs, locator_fields, or schema_fields; a summary object with nested timestamps is not a renderable locator. "
-            "Do not accept a plan that weakens or omits part of the request. If all required sources exist but the plan omitted a layer, return a complete revised_visual_goals list. "
+            "Return exactly one JSON object with decision, revised_visual_goals, and required_data_request. "
+            "decision=approve carries neither revision nor data request; decision=revise carries a complete revised_visual_goals list; "
+            "decision=need_data carries exactly one required_data_request. "
+            "revised_visual_goals is always an array, never null. "
+            "Audit whether the visualization as a whole lets the user inspect the analytical conclusion; do not require one chart layer per claim or mirror the analysis artifact structure. "
+            "A contextual full series plus scalar text/table conclusions can jointly verify interval change, growth rate, or other aggregate analysis. "
+            "Require a timestamped point only when the user explicitly needs a located event or when the chosen visual expression itself needs that point. "
+            "A point or rule layer is grounded only when its selected source exposes timestamped numeric rows. "
+            "Reject any point/rule/time-encoded layer whose source render_capabilities says scalar_only or timestamped_numeric=false. "
+            "Encoding is only for fields listed by the selected source. Explanatory formulas and conclusions belong in the goal summary or layer label, not in an invented encoding field. "
+            "A scalar text layer may use an empty encoding because the materialized metric and grounded Insight statement carry its content. "
+            "If all required sources exist but a clearer grounded expression is needed, choose revise and return the complete replacement goals. "
             "Treat visually expressible analytical conclusions as claims that require visual verification, even when the user did not explicitly ask for a chart. "
             "A valid verification plan contains both the conclusion layer and enough contextual data across the complete user analysis interval, at the granularity needed to inspect that conclusion. "
             "If a source is missing, return required_data_request using the owning required_action: sql_query for raw rows/full contextual series, anomaly for anomaly artifacts, "
             "or code_interpreter for calculated/filtered/optimization results. For code_interpreter include exact non-empty insight_requests. "
             "When anomaly or code_interpreter must operate on a particular source, set input_evidence to its evidence id. "
             "materialization_complete only means the executed query result was stored without truncation; never use it alone to infer coverage of the analysis interval. "
-            "Use source time_range, query_context, row_count, shape, and lineage to decide visual-verification completeness.\n"
+            "Use source time_range, query_context, row_count, shape, and lineage to decide visual-verification completeness. "
+            "Do not request new analysis merely to make an existing scalar conclusion chart-shaped when contextual data already makes it visually inspectable.\n"
             f"User request: {request.message}\n"
             f"Audit constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
             f"Proposed plan: {json.dumps(plan.model_dump(mode='json'), ensure_ascii=False)}\n"
@@ -165,12 +197,10 @@ class VisualizationTool(BaseTool):
         )
         messages = [("system", prompt), ("user", request.message)]
         started_at = time.perf_counter()
-        response = await self._llm.ainvoke(messages)
+        response, content, parsed, parse_error = await _invoke_structured(
+            self._llm, VisualizationPlanAudit, messages,
+        )
         duration_ms = int((time.perf_counter() - started_at) * 1000)
-        content = getattr(response, "content", response)
-        if isinstance(content, list):
-            content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
-        content = str(content)
         record_llm_token_usage(
             request_state,
             source="visualization.audit",
@@ -180,7 +210,9 @@ class VisualizationTool(BaseTool):
             duration_ms=duration_ms,
         )
         try:
-            return VisualizationPlanAudit.model_validate(json.loads(_json_object(content)))
+            if parse_error is not None:
+                raise parse_error
+            return parsed
         except (json.JSONDecodeError, ValueError) as exc:
             if not contract_repair_attempted:
                 repair_request = request.model_copy(update={
@@ -188,7 +220,8 @@ class VisualizationTool(BaseTool):
                         **request.constraints,
                         "audit_contract_repair": (
                             f"The previous audit violated its schema: {exc}. "
-                            "Return a corrected audit object. input_evidence must be one exact database evidence id or null, never a list."
+                            "Return a corrected audit object with exactly one decision state. "
+                            "input_evidence must be one exact database evidence id or null, never a list."
                         ),
                     },
                 })
@@ -202,24 +235,27 @@ class VisualizationTool(BaseTool):
         request: VisualizationInput,
         inventory: dict,
         request_state: RequestStateModel,
+        source_preferences: set[str],
         repair_context: dict | None = None,
         contract_repair_attempted: bool = False,
     ) -> VisualizationPlan:
         if self._llm is None:
             raise RuntimeError("visualization planning requires an LLM")
-        source_filter, unknown = _expand_source_preferences(request.source_refs, inventory)
-        if request.source_refs:
-            if unknown:
-                raise _semantic_error(ValueError(f"unknown requested source refs: {sorted(unknown)}"), inventory)
         prompt = prompt_locale_instruction(request_state.response_language) + (
             "You plan grounded time-series visualizations. Return exactly one JSON object matching this schema: "
             "{\"visual_goals\":[{\"purpose\":str,\"title\":str,\"priority\":\"primary\"|\"supporting\","
             "\"summary\":str|null,\"required_roles\":[str],\"layers\":[{\"role\":str,\"source_ref\":str,"
             "\"mark\":str,\"encoding\":object,\"label\":str|null}]}],\"required_data_request\":object|null}. "
             "Use only exact inventory source refs, fields, and marks. Every visually expressible analytical conclusion must be verified by a grounded semantic layer plus contextual data. "
+            "Choose the visual expression yourself from the user's intent; do not translate every insight into a separate point or annotation layer. "
+            "The inventory contains renderable sources only; outer evidence/analysis/artifact refs have already been resolved into these candidates. "
             "The context must cover the complete user analysis interval at the granularity necessary to inspect the conclusion, not an unrelated aggregate, preview, head/tail sample, or bounded subset. "
-            "A max/min/anomaly/decision highlight must be an additional semantic layer with a timestamp and value; a scalar alone is insufficient. "
-            "Never select an insight as a point/rule source when its inventory has no item_refs and no timestamp/value locator_fields. Request code_interpreter or the owning tool to publish locators instead. "
+            "For interval changes, rates, totals, and similar scalar conclusions, combine a text/table layer with the complete contextual series; the scalar does not need its own timestamp. "
+            "For an explicitly located event such as a requested max/min/anomaly/decision highlight, use a timestamped source when available; request missing data only if that located event is essential to the requested visual purpose. "
+            "Never select an insight as a point/rule source when its inventory is not timestamped_numeric. "
+            "A source whose render_capabilities.scalar_only is true may be used only with text or table and must never be assigned a timestamp encoding. "
+            "For a scalar text layer prefer an empty encoding and communicate its meaning with the grounded Insight plus label/summary. "
+            "Never put a formula, explanation, or other metadata name into encoding unless it is explicitly listed in that source's schema_fields or locator_fields. "
             "Every encoding channel must be either an exact field-name string or an object with an exact field key and optional data_type; "
             "do not emit literal color/value constants. Use point or rule for a timestamped highlight; use text only for scalar cards. "
             "If the inventory cannot provide every required base-series or highlight role, return no visual_goals and describe the missing "
@@ -230,34 +266,36 @@ class VisualizationTool(BaseTool):
             "The inventory preview is bounded, while row_count and time_range describe the full persisted artifact. "
             "Do not invent a fallback chart and do not weaken the requested purpose.\n"
             f"Visualization request: {request.message}\n"
-            f"Preferred source refs: {json.dumps(sorted(source_filter), ensure_ascii=False)}\n"
+            f"Preferred source refs: {json.dumps(sorted(source_preferences), ensure_ascii=False)}\n"
             f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
             f"Repair context: {json.dumps(repair_context, ensure_ascii=False) if repair_context else 'none'}\n"
             f"Presentation inventory: {json.dumps(inventory, ensure_ascii=False)}"
         )
+        messages = [("system", prompt), ("user", request.message)]
         started_at = time.perf_counter()
-        response = await self._llm.ainvoke([("system", prompt), ("user", request.message)])
+        response, content, parsed, parse_error = await _invoke_structured(
+            self._llm, VisualizationPlan, messages,
+        )
         duration_ms = int((time.perf_counter() - started_at) * 1000)
-        content = getattr(response, "content", response)
-        if isinstance(content, list):
-            content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
-        content = str(content)
         record_llm_token_usage(
             request_state,
             source="visualization.plan",
             response=response,
-            messages=[("system", prompt), ("user", request.message)],
+            messages=messages,
             output_text=content,
             duration_ms=duration_ms,
         )
         try:
-            return VisualizationPlan.model_validate(json.loads(_json_object(content)))
+            if parse_error is not None:
+                raise parse_error
+            return parsed
         except (json.JSONDecodeError, ValueError) as exc:
             if not contract_repair_attempted:
                 return await self._plan(
                     request,
                     inventory,
                     request_state,
+                    source_preferences=source_preferences,
                     repair_context={
                         **(repair_context or {}),
                         "validation_error": f"invalid visualization plan: {exc}",
@@ -271,42 +309,49 @@ class VisualizationTool(BaseTool):
             raise _semantic_error(ValueError(f"invalid visualization plan: {exc}"), inventory) from exc
 
 
-def _expand_source_preferences(refs: list[str], inventory: dict) -> tuple[set[str], set[str]]:
-    """Resolve stable outer artifact refs to tool-internal presentation views."""
-    available = {
-        str(item.get("source_ref"))
-        for item in inventory.get("sources", [])
-        if isinstance(item, dict) and item.get("source_ref")
-    }
-    expanded: set[str] = set()
-    unknown: set[str] = set()
-    for raw_ref in refs:
-        ref = str(raw_ref or "").strip()
-        if not ref:
-            continue
-        matches: set[str] = set()
-        recognized = ref in available
-        if ref.startswith("evidence:"):
-            evidence_id = ref.split(":", 1)[1]
-            matches.update(
-                candidate
-                for candidate in available
-                if candidate.startswith(f"view:evidence:{evidence_id}:")
-            )
-        elif ref.startswith("analysis:"):
-            analysis_id = ref.split(":", 1)[1]
-            matches.update(
-                candidate
-                for candidate in available
-                if candidate.startswith(f"view:analysis:{analysis_id}:")
-            )
-        if not matches and recognized and not ref.startswith("analysis:"):
-            matches.add(ref)
-        if matches:
-            expanded.update(matches)
-        elif not recognized:
-            unknown.add(ref)
-    return expanded, unknown
+async def _invoke_structured(llm, schema, messages):
+    response = None
+    content = ""
+    try:
+        if hasattr(llm, "with_structured_output"):
+            runnable = llm.with_structured_output(schema, method="json_mode", include_raw=True)
+            bundle = await runnable.ainvoke(messages)
+            if isinstance(bundle, dict):
+                response = bundle.get("raw")
+                content = _llm_content(response)
+                parsed = bundle.get("parsed")
+                if parsed is None:
+                    error = bundle.get("parsing_error") or ValueError("structured output was not parsed")
+                    return response, content, None, ValueError(str(error))
+                parsed = parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
+                return response, content, parsed, None
+            parsed = bundle if isinstance(bundle, schema) else schema.model_validate(bundle)
+            return bundle, _llm_content(bundle), parsed, None
+        response = await llm.ainvoke(messages)
+        content = _llm_content(response)
+        parsed = schema.model_validate(json.loads(_json_object(content)))
+        return response, content, parsed, None
+    except (json.JSONDecodeError, ValueError) as exc:
+        return response, content, None, exc
+
+
+def _llm_content(response) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        ).strip()
+    return str(content or "").strip()
+
+
+def _expand_source_preferences(
+    refs: list[str], catalog: PresentationCatalog,
+) -> tuple[set[str], set[str]]:
+    """Compatibility wrapper around the catalog-owned artifact-to-view resolver."""
+    return catalog.expand_preferences(refs)
 
 
 def _json_object(content: str) -> str:

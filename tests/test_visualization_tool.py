@@ -12,6 +12,7 @@ from core.harness.observation_view import model_observation_view
 from core.visualization import PresentationCatalog, VisualizationArtifactStore
 from core.harness import build_action_space, build_observation_frame
 from runtime.request_state import apply_observation, build_request_state
+from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from runtime.action_policy import validate_action
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
@@ -27,7 +28,7 @@ from tools.registry import build_tool_registry
 class _PlannerLlm:
     def __init__(self, payload: str, audit_payload: str | None = None):
         self.payload = payload
-        self.audit_payload = audit_payload or '{"approved":true,"revised_visual_goals":[],"required_data_request":null}'
+        self.audit_payload = audit_payload or '{"decision":"approve","revised_visual_goals":[],"required_data_request":null}'
         self.calls = 0
 
     async def ainvoke(self, _messages):
@@ -49,11 +50,28 @@ class _SequencePlannerLlm:
         if "independently audit" in str(_messages[0][1]):
             self.calls += 1
             return SimpleNamespace(
-                content='{"approved":true,"revised_visual_goals":[],"required_data_request":null}',
+                content='{"decision":"approve","revised_visual_goals":[],"required_data_request":null}',
                 response_metadata={},
             )
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
+        return SimpleNamespace(content=payload, response_metadata={})
+
+
+class _WorkflowPlannerLlm:
+    def __init__(self, *, plans: list[str], audits: list[str]):
+        self.plans = list(plans)
+        self.audits = list(audits)
+        self.plan_calls = 0
+        self.audit_calls = 0
+
+    async def ainvoke(self, messages):
+        if "independently audit" in str(messages[0][1]):
+            payload = self.audits[min(self.audit_calls, len(self.audits) - 1)]
+            self.audit_calls += 1
+        else:
+            payload = self.plans[min(self.plan_calls, len(self.plans) - 1)]
+            self.plan_calls += 1
         return SimpleNamespace(content=payload, response_metadata={})
 
 
@@ -97,6 +115,158 @@ def test_planner_inventory_distinguishes_materialization_from_interval_coverage(
     }
     assert source["query_context"][0]["query"] == "unit:full"
     assert "full_fidelity" not in source
+
+
+def _state_with_analysis_views():
+    state = _state(25)
+    derived = DerivedEvidence(
+        evidence_id="dev_endpoints",
+        name="interval endpoints",
+        shape="timeseries",
+        rows=[
+            {"role": "start", "timestamp": "2026-01-01T00:00:00Z", "value": 0.0},
+            {"role": "end", "timestamp": "2026-01-02T00:00:00Z", "value": 24.0},
+        ],
+        lineage=["evidence:evi_full"],
+        transform_summary="First and last observations.",
+    )
+    analysis = AnalysisResult(
+        analysis_id="ana_demo",
+        analysis_goal="calculate interval change",
+        code_hash="abc",
+        input_evidence_id="evi_full",
+        input_row_count=25,
+        status="succeeded",
+        summary="Computed interval change.",
+        computed_insights=[
+            ComputedInsight(
+                insight_key="absolute_change",
+                value=24.0,
+                calculation_trace="last minus first",
+                derived_evidence_ids=[derived.evidence_id],
+            )
+        ],
+        derived_evidence=[derived],
+    )
+    state.analysis_artifacts[analysis.analysis_id] = analysis
+    state.derived_evidence_artifacts[derived.evidence_id] = derived
+    return state
+
+
+def test_planner_inventory_exposes_renderable_sources_not_storage_artifacts():
+    inventory = PresentationCatalog(_state_with_analysis_views()).planner_inventory()
+    refs = {item["source_ref"] for item in inventory["sources"]}
+
+    assert "analysis:ana_demo" not in refs
+    assert "derived_evidence:dev_endpoints" not in refs
+    assert "evidence:evi_full" not in refs
+    assert "view:evidence:evi_full:default" in refs
+    assert "view:derived_evidence:dev_endpoints" in refs
+
+
+def test_scalar_insight_inventory_cannot_be_used_as_a_timestamped_layer():
+    state = _state(25)
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_change",
+            insight_key="absolute_change",
+            name="absolute change",
+            insight_type="change",
+            statement="Absolute change is 24.",
+            value=24.0,
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "last-first"},
+        )
+    ]
+    inventory = PresentationCatalog(state).planner_inventory()
+    source = next(item for item in inventory["sources"] if item["source_ref"] == "insight:insight_change")
+
+    assert source["render_capabilities"]["scalar_only"] is True
+    assert source["render_capabilities"]["timestamped_numeric"] is False
+    assert source["render_capabilities"]["supported_marks"] == ["text", "table"]
+
+
+@pytest.mark.asyncio
+async def test_audit_can_verify_scalar_conclusion_with_context_series_without_new_analysis(tmp_path):
+    state = _state(25)
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_change_rate",
+            insight_key="change_rate",
+            name="change rate",
+            insight_type="change_rate",
+            statement="The interval change rate is 24%.",
+            value=0.24,
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "(end-start)/start"},
+        )
+    ]
+    initial_plan = (
+        '{"visual_goals":[{"purpose":"verify interval change","title":"Change",'
+        '"priority":"primary","summary":null,"required_roles":["series","change_rate"],"layers":['
+        '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"change_rate","source_ref":"insight:insight_change_rate","mark":"point",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
+    )
+    revised_goals = (
+        '[{"purpose":"verify interval change","title":"Change","priority":"primary",'
+        '"summary":"The full interval and computed rate are shown together.",'
+        '"required_roles":["series","change_rate"],"layers":['
+        '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"change_rate","source_ref":"insight:insight_change_rate","mark":"text",'
+        '"encoding":{"text":"value"},"label":"24%"}]}]'
+    )
+    audit = (
+        '{"decision":"revise","revised_visual_goals":' + revised_goals
+        + ',"required_data_request":null}'
+    )
+    llm = _WorkflowPlannerLlm(plans=[initial_plan], audits=[audit])
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=store,
+    ).execute(
+        VisualizationInput(
+            message="Analyze and visually verify the interval change rate.",
+            source_refs=["evidence:evi_full", "insight:insight_change_rate"],
+        ),
+        request_state=state,
+    )
+
+    visualization = result["visualizations"][0]
+    assert llm.plan_calls == 1
+    assert llm.audit_calls == 1
+    assert [layer["mark"] for layer in visualization["layers"]] == ["line", "text"]
+    complete = store.get(visualization["visualization_id"])
+    assert complete is not None
+    assert complete.datasets[1].metric["value"] == 0.24
+
+
+def test_direct_timestamp_value_insight_is_a_renderable_locator():
+    state = _state(25)
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_start",
+            insight_key="start_value",
+            name="start value",
+            insight_type="point_value",
+            statement="Start value is 0.",
+            value={"timestamp": "2026-01-01T00:00:00Z", "value": 0.0},
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "first observation"},
+        )
+    ]
+    inventory = PresentationCatalog(state).planner_inventory()
+    source = next(item for item in inventory["sources"] if item["source_ref"] == "insight:insight_start")
+
+    assert source["locator_fields"] == ["timestamp", "value"]
+    assert source["render_capabilities"]["timestamped_numeric"] is True
+    assert source["render_capabilities"]["scalar_only"] is False
 
 
 @pytest.mark.asyncio
@@ -145,6 +315,58 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
 
     assert llm.calls == 3
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 25
+
+
+@pytest.mark.asyncio
+async def test_materialization_repair_reenters_independent_audit(tmp_path):
+    state = _state_with_analysis_views()
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_change",
+            insight_key="absolute_change",
+            name="absolute change",
+            insight_type="change",
+            statement="Absolute change is 24.",
+            value=24.0,
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "last-first"},
+        )
+    ]
+    invalid = (
+        '{"visual_goals":[{"purpose":"verify change","title":"Change","priority":"primary",'
+        '"summary":null,"required_roles":["base_series","change"],"layers":['
+        '{"role":"base_series","source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"change","source_ref":"insight:insight_change","mark":"point",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
+    )
+    repaired = (
+        '{"visual_goals":[{"purpose":"verify change","title":"Change","priority":"primary",'
+        '"summary":null,"required_roles":["base_series","endpoints","change"],"layers":['
+        '{"role":"base_series","source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"endpoints","source_ref":"view:derived_evidence:dev_endpoints","mark":"point",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
+        '{"role":"change","source_ref":"insight:insight_change","mark":"text",'
+        '"encoding":{"y":"value"},"label":null}]}],"required_data_request":null}'
+    )
+    approved = '{"decision":"approve","revised_visual_goals":[],"required_data_request":null}'
+    llm = _WorkflowPlannerLlm(plans=[invalid, repaired], audits=[approved, approved])
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(
+        VisualizationInput(
+            message="Verify interval change.",
+            source_refs=["evidence:evi_full", "analysis:ana_demo"],
+        ),
+        request_state=state,
+    )
+
+    assert llm.plan_calls == 2
+    assert llm.audit_calls == 2
+    assert result["visualizations"][0]["required_roles"] == ["base_series", "endpoints", "change"]
 
 
 def test_visualization_failure_receipt_does_not_expose_internal_inventory():
@@ -206,7 +428,7 @@ async def test_visualization_audit_rejects_plan_that_omits_requested_decision_po
         '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
     )
     audit = (
-        '{"approved":false,"revised_visual_goals":[],"required_data_request":{'
+        '{"decision":"need_data","revised_visual_goals":[],"required_data_request":{'
         '"required_action":"code_interpreter","purpose":"calculate requested buy and sell points",'
         '"required_shape":"decision_points","required_fields":["timestamp","value"],'
         '"required_properties":["buy precedes sell"],"insight_requests":[{'
@@ -408,27 +630,20 @@ async def test_visualization_observation_is_a_react_receipt_not_a_render_payload
 
 
 def test_visualization_tool_expands_outer_artifact_refs_to_internal_views():
-    inventory = {
-        "sources": [
-            {"source_ref": "analysis:ana_demo"},
-            {"source_ref": "view:analysis:ana_demo:full_series"},
-            {"source_ref": "view:analysis:ana_demo:max_point"},
-            {"source_ref": "insight:insight_max"},
-        ]
-    }
+    catalog = PresentationCatalog(_state_with_analysis_views())
 
     expanded, unknown = _expand_source_preferences(
-        ["analysis:ana_demo", "insight:insight_max"],
-        inventory,
+        ["analysis:ana_demo", "derived_evidence:dev_endpoints"],
+        catalog,
     )
 
     assert unknown == set()
     assert expanded == {
-        "view:analysis:ana_demo:full_series",
-        "view:analysis:ana_demo:max_point",
-        "insight:insight_max",
+        "view:evidence:evi_full:default",
+        "view:derived_evidence:dev_endpoints",
     }
     assert "analysis:ana_demo" not in expanded
+    assert "derived_evidence:dev_endpoints" not in expanded
 
 
 @pytest.mark.asyncio
