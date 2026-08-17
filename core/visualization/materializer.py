@@ -1,9 +1,4 @@
-"""Materialize LLM-selected visual intents from canonical request artifacts.
-
-The planner selects an analytical template and grounded source references.  This
-module owns all mechanical concerns: field validation, normalization, sampling,
-scale legibility, bindings, and the renderer-independent V2 payload.
-"""
+"""Grounded Visualization V3 catalog, layer materializer, and semantic validation."""
 from __future__ import annotations
 
 import hashlib
@@ -12,8 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
 
-from schemas.data_fact import DataFact, FactItem
-from schemas.output import VisualIntent
+from schemas.analysis import AnalysisDataView
+from schemas.key_insight import KeyInsight, InsightItem
+from schemas.output import VisualGoal, VisualLayerPlan
 from schemas.state import RequestStateModel
 from schemas.visualization import (
     VisualizationAccessibility,
@@ -27,21 +23,17 @@ from schemas.visualization import (
 )
 
 
-TEMPLATE_SOURCE_KINDS: dict[str, set[str]] = {
-    "metric.single": {"fact", "analysis", "evidence"},
-    "table.detail": {"fact", "analysis", "evidence", "forecast", "anomaly"},
-    "ranking.topk": {"fact", "evidence", "analysis"},
-    "timeseries.trend": {"evidence", "analysis"},
-    "timeseries.highlight": {"evidence", "analysis", "fact"},
-    "interval.highlight": {"evidence", "analysis", "fact"},
-    "timeseries.forecast": {"forecast", "evidence"},
-    "timeseries.anomaly": {"anomaly"},
-    "category.comparison": {"evidence", "analysis", "fact"},
-    "timeseries.comparison": {"evidence", "analysis"},
-    "distribution.histogram": {"evidence", "analysis", "fact"},
-    "distribution.boxplot": {"evidence", "analysis", "fact"},
-    "relationship.scatter": {"evidence", "analysis"},
-}
+SUPPORTED_MARKS = ["line", "point", "bar", "area", "band", "rule", "rect", "text", "boxplot", "table"]
+
+
+@dataclass(frozen=True)
+class DataViewValue:
+    rows: list[dict]
+    scalar: dict | None
+    shape: str
+    schema_fields: list[dict]
+    lineage: list[str]
+    name: str
 
 
 @dataclass(frozen=True)
@@ -51,28 +43,97 @@ class PresentationSource:
     value: Any
 
 
+class InvalidPresentationLineageError(ValueError):
+    def __init__(self, *, view_ref: str, lineage_ref: str):
+        self.view_ref = view_ref
+        self.lineage_ref = lineage_ref
+        super().__init__(f"data view '{view_ref}' contains unknown lineage source '{lineage_ref}'")
+
+
 class PresentationCatalog:
-    """Index canonical artifacts and expose a bounded planner inventory."""
+    """Index artifacts, insights, insight items, and explicit typed data views."""
 
     def __init__(self, request_state: RequestStateModel):
         self.request_state = request_state
         self._sources: dict[str, PresentationSource] = {}
         for evidence_id, evidence in request_state.database_evidence_artifacts.items():
-            self._register("evidence", evidence_id, evidence)
+            self._register_artifact("evidence", evidence_id, evidence)
+            rows = _rows_from_evidence(evidence)
+            self._register_view(
+                f"view:evidence:{evidence_id}:default",
+                name=evidence.summary or evidence_id,
+                shape="timeseries" if _candidate_fields(rows, "time") else "records",
+                rows=rows,
+                scalar=None,
+                lineage=[f"evidence:{evidence_id}"],
+            )
         for analysis_id, analysis in request_state.analysis_artifacts.items():
-            self._register("analysis", analysis_id, analysis)
+            self._register_artifact("analysis", analysis_id, analysis)
+            for view in analysis.data_views:
+                self._register_analysis_view(analysis_id, view)
         for forecast_id, forecast in request_state.forecast_artifacts.items():
-            self._register("forecast", forecast_id, forecast)
+            self._register_artifact("forecast", forecast_id, forecast)
+            rows = [{"timestamp": point.timestamp, "value": point.value} for point in forecast.forecast_points]
+            self._register_view(
+                f"view:forecast:{forecast_id}:points", name="Forecast", shape="timeseries", rows=rows,
+                scalar=None, lineage=[f"forecast:{forecast_id}", *_forecast_input_refs(forecast)],
+            )
+            interval_rows = [
+                {"timestamp": item.timestamp, "lower": item.lower, "upper": item.upper}
+                for item in forecast.confidence_interval
+            ]
+            if interval_rows:
+                self._register_view(
+                    f"view:forecast:{forecast_id}:interval", name="Confidence interval", shape="intervals",
+                    rows=interval_rows, scalar=None, lineage=[f"forecast:{forecast_id}"],
+                )
         for anomaly_id, anomaly in request_state.anomaly_artifacts.items():
-            self._register("anomaly", anomaly_id, anomaly)
-        for fact in request_state.fact_set.facts:
-            self._register("fact", fact.fact_id, fact)
+            self._register_artifact("anomaly", anomaly_id, anomaly)
+            rows = [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)]
+            if rows:
+                lineage = [f"anomaly:{anomaly_id}"]
+                evidence_ref = _anomaly_evidence_ref(anomaly)
+                if evidence_ref:
+                    lineage.append(evidence_ref)
+                self._register_view(
+                    f"view:anomaly:{anomaly_id}:points", name="Anomaly points", shape="records",
+                    rows=rows, scalar=None, lineage=lineage,
+                )
+        for insight in request_state.insight_set.insights:
+            self._register_artifact("insight", insight.insight_id, insight)
+            insight_source = self._sources[f"insight:{insight.insight_id}"]
+            # The outer ReAct model reasons with semantic insight keys while the
+            # presentation layer persists canonical insight ids. Resolve either
+            # form to the same canonical source without exposing more paths.
+            if insight.insight_key:
+                self._sources.setdefault(f"insight:{insight.insight_key}", insight_source)
+                self._sources.setdefault(insight.insight_key, insight_source)
+            for item in insight.items:
+                ref = f"insight:{insight.insight_id}#{item.item_id}"
+                self._sources[ref] = PresentationSource(ref, "insight_item", (insight, item))
 
-    def _register(self, kind: str, source_id: str, value: Any) -> None:
-        canonical = f"{kind}:{source_id}"
-        source = PresentationSource(canonical, kind, value)
-        self._sources[canonical] = source
+    def _register_artifact(self, kind: str, source_id: str, value: Any) -> None:
+        ref = f"{kind}:{source_id}"
+        source = PresentationSource(ref, kind, value)
+        self._sources[ref] = source
         self._sources.setdefault(source_id, source)
+
+    def _register_analysis_view(self, analysis_id: str, view: AnalysisDataView) -> None:
+        self._register_view(
+            f"view:analysis:{analysis_id}:{view.view_id}", name=view.name, shape=view.shape,
+            rows=[dict(row) for row in view.rows], scalar=view.scalar,
+            lineage=list(dict.fromkeys([f"analysis:{analysis_id}", *view.lineage])),
+            schema_fields=[item.model_dump(mode="json") for item in view.schema_fields],
+        )
+
+    def _register_view(
+        self, ref: str, *, name: str, shape: str, rows: list[dict], scalar: dict | None,
+        lineage: list[str], schema_fields: list[dict] | None = None,
+    ) -> None:
+        fields = schema_fields or _schema_fields(rows or ([scalar] if scalar else []))
+        self._sources[ref] = PresentationSource(
+            ref, "view", DataViewValue(rows, scalar, shape, fields, list(dict.fromkeys(lineage)), name)
+        )
 
     def resolve(self, ref: str) -> PresentationSource:
         source = self._sources.get(str(ref or "").strip())
@@ -82,880 +143,509 @@ class PresentationCatalog:
         return source
 
     def canonical_refs(self) -> list[str]:
-        return sorted(key for key in self._sources if ":" in key)
+        return sorted(key for key, source in self._sources.items() if key == source.ref and ":" in key)
+
+    def resolve_lineage(self, source: PresentationSource) -> list[PresentationSource]:
+        if source.kind != "view":
+            return []
+        resolved: list[PresentationSource] = []
+        for lineage_ref in source.value.lineage:
+            lineage = self._sources.get(str(lineage_ref or "").strip())
+            if lineage is None:
+                raise InvalidPresentationLineageError(view_ref=source.ref, lineage_ref=str(lineage_ref))
+            resolved.append(lineage)
+        return resolved
 
     def planner_inventory(self) -> dict:
         return {
-            "templates": [
-                {"template_id": template_id, "accepted_source_kinds": sorted(kinds)}
-                for template_id, kinds in TEMPLATE_SOURCE_KINDS.items()
-            ],
+            "schema_version": "3",
+            "marks": SUPPORTED_MARKS,
             "sources": [
                 self._source_inventory(source)
                 for ref, source in sorted(self._sources.items())
                 if ref == source.ref
             ],
             "rules": [
-                "Plan views around user goals, not one chart per Fact.",
-                "Use one primary view per analytical purpose; supporting views must add precision or a distinct comparison.",
-                "Use ranking.topk when only ranked rows are available. Use timeseries.highlight only when an existing full series is relevant to the question.",
-                "When the user asks to visualize one or more time series, choose a timeseries trend/comparison/highlight template as the primary view; use table.detail only when row-level detail is explicitly requested.",
-                "Use metric.single for a standalone point value; place it on a time series only when temporal position matters and that series already exists.",
-                "Use timeseries.forecast as one view combining available history, forecast boundary, forecast points, and confidence interval.",
-                "Never request extra data for presentation and never invent source refs or field names.",
-                "Encodings may select only exact field names listed by the chosen sources; series must be a categorical field, never a numeric measure. Omit y/series encodings for wide multi-value rows when all numeric fields should be plotted.",
+                "Plan visual_goals around the user's purpose and declare every required semantic role.",
+                "Each layer owns exactly one grounded source_ref; never replace a base series with an annotation collection.",
+                "Use typed view:* sources for chart data and insight:*#item sources for semantic decision points.",
+                "Use only listed fields in encoding and never invent rows, field names, renderer options, or colors.",
+                "Business filtering and calculations must already exist in a Data View; presentation does not recompute them.",
             ],
         }
 
     def _source_inventory(self, source: PresentationSource) -> dict:
+        if source.kind == "view":
+            value: DataViewValue = source.value
+            preview = value.rows[:4] if value.rows else ([value.scalar] if value.scalar else [])
+            lineage_sources = []
+            for ref in value.lineage:
+                resolved = self._sources.get(ref)
+                if resolved is not None:
+                    lineage_sources.append(resolved)
+            return {
+                "source_ref": source.ref, "kind": "data_view", "name": value.name, "shape": value.shape,
+                "row_count": len(value.rows) or int(value.scalar is not None), "schema_fields": value.schema_fields,
+                "lineage": value.lineage,
+                "full_fidelity": _full_fidelity_status(lineage_sources),
+                "preview": [_bounded_row(item) for item in preview if item],
+            }
+        if source.kind == "insight":
+            insight: KeyInsight = source.value
+            locator_row = _insight_locator_row(insight)
+            return {
+                "source_ref": source.ref, "kind": "insight", "status": insight.status, "insight_type": insight.insight_type,
+                "semantic_class": insight.semantic_class, "statement": insight.statement, "value_shape": insight.value_shape,
+                "item_refs": [f"{source.ref}#{item.item_id}" for item in insight.items[:12]],
+                "locator_fields": list(locator_row) if locator_row else [],
+                "locator_preview": _bounded_row(locator_row) if locator_row else None,
+            }
+        if source.kind == "insight_item":
+            insight, item = source.value
+            return {
+                "source_ref": source.ref, "kind": "insight_item", "status": insight.status,
+                "label": item.label or insight.name, "timestamp": item.timestamp, "value": item.value,
+            }
         value = source.value
-        if source.kind == "evidence":
-            rows = _rows_from_evidence(value)
-            return {
-                "source_ref": source.ref,
-                "kind": source.kind,
-                "result_type": value.result_type,
-                "summary": value.summary,
-                "columns": list(dict.fromkeys([*(value.columns or []), *_row_fields(rows)])),
-                "row_count": len(rows) or _evidence_point_count(value),
-                "candidate_time_fields": _candidate_fields(rows, "time"),
-                "candidate_numeric_fields": _candidate_fields(rows, "number"),
-                "candidate_dimension_fields": _candidate_fields(rows, "category"),
-                "preview": [_bounded_row(row) for row in rows[:4]],
-            }
-        if source.kind == "fact":
-            fact: DataFact = value
-            return {
-                "source_ref": source.ref,
-                "kind": source.kind,
-                "fact_type": fact.fact_type,
-                "semantic_class": fact.semantic_class,
-                "derivation": fact.derivation,
-                "value_shape": fact.value_shape,
-                "statement": fact.statement,
-                "unit": fact.unit,
-                "item_count": len(fact.items),
-                "item_fields": _row_fields([_fact_item_row(item) for item in fact.items]),
-                "item_preview": [_bounded_row(_fact_item_row(item)) for item in fact.items[:4]],
-            }
-        if source.kind == "analysis":
-            result = value.result if isinstance(value.result, dict) else {}
-            rows = _rows_from_analysis(result)
-            return {
-                "source_ref": source.ref,
-                "kind": source.kind,
-                "goal": value.analysis_goal,
-                "summary": value.summary,
-                "input_evidence_ref": f"evidence:{value.input_evidence_id}",
-                "metrics": _bounded_mapping(result.get("metrics")),
-                "detail_fields": _row_fields(rows),
-                "row_count": len(rows),
-                "candidate_time_fields": _candidate_fields(rows, "time"),
-                "candidate_numeric_fields": _candidate_fields(rows, "number"),
-                "preview": [_bounded_row(row) for row in rows[:4]],
-            }
-        if source.kind == "forecast":
-            coverage = value.diagnostics.get("coverage") if isinstance(value.diagnostics, dict) else {}
-            return {
-                "source_ref": source.ref,
-                "kind": source.kind,
-                "model": value.model_name,
-                "horizon": value.horizon,
-                "forecast_point_count": len(value.forecast_points),
-                "confidence_interval_count": len(value.confidence_interval),
-                "input_evidence_refs": list((coverage or {}).get("input_evidence_refs") or []),
-                "time_range": _point_time_range(value.forecast_points),
-            }
         return {
-            "source_ref": source.ref,
-            "kind": source.kind,
-            "detector": value.detector_name,
-            "anomaly_point_count": len(value.anomaly_points),
-            "anomaly_span_count": len(value.anomaly_spans),
-            "input_evidence_ref": _anomaly_evidence_ref(value),
+            "source_ref": source.ref, "kind": source.kind,
+            "summary": getattr(value, "summary", None) or getattr(value, "analysis_goal", None),
         }
 
 
 class VisualizationMaterializer:
+    """Compile grounded V3 layer plans without guessing cross-source precedence."""
+
     def __init__(self, request_state: RequestStateModel):
         self.request_state = request_state
         self.catalog = PresentationCatalog(request_state)
-        self.max_points = max(8, int(request_state.context_budget.get("max_visible_points") or 600))
 
-    def materialize_all(self, intents: list[VisualIntent]) -> list[VisualizationPayload]:
+    def materialize_all(self, goals: list[VisualGoal]) -> list[VisualizationPayload]:
         output: list[VisualizationPayload] = []
-        seen: set[tuple[str, tuple[str, ...], str]] = set()
-        for index, intent in enumerate(intents):
-            key = (intent.template_id, tuple(sorted(intent.source_refs)), intent.purpose.strip().lower())
-            if key in seen:
-                raise ValueError(f"duplicate visualization intent for purpose '{intent.purpose}'")
-            seen.add(key)
-            output.append(self.materialize(intent, index=index))
+        purposes: set[str] = set()
+        for index, goal in enumerate(goals):
+            key = goal.purpose.strip().casefold()
+            if goal.priority == "primary" and key in purposes:
+                raise ValueError(f"multiple primary visualizations cover the same purpose: {goal.purpose}")
+            if goal.priority == "primary":
+                purposes.add(key)
+            try:
+                output.append(self.materialize(goal, index=index))
+            except ValueError:
+                if goal.priority == "supporting":
+                    continue
+                raise
         return output
 
-    def materialize(self, intent: VisualIntent, *, index: int = 0) -> VisualizationPayload:
-        sources = [self.catalog.resolve(ref) for ref in intent.source_refs]
-        fact_sources = [self.catalog.resolve(ref) for ref in intent.fact_refs]
-        if not sources and not fact_sources:
-            raise ValueError(f"visual intent '{intent.purpose}' must reference at least one source")
-        accepted = TEMPLATE_SOURCE_KINDS[intent.template_id]
-        incompatible = sorted({source.kind for source in sources if source.kind not in accepted})
-        if incompatible:
-            raise ValueError(f"template {intent.template_id} does not accept source kinds {incompatible}")
-        if any(source.kind != "fact" for source in fact_sources):
-            raise ValueError("fact_refs may only reference Fact sources")
-        method_name = "_materialize_" + intent.template_id.replace(".", "_")
-        method = getattr(self, method_name)
-        dataset, layers, bindings, layout = method(intent, sources, fact_sources)
-        source_refs = list(dict.fromkeys(source.ref for source in sources))
-        fact_refs = list(dict.fromkeys(source.ref for source in fact_sources))
-        accessibility = self._accessibility(intent, dataset, layers)
+    def materialize(self, goal: VisualGoal, *, index: int = 0) -> VisualizationPayload:
+        if not goal.layers:
+            raise ValueError(f"visual goal '{goal.purpose}' requires at least one layer")
+        datasets: list[VisualizationDataset] = []
+        layers: list[VisualizationLayer] = []
+        bindings: dict[str, VisualizationBinding] = {}
+        source_refs: list[str] = []
+        for layer_index, plan in enumerate(goal.layers):
+            source = self.catalog.resolve(plan.source_ref)
+            dataset, layer, layer_bindings = self._materialize_layer(plan, source, layer_index)
+            datasets.append(dataset)
+            layers.append(layer)
+            source_refs.append(source.ref)
+            for binding in layer_bindings:
+                bindings[binding.binding_id] = binding
         digest = hashlib.sha1(
-            f"{intent.template_id}|{intent.purpose}|{'|'.join(source_refs)}".encode("utf-8")
+            f"{goal.purpose}|{'|'.join(source_refs)}|{'|'.join(layer.role for layer in layers)}".encode("utf-8")
         ).hexdigest()[:12]
-        return VisualizationPayload(
-            visualization_id=f"viz_{digest}_{index}",
-            template_id=intent.template_id,
-            purpose=intent.purpose,
-            priority=intent.priority,
-            title=intent.title,
-            summary=intent.summary,
-            source_refs=source_refs,
-            fact_refs=fact_refs,
-            dataset=dataset,
-            layers=layers,
-            bindings=bindings,
-            layout=layout,
-            accessibility=accessibility,
+        payload = VisualizationPayload(
+            visualization_id=f"viz_{digest}_{index}", purpose=goal.purpose, priority=goal.priority,
+            title=goal.title, summary=goal.summary, source_refs=list(dict.fromkeys(source_refs)),
+            required_roles=list(dict.fromkeys(goal.required_roles)), datasets=datasets, layers=layers,
+            bindings=list(bindings.values()), layout=_legible_layout_from_datasets(datasets),
+            accessibility=_accessibility(goal, datasets),
         )
+        VisualizationSemanticValidator(self.catalog).validate(goal, payload)
+        return payload
 
-    def _materialize_metric_single(self, intent, sources, facts):
-        source = (facts or sources)[0]
-        metric = _metric_from_source(source, intent.encodings)
-        dataset = VisualizationDataset(metric=metric, rows=[metric], columns=list(metric))
-        return dataset, [], _bindings_for_fact_sources(facts or ([source] if source.kind == "fact" else [])), "overlay"
-
-    def _materialize_table_detail(self, intent, sources, facts):
-        rows = _rows_from_sources(_unique_sources([*sources, *facts]))
-        if not rows:
-            raise ValueError("table.detail requires row-shaped source data")
-        columns = list(dict.fromkeys(intent.encodings.values())) if intent.encodings else _row_fields(rows)
-        columns = [column for column in columns if any(column in row for row in rows)] or _row_fields(rows)
-        dataset = VisualizationDataset(rows=rows[: self.max_points], columns=columns)
-        return dataset, [], _bindings_for_fact_sources(facts), "overlay"
-
-    def _materialize_ranking_topk(self, intent, sources, facts):
-        rows = _rows_from_sources(_unique_sources([*facts, *sources]))
-        if not rows:
-            raise ValueError("ranking.topk requires ranked items or rows")
-        x_field = intent.encodings.get("x") or _ranking_label_field(rows)
-        y_field = intent.encodings.get("y") or _first_field(rows, "number")
-        if not x_field or not y_field:
-            raise ValueError("ranking.topk requires a category/label field and a numeric field")
-        ranked = [row for row in rows if _number(row.get(y_field)) is not None]
-        ranked.sort(key=lambda row: (row.get("rank") is None, row.get("rank") or 0, -(_number(row.get(y_field)) or 0)))
-        bindings = _bindings_for_fact_sources(facts or [source for source in sources if source.kind == "fact"])
-        binding_by_item = {binding.item_id: binding.binding_id for binding in bindings if binding.item_id}
-        points = [
-            VisualizationPoint(
-                x=row.get(x_field), y=_number(row.get(y_field)), label=str(row.get(x_field) or ""),
-                binding_id=binding_by_item.get(str(row.get("item_id") or "")),
-                metadata={"rank": row.get("rank")},
+    def _materialize_layer(
+        self, plan: VisualLayerPlan, source: PresentationSource, index: int,
+    ) -> tuple[VisualizationDataset, VisualizationLayer, list[VisualizationBinding]]:
+        rows, scalar = _source_data(source)
+        encoding = _encoding_fields(plan.encoding)
+        if plan.mark == "table":
+            if not rows and scalar:
+                rows = [dict(scalar)]
+            if not rows:
+                raise ValueError(f"layer role '{plan.role}' requires row-shaped data")
+            columns = _table_columns(plan.encoding, rows)
+            dataset_id = f"dataset_{index}"
+            dataset = VisualizationDataset(
+                dataset_id=dataset_id, source_ref=source.ref, rows=rows, columns=columns,
             )
-            for row in ranked[: self.max_points]
-        ]
-        dataset = _series_dataset(x_field, y_field, [VisualizationSeries(series_id="ranking", name=intent.title, role="ranking", points=points)])
-        return dataset, [VisualizationLayer(kind="bar", role="fact", series_id="ranking")], bindings, "overlay"
-
-    def _materialize_timeseries_trend(self, intent, sources, facts):
-        return self._time_series_view(intent, sources, facts, add_fact_layers=False)
-
-    def _materialize_timeseries_highlight(self, intent, sources, facts):
-        return self._time_series_view(intent, sources, facts, add_fact_layers=True)
-
-    def _materialize_interval_highlight(self, intent, sources, facts):
-        return self._time_series_view(intent, sources, facts, add_fact_layers=True, interval=True)
-
-    def _materialize_timeseries_comparison(self, intent, sources, facts):
-        return self._time_series_view(intent, sources, facts, add_fact_layers=False)
-
-    def _time_series_view(self, intent, sources, facts, *, add_fact_layers, interval=False):
-        fact_series_sources = [
-            source
-            for source in facts
-            if source.value.items or isinstance(source.value.value, list)
-        ]
-        base_sources = fact_series_sources or _lineage_distinct_sources(sources)
-        series = _series_from_sources(base_sources, intent.encodings)
-        if not series:
-            raise ValueError(f"{intent.template_id} requires time-series source data")
-        fact_points = _fact_layer_points(facts, intent.encodings)
-        preserve_x = {point.x for point in fact_points if point.x is not None}
-        sampled = [
-            item.model_copy(update={"points": _sample_points(item.points, self.max_points, preserve_x)})
-            for item in series
-        ]
-        layers = [VisualizationLayer(kind="line", role="context", series_id=item.series_id) for item in sampled]
-        bindings = _bindings_for_fact_sources(facts)
-        if add_fact_layers and fact_points:
-            kind = "area" if interval else "point"
-            layers.append(VisualizationLayer(kind=kind, role="fact", points=fact_points, label="Fact highlight"))
-        dataset = _series_dataset(
-            intent.encodings.get("x") or "timestamp",
-            intent.encodings.get("y") or "value",
-            sampled,
-        )
-        return dataset, layers, bindings, _legible_layout(sampled)
-
-    def _materialize_timeseries_forecast(self, intent, sources, facts):
-        forecast_source = _single_kind(sources, "forecast", intent.template_id)
-        forecast = forecast_source.value
-        evidence = self._forecast_evidence(forecast)
-        supplied_evidence_ids = {source.value.evidence_id for source in sources if source.kind == "evidence"}
-        if supplied_evidence_ids and supplied_evidence_ids != {evidence.evidence_id}:
-            raise ValueError(
-                "timeseries.forecast Evidence source must be the Forecast artifact's canonical input Evidence"
-            )
-        historical = _series_from_evidence(evidence, intent.encodings)
-        if not historical:
-            raise ValueError("forecast input evidence does not contain a readable time series")
-        history = historical[0]
-        forecast_bindings: list[VisualizationBinding] = []
-        forecast_points: list[VisualizationPoint] = []
-        evidence_id = evidence.evidence_id
-        interval_by_x = _confidence_by_timestamp(forecast.confidence_interval)
-        for index, point in enumerate(forecast.forecast_points):
-            binding_id = f"{forecast_source.ref}:point:{index}"
-            bounds = interval_by_x.get(str(point.timestamp), {})
-            forecast_points.append(VisualizationPoint(
-                x=point.timestamp,
-                y=float(point.value),
-                lower=_number(bounds.get("lower")),
-                upper=_number(bounds.get("upper")),
-                binding_id=binding_id,
-            ))
-            forecast_bindings.append(VisualizationBinding(
-                binding_id=binding_id,
-                source_type="prediction_point",
-                source_ref=forecast_source.ref,
-                evidence_id=evidence_id,
-                locator={"timestamp": point.timestamp, "forecast_index": index},
-            ))
-        history_budget = max(2, self.max_points - len(forecast_points))
-        history_points = _sample_points(history.points, history_budget, set(), prefer_recent=True)
-        history_series = history.model_copy(update={"series_id": "historical", "name": history.name or "Historical", "role": "historical", "points": history_points})
-        predicted_series = VisualizationSeries(
-            series_id="forecast", name="Forecast", role="forecast", unit=history.unit, points=forecast_points
-        )
-        series = [history_series, predicted_series]
-        layers = [
-            VisualizationLayer(kind="line", role="context", series_id="historical"),
-            VisualizationLayer(kind="line", role="forecast", series_id="forecast"),
-        ]
-        if any(point.lower is not None and point.upper is not None for point in forecast_points):
-            layers.append(VisualizationLayer(kind="band", role="confidence", series_id="forecast", label="Confidence interval"))
-        if forecast_points:
-            layers.append(VisualizationLayer(
-                kind="rule", role="forecast", points=[VisualizationPoint(x=forecast_points[0].x, label="Forecast starts")]
-            ))
-        dataset = _series_dataset(evidence.data.get("time_field", "timestamp"), history.name or "value", series)
-        return dataset, layers, forecast_bindings, _legible_layout(series)
-
-    def _materialize_timeseries_anomaly(self, intent, sources, facts):
-        anomaly_source = _single_kind(sources, "anomaly", intent.template_id)
-        anomaly = anomaly_source.value
-        evidence = self._anomaly_evidence(anomaly)
-        series = _series_from_evidence(evidence, intent.encodings)
-        if not series:
-            raise ValueError("anomaly input evidence does not contain a readable time series")
-        anomaly_points: list[VisualizationPoint] = []
-        bindings: list[VisualizationBinding] = []
-        for index, item in enumerate(anomaly.anomaly_points):
-            if not isinstance(item, dict):
-                continue
-            x = item.get("timestamp") or item.get("time") or item.get("date")
-            y = _number(item.get("value") if "value" in item else item.get("y"))
-            binding_id = f"{anomaly_source.ref}:point:{index}"
-            anomaly_points.append(VisualizationPoint(x=x, y=y, label=str(item.get("label") or "Anomaly"), binding_id=binding_id, metadata=item))
-            bindings.append(VisualizationBinding(
-                binding_id=binding_id, source_type="anomaly_point", source_ref=anomaly_source.ref,
-                evidence_id=evidence.evidence_id, locator={"timestamp": x, "anomaly_index": index},
-            ))
-        preserve = {point.x for point in anomaly_points}
-        sampled = [item.model_copy(update={"points": _sample_points(item.points, self.max_points, preserve)}) for item in series]
-        dataset = _series_dataset(intent.encodings.get("x") or "timestamp", intent.encodings.get("y") or "value", sampled)
-        layers = [VisualizationLayer(kind="line", role="context", series_id=item.series_id) for item in sampled]
-        layers.append(VisualizationLayer(kind="point", role="anomaly", points=anomaly_points, label="Anomaly"))
-        return dataset, layers, bindings, _legible_layout(sampled)
-
-    def _materialize_category_comparison(self, intent, sources, facts):
-        return self._categorical_series(intent, sources, facts)
-
-    def _categorical_series(self, intent, sources, facts):
-        rows = _rows_from_sources([*sources, *facts])
-        x_field = intent.encodings.get("x") or _first_field(rows, "category")
-        y_field = intent.encodings.get("y") or _first_field(rows, "number")
-        series_field = intent.encodings.get("series")
-        if not x_field or not y_field:
-            raise ValueError("category.comparison requires category and numeric fields")
-        grouped: dict[str, list[VisualizationPoint]] = {}
-        for row in rows:
-            value = _number(row.get(y_field))
-            if value is None:
-                continue
-            name = str(row.get(series_field) or y_field) if series_field else y_field
-            grouped.setdefault(name, []).append(VisualizationPoint(x=row.get(x_field), y=value))
-        series = [VisualizationSeries(series_id=f"category_{index}", name=name, role="comparison", points=points[: self.max_points]) for index, (name, points) in enumerate(grouped.items())]
-        dataset = _series_dataset(x_field, y_field, series)
-        layers = [VisualizationLayer(kind="bar", role="comparison", series_id=item.series_id) for item in series]
-        return dataset, layers, _bindings_for_fact_sources(facts), _legible_layout(series)
-
-    def _materialize_distribution_histogram(self, intent, sources, facts):
-        values, value_field = _numeric_values([*sources, *facts], intent.encodings.get("y") or intent.encodings.get("value"))
-        if len(values) < 2:
-            raise ValueError("distribution.histogram requires at least two numeric values")
-        bins = _histogram(values)
-        points = [VisualizationPoint(x=item["label"], y=float(item["count"]), metadata=item) for item in bins]
-        series = [VisualizationSeries(series_id="distribution", name=value_field, role="distribution", points=points)]
-        dataset = _series_dataset("bin", "count", series)
-        return dataset, [VisualizationLayer(kind="bar", role="comparison", series_id="distribution")], [], "overlay"
-
-    def _materialize_distribution_boxplot(self, intent, sources, facts):
-        rows = _rows_from_sources([*sources, *facts])
-        value_field = intent.encodings.get("y") or intent.encodings.get("value") or _first_field(rows, "number")
-        group_field = intent.encodings.get("x") or intent.encodings.get("series") or _first_field(rows, "category")
-        if not value_field:
-            raise ValueError("distribution.boxplot requires a numeric field")
-        grouped: dict[str, list[float]] = {}
-        for row in rows:
-            value = _number(row.get(value_field))
-            if value is not None:
-                grouped.setdefault(str(row.get(group_field) if group_field else value_field), []).append(value)
-        points = []
-        for label, values in grouped.items():
-            if values:
-                q1, median, q3 = _quartiles(values)
-                points.append(VisualizationPoint(x=label, y=median, lower=min(values), upper=max(values), metadata={"q1": q1, "median": median, "q3": q3}))
+            return dataset, VisualizationLayer(
+                layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
+                encoding=encoding, dataset_id=dataset_id, label=plan.label,
+            ), []
+        points, bindings, x_field, y_field = _points_for_source(source, rows, scalar, encoding)
+        if plan.mark == "text" and scalar:
+            dataset_id = f"dataset_{index}"
+            metric = dict(scalar)
+            metric.setdefault("label", plan.label or plan.role)
+            dataset = VisualizationDataset(dataset_id=dataset_id, source_ref=source.ref, metric=metric)
+            return dataset, VisualizationLayer(
+                layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
+                encoding=encoding, dataset_id=dataset_id, points=points, label=plan.label,
+            ), bindings
         if not points:
-            raise ValueError("distribution.boxplot has no numeric groups")
-        series = [VisualizationSeries(series_id="boxplot", name=value_field, role="distribution", points=points)]
-        return _series_dataset(group_field or "group", value_field, series), [VisualizationLayer(kind="boxplot", role="comparison", series_id="boxplot")], [], "overlay"
-
-    def _materialize_relationship_scatter(self, intent, sources, facts):
-        rows = _rows_from_sources(sources)
-        numeric_fields = _candidate_fields(rows, "number")
-        x_field = intent.encodings.get("x") or (numeric_fields[0] if numeric_fields else None)
-        y_field = intent.encodings.get("y") or (numeric_fields[1] if len(numeric_fields) > 1 else None)
-        if not x_field or not y_field or x_field == y_field:
-            raise ValueError("relationship.scatter requires two distinct numeric encodings")
-        points = [VisualizationPoint(x=_number(row.get(x_field)), y=_number(row.get(y_field))) for row in rows if _number(row.get(x_field)) is not None and _number(row.get(y_field)) is not None]
-        points = _sample_points(points, self.max_points, set())
-        series = [VisualizationSeries(series_id="relationship", name=f"{x_field} vs {y_field}", role="relationship", points=points)]
-        return _series_dataset(x_field, y_field, series, x_type="number"), [VisualizationLayer(kind="scatter", role="comparison", series_id="relationship")], [], "overlay"
-
-    def _forecast_evidence(self, forecast):
-        coverage = forecast.diagnostics.get("coverage") if isinstance(forecast.diagnostics, dict) else {}
-        refs = list((coverage or {}).get("input_evidence_refs") or [])
-        if not refs:
-            ref = forecast.diagnostics.get("resolved_evidence_id") if isinstance(forecast.diagnostics, dict) else None
-            refs = [ref] if ref else []
-        if not refs:
-            raise ValueError("forecast artifact does not identify its input Evidence")
-        source = self.catalog.resolve(str(refs[0]))
-        if source.kind != "evidence":
-            raise ValueError("forecast input reference must resolve to Evidence")
-        return source.value
-
-    def _anomaly_evidence(self, anomaly):
-        ref = _anomaly_evidence_ref(anomaly)
-        if not ref:
-            raise ValueError("anomaly artifact does not identify its input Evidence")
-        source = self.catalog.resolve(ref)
-        if source.kind != "evidence":
-            raise ValueError("anomaly input reference must resolve to Evidence")
-        return source.value
-
-    def _accessibility(self, intent, dataset, layers):
-        rows = dataset.rows[:24]
-        columns = dataset.columns
-        if not rows and dataset.series:
-            rows = []
-            for series in dataset.series:
-                for point in series.points[:12]:
-                    rows.append({"series": series.name, "x": point.x, "y": point.y, "lower": point.lower, "upper": point.upper})
-            columns = ["series", "x", "y", "lower", "upper"]
-        if dataset.metric:
-            rows = [dataset.metric]
-            columns = list(dataset.metric)
-        return VisualizationAccessibility(
-            description=intent.summary or intent.purpose,
-            table_columns=columns,
-            table_rows=rows[:24],
+            raise ValueError(f"layer role '{plan.role}' produced no renderable points from {source.ref}")
+        dataset_id = f"dataset_{index}"
+        series_id = f"series_{index}"
+        series = VisualizationSeries(series_id=series_id, name=plan.label or plan.role, role=plan.role, points=points)
+        dataset = VisualizationDataset(
+            dataset_id=dataset_id, source_ref=source.ref,
+            dimensions=_dimensions(x_field, y_field, rows, scalar), series=[series],
         )
+        layer = VisualizationLayer(
+            layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
+            encoding=encoding, dataset_id=dataset_id, series_id=series_id,
+            points=points if plan.mark in {"point", "rule", "text", "rect"} else [], label=plan.label,
+        )
+        return dataset, layer, bindings
 
 
-def _single_kind(sources, kind, template_id):
-    matches = [source for source in sources if source.kind == kind]
-    if len(matches) != 1:
-        raise ValueError(f"{template_id} requires exactly one {kind} source")
-    return matches[0]
+class VisualizationSemanticValidator:
+    """Validate that materialized layers satisfy the roles authored by the LLM."""
+
+    def __init__(self, catalog: PresentationCatalog):
+        self.catalog = catalog
+
+    def validate(self, goal: VisualGoal, payload: VisualizationPayload) -> None:
+        role_layers: dict[str, list[VisualizationLayer]] = {}
+        datasets = {dataset.dataset_id: dataset for dataset in payload.datasets}
+        for layer in payload.layers:
+            role_layers.setdefault(layer.role.strip().casefold(), []).append(layer)
+            source = self.catalog.resolve(layer.source_ref)
+            if source.kind == "insight" and source.value.status != "verified":
+                raise ValueError(f"visual layer '{layer.role}' uses non-verified Insight {source.ref}")
+            if source.kind == "insight_item" and source.value[0].status != "verified":
+                raise ValueError(f"visual layer '{layer.role}' uses non-verified Insight item {source.ref}")
+            if source.kind == "view":
+                for lineage_ref in source.value.lineage:
+                    self.catalog.resolve(lineage_ref)
+            dataset = datasets[layer.dataset_id]
+            if layer.mark == "table":
+                nonempty = bool(dataset.rows)
+            elif layer.mark == "text":
+                nonempty = bool(dataset.metric)
+            else:
+                nonempty = bool(dataset.series and dataset.series[0].points)
+            if not nonempty:
+                raise ValueError(f"visual layer '{layer.role}' is empty")
+            available = {field["name"] for field in _source_schema(source)}
+            invalid_fields = sorted({value for value in layer.encoding.values() if value not in available})
+            if invalid_fields:
+                raise ValueError(
+                    f"visual layer '{layer.role}' references unavailable fields {invalid_fields}; available fields: {sorted(available)}"
+                )
+        missing = [role for role in goal.required_roles if not role_layers.get(role.strip().casefold())]
+        if missing:
+            raise ValueError(f"visualization semantic validation failed; missing required roles: {missing}")
 
 
-def _series_dataset(x_field, y_field, series, *, x_type="time"):
-    return VisualizationDataset(
-        dimensions=[
-            VisualizationDimension(name=x_field, data_type=x_type, role="x"),
-            VisualizationDimension(name=y_field, data_type="number", role="y"),
-        ],
-        series=series,
+def _source_data(source: PresentationSource) -> tuple[list[dict], dict | None]:
+    if source.kind == "view":
+        return [dict(row) for row in source.value.rows], dict(source.value.scalar) if source.value.scalar else None
+    if source.kind == "insight_item":
+        _insight, item = source.value
+        return [_insight_item_row(item)], None
+    if source.kind == "insight":
+        insight: KeyInsight = source.value
+        if insight.items:
+            return [_insight_item_row(item) for item in insight.items], None
+        locator_row = _insight_locator_row(insight)
+        if locator_row:
+            return [locator_row], None
+        if isinstance(insight.value, list):
+            return [dict(item) if isinstance(item, dict) else {"value": item} for item in insight.value], None
+        if isinstance(insight.value, dict):
+            return [], dict(insight.value)
+        return [], {"label": insight.name, "value": insight.value}
+    if source.kind == "forecast":
+        return [{"timestamp": item.timestamp, "value": item.value} for item in source.value.forecast_points], None
+    if source.kind == "anomaly":
+        return [dict(item) for item in source.value.anomaly_points if isinstance(item, dict)], None
+    if source.kind == "evidence":
+        return _rows_from_evidence(source.value), None
+    if source.kind == "analysis":
+        raise ValueError(f"analysis artifact {source.ref} must be referenced through an explicit view:analysis source")
+    return [], None
+
+
+def _insight_locator_row(insight: KeyInsight) -> dict:
+    trace = insight.calculation_trace if isinstance(insight.calculation_trace, dict) else {}
+    row = trace.get("row")
+    if not isinstance(row, dict):
+        return {}
+    return {str(key): value for key, value in row.items() if value is not None}
+
+
+def _encoding_fields(encoding: dict) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for channel, value in (encoding or {}).items():
+        if isinstance(value, str):
+            if channel != "columns":
+                result[channel] = value
+            continue
+        field = getattr(value, "field", None)
+        if isinstance(field, str) and field.strip():
+            result[channel] = field.strip()
+    return result
+
+
+def _table_columns(encoding: dict, rows: list[dict]) -> list[str]:
+    requested = (encoding or {}).get("columns")
+    if isinstance(requested, list):
+        columns = [str(item).strip() for item in requested if str(item).strip()]
+    else:
+        columns = list(_encoding_fields(encoding).values())
+    return list(dict.fromkeys(columns)) or _row_fields(rows)
+
+
+def _points_for_source(source, rows, scalar, encoding):
+    bindings: list[VisualizationBinding] = []
+    if source.kind == "insight_item":
+        insight, item = source.value
+        binding = _insight_item_binding(source.ref, insight, item)
+        bindings.append(binding)
+    elif source.kind == "insight":
+        insight = source.value
+        if insight.items:
+            bindings.extend(
+                _insight_item_binding(f"insight:{insight.insight_id}#{item.item_id}", insight, item)
+                for item in insight.items
+            )
+        else:
+            bindings.append(_insight_binding(source.ref, insight))
+    x_field = encoding.get("x") or _first_field(rows, "time") or _first_field(rows, "category")
+    y_field = encoding.get("y") or encoding.get("value") or _first_field(rows, "number")
+    lower_field = encoding.get("lower") or "lower"
+    upper_field = encoding.get("upper") or "upper"
+    label_field = encoding.get("label")
+    points: list[VisualizationPoint] = []
+    binding_by_item = {binding.item_id: binding.binding_id for binding in bindings if binding.item_id}
+    for row in rows:
+        y = _number(row.get(y_field)) if y_field else None
+        lower = _number(row.get(lower_field))
+        upper = _number(row.get(upper_field))
+        item_id = str(row.get("item_id") or "")
+        point = VisualizationPoint(
+            x=row.get(x_field) if x_field else row.get("label") or row.get("name"), y=y,
+            lower=lower, upper=upper,
+            label=str(row.get(label_field) or row.get("label") or row.get("type") or "") or None,
+            binding_id=binding_by_item.get(item_id),
+            metadata={key: value for key, value in row.items() if key not in {x_field, y_field, lower_field, upper_field}},
+        )
+        if point.x is not None or point.y is not None or point.lower is not None or point.upper is not None:
+            points.append(point)
+    if scalar:
+        y_key = y_field or next((key for key, value in scalar.items() if _number(value) is not None), None)
+        x_key = x_field or next((key for key, value in scalar.items() if _time_value(value) is not None), None)
+        binding_id = bindings[0].binding_id if bindings else None
+        point = VisualizationPoint(
+            x=scalar.get(x_key) if x_key else scalar.get("label"),
+            y=_number(scalar.get(y_key)) if y_key else None,
+            label=str(scalar.get("label") or "") or None, binding_id=binding_id,
+        )
+        if point.x is not None or point.y is not None:
+            points.append(point)
+        x_field = x_key or "label"
+        y_field = y_key or "value"
+    return points, bindings, x_field or "x", y_field or "value"
+
+
+def _insight_item_binding(ref: str, insight: KeyInsight, item: InsightItem) -> VisualizationBinding:
+    evidence_id = next((e.source_id for e in item.evidence_refs or insight.evidence_refs if e.source_type in {"query", "database_evidence"}), None)
+    return VisualizationBinding(
+        binding_id=ref, source_type="insight_item", insight_id=insight.insight_id, item_id=item.item_id,
+        evidence_id=evidence_id, source_ref=ref, locator=item.locator,
     )
 
 
-def _rows_from_sources(sources: Iterable[PresentationSource]) -> list[dict]:
-    rows: list[dict] = []
-    for source in sources:
-        if source.kind == "evidence":
-            rows.extend(_rows_from_evidence(source.value))
-        elif source.kind == "analysis":
-            rows.extend(_rows_from_analysis(source.value.result))
-        elif source.kind == "fact":
-            fact: DataFact = source.value
-            if fact.items:
-                rows.extend(_fact_item_row(item) for item in fact.items)
-            elif isinstance(fact.value, list):
-                rows.extend(item if isinstance(item, dict) else {"value": item} for item in fact.value)
-            elif isinstance(fact.value, dict):
-                rows.append(dict(fact.value))
-            else:
-                rows.append({"name": fact.name, "value": fact.value, "unit": fact.unit})
-        elif source.kind == "forecast":
-            rows.extend({"timestamp": point.timestamp, "value": point.value} for point in source.value.forecast_points)
-        elif source.kind == "anomaly":
-            rows.extend(item for item in source.value.anomaly_points if isinstance(item, dict))
-    return rows
+def _insight_binding(ref: str, insight: KeyInsight) -> VisualizationBinding:
+    evidence_id = next((e.source_id for e in insight.evidence_refs if e.source_type in {"query", "database_evidence"}), None)
+    return VisualizationBinding(
+        binding_id=ref, source_type="insight", insight_id=insight.insight_id, evidence_id=evidence_id,
+        source_ref=ref, locator={"time_range": insight.time_range} if insight.time_range else {},
+    )
 
 
-def _unique_sources(sources: Iterable[PresentationSource]) -> list[PresentationSource]:
-    return list({source.ref: source for source in sources}.values())
+def _source_schema(source: PresentationSource) -> list[dict]:
+    if source.kind == "view":
+        return source.value.schema_fields
+    rows, scalar = _source_data(source)
+    return _schema_fields(rows or ([scalar] if scalar else []))
 
 
-def _lineage_distinct_sources(sources: Iterable[PresentationSource]) -> list[PresentationSource]:
-    unique = _unique_sources(sources)
-    consumed_evidence_ids = {
-        source.value.input_evidence_id
-        for source in unique
-        if source.kind == "analysis" and source.value.input_evidence_id
-    }
+def _schema_fields(rows: list[dict]) -> list[dict]:
+    result = []
+    for name in _row_fields(rows):
+        values = [row.get(name) for row in rows if row.get(name) is not None]
+        kind = "string"
+        if any(_time_value(value) is not None for value in values[:12]):
+            kind = "time"
+        elif any(_number(value) is not None for value in values[:12]):
+            kind = "number"
+        elif any(isinstance(value, bool) for value in values[:12]):
+            kind = "boolean"
+        elif any(isinstance(value, (dict, list)) for value in values[:12]):
+            kind = "object"
+        elif len({str(value) for value in values[:40]}) <= 12:
+            kind = "category"
+        result.append({"name": name, "data_type": kind})
+    return result
+
+
+def _dimensions(x_field, y_field, rows, scalar):
+    schema = {item["name"]: item["data_type"] for item in _schema_fields(rows or ([scalar] if scalar else []))}
+    x_type = schema.get(x_field, "string")
+    if x_type not in {"time", "number", "category", "string"}:
+        x_type = "string"
     return [
-        source
-        for source in unique
-        if source.kind != "evidence" or source.value.evidence_id not in consumed_evidence_ids
+        VisualizationDimension(name=x_field, data_type=x_type, role="x"),
+        VisualizationDimension(name=y_field, data_type="number", role="y"),
     ]
 
 
-def _rows_from_evidence(evidence) -> list[dict]:
-    data = evidence.data if isinstance(evidence.data, dict) else {}
-    rows = data.get("rows")
-    if isinstance(rows, list):
-        return [dict(row) for row in rows if isinstance(row, dict)]
-    points = data.get("points")
-    if isinstance(points, list):
-        return [dict(point) for point in points if isinstance(point, dict)]
-    statistics = data.get("statistics")
-    if isinstance(statistics, dict):
-        return [{"metric": key, "value": value} for key, value in statistics.items()]
-    series = data.get("series")
-    if isinstance(series, list):
-        output: list[dict] = []
-        for item in series:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("series_name") or item.get("value_field") or "series"
-            for point in item.get("points") or []:
-                if isinstance(point, dict):
-                    output.append({**point, "series": name})
-        return output
-    return []
-
-
-def _rows_from_analysis(result) -> list[dict]:
-    if not isinstance(result, dict):
-        return []
-    details = result.get("details")
-    if isinstance(details, dict):
-        collections = [
-            [item if isinstance(item, dict) else {"value": item} for item in value]
-            for value in details.values()
-            if isinstance(value, list) and value
-        ]
-        if collections:
-            # Analysis code may give row collections domain-specific names. Select
-            # the richest collection as its primary renderable dataset; metrics
-            # remain the summary only when no row-shaped detail data is available.
-            return max(
-                collections,
-                key=lambda rows: (len(rows), len(_row_fields(rows))),
+def _accessibility(goal, datasets):
+    rows: list[dict] = []
+    for dataset in datasets:
+        if dataset.rows:
+            rows.extend(dataset.rows[:12])
+        for series in dataset.series:
+            rows.extend(
+                {"role": series.role, "x": point.x, "y": point.y, "lower": point.lower, "upper": point.upper}
+                for point in series.points[:12]
             )
-    metrics = result.get("metrics")
-    if isinstance(metrics, dict):
-        return [{"metric": key, "value": value} for key, value in metrics.items()]
-    return []
+    columns = _row_fields(rows)
+    return VisualizationAccessibility(
+        description=goal.summary or goal.purpose, table_columns=columns, table_rows=rows[:24],
+    )
 
 
-def _series_from_sources(sources, encodings):
-    output: list[VisualizationSeries] = []
-    for source in sources:
-        if source.kind == "evidence":
-            output.extend(_series_from_evidence(source.value, encodings))
-        elif source.kind == "analysis":
-            rows = _rows_from_analysis(source.value.result)
-            output.extend(_series_from_rows(rows, encodings, prefix=source.value.analysis_id))
-        elif source.kind == "fact":
-            fact: DataFact = source.value
-            if not fact.items and not isinstance(fact.value, list):
-                continue
-            rows = _rows_from_sources([source])
-            fact_series = _series_from_rows(rows, encodings, prefix=fact.fact_id)
-            if len(fact_series) == 1:
-                fact_series[0] = fact_series[0].model_copy(update={"name": fact.name})
-            output.extend(fact_series)
-    return output
-
-
-def _series_from_evidence(evidence, encodings):
-    data = evidence.data if isinstance(evidence.data, dict) else {}
-    payloads = data.get("series")
-    if isinstance(payloads, list) and payloads:
-        output = []
-        for index, payload in enumerate(payloads):
-            if not isinstance(payload, dict):
-                continue
-            points = [
-                VisualizationPoint(x=point.get("timestamp"), y=_number(point.get("value")))
-                for point in payload.get("points") or []
-                if isinstance(point, dict) and _number(point.get("value")) is not None
-            ]
-            output.append(VisualizationSeries(
-                series_id=f"series_{index}",
-                name=str(payload.get("series_name") or payload.get("value_field") or f"Series {index + 1}"),
-                role="comparison" if len(payloads) > 1 else "historical",
-                unit=(payload.get("labels") or {}).get("unit") if isinstance(payload.get("labels"), dict) else None,
-                points=points,
-            ))
-        return output
-    return _series_from_rows(_rows_from_evidence(evidence), encodings, prefix=evidence.evidence_id)
-
-
-def _series_from_rows(rows, encodings, *, prefix):
-    if not rows:
-        return []
-    x_field = encodings.get("x") or _first_field(rows, "time")
-    numeric_fields = _candidate_fields(rows, "number")
-    requested_y = encodings.get("y")
-    y_fields = [requested_y] if requested_y else numeric_fields
-    series_field = encodings.get("series")
-    if series_field:
-        available_fields = _row_fields(rows)
-        if series_field not in available_fields:
-            raise ValueError(
-                f"series encoding '{series_field}' is not present; available fields: {available_fields}"
-            )
-        if series_field in numeric_fields:
-            raise ValueError(
-                f"series encoding '{series_field}' is numeric; use a categorical series field or omit series for wide numeric rows"
-            )
-    if not x_field or not y_fields:
-        return []
-    grouped: dict[tuple[str, str], list[VisualizationPoint]] = {}
-    for row in rows:
-        for y_field in y_fields:
-            value = _number(row.get(y_field))
-            if value is None:
-                continue
-            group = str(row.get(series_field)) if series_field and row.get(series_field) is not None else y_field
-            grouped.setdefault((group, y_field), []).append(VisualizationPoint(x=row.get(x_field), y=value))
-    output = []
-    for index, ((group, _), points) in enumerate(grouped.items()):
-        points.sort(key=lambda point: _x_sort_key(point.x))
-        output.append(VisualizationSeries(
-            series_id=f"{prefix}_{index}", name=group, role="comparison" if len(grouped) > 1 else "historical", points=points
-        ))
-    return output
-
-
-def _fact_layer_points(facts, encodings=None):
-    encodings = encodings or {}
-    points: list[VisualizationPoint] = []
-    for source in facts:
-        fact: DataFact = source.value
-        if fact.items:
-            for item in fact.items:
-                points.append(VisualizationPoint(
-                    x=item.timestamp or item.locator.get("timestamp"),
-                    y=_number(item.value),
-                    label=item.label or (f"#{item.rank}" if item.rank is not None else fact.name),
-                    binding_id=f"{source.ref}:item:{item.item_id}",
-                    metadata={"rank": item.rank} if item.rank is not None else {},
-                ))
-            continue
-        value = fact.value
-        if isinstance(value, dict):
-            start_field = encodings.get("start") or _role_field(value, "start", expected="time")
-            end_field = encodings.get("end") or _role_field(value, "end", expected="time")
-            start = value.get(start_field) if start_field else None
-            end = value.get(end_field) if end_field else None
-            if start is not None or end is not None:
-                points.extend([
-                    VisualizationPoint(x=start, label=fact.name, binding_id=f"{source.ref}:value", metadata={"boundary": "start"}),
-                    VisualizationPoint(x=end, label=fact.name, binding_id=f"{source.ref}:value", metadata={"boundary": "end"}),
-                ])
-                continue
-            x = value.get("timestamp") or value.get("time") or value.get("date")
-            y = _number(value.get("value") if "value" in value else value.get("y"))
-        else:
-            x = (fact.time_range or {}).get("end") if fact.time_range else None
-            y = _number(value)
-        points.append(VisualizationPoint(x=x, y=y, label=fact.name, binding_id=f"{source.ref}:value"))
-    return [point for point in points if point.x is not None or point.y is not None]
-
-
-def _role_field(values: dict, role: str, *, expected: str):
-    matches = []
-    for key, value in values.items():
-        normalized = str(key).casefold().replace("-", "_")
-        if role not in normalized:
-            continue
-        if expected == "time" and _time_value(value) is not None:
-            matches.append(key)
-        elif expected == "number" and _number(value) is not None:
-            matches.append(key)
-    return matches[0] if len(matches) == 1 else None
-
-
-def _bindings_for_fact_sources(facts):
-    bindings: list[VisualizationBinding] = []
-    for source in facts:
-        fact: DataFact = source.value
-        evidence_id = next((ref.source_id for ref in fact.evidence_refs if ref.source_type in {"query", "database_evidence"}), None)
-        if fact.items:
-            for item in fact.items:
-                bindings.append(VisualizationBinding(
-                    binding_id=f"{source.ref}:item:{item.item_id}", source_type="fact_item", fact_id=fact.fact_id,
-                    item_id=item.item_id, evidence_id=evidence_id, source_ref=source.ref, locator=item.locator,
-                ))
-        else:
-            bindings.append(VisualizationBinding(
-                binding_id=f"{source.ref}:value", source_type="fact", fact_id=fact.fact_id,
-                evidence_id=evidence_id, source_ref=source.ref,
-                locator={"time_range": fact.time_range} if fact.time_range else {},
-            ))
-    return bindings
-
-
-def _metric_from_source(source, encodings):
-    if source.kind == "fact":
-        fact = source.value
-        if not isinstance(fact.value, dict):
-            return {"label": fact.name, "value": fact.value, "unit": fact.unit, "statement": fact.statement}
-
-        selected_field = encodings.get("value") or encodings.get("y")
-        if selected_field:
-            if selected_field not in fact.value or _number(fact.value.get(selected_field)) is None:
-                raise ValueError(
-                    f"metric.single encoding '{selected_field}' must select a numeric field from the Fact value"
-                )
-        else:
-            numeric_fields = [key for key, value in fact.value.items() if _number(value) is not None]
-            if len(numeric_fields) != 1:
-                raise ValueError(
-                    "metric.single requires one unambiguous numeric Fact value or an explicit value encoding"
-                )
-            selected_field = numeric_fields[0]
-
-        context = {
-            key: value
-            for key, value in fact.value.items()
-            if key != selected_field and isinstance(value, (str, int, float, bool))
-        }
-        return {
-            "label": fact.name,
-            "value": fact.value[selected_field],
-            "unit": fact.unit,
-            "statement": fact.statement,
-            **context,
-        }
-    rows = _rows_from_sources([source])
-    value_field = encodings.get("value") or encodings.get("y") or _first_field(rows, "number")
-    if not rows or not value_field:
-        raise ValueError("metric.single requires a scalar Fact or numeric source field")
-    return {"label": value_field, "value": rows[0].get(value_field)}
-
-
-def _numeric_values(sources, requested_field):
-    rows = _rows_from_sources(sources)
-    field = requested_field or _first_field(rows, "number")
-    if not field:
-        return [], "value"
-    return [value for row in rows if (value := _number(row.get(field))) is not None], field
-
-
-def _sample_points(points, limit, preserve_x, *, prefer_recent=False):
-    if len(points) <= limit:
-        return list(points)
-    if prefer_recent:
-        selected = list(points[-limit:])
-        if points[0].x in preserve_x and all(item.x != points[0].x for item in selected):
-            selected[0] = points[0]
-        return selected
-    keep = {0, len(points) - 1}
-    keep.update(index for index, point in enumerate(points) if point.x in preserve_x)
-    remaining = max(0, limit - len(keep))
-    bucket_count = max(1, remaining // 2)
-    bucket_size = len(points) / bucket_count
-    for bucket in range(bucket_count):
-        start = int(bucket * bucket_size)
-        end = min(len(points), int((bucket + 1) * bucket_size))
-        candidates = [(index, points[index].y) for index in range(start, end) if points[index].y is not None]
-        if candidates:
-            keep.add(min(candidates, key=lambda item: item[1])[0])
-            keep.add(max(candidates, key=lambda item: item[1])[0])
-    if len(keep) < limit:
-        stride = (len(points) - 1) / max(limit - 1, 1)
-        keep.update(round(index * stride) for index in range(limit))
-    return [points[index] for index in sorted(keep)[:limit]]
-
-
-def _legible_layout(series):
-    populated = [[point.y for point in item.points if point.y is not None] for item in series]
-    populated = [values for values in populated if values]
-    if len(populated) < 2:
-        return "overlay"
-    all_values = [value for values in populated for value in values]
-    domain = max(all_values) - min(all_values)
-    if domain <= 0:
-        return "overlay"
-    chart_height = 280.0
-    minimum_readable_span = 12.0
-    for values in populated:
-        projected_span = ((max(values) - min(values)) / domain) * chart_height
-        if projected_span < minimum_readable_span:
+def _legible_layout_from_datasets(datasets):
+    series = [series for dataset in datasets for series in dataset.series]
+    scales = []
+    for item in series:
+        values = [abs(point.y) for point in item.points if point.y is not None and point.y != 0]
+        if values:
+            scales.append((min(values), max(values)))
+    if len(scales) > 1:
+        positive = [low for low, _high in scales if low > 0]
+        if positive and max(high for _low, high in scales) / min(positive) >= 1000:
             return "facets"
     return "overlay"
 
 
-def _histogram(values):
-    ordered = sorted(values)
-    q1, _, q3 = _quartiles(ordered)
-    iqr = q3 - q1
-    width = (2 * iqr / (len(ordered) ** (1 / 3))) if iqr > 0 else 0
-    count = max(1, min(50, math.ceil((ordered[-1] - ordered[0]) / width))) if width > 0 else max(1, round(math.sqrt(len(ordered))))
-    minimum, maximum = ordered[0], ordered[-1]
-    span = maximum - minimum
-    if span == 0:
-        return [{"start": minimum, "end": maximum, "label": str(minimum), "count": len(ordered)}]
-    bin_width = span / count
-    bins = [{"start": minimum + index * bin_width, "end": minimum + (index + 1) * bin_width, "count": 0} for index in range(count)]
-    for value in ordered:
-        index = min(count - 1, int((value - minimum) / bin_width))
-        bins[index]["count"] += 1
-    for item in bins:
-        item["label"] = f"{item['start']:.4g}–{item['end']:.4g}"
-    return bins
+def _forecast_input_refs(forecast) -> list[str]:
+    coverage = forecast.diagnostics.get("coverage") if isinstance(forecast.diagnostics, dict) else {}
+    return [str(ref) if ":" in str(ref) else f"evidence:{ref}" for ref in (coverage or {}).get("input_evidence_refs", [])]
 
 
-def _quartiles(values):
-    ordered = sorted(values)
-    return (_percentile(ordered, 0.25), _percentile(ordered, 0.5), _percentile(ordered, 0.75))
-
-
-def _percentile(values, fraction):
-    if len(values) == 1:
-        return values[0]
-    position = (len(values) - 1) * fraction
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return values[lower]
-    return values[lower] + (values[upper] - values[lower]) * (position - lower)
-
-
-def _confidence_by_timestamp(intervals):
-    output = {}
-    for index, item in enumerate(intervals or []):
-        if not isinstance(item, dict):
-            continue
-        timestamp = item.get("timestamp") or item.get("time") or item.get("date") or str(index)
-        output[str(timestamp)] = {
-            "lower": item.get("lower") if "lower" in item else item.get("lower_bound"),
-            "upper": item.get("upper") if "upper" in item else item.get("upper_bound"),
-        }
-    return output
-
-
-def _anomaly_evidence_ref(anomaly):
+def _anomaly_evidence_ref(anomaly) -> str | None:
     diagnostics = anomaly.diagnostics if isinstance(anomaly.diagnostics, dict) else {}
-    evidence_id = diagnostics.get("resolved_evidence_id") or diagnostics.get("selected_evidence_id")
-    if evidence_id:
-        return f"evidence:{evidence_id}"
-    if anomaly.anomaly_id.startswith("anomaly_"):
-        return f"evidence:{anomaly.anomaly_id[len('anomaly_') :]}"
+    for key in ("resolved_evidence_id", "selected_evidence_id", "input_evidence_id"):
+        if diagnostics.get(key):
+            value = str(diagnostics[key])
+            return value if value.startswith("evidence:") else f"evidence:{value}"
     return None
 
 
-def _evidence_point_count(evidence):
+def _full_fidelity_status(sources: list[PresentationSource]) -> bool | None:
+    values: list[bool] = []
+    for source in sources:
+        diagnostics = getattr(source.value, "diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            continue
+        if isinstance(diagnostics.get("is_full_fidelity"), bool):
+            values.append(diagnostics["is_full_fidelity"])
+        sampling = diagnostics.get("prompt_sampling")
+        if isinstance(sampling, dict) and isinstance(sampling.get("is_full_fidelity"), bool):
+            values.append(sampling["is_full_fidelity"])
+    if not values:
+        return None
+    return all(values)
+
+
+def _rows_from_evidence(evidence) -> list[dict]:
     data = evidence.data if isinstance(evidence.data, dict) else {}
-    if isinstance(data.get("points"), list):
-        return len(data["points"])
-    if isinstance(data.get("series"), list):
-        return sum(len(item.get("points") or []) for item in data["series"] if isinstance(item, dict))
-    return 0
+    for key in ("rows", "points"):
+        if isinstance(data.get(key), list):
+            return [dict(row) for row in data[key] if isinstance(row, dict)]
+    series = data.get("series")
+    if isinstance(series, list):
+        rows = []
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("series_name") or item.get("value_field") or "series"
+            rows.extend({**point, "series": name} for point in item.get("points", []) if isinstance(point, dict))
+        return rows
+    statistics = data.get("statistics")
+    if isinstance(statistics, dict):
+        return [{"metric": key, "value": value} for key, value in statistics.items()]
+    return []
 
 
-def _fact_item_row(item: FactItem):
-    return {
-        "item_id": item.item_id,
-        "label": item.label,
-        "rank": item.rank,
-        "timestamp": item.timestamp,
-        "value": item.value,
-        **item.dimensions,
-        **item.locator,
+def _insight_item_row(item: InsightItem) -> dict:
+    row = {
+        "item_id": item.item_id, "value": item.value, "label": item.label, "rank": item.rank,
+        "timestamp": item.timestamp, **item.dimensions, **item.locator,
     }
+    return {key: value for key, value in row.items() if value is not None}
 
 
-def _candidate_fields(rows, kind):
-    fields = _row_fields(rows)
-    output = []
-    for field in fields:
-        values = [row.get(field) for row in rows[:64] if row.get(field) is not None]
+def _candidate_fields(rows: list[dict], expected: str) -> list[str]:
+    fields = []
+    for field in _row_fields(rows):
+        values = [row.get(field) for row in rows[:40] if row.get(field) is not None]
         if not values:
             continue
-        if kind == "number" and sum(_number(value) is not None for value in values) >= max(1, len(values) * 0.8):
-            output.append(field)
-        elif kind == "time" and sum(_time_value(value) is not None for value in values) >= max(1, len(values) * 0.8):
-            output.append(field)
-        elif kind == "category" and not all(_number(value) is not None for value in values) and not all(_time_value(value) is not None for value in values):
-            output.append(field)
-    return output
+        if expected == "time" and any(_time_value(value) is not None for value in values):
+            fields.append(field)
+        elif expected == "number" and any(_number(value) is not None for value in values):
+            fields.append(field)
+        elif expected == "category" and not any(_number(value) is not None or _time_value(value) is not None for value in values):
+            fields.append(field)
+    return fields
 
 
-def _first_field(rows, kind):
-    fields = _candidate_fields(rows, kind)
-    return fields[0] if fields else None
+def _first_field(rows: list[dict], expected: str) -> str | None:
+    values = _candidate_fields(rows, expected)
+    return values[0] if values else None
 
 
-def _ranking_label_field(rows):
-    for field in ("label", "name", "category", "timestamp", "item_id"):
-        if any(row.get(field) not in (None, "") for row in rows):
-            return field
-    return _first_field(rows, "category") or _first_field(rows, "time")
+def _row_fields(rows: Iterable[dict]) -> list[str]:
+    result: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in result:
+                result.append(key)
+    return result
 
 
-def _row_fields(rows):
-    return list(dict.fromkeys(key for row in rows if isinstance(row, dict) for key in row))
+def _bounded_row(row: dict) -> dict:
+    return {str(key): _bounded_value(value) for key, value in list(row.items())[:12]}
 
 
-def _number(value):
+def _bounded_value(value):
+    if isinstance(value, str):
+        return value[:240]
+    if isinstance(value, list):
+        return [_bounded_value(item) for item in value[:6]]
+    if isinstance(value, dict):
+        return {str(key): _bounded_value(item) for key, item in list(value.items())[:8]}
+    return value
+
+
+def _number(value) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -965,36 +655,33 @@ def _number(value):
     return number if math.isfinite(number) else None
 
 
-def _time_value(value):
-    if not isinstance(value, str):
+def _time_value(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
         return None
+    text = value.strip().replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _sample_points(points, limit, preserve):
+    if len(points) <= limit:
+        return points
+    preserved = [point for point in points if point.x in preserve]
+    remaining = max(2, limit - len(preserved))
+    step = max(1, math.ceil(len(points) / remaining))
+    sampled = [points[index] for index in range(0, len(points), step)][:remaining]
+    by_key = {(str(point.x), point.y, point.binding_id): point for point in [*sampled, *preserved]}
+    return sorted(by_key.values(), key=lambda point: _x_sort_key(point.x))[:limit]
 
 
 def _x_sort_key(value):
     parsed = _time_value(value)
     if parsed is not None:
-        return (0, parsed)
-    numeric = _number(value)
-    if numeric is not None:
-        return (1, numeric)
+        return (0, parsed.timestamp())
+    if isinstance(value, (int, float)):
+        return (1, float(value))
     return (2, str(value))
-
-
-def _bounded_row(row):
-    return {str(key): value for key, value in list(row.items())[:10]}
-
-
-def _bounded_mapping(value):
-    if not isinstance(value, dict):
-        return {}
-    return {str(key): child for key, child in list(value.items())[:12]}
-
-
-def _point_time_range(points):
-    if not points:
-        return None
-    return {"start": points[0].timestamp, "end": points[-1].timestamp}

@@ -2,25 +2,26 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.settings import get_settings
 from core.visualization import PresentationCatalog, VisualizationMaterializer
 from runtime.request_state import build_request_state
+from schemas.analysis import AnalysisResult
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.data_fact import DataFact, FactEvidenceRef, FactItem
-from schemas.output import VisualIntent
-from schemas.timeseries import AnomalyResult, ForecastResult, TimeSeriesPoint
+from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
+from schemas.output import VisualGoal, VisualLayerPlan
+from schemas.timeseries import AnomalyResult
 
 
 def _state(rows: list[dict]):
     state = build_request_state(
-        ChatRequest(message="show the data", database_context={"database_id": "demo", "database_type": "unit"}),
+        ChatRequest(message="analyze the series", database_context={"database_id": "demo", "database_type": "unit"}),
         get_settings(),
     )
     evidence = DatabaseEvidence(
-        evidence_id="evi_series",
-        result_type="timeseries",
-        database="demo",
+        evidence_id="evi_series", result_type="timeseries", database="demo",
         summary=f"Loaded {len(rows)} rows.",
         data={"rows": rows, "time_field": "timestamp", "value_field": "value"},
         columns=list(rows[0]) if rows else [],
@@ -31,204 +32,148 @@ def _state(rows: list[dict]):
     return state
 
 
-def _top3_fact(rows: list[dict]) -> DataFact:
-    selected = sorted(rows, key=lambda row: row["value"], reverse=True)[:3]
-    return DataFact(
-        fact_id="fact_top3",
-        fact_key="price.top3",
-        name="Price Top 3",
-        fact_type="extreme",
-        semantic_class="ranking_set",
-        derivation="top_k",
-        value_shape="ranked_set",
-        statement="The three highest prices.",
-        value=selected,
-        items=[
-            FactItem(
-                item_id=f"top-{rank}", rank=rank, timestamp=row["timestamp"], value=row["value"],
-                evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_series")],
-            )
-            for rank, row in enumerate(selected, start=1)
-        ],
-        method="code_interpreter",
-        evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_series")],
+def _goal(*layers: VisualLayerPlan, required_roles: list[str] | None = None):
+    return VisualGoal(
+        purpose="show the decision in temporal context", title="Decision chart",
+        required_roles=required_roles or [layer.role for layer in layers], layers=list(layers),
     )
 
 
-def test_catalog_exposes_bounded_semantic_inventory_not_full_arrays():
+def test_catalog_exposes_typed_bounded_data_views():
     rows = [{"timestamp": f"2026-01-{day:02d}T00:00:00Z", "value": float(day)} for day in range(1, 20)]
-    state = _state(rows)
-    inventory = PresentationCatalog(state).planner_inventory()
+    inventory = PresentationCatalog(_state(rows)).planner_inventory()
 
-    evidence = next(item for item in inventory["sources"] if item["source_ref"] == "evidence:evi_series")
-    assert evidence["row_count"] == len(rows)
-    assert evidence["candidate_time_fields"] == ["timestamp"]
-    assert evidence["candidate_numeric_fields"] == ["value"]
-    assert len(evidence["preview"]) == 4
-    assert "rows" not in evidence
+    view = next(item for item in inventory["sources"] if item["source_ref"] == "view:evidence:evi_series:default")
+    assert inventory["schema_version"] == "3"
+    assert view["shape"] == "timeseries"
+    assert view["row_count"] == len(rows)
+    assert {field["name"] for field in view["schema_fields"]} == {"timestamp", "value"}
+    assert len(view["preview"]) == 4
+    assert "rows" not in view
 
 
-def test_timeseries_highlight_samples_context_and_preserves_fact_marks():
+def test_layers_keep_base_series_and_semantic_insight_items_separate():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    rows = [
-        {"timestamp": (start + timedelta(hours=index)).isoformat(), "value": float(index + 1)}
-        for index in range(100)
-    ]
+    rows = [{"timestamp": (start + timedelta(hours=i)).isoformat(), "value": float(i + 1)} for i in range(100)]
     state = _state(rows)
-    fact = _top3_fact(rows)
-    state.fact_set.facts = [fact]
-    intent = VisualIntent(
-        purpose="show top three in their existing temporal context",
-        template_id="timeseries.highlight",
-        title="Top 3 in context",
-        source_refs=["evidence:evi_series"],
-        fact_refs=["fact:fact_top3"],
+    insight = KeyInsight(
+        insight_id="insight_trade", insight_key="trade.best", name="Best trade", insight_type="extreme",
+        semantic_class="decision_points", derivation="optimization", value_shape="record_set",
+        statement="Buy then sell.", value={}, method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_series")],
+        items=[
+            InsightItem(item_id="buy", label="Buy", timestamp=rows[10]["timestamp"], value=11.0),
+            InsightItem(item_id="sell", label="Sell", timestamp=rows[90]["timestamp"], value=91.0),
+        ],
     )
-
-    result = VisualizationMaterializer(state).materialize(intent)
-
-    assert result.schema_version == "2"
-    assert len(result.dataset.series[0].points) <= 32
-    assert len(result.layers[-1].points) == 3
-    assert len(result.bindings) == 3
-    assert all(point.binding_id for point in result.layers[-1].points)
-
-
-def test_ranked_rows_render_as_ranking_without_inventing_context():
-    rows = [
-        {"timestamp": "2026-01-01", "value": 30.0},
-        {"timestamp": "2026-01-02", "value": 20.0},
-        {"timestamp": "2026-01-03", "value": 10.0},
-    ]
-    state = _state(rows)
-    fact = _top3_fact(rows)
-    state.fact_set.facts = [fact]
-    intent = VisualIntent(
-        purpose="rank the available top values",
-        template_id="ranking.topk",
-        title="Price Top 3",
-        source_refs=["fact:fact_top3"],
-        fact_refs=["fact:fact_top3"],
-        encodings={"x": "timestamp", "y": "value"},
-    )
-
-    result = VisualizationMaterializer(state).materialize(intent)
-
-    assert [point.y for point in result.dataset.series[0].points] == [30.0, 20.0, 10.0]
-    assert result.template_id == "ranking.topk"
-    assert len(result.bindings) == 3
-
-
-def test_forecast_is_one_grounded_view_with_history_boundary_and_all_future_points():
-    rows = [{"timestamp": f"2026-01-{day:02d}T00:00:00Z", "value": 100.0 + day} for day in range(1, 29)]
-    state = _state(rows)
-    forecast = ForecastResult(
-        forecast_id="forecast_evi_series",
-        model_name="unit",
-        horizon=7,
-        forecast_points=[TimeSeriesPoint(timestamp=f"2026-02-{day:02d}T00:00:00Z", value=130.0 + day) for day in range(1, 8)],
-        diagnostics={"coverage": {"input_evidence_refs": ["evi_series"]}},
-    )
-    state.forecast_artifacts[forecast.forecast_id] = forecast
-    intent = VisualIntent(
-        purpose="show recent history and the next seven predictions",
-        template_id="timeseries.forecast",
-        title="Price forecast",
-        source_refs=["evidence:evi_series", "forecast:forecast_evi_series"],
-    )
-
-    result = VisualizationMaterializer(state).materialize(intent)
-
-    assert len(result.dataset.series) == 2
-    assert result.dataset.series[0].role == "historical"
-    assert result.dataset.series[1].role == "forecast"
-    assert len(result.dataset.series[1].points) == 7
-    assert sum(layer.kind == "rule" for layer in result.layers) == 1
-    assert len(result.bindings) == 7
-
-
-def test_unreadable_shared_scale_uses_explicit_facets():
-    rows = [
-        {"timestamp": "2026-01-01T00:00:00Z", "small": 1.0, "large": 1_000_000.0},
-        {"timestamp": "2026-01-02T00:00:00Z", "small": 1.1, "large": 2_000_000.0},
-        {"timestamp": "2026-01-03T00:00:00Z", "small": 1.2, "large": 3_000_000.0},
-    ]
-    state = _state(rows)
-    intent = VisualIntent(
-        purpose="compare both time series",
-        template_id="timeseries.comparison",
-        title="Comparison",
-        source_refs=["evidence:evi_series"],
-        encodings={"x": "timestamp"},
-    )
-
-    result = VisualizationMaterializer(state).materialize(intent)
-    assert result.layout == "facets"
-
-
-def test_distribution_and_relationship_templates_use_general_data_shapes():
-    rows = [{"group": "a" if index < 5 else "b", "x": float(index), "y": float(index * index)} for index in range(10)]
-    state = _state(rows)
-    materializer = VisualizationMaterializer(state)
-
-    histogram = materializer.materialize(VisualIntent(
-        purpose="show distribution", template_id="distribution.histogram", title="Distribution",
-        source_refs=["evidence:evi_series"], encodings={"value": "y"},
-    ))
-    scatter = materializer.materialize(VisualIntent(
-        purpose="show relationship", template_id="relationship.scatter", title="Relationship",
-        source_refs=["evidence:evi_series"], encodings={"x": "x", "y": "y"},
+    state.insight_set.insights = [insight]
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(role="clean_series", source_ref="view:evidence:evi_series:default", mark="line", encoding={"x": "timestamp", "y": "value"}),
+        VisualLayerPlan(role="buy", source_ref="insight:insight_trade#buy", mark="point", encoding={"x": "timestamp", "y": "value"}),
+        VisualLayerPlan(role="sell", source_ref="insight:insight_trade#sell", mark="point", encoding={"x": "timestamp", "y": "value"}),
     ))
 
-    assert histogram.dataset.series[0].points
-    assert len(scatter.dataset.series[0].points) == 10
+    assert result.schema_version == "3"
+    assert len(result.datasets[0].series[0].points) == 100
+    assert [layer.role for layer in result.layers] == ["clean_series", "buy", "sell"]
+    assert {binding.item_id for binding in result.bindings} == {"buy", "sell"}
+    assert all(layer.source_ref for layer in result.layers)
 
 
-def test_detail_interval_anomaly_category_and_boxplot_templates_materialize():
+def test_analysis_data_view_preserves_authoritative_anomaly_lineage():
     rows = [
-        {"timestamp": "2026-01-01T00:00:00Z", "group": "a", "value": 10.0},
-        {"timestamp": "2026-01-02T00:00:00Z", "group": "a", "value": 12.0},
-        {"timestamp": "2026-01-03T00:00:00Z", "group": "b", "value": 30.0},
-        {"timestamp": "2026-01-04T00:00:00Z", "group": "b", "value": 32.0},
+        {"timestamp": "2026-01-01T00:00:00Z", "value": 10.0},
+        {"timestamp": "2026-01-02T00:00:00Z", "value": 999.0},
+        {"timestamp": "2026-01-03T00:00:00Z", "value": 12.0},
     ]
     state = _state(rows)
-    interval = DataFact(
-        fact_id="fact_interval", name="Selected interval", fact_type="custom",
-        statement="January 2 through January 3.",
-        value={"start": rows[1]["timestamp"], "end": rows[2]["timestamp"]},
-        method="code_interpreter", evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi_series")],
-    )
-    state.fact_set.facts = [interval]
     anomaly = AnomalyResult(
         anomaly_id="anomaly_evi_series", detector_name="unit",
-        anomaly_points=[{"timestamp": rows[2]["timestamp"], "value": 30.0}],
-        diagnostics={"resolved_evidence_id": "evi_series"},
+        anomaly_points=[rows[1]], diagnostics={"resolved_evidence_id": "evi_series"},
     )
     state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
-    materializer = VisualizationMaterializer(state)
+    analysis = AnalysisResult(
+        analysis_id="ana_clean", analysis_goal="exclude anomalies", code_hash="sha256:test",
+        input_evidence_id="evi_series", input_row_count=3, status="succeeded", summary="Cleaned.",
+        result={
+            "summary": "Cleaned.", "metrics": {}, "details": {},
+            "data_views": [{
+                "view_id": "clean", "name": "Clean series", "shape": "timeseries",
+                "rows": [rows[0], rows[2]],
+                "schema_fields": [{"name": "timestamp", "data_type": "time"}, {"name": "value", "data_type": "number"}],
+                "lineage": ["evidence:evi_series", "anomaly:anomaly_evi_series"],
+                "transform_summary": "Excluded authoritative anomaly points.",
+            }],
+        },
+    )
+    state.analysis_artifacts[analysis.analysis_id] = analysis
 
-    table = materializer.materialize(VisualIntent(
-        purpose="show details", template_id="table.detail", title="Details", source_refs=["evidence:evi_series"],
-    ))
-    interval_view = materializer.materialize(VisualIntent(
-        purpose="show selected interval", template_id="interval.highlight", title="Interval",
-        source_refs=["evidence:evi_series"], fact_refs=["fact:fact_interval"],
-    ))
-    anomaly_view = materializer.materialize(VisualIntent(
-        purpose="show anomaly", template_id="timeseries.anomaly", title="Anomaly",
-        source_refs=["anomaly:anomaly_evi_series"],
-    ))
-    category = materializer.materialize(VisualIntent(
-        purpose="compare categories", template_id="category.comparison", title="Categories",
-        source_refs=["evidence:evi_series"], encodings={"x": "group", "y": "value"},
-    ))
-    boxplot = materializer.materialize(VisualIntent(
-        purpose="compare distributions", template_id="distribution.boxplot", title="Boxplot",
-        source_refs=["evidence:evi_series"], encodings={"x": "group", "y": "value"},
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(role="clean_series", source_ref="view:analysis:ana_clean:clean", mark="line", encoding={"x": "timestamp", "y": "value"}),
+        VisualLayerPlan(role="excluded_anomalies", source_ref="view:anomaly:anomaly_evi_series:points", mark="point", encoding={"x": "timestamp", "y": "value"}),
     ))
 
-    assert len(table.dataset.rows) == 4
-    assert any(layer.kind == "area" for layer in interval_view.layers)
-    assert anomaly_view.layers[-1].role == "anomaly"
-    assert category.dataset.series[0].points
-    assert len(boxplot.dataset.series[0].points) == 2
+    assert [len(dataset.series[0].points) for dataset in result.datasets] == [2, 1]
+    assert result.source_refs == ["view:analysis:ana_clean:clean", "view:anomaly:anomaly_evi_series:points"]
+
+
+def test_semantic_validator_rejects_missing_required_role():
+    state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
+    goal = _goal(
+        VisualLayerPlan(role="series", source_ref="view:evidence:evi_series:default", mark="line", encoding={"x": "timestamp", "y": "value"}),
+        required_roles=["series", "decision_point"],
+    )
+    with pytest.raises(ValueError, match="missing required roles"):
+        VisualizationMaterializer(state).materialize(goal)
+
+
+def test_semantic_validator_rejects_unavailable_encoding_field():
+    state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
+    goal = _goal(VisualLayerPlan(
+        role="series", source_ref="view:evidence:evi_series:default", mark="line",
+        encoding={"x": "invented_time", "y": "value"},
+    ))
+    with pytest.raises(ValueError, match="unavailable fields"):
+        VisualizationMaterializer(state).materialize(goal)
+
+
+def test_table_is_a_first_class_mark():
+    rows = [{"category": "a", "value": 1.0}, {"category": "b", "value": 2.0}]
+    result = VisualizationMaterializer(_state(rows)).materialize(_goal(
+        VisualLayerPlan(role="details", source_ref="view:evidence:evi_series:default", mark="table", encoding={"columns": ["category", "value"]}),
+    ))
+    assert result.layers[0].mark == "table"
+    assert result.datasets[0].rows == rows
+    assert result.datasets[0].columns == ["category", "value"]
+
+
+def test_structured_field_encodings_are_normalized_to_public_field_names():
+    state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
+    result = VisualizationMaterializer(state).materialize(_goal(VisualLayerPlan.model_validate({
+        "role": "series", "source_ref": "view:evidence:evi_series:default", "mark": "line",
+        "encoding": {"x": {"field": "timestamp", "data_type": "time"}, "y": {"field": "value", "data_type": "number"}},
+    })))
+    assert result.layers[0].encoding == {"x": "timestamp", "y": "value"}
+
+
+def test_one_grounded_scalar_record_can_drive_multiple_semantic_point_layers_and_table():
+    state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
+    trade = KeyInsight(
+        insight_id="insight_trade_record", name="Optimal trade", insight_type="analysis",
+        statement="Optimal buy and sell.", method="code_interpreter",
+        value={
+            "buy_time": "2026-01-01T00:00:00Z", "buy_price": 10.0,
+            "sell_time": "2026-01-02T00:00:00Z", "sell_price": 15.0, "profit": 5.0,
+        },
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_series")],
+    )
+    state.insight_set.insights = [trade]
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(role="buy", source_ref="insight:insight_trade_record", mark="point", encoding={"x": "buy_time", "y": "buy_price"}),
+        VisualLayerPlan(role="sell", source_ref="insight:insight_trade_record", mark="point", encoding={"x": "sell_time", "y": "sell_price"}),
+        VisualLayerPlan(role="summary", source_ref="insight:insight_trade_record", mark="table", encoding={}),
+    ))
+
+    assert result.datasets[0].series[0].points[0].y == 10.0
+    assert result.datasets[1].series[0].points[0].y == 15.0
+    assert result.datasets[2].rows[0]["profit"] == 5.0

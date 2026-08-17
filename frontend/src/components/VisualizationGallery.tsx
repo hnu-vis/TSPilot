@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { EChartsOption } from 'echarts';
 import { BarChart, BoxplotChart, LineChart, ScatterChart } from 'echarts/charts';
 import {
@@ -15,6 +15,8 @@ import * as echarts from 'echarts/core';
 import type { EChartsType } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import type { Visualization, VisualizationPoint, VisualizationSeries } from '../types';
+import { fetchVisualizationData } from '../services/api';
+import { useI18n } from '../i18n';
 
 echarts.use([
   LineChart,
@@ -39,7 +41,39 @@ type GalleryProps = {
 };
 
 export function VisualizationGallery({ visualizations, activeBindingId, onSelectBinding }: GalleryProps) {
-  const ordered = [...visualizations].sort((left, right) => (
+  const { t } = useI18n();
+  const [loaded, setLoaded] = useState<Record<string, Visualization>>({});
+  const [loadErrors, setLoadErrors] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const controller = new AbortController();
+    visualizations.forEach((visualization) => {
+      if (!visualization.data_ref || loaded[visualization.visualization_id]) return;
+      void fetchVisualizationData(visualization.data_ref)
+        .then((payload) => {
+          if (!controller.signal.aborted) {
+            setLoaded((current) => ({ ...current, [visualization.visualization_id]: payload }));
+          }
+        })
+        .catch((error) => {
+          if (!controller.signal.aborted) {
+            setLoadErrors((current) => ({
+              ...current,
+              [visualization.visualization_id]: error instanceof Error ? error.message : t('Unable to load chart data.'),
+            }));
+          }
+        });
+    });
+    return () => controller.abort();
+  }, [visualizations, loaded]);
+
+  const hydrated = visualizations.map((visualization) => loaded[visualization.visualization_id] || visualization);
+  const pendingIds = new Set(visualizations
+    .filter((visualization) => visualization.data_ref && !loaded[visualization.visualization_id] && !loadErrors[visualization.visualization_id])
+    .map((visualization) => visualization.visualization_id));
+  const renderable = hydrated.filter((visualization) => !pendingIds.has(visualization.visualization_id) && isRenderableVisualization(visualization));
+  const rejectedCount = hydrated.filter((visualization) => !pendingIds.has(visualization.visualization_id) && !isRenderableVisualization(visualization)).length;
+  const ordered = [...renderable].sort((left, right) => (
     Number(right.priority === 'primary') - Number(left.priority === 'primary')
   ));
   const activeBinding = ordered
@@ -48,6 +82,17 @@ export function VisualizationGallery({ visualizations, activeBindingId, onSelect
 
   return (
     <div className="answer-visualization-gallery">
+      {rejectedCount > 0 && (
+        <div className="answer-visualization-unavailable" role="status">
+          {t('{count} saved visualizations cannot be displayed because the data schema is no longer supported.', { count: rejectedCount })}
+        </div>
+      )}
+      {Object.values(loadErrors).map((message) => (
+        <div className="answer-visualization-unavailable" role="status" key={message}>{message}</div>
+      ))}
+      {pendingIds.size > 0 && (
+        <div className="answer-visualization-unavailable" role="status">{t('Loading complete visualization data…')}</div>
+      )}
       <div className="answer-visualization-grid">
         {ordered.map((visualization) => (
           <VisualizationCard
@@ -60,7 +105,7 @@ export function VisualizationGallery({ visualizations, activeBindingId, onSelect
       </div>
       {activeBinding && (
         <div className="visualization-link-detail" role="status">
-          <strong>Linked evidence</strong>
+          <strong>{t('Linked evidence')}</strong>
           <span>{activeBinding.source_type}</span>
           {activeBinding.source_ref && <code>{activeBinding.source_ref}</code>}
           {activeBinding.evidence_id && <code>{activeBinding.evidence_id}</code>}
@@ -73,18 +118,56 @@ export function VisualizationGallery({ visualizations, activeBindingId, onSelect
   );
 }
 
+export function isRenderableVisualization(value: unknown): value is Visualization {
+  if (!isRecord(value) || value.schema_version !== '3') return false;
+  if (
+    typeof value.visualization_id !== 'string'
+    || typeof value.title !== 'string'
+    || !['primary', 'supporting'].includes(String(value.priority))
+    || !Array.isArray(value.datasets)
+    || !Array.isArray(value.layers)
+    || !Array.isArray(value.bindings)
+    || !isRecord(value.accessibility)
+    || typeof value.accessibility.description !== 'string'
+  ) return false;
+
+  const datasetsAreValid = value.datasets.every((dataset) => (
+    isRecord(dataset)
+    && typeof dataset.dataset_id === 'string'
+    && typeof dataset.source_ref === 'string'
+    && (dataset.series === undefined || Array.isArray(dataset.series))
+    && (dataset.rows === undefined || Array.isArray(dataset.rows))
+    && (dataset.columns === undefined || Array.isArray(dataset.columns))
+  ));
+  if (!datasetsAreValid) return false;
+
+  const datasetIds = new Set(value.datasets.map((dataset) => String(dataset.dataset_id)));
+  return value.layers.every((layer) => (
+    isRecord(layer)
+    && typeof layer.layer_id === 'string'
+    && typeof layer.mark === 'string'
+    && typeof layer.role === 'string'
+    && typeof layer.dataset_id === 'string'
+    && datasetIds.has(layer.dataset_id)
+    && (layer.points === undefined || Array.isArray(layer.points))
+  ));
+}
+
 function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: {
   visualization: Visualization;
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
 }) {
-  const isMetric = visualization.template_id === 'metric.single';
-  const isTable = visualization.template_id === 'table.detail';
-  const metric = visualization.dataset.metric;
+  const { t } = useI18n();
+  const marks = (visualization.layers || []).map((layer) => layer.mark);
+  const isMetric = marks.length === 1 && marks[0] === 'text';
+  const isTable = marks.length > 0 && marks.every((mark) => mark === 'table');
+  const metric = visualization.datasets.find((dataset) => dataset.metric)?.metric;
   const metricDisplay = metric ? normalizeMetricDisplay(metric) : null;
-  const rows = visualization.dataset.rows || [];
-  const columns = visualization.dataset.columns?.length
-    ? visualization.dataset.columns
+  const rows = visualization.datasets.flatMap((dataset) => dataset.rows || []);
+  const configuredColumns = visualization.datasets.flatMap((dataset) => dataset.columns || []);
+  const columns = configuredColumns.length
+    ? Array.from(new Set(configuredColumns))
     : Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
   return (
     <article className={`answer-visualization-card is-${visualization.priority}`}>
@@ -93,19 +176,19 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
           <strong>{visualization.title}</strong>
           {visualization.summary && <p>{visualization.summary}</p>}
         </div>
-        <span>{formatTemplateLabel(visualization.template_id)}</span>
+        <span>{Array.from(new Set(marks)).map(formatMarkLabel).join(' · ')}</span>
       </div>
       {isMetric && metricDisplay ? (
-        <div className="answer-fact-metric" role="group" aria-label={visualization.title}>
+        <div className="answer-insight-metric" role="group" aria-label={visualization.title}>
           {metricDisplay.value !== undefined && (
-            <div className="answer-fact-metric-value">
+            <div className="answer-insight-metric-value">
               <strong>{formatCell(metricDisplay.value)}</strong>
               {metricDisplay.unit ? <span>{formatCell(metricDisplay.unit)}</span> : null}
             </div>
           )}
           {metricDisplay.label ? <small>{formatCell(metricDisplay.label)}</small> : null}
           {metricDisplay.context.length > 0 && (
-            <dl className="answer-fact-metric-context">
+            <dl className="answer-insight-metric-context">
               {metricDisplay.context.map(([key, value]) => (
                 <div key={key}>
                   <dt>{formatFieldLabel(key)}</dt>
@@ -126,7 +209,7 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
       )}
       {!isTable && (visualization.accessibility.table_rows?.length || 0) > 0 && (
         <details className="visualization-data-details">
-          <summary>View chart data</summary>
+          <summary>{t('View chart data')}</summary>
           <AccessibleTable
             visualization={visualization}
             rows={visualization.accessibility.table_rows || []}
@@ -207,7 +290,7 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
     <div
       ref={hostRef}
       className={`answer-echart${visualization.layout === 'facets' ? ' is-faceted' : ''}`}
-      style={{ height: visualization.layout === 'facets' ? Math.max(360, (visualization.dataset.series?.length || 1) * 190 + 28) : 340 }}
+      style={{ height: visualization.layout === 'facets' ? Math.max(360, Math.max(1, (visualization.layers || []).filter((layer) => layer.mark !== 'table').length) * 190 + 28) : 340 }}
       role="img"
       aria-label={visualization.accessibility.description || visualization.title}
     />
@@ -215,60 +298,40 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
 }
 
 export function buildVisualizationOption(visualization: Visualization, activeBindingId: string | null = null): EChartsOption {
-  const template = visualization.template_id;
-  const sourceSeries = visualization.dataset.series || [];
-  const isRanking = template === 'ranking.topk';
-  const isCategory = ['ranking.topk', 'category.comparison', 'distribution.histogram', 'distribution.boxplot'].includes(template);
-  const isScatter = template === 'relationship.scatter';
-  const faceted = visualization.layout === 'facets' && sourceSeries.length > 1;
+  const layers = (visualization.layers || []).filter((layer) => layer.mark !== 'table');
+  const datasets = new Map(visualization.datasets.map((dataset) => [dataset.dataset_id, dataset]));
+  const faceted = visualization.layout === 'facets' && layers.length > 1;
   const grids = faceted
-    ? sourceSeries.map((_, index) => ({ left: 66, right: 24, top: 34 + index * 190, height: 130 }))
+    ? layers.map((_, index) => ({ left: 66, right: 24, top: 34 + index * 190, height: 130 }))
     : [{ left: 62, right: 24, top: 36, bottom: 52, containLabel: false }];
-  const xAxis = sourceSeries.map((_series, index) => ({
-    type: isRanking ? 'value' : (isCategory ? 'category' : (isScatter ? 'value' : 'time')),
+  const xAxis = layers.map((layer, index) => ({
+    type: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type),
     gridIndex: faceted ? index : 0,
-    axisLabel: { hideOverlap: true, color: '#667085', formatter: isCategory ? undefined : formatAxisTime },
+    axisLabel: { hideOverlap: true, color: '#667085', formatter: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type) === 'time' ? formatAxisTime : undefined },
     axisLine: { lineStyle: { color: '#d0d5dd' } },
     splitLine: { show: false },
-    data: isCategory && !isRanking ? (sourceSeries[index]?.points || []).map((point) => String(point.x ?? '')) : undefined,
   }));
-  const yAxis = sourceSeries.map((series, index) => ({
-    type: isRanking ? 'category' : 'value',
+  const yAxis = layers.map((layer, index) => ({
+    type: 'value',
     gridIndex: faceted ? index : 0,
-    name: faceted ? series.name : undefined,
+    name: faceted ? layer.label || formatRoleLabel(layer.role) : undefined,
     nameTextStyle: { color: '#667085', align: 'left' },
     scale: true,
     axisLabel: { color: '#667085', formatter: formatAxisNumber },
     splitLine: { lineStyle: { color: '#eef1f4' } },
-    data: isRanking ? (sourceSeries[index]?.points || []).map((point) => String(point.x ?? '')) : undefined,
   }));
   const seriesOptions: any[] = [];
-  sourceSeries.forEach((series, index) => {
-    seriesOptions.push(buildSeriesOption(visualization, series, index, faceted, activeBindingId));
-    if (template === 'timeseries.forecast' && series.role === 'forecast') {
-      seriesOptions.push(...confidenceBandSeries(series, index, faceted));
+  layers.forEach((layer, index) => {
+    const dataset = datasets.get(layer.dataset_id);
+    const points = dataset?.series?.[0]?.points || layer.points || [];
+    if (layer.mark === 'rule') return;
+    if (layer.mark === 'band') {
+      seriesOptions.push(...confidenceBandSeries({ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points }, index, faceted));
+      return;
     }
+    seriesOptions.push(buildLayerSeriesOption(layer, points, index, faceted, activeBindingId));
   });
-  const semanticLayers = visualization.layers || [];
-  const factPoints = semanticLayers.flatMap((layer) => (
-    ['fact', 'anomaly'].includes(layer.role) && layer.kind === 'point' && !layer.series_id ? layer.points || [] : []
-  ));
-  if (factPoints.length > 0) {
-    seriesOptions.push({
-      name: semanticLayers.find((layer) => ['fact', 'anomaly'].includes(layer.role))?.label || 'Highlight',
-      type: 'scatter',
-      xAxisIndex: 0,
-      yAxisIndex: 0,
-      symbolSize: (value: unknown, params: { data?: unknown }) => (
-        isRecord(params.data) && params.data.bindingId === activeBindingId ? 14 : 10
-      ),
-      itemStyle: { color: '#dc6803', borderColor: '#fff', borderWidth: 2 },
-      label: { show: true, position: 'top', color: '#7a2e0e', formatter: (params: { data?: unknown }) => isRecord(params.data) ? String(params.data.semanticLabel || '') : '' },
-      data: factPoints.filter((point) => point.x !== null && point.x !== undefined).map(toEChartsPoint),
-      z: 10,
-    });
-  }
-  const rulePoints = semanticLayers.flatMap((layer) => layer.kind === 'rule' ? layer.points || [] : []);
+  const rulePoints = layers.flatMap((layer) => layer.mark === 'rule' ? layer.points || [] : []);
   if (rulePoints.length > 0 && seriesOptions.length > 0) {
     const first = seriesOptions[0] as Record<string, unknown>;
     first.markLine = {
@@ -278,7 +341,7 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
       data: rulePoints.map((point) => ({ name: point.label || '', xAxis: point.x, yAxis: point.x == null ? point.y : undefined })),
     };
   }
-  const intervalPoints = semanticLayers.flatMap((layer) => layer.kind === 'area' ? layer.points || [] : []);
+  const intervalPoints = layers.flatMap((layer) => layer.mark === 'rect' ? layer.points || [] : []);
   if (intervalPoints.length >= 2 && seriesOptions.length > 0) {
     const first = seriesOptions[0] as Record<string, unknown>;
     first.markArea = {
@@ -293,11 +356,11 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     aria: { enabled: true, decal: { show: true }, description: visualization.accessibility.description },
     color: ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'],
     grid: grids,
-    tooltip: { trigger: isScatter ? 'item' : 'axis', confine: true, valueFormatter: formatAxisNumber },
+    tooltip: { trigger: layers.some((layer) => layer.mark === 'point') ? 'item' : 'axis', confine: true, valueFormatter: formatAxisNumber },
     legend: { type: 'scroll', top: 2, textStyle: { color: '#475467' } },
     xAxis: faceted ? xAxis : xAxis.slice(0, 1),
     yAxis: faceted ? yAxis : yAxis.slice(0, 1),
-    dataZoom: sourceSeries.some((series) => (series.points?.length || 0) > 80)
+    dataZoom: layers.some((layer) => (datasets.get(layer.dataset_id)?.series?.[0]?.points?.length || 0) > 80)
       ? [{ type: 'inside', filterMode: 'none' }, { type: 'slider', height: 18, bottom: 4 }]
       : [],
     series: seriesOptions,
@@ -305,18 +368,17 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
   return option as EChartsOption;
 }
 
-function buildSeriesOption(
-  visualization: Visualization,
-  series: VisualizationSeries,
+function buildLayerSeriesOption(
+  layer: NonNullable<Visualization['layers']>[number],
+  points: VisualizationPoint[],
   index: number,
   faceted: boolean,
   activeBindingId: string | null,
 ): any {
-  const template = visualization.template_id;
-  const points = series.points || [];
-  if (template === 'distribution.boxplot') {
+  const name = layer.label || formatRoleLabel(layer.role);
+  if (layer.mark === 'boxplot') {
     return {
-      name: series.name,
+      name,
       type: 'boxplot',
       xAxisIndex: faceted ? index : 0,
       yAxisIndex: faceted ? index : 0,
@@ -329,36 +391,36 @@ function buildSeriesOption(
       ]),
     };
   }
-  if (['ranking.topk', 'category.comparison', 'distribution.histogram'].includes(template)) {
+  if (layer.mark === 'bar') {
     return {
-      name: series.name,
+      name,
       type: 'bar',
       xAxisIndex: faceted ? index : 0,
       yAxisIndex: faceted ? index : 0,
       barMaxWidth: 34,
       itemStyle: { borderRadius: [5, 5, 0, 0] },
       emphasis: { focus: 'series' },
-      data: points.map((point) => ({
-        value: template === 'ranking.topk' ? [point.y, String(point.x ?? '')] : point.y,
-        name: String(point.x ?? ''),
-        bindingId: point.binding_id,
-        semanticLabel: point.label,
-      })),
-    };
-  }
-  if (template === 'relationship.scatter') {
-    return {
-      name: series.name,
-      type: 'scatter',
-      xAxisIndex: faceted ? index : 0,
-      yAxisIndex: faceted ? index : 0,
-      symbolSize: 8,
-      large: points.length > 1200,
       data: points.map(toEChartsPoint),
     };
   }
+  if (['point', 'text'].includes(layer.mark)) {
+    const style = semanticLayerStyle(layer.role);
+    return {
+      name,
+      type: 'scatter',
+      xAxisIndex: faceted ? index : 0,
+      yAxisIndex: faceted ? index : 0,
+      symbol: style.symbol,
+      symbolSize: (value: unknown, params: { data?: unknown }) => isRecord(params.data) && params.data.bindingId === activeBindingId ? 15 : style.size,
+      itemStyle: { color: style.color, borderColor: '#fff', borderWidth: 2 },
+      label: { show: true, position: 'top', color: style.labelColor, formatter: (params: { data?: unknown }) => isRecord(params.data) ? String(params.data.semanticLabel || '') : '' },
+      large: points.length > 1200,
+      data: points.map(toEChartsPoint),
+      z: 10,
+    };
+  }
   return {
-    name: series.name,
+    name,
     type: 'line',
     xAxisIndex: faceted ? index : 0,
     yAxisIndex: faceted ? index : 0,
@@ -368,10 +430,11 @@ function buildSeriesOption(
     ),
     smooth: false,
     connectNulls: false,
-    lineStyle: series.role === 'forecast' ? { type: 'dashed', width: 2.5 } : { width: 2 },
+    lineStyle: layer.role.includes('forecast') ? { type: 'dashed', width: 2.5 } : { width: 2 },
+    areaStyle: layer.mark === 'area' ? { opacity: 0.16 } : undefined,
     data: points.map(toEChartsPoint),
     emphasis: { focus: 'series' },
-    z: series.role === 'forecast' ? 5 : 3,
+    z: layer.role.includes('forecast') ? 5 : 3,
   };
 }
 
@@ -475,8 +538,32 @@ function formatAxisNumber(value: unknown): string {
   }).format(numeric);
 }
 
-function formatTemplateLabel(templateId: string) {
-  return templateId.split('.').map((part) => part[0]?.toUpperCase() + part.slice(1)).join(' · ');
+function formatMarkLabel(mark: string) {
+  return mark[0]?.toUpperCase() + mark.slice(1);
+}
+
+function formatRoleLabel(role: string) {
+  return role.replace(/[._-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function axisType(dataType?: string): 'time' | 'value' | 'category' {
+  if (dataType === 'time') return 'time';
+  if (dataType === 'number') return 'value';
+  return 'category';
+}
+
+function semanticLayerStyle(role: string) {
+  const normalized = role.toLowerCase();
+  if (normalized.includes('buy') || normalized.includes('start')) {
+    return { color: '#087f5b', labelColor: '#05603f', symbol: 'triangle', size: 13 };
+  }
+  if (normalized.includes('sell') || normalized.includes('end')) {
+    return { color: '#b42318', labelColor: '#7a271a', symbol: 'diamond', size: 13 };
+  }
+  if (normalized.includes('anomaly') || normalized.includes('excluded') || normalized.includes('outlier')) {
+    return { color: '#dc6803', labelColor: '#7a2e0e', symbol: 'circle', size: 9 };
+  }
+  return { color: '#6941c6', labelColor: '#4a1fb8', symbol: 'circle', size: 10 };
 }
 
 function formatCell(value: unknown): string {

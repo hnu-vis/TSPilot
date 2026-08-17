@@ -1,5 +1,17 @@
 """Grounded presentation-source inventory and template materialization."""
 
-from core.visualization.materializer import PresentationCatalog, VisualizationMaterializer
+from core.visualization.materializer import (
+    InvalidPresentationLineageError,
+    PresentationCatalog,
+    VisualizationMaterializer,
+    VisualizationSemanticValidator,
+)
+from core.visualization.artifact_store import VisualizationArtifactStore
 
-__all__ = ["PresentationCatalog", "VisualizationMaterializer"]
+__all__ = [
+    "InvalidPresentationLineageError",
+    "PresentationCatalog",
+    "VisualizationMaterializer",
+    "VisualizationSemanticValidator",
+    "VisualizationArtifactStore",
+]

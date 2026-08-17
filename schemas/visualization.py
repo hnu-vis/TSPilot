@@ -6,21 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-VisualizationTemplateId = Literal[
-    "metric.single",
-    "table.detail",
-    "ranking.topk",
-    "timeseries.trend",
-    "timeseries.highlight",
-    "interval.highlight",
-    "timeseries.forecast",
-    "timeseries.anomaly",
-    "category.comparison",
-    "timeseries.comparison",
-    "distribution.histogram",
-    "distribution.boxplot",
-    "relationship.scatter",
-]
+VisualizationMark = Literal["line", "point", "bar", "area", "band", "rule", "rect", "text", "boxplot", "table"]
 
 
 class VisualizationBinding(BaseModel):
@@ -28,7 +14,7 @@ class VisualizationBinding(BaseModel):
 
     binding_id: str
     source_type: str
-    fact_id: str | None = None
+    insight_id: str | None = None
     item_id: str | None = None
     related_item_ids: list[str] = Field(default_factory=list)
     evidence_id: str | None = None
@@ -56,19 +42,17 @@ class VisualizationPoint(BaseModel):
 class VisualizationSeries(BaseModel):
     series_id: str
     name: str
-    role: Literal[
-        "historical",
-        "forecast",
-        "comparison",
-        "ranking",
-        "distribution",
-        "relationship",
-    ]
+    role: str
     unit: str | None = None
     points: list[VisualizationPoint] = Field(default_factory=list)
 
 
 class VisualizationDataset(BaseModel):
+    dataset_id: str
+    source_ref: str
+    data_ref: str | None = None
+    row_count: int | None = None
+    time_range: dict | None = None
     dimensions: list[VisualizationDimension] = Field(default_factory=list)
     series: list[VisualizationSeries] = Field(default_factory=list)
     rows: list[dict] = Field(default_factory=list)
@@ -77,8 +61,12 @@ class VisualizationDataset(BaseModel):
 
 
 class VisualizationLayer(BaseModel):
-    kind: Literal["line", "bar", "point", "rule", "area", "band", "boxplot", "scatter"]
-    role: Literal["context", "fact", "forecast", "anomaly", "comparison", "confidence"]
+    layer_id: str
+    mark: VisualizationMark
+    role: str
+    source_ref: str
+    encoding: dict[str, str] = Field(default_factory=dict)
+    dataset_id: str
     series_id: str | None = None
     points: list[VisualizationPoint] = Field(default_factory=list)
     label: str | None = None
@@ -91,18 +79,18 @@ class VisualizationAccessibility(BaseModel):
 
 
 class VisualizationPayload(BaseModel):
-    """Public V2 payload; it contains semantics and data, never renderer code."""
+    """Public V3 payload; it contains grounded layers, never renderer code."""
 
-    schema_version: Literal["2"] = "2"
+    schema_version: Literal["3"] = "3"
     visualization_id: str
-    template_id: VisualizationTemplateId
+    data_ref: str | None = None
     purpose: str
     priority: Literal["primary", "supporting"] = "primary"
     title: str
     summary: str | None = None
     source_refs: list[str] = Field(default_factory=list)
-    fact_refs: list[str] = Field(default_factory=list)
-    dataset: VisualizationDataset = Field(default_factory=VisualizationDataset)
+    required_roles: list[str] = Field(default_factory=list)
+    datasets: list[VisualizationDataset] = Field(default_factory=list)
     layers: list[VisualizationLayer] = Field(default_factory=list)
     bindings: list[VisualizationBinding] = Field(default_factory=list)
     layout: Literal["overlay", "facets"] = "overlay"
@@ -111,17 +99,16 @@ class VisualizationPayload(BaseModel):
     @model_validator(mode="after")
     def validate_renderable_content(self):
         has_content = bool(
-            self.dataset.series
-            or self.dataset.rows
-            or self.dataset.metric
+            any(dataset.series or dataset.rows or dataset.metric for dataset in self.datasets)
             or any(layer.points for layer in self.layers)
         )
-        if not has_content:
+        if not has_content and not self.data_ref:
             raise ValueError("visualization payload must contain renderable data")
         binding_ids = {binding.binding_id for binding in self.bindings}
         referenced_ids = {
             point.binding_id
-            for series in self.dataset.series
+            for dataset in self.datasets
+            for series in dataset.series
             for point in series.points
             if point.binding_id
         }
@@ -134,4 +121,8 @@ class VisualizationPayload(BaseModel):
         unknown = referenced_ids - binding_ids
         if unknown:
             raise ValueError(f"visualization points reference unknown bindings: {sorted(unknown)}")
+        dataset_ids = {dataset.dataset_id for dataset in self.datasets}
+        missing_datasets = {layer.dataset_id for layer in self.layers} - dataset_ids
+        if missing_datasets:
+            raise ValueError(f"visualization layers reference unknown datasets: {sorted(missing_datasets)}")
         return self
