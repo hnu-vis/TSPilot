@@ -6,7 +6,7 @@ from typing import Any
 from core.harness import default_capability_registry
 
 
-CAPABILITY_ORDER = ("query", "analysis", "forecast", "anomaly", "external_knowledge", "skill")
+CAPABILITY_ORDER = ("query", "analysis", "forecast", "anomaly", "visualization", "external_knowledge", "skill")
 
 
 def build_intent_profile_fallback(message: str) -> dict[str, Any]:

@@ -87,6 +87,17 @@ class ActionSpaceBuilder:
             required.append(repair_action)
             missing.append("validation_repair")
 
+        if not required and frame.shape_recovery_request:
+            recovery = frame.shape_recovery_request
+            required.append(
+                RequiredAction(
+                    action="sql_query",
+                    reason="The latest SQL evidence does not satisfy its structured query contract.",
+                    input_guidance=recovery,
+                )
+            )
+            missing.append("query_evidence_recovery")
+
         for capability_id, artifact_attr, missing_name in (
             ("anomaly", "has_anomaly", "anomaly"),
             ("forecast", "has_forecast", "forecast"),
@@ -140,20 +151,6 @@ class ActionSpaceBuilder:
                 )
             )
             missing.append("visualization")
-
-        if not required and frame.shape_recovery_request:
-            recovery = frame.shape_recovery_request
-            action = "sql_query"
-            if has_evidence and recovery.get("recommended_downstream_action") == "code_interpreter":
-                action = "code_interpreter"
-            required.append(
-                RequiredAction(
-                    action=action,
-                    reason="The previous sql_query failed dialect/query-task shape validation.",
-                    input_guidance=recovery,
-                )
-            )
-            missing.append("query_shape_recovery")
 
         if not required:
             gap_action = self._action_for_completion_gap(frame, has_evidence=has_evidence)

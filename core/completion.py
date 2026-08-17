@@ -158,6 +158,11 @@ def _missing_required_tool_outputs(request_state: RequestStateModel) -> list[str
         and not _key_insights_cover_required_analysis(request_state)
     ):
         missing.append("analysis")
+    if (
+        _requires_specialized_capability(request_state, requirements, "visualization")
+        and not _visual_verification_is_current(request_state)
+    ):
+        missing.append("visualization")
     return missing
 
 
@@ -196,8 +201,33 @@ def _requires_specialized_capability(
         return _contract_requires_outlier_treatment(request_state)
     return any(
         output.required
-        and capability in _contract_output_specialized_capabilities(output)
+        and capability in _contract_output_semantic_capabilities(output)
         for output in contract.required_outputs
+    )
+
+
+def _visual_verification_is_current(request_state: RequestStateModel) -> bool:
+    if not request_state.visualizations:
+        return False
+    visualization_iteration = _latest_successful_output_iteration(request_state, "visualization")
+    source_iteration = max(
+        (
+            _latest_successful_output_iteration(request_state, action)
+            for action in ("sql_query", "anomaly", "forecast", "code_interpreter")
+        ),
+        default=-1,
+    )
+    return visualization_iteration >= source_iteration
+
+
+def _latest_successful_output_iteration(request_state: RequestStateModel, action: str) -> int:
+    return max(
+        (
+            int((output.meta or {}).get("iteration") or -1)
+            for output in request_state.action_outputs
+            if output.tool_name == action and output.success
+        ),
+        default=-1,
     )
 
 
@@ -493,7 +523,7 @@ def _contract_output_is_covered_by_state(request_state: RequestStateModel, outpu
     # database row or derived scalar cannot satisfy a requested chart merely
     # because it has the same measure or time-series semantics.
     if "visualization" in capabilities:
-        return bool(request_state.visualizations)
+        return _visual_verification_is_current(request_state)
     if "forecast" in capabilities:
         return _latest_forecast_is_usable(request_state)
     if "anomaly" in capabilities:
@@ -602,6 +632,8 @@ def _next_action_for_missing_required(missing: list[str]) -> str:
         return "Call forecast with the latest time-series evidence before answering."
     if "anomaly" in missing:
         return "Call anomaly with the latest time-series evidence before answering."
+    if "visualization" in missing:
+        return "Call visualization to create a current visual verification artifact before answering."
     return "Call the missing specialized analysis tool before answering."
 
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from core.completion import apply_previous_observation_assessment, normalize_todo_for_completion
+from core.completion import apply_previous_observation_assessment, evaluate_goal_completion, normalize_todo_for_completion
 from runtime.react_loop import ReActLoop
 from runtime.action_policy import runtime_action_constraints, validate_action
 from runtime.output_selection import select_outputs_for_action
 from runtime.request_state import apply_observation, apply_observation_async, enrich_observation_payload
 from schemas.agent_turn import PreviousObservationAssessment, ReActTurn
+from schemas.action_output import ActionOutput
 from schemas.database import DatabaseEvidence
 from schemas.state import ConversationStateModel
 from schemas.database_context import DatabaseContext
@@ -218,6 +221,107 @@ def test_downstream_analysis_constraints_follow_active_analysis_todo_only():
     guidance = required["input_guidance"]
     assert guidance["analysis_request"]["required_outputs"] == ["分析趋势"]
     assert guidance["analysis_request"]["missing"] == ["分析趋势"]
+
+
+def test_completed_anomaly_does_not_suppress_declared_downstream_analysis():
+    request_state = RequestStateModel(
+        request_id="req-anomaly-before-analysis",
+        message="排除异常后计算最优交易",
+        status="running",
+        requested_capabilities=["query", "anomaly", "analysis"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm", "goal": "排除异常后计算最优交易",
+            "required_outputs": [{
+                "id": "optimal_trade", "description": "排除异常后的最优单次交易",
+                "output_type": "analysis", "evidence_kind": "analysis",
+            }],
+        }),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_market", result_type="timeseries", database="demo",
+            summary="Loaded rows.", data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+            diagnostics={"task_coverage": {
+                "missing": ["最优交易"],
+                "query_task_contract": {
+                    "downstream_action": "code_interpreter",
+                    "preferred_evidence_shape": "raw_series",
+                },
+            }},
+        ),
+        latest_anomaly=AnomalyResult(
+            anomaly_id="ano_market", detector_name="test", status="succeeded",
+            summary="No anomalies.", anomaly_points=[], diagnostics={"resolved_evidence_id": "evi_market"},
+        ),
+    )
+
+    constraints = runtime_action_constraints(request_state)
+
+    assert constraints["required_actions"][0]["action"] == "code_interpreter"
+
+
+def test_successful_but_contract_incomplete_sql_is_repaired_before_anomaly():
+    evidence = DatabaseEvidence(
+        evidence_id="evi_limited", result_type="timeseries", database="demo",
+        query="SELECT timestamp, value FROM prices LIMIT 48", summary="Loaded 48 rows.",
+        data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+        diagnostics={"task_coverage": {
+            "runtime_requires_followup": True,
+            "runtime_missing": ["raw LIMIT truncates the analysis interval"],
+            "next_action_hint": "Query the complete raw interval without LIMIT.",
+        }},
+    )
+    request_state = RequestStateModel(
+        request_id="req-repair-before-anomaly", message="排除异常后计算最优交易", status="running",
+        requested_capabilities=["query", "anomaly", "analysis"],
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        observations=[ToolObservation(
+            tool_name="sql_query", success=True, summary="Loaded limited rows.",
+            payload={"evidence_id": evidence.evidence_id},
+        )],
+    )
+
+    constraints = runtime_action_constraints(request_state)
+
+    required = constraints["required_actions"][0]
+    assert required["action"] == "sql_query"
+    assert required["input_guidance"]["constraints"]["evidence_shape"] == "raw_timeseries"
+    assert "LIMIT" in required["input_guidance"]["message"]
+
+
+def test_visual_verification_must_be_newer_than_analytical_sources():
+    request_state = RequestStateModel(
+        request_id="req-current-visual-verification",
+        message="展示最高点",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "visualization"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm", "goal": "展示最高点",
+            "required_outputs": [{
+                "id": "visual_verification", "description": "完整区间上的最高点可视验证",
+                "output_type": "visualization", "evidence_kind": "visualization",
+            }],
+        }),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_market", result_type="timeseries", database="demo",
+            summary="Loaded rows.", data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+        ),
+    )
+    request_state.visualizations = [SimpleNamespace(visualization_id="viz_old", source_refs=["evidence:evi_market"])]
+    request_state.action_outputs = [
+        ActionOutput(tool_name="visualization", success=True, content="old", observations={}, meta={"iteration": 1}),
+        ActionOutput(tool_name="sql_query", success=True, content="new context", observations={}, meta={"iteration": 2}),
+    ]
+
+    stale = evaluate_goal_completion(request_state)
+    assert stale.can_answer is False
+    assert stale.missing_evidence == ["visualization"]
+
+    request_state.action_outputs.append(
+        ActionOutput(tool_name="visualization", success=True, content="current", observations={}, meta={"iteration": 3})
+    )
+    current = evaluate_goal_completion(request_state)
+    assert current.can_answer is True
 
 
 def test_output_selector_filters_task_contract_by_action_capability():

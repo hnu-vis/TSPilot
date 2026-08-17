@@ -505,14 +505,7 @@ def _explicitly_requests_todo_plan(message: str) -> bool:
 def runtime_action_constraints(request_state: RequestStateModel) -> dict:
     """Return runtime-owned next-action constraints derived from structured state."""
 
-    downstream_analysis = None
-    capabilities = _effective_capabilities(request_state)
-    specialized_covered = (
-        ("anomaly" in capabilities and request_state.latest_anomaly is not None)
-        or ("forecast" in capabilities and _latest_forecast_is_usable(request_state))
-    )
-    if not specialized_covered:
-        downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
+    downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
     frame = build_observation_frame(
         request_state,
         requires_initial_todo_plan=_requires_initial_todo_plan(request_state),
@@ -568,8 +561,23 @@ def _latest_forecast_is_usable(request_state: RequestStateModel) -> bool:
 
 def _latest_query_shape_recovery(request_state: RequestStateModel) -> dict | None:
     latest = request_state.observations[-1] if request_state.observations else None
-    if latest is None or latest.tool_name != "sql_query" or latest.success:
+    if latest is None or latest.tool_name != "sql_query":
         return None
+    if latest.success:
+        evidence = request_state.latest_database_evidence
+        diagnostics = evidence.diagnostics if evidence is not None and isinstance(evidence.diagnostics, dict) else {}
+        coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
+        if coverage.get("runtime_requires_followup") is not True:
+            return None
+        missing = [str(item).strip() for item in coverage.get("runtime_missing", []) if str(item).strip()]
+        hint = str(coverage.get("next_action_hint") or "").strip()
+        return {
+            "message": hint or "Repair the latest query so its evidence satisfies the declared analysis contract.",
+            "purpose": "Provide complete raw evidence required by downstream analytical tools.",
+            "constraints": {"evidence_shape": "raw_timeseries"},
+            "previous_query": evidence.query if evidence is not None else None,
+            "runtime_missing": missing,
+        }
     payload = latest.payload if isinstance(latest.payload, dict) else {}
     error_type = str(payload.get("error_type") or "").strip()
     if error_type != "query_shape_invalid":

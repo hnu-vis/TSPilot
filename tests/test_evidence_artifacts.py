@@ -8,7 +8,7 @@ import pytest
 
 from app.settings import get_settings
 from core.analysis.python_runner import AnalysisCodeError
-from runtime.request_state import build_request_state
+from runtime.request_state import _apply_evidence_payload, build_request_state
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsightRequest
@@ -153,3 +153,20 @@ result = {
         ), request_state=state,
     ))
     assert result["computed_insights"][0]["calculation_trace"]["source_ref"] == "anomaly:ano_evi_full"
+
+
+def test_new_evidence_augments_state_without_invalidating_derived_artifacts():
+    state = _state()
+    anomaly = AnomalyResult(
+        anomaly_id="ano_old", detector_name="test", status="succeeded", summary="old anomaly",
+        anomaly_points=[], diagnostics={"resolved_evidence_id": "evi_full"},
+    )
+    state.latest_anomaly = anomaly
+    state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
+    replacement = _evidence(80).model_copy(update={"evidence_id": "evi_repaired"})
+
+    _apply_evidence_payload(state, replacement.model_dump(mode="json"))
+
+    assert state.latest_database_evidence.evidence_id == "evi_repaired"
+    assert state.latest_anomaly == anomaly
+    assert state.anomaly_artifacts["ano_old"] == anomaly
