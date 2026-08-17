@@ -1,16 +1,17 @@
-import { Menu } from 'lucide-react';
+import { Languages, Menu } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatThread } from './components/ChatThread';
 import { Composer } from './components/Composer';
 import { DatabaseManager } from './components/DatabaseManager';
-import { FactMemoryManager } from './components/FactMemoryManager';
+import { InsightMemoryManager } from './components/InsightMemoryManager';
 import { HistorySidebar, type WorkspaceView } from './components/HistorySidebar';
 import { InspectorPanel } from './components/InspectorPanel';
+import { ModelManager } from './components/ModelManager';
 import {
   extractFinalAnswer,
   fetchDatabases,
   fetchKnowledge,
-  fetchModel,
+  fetchModelsConfig,
   streamChat,
 } from './services/api';
 import {
@@ -27,10 +28,12 @@ import {
   upsertTraceStep,
 } from './store/conversations';
 import type { Conversation, ResourceState, StreamEvent, TraceStep } from './types';
+import { useI18n } from './i18n';
 
 const now = () => new Date().toISOString();
 
 export default function App() {
+  const { locale, setLocale, t } = useI18n();
   const [conversations, setConversations] = useState<Conversation[]>(() => (
     sortConversations(dedupeEmptyNewConversations(loadConversations()))
   ));
@@ -41,7 +44,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<WorkspaceView>('chat');
   const [isInspectorCollapsed, setIsInspectorCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [resources, setResources] = useState<ResourceState>({ databases: [], knowledge: [], model: 'backend model' });
+  const [resources, setResources] = useState<ResourceState>({ databases: [], knowledge: [], model: 'backend model', models: [] });
   const [, setResourceError] = useState<string | null>(null);
   const activeAbortRef = useRef<AbortController | null>(null);
 
@@ -62,7 +65,8 @@ export default function App() {
     ),
   );
   const isDatabaseView = activeView === 'database';
-  const isFactMemoryView = activeView === 'fact-memory';
+  const isInsightMemoryView = activeView === 'insight-memory';
+  const isModelView = activeView === 'model';
   const isInspectorVisible = activeView === 'chat' && hasConversationContent;
 
   const chatHasConversationContent = Boolean(
@@ -80,11 +84,12 @@ export default function App() {
     localStorage.setItem('tspilot.history-collapsed', String(isHistoryCollapsed));
   }, [isHistoryCollapsed]);
 
-  const loadResources = () => Promise.all([fetchDatabases(), fetchKnowledge(), fetchModel()]);
+  const loadResources = () => Promise.all([fetchDatabases(), fetchKnowledge(), fetchModelsConfig()]);
 
   const refreshResources = async () => {
-    const [databases, knowledge, model] = await loadResources();
-    setResources({ databases, knowledge, model });
+    const [databases, knowledge, modelsConfig] = await loadResources();
+    const activeModel = modelsConfig.ai.llm.models.find((item) => item.is_active) || modelsConfig.ai.llm.models[0];
+    setResources({ databases, knowledge, model: activeModel?.model || 'backend model', models: modelsConfig.ai.llm.models });
     setResourceError(null);
     return databases;
   };
@@ -92,19 +97,31 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     loadResources()
-      .then(([databases, knowledge, model]) => {
+      .then(([databases, knowledge, modelsConfig]) => {
         if (!cancelled) {
-          setResources({ databases, knowledge, model });
+          const activeModel = modelsConfig.ai.llm.models.find((item) => item.is_active) || modelsConfig.ai.llm.models[0];
+          setResources({ databases, knowledge, model: activeModel?.model || 'backend model', models: modelsConfig.ai.llm.models });
           setResourceError(null);
         }
       })
       .catch((error) => {
-        if (!cancelled) setResourceError(error instanceof Error ? error.message : 'Unable to load resources.');
+        if (!cancelled) setResourceError(error instanceof Error ? error.message : t('Unable to load resources.'));
       });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (activeView !== 'chat') return;
+    let cancelled = false;
+    fetchModelsConfig().then((modelsConfig) => {
+      if (cancelled) return;
+      const activeModel = modelsConfig.ai.llm.models.find((item) => item.is_active) || modelsConfig.ai.llm.models[0];
+      setResources((current) => ({ ...current, model: activeModel?.model || 'backend model', models: modelsConfig.ai.llm.models }));
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [activeView]);
 
   const sortedConversations = useMemo(() => sortConversations(conversations), [conversations]);
 
@@ -153,7 +170,7 @@ export default function App() {
     }));
   };
 
-  const handleResourceChange = (field: 'selectedDatabaseId' | 'selectedKnowledgeId', value: string | null) => {
+  const handleResourceChange = (field: 'selectedDatabaseId' | 'selectedKnowledgeId' | 'selectedModelId', value: string | null) => {
     if (!activeConversation) return;
     updateConversation(activeConversation.id, (conversation) => ({
       ...conversation,
@@ -183,6 +200,7 @@ export default function App() {
           conversationId,
           database: selectedDatabase,
           history: buildBackendHistory(withUserMessage),
+          modelId: withUserMessage.selectedModelId || resources.models.find((item) => item.is_active)?.id || null,
         },
         (event) => handleStreamEvent(conversationId, event),
         abortController.signal,
@@ -190,14 +208,14 @@ export default function App() {
     } catch (error) {
       if (isAbortError(error)) {
         updateConversation(conversationId, (conversation) => appendAssistantError(
-          markLatestRunningStepErrored(conversation, 'Stopped by user.'),
-          '已停止。',
+          markLatestRunningStepErrored(conversation, t('Stopped by user.')),
+          t('Stopped by user.'),
         ));
         return;
       }
       updateConversation(conversationId, (conversation) => appendAssistantError(
         conversation,
-        error instanceof Error ? error.message : 'The chat request failed.',
+        error instanceof Error ? error.message : t('The chat request failed.'),
       ));
     } finally {
       if (activeAbortRef.current === abortController) {
@@ -267,7 +285,7 @@ export default function App() {
         agent: 'data_agent',
         phase: 'tool_call',
         status: 'running',
-        summary: action || 'Processing step.',
+        summary: action || t('Processing step.'),
         tool: action || undefined,
         thought: stringFrom(event.data.thought, ''),
         actionInput: asRecord(event.data.action_input) || undefined,
@@ -292,7 +310,7 @@ export default function App() {
         agent: 'data_agent',
         phase: 'tool_result',
         status: success ? 'complete' : 'error',
-        summary: observation ? stringFrom(observation.summary, success ? 'Step completed.' : 'Step failed.') : success ? 'Step completed.' : 'Step failed.',
+        summary: observation ? stringFrom(observation.summary, t(success ? 'Step completed.' : 'Step failed.')) : t(success ? 'Step completed.' : 'Step failed.'),
         tool: observation ? stringFrom(observation.tool_name, '') || stringFrom(observation.tool, '') : undefined,
         observation: observation || undefined,
         startedAt: stringFrom(event.data.started_at) || undefined,
@@ -314,7 +332,7 @@ export default function App() {
         agent: stringFrom(event.data.agent, 'data_agent'),
         phase: stringFrom(event.data.phase, 'reasoning'),
         status: statusFrom(event.data.status, 'running'),
-        summary: stringFrom(event.data.message, 'Thinking about the next action.'),
+        summary: stringFrom(event.data.message, t('Thinking about the next action.')),
         thought: stringFrom(event.data.thought, ''),
         startedAt: stringFrom(event.data.started_at) || undefined,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
@@ -334,7 +352,7 @@ export default function App() {
         agent: stringFrom(event.data.agent, 'data_agent'),
         phase: stringFrom(event.data.phase, 'intent'),
         status: statusFrom(event.data.status, 'running'),
-        summary: stringFrom(event.data.message, 'Processing request.'),
+        summary: stringFrom(event.data.message, t('Processing request.')),
         tool: stringFrom(event.data.tool, '') || undefined,
         startedAt: stringFrom(event.data.started_at) || timestamp,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
@@ -354,7 +372,7 @@ export default function App() {
         agent: 'data_agent',
         phase: 'tool_call',
         status: 'running',
-        summary: stringFrom(event.data.summary, 'Calling tool.'),
+        summary: stringFrom(event.data.summary, t('Calling tool.')),
         tool: stringFrom(event.data.tool, 'tool'),
         thought: stringFrom(event.data.thought, ''),
         toolCall: event.data,
@@ -378,7 +396,7 @@ export default function App() {
         agent: 'data_agent',
         phase: 'tool_result',
         status: success ? 'complete' : 'error',
-        summary: stringFrom(event.data.summary, success ? 'Tool completed.' : 'Tool failed.'),
+        summary: stringFrom(event.data.summary, t(success ? 'Tool completed.' : 'Tool failed.')),
         tool: stringFrom(event.data.tool, 'tool'),
         toolResult: event.data,
         observation: asRecord(event.data.observation) || event.data,
@@ -404,12 +422,12 @@ export default function App() {
         agent: 'runtime',
         phase: 'intent',
         status: 'complete',
-        summary: total > 0 ? `Todo progress ${completed}/${total}` : 'Todo progress updated.',
+        summary: total > 0 ? `${t('Todo list')} ${completed}/${total}` : t('Todo progress updated.'),
         tool: 'todowrite',
         toolResult: {
           tool: 'todowrite',
           success: true,
-          summary: 'Todo progress updated.',
+          summary: t('Todo progress updated.'),
           payload_preview: event.data,
         },
         completedAt: timestamp,
@@ -428,8 +446,8 @@ export default function App() {
       const id = `${event.event}-${iteration || Date.now()}`;
       const timestamp = now();
       const message = stringFrom(event.data.message, event.event === 'agent_decision_timeout'
-        ? 'Agent decision timed out.'
-        : 'Request deadline exceeded.');
+        ? t('Agent decision timed out.')
+        : t('Request deadline exceeded.'));
       const step: TraceStep = {
         id,
         iteration,
@@ -464,7 +482,7 @@ export default function App() {
     }
 
     if (event.event === 'error') {
-      const message = stringFrom(event.data.message, 'The backend returned an error.');
+      const message = stringFrom(event.data.message, t('The backend returned an error.'));
       updateConversation(conversationId, (conversation) => appendAssistantError(
         markLatestRunningStepErrored(conversation, message),
         message,
@@ -500,26 +518,38 @@ export default function App() {
         onDelete={handleDeleteConversation}
       />
 
-      <main className={`workspace ${chatHasConversationContent ? '' : 'empty-workspace'} ${isDatabaseView || isFactMemoryView ? 'database-workspace' : ''}`}>
-        <header className="topbar">
+      <main className={`workspace ${chatHasConversationContent ? '' : 'empty-workspace'} ${isDatabaseView || isInsightMemoryView || isModelView ? 'database-workspace' : ''}`}>
+        <header className={`topbar ${activeView === 'chat' ? 'chat-topbar' : ''}`}>
           <button
             type="button"
             className="mobile-history-button"
-            aria-label="Open chat history"
+            aria-label={t('Open chat history')}
             onClick={() => setIsHistoryOpen((open) => !open)}
           >
             <Menu size={17} />
           </button>
           <div className="topbar-title">
-            <h1>{isDatabaseView ? 'Database' : isFactMemoryView ? 'Fact Memory' : activeConversation.title}</h1>
-            <p>
-              {isDatabaseView
-                ? 'Manage available data sources and inspect schema before analysis.'
-                : isFactMemoryView
-                  ? 'Manage reusable fact definitions, recipes, and verification guidance.'
-                  : 'Ask, inspect the agent process, and continue from previous context.'}
-            </p>
+            <h1>{isDatabaseView ? t('Database') : isInsightMemoryView ? t('Key Insight Memory') : isModelView ? t('Model') : displayConversationTitle(activeConversation.title, t)}</h1>
+            {activeView !== 'chat' && (
+              <p>
+                {isDatabaseView
+                  ? t('Manage available data sources and inspect schema before analysis.')
+                  : isInsightMemoryView
+                    ? t('Manage reusable Key Insight definitions, playbooks, and verification guidance.')
+                    : t('Configure model endpoints and select the engines used for time-series intelligence.')}
+              </p>
+            )}
           </div>
+          <button
+            type="button"
+            className="topbar-language-button"
+            aria-label={t(locale === 'zh-CN' ? 'Switch interface to English' : 'Switch interface to Chinese')}
+            title={t('Interface language')}
+            onClick={() => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN')}
+          >
+            <Languages size={16} aria-hidden="true" />
+            <span>{locale === 'zh-CN' ? '中文' : 'EN'}</span>
+          </button>
         </header>
 
         {isDatabaseView ? (
@@ -529,11 +559,13 @@ export default function App() {
             onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
             onDatabasesChange={refreshResources}
           />
-        ) : isFactMemoryView ? (
-          <FactMemoryManager
+        ) : isInsightMemoryView ? (
+          <InsightMemoryManager
             databases={resources.databases}
             selectedDatabaseId={activeConversation.selectedDatabaseId}
           />
+        ) : isModelView ? (
+          <ModelManager />
         ) : (
           <section className={`thread-area ${hasConversationContent ? '' : 'empty-thread-area'}`}>
             <ChatThread
@@ -552,8 +584,11 @@ export default function App() {
                   selectedDatabaseId={activeConversation.selectedDatabaseId}
                   selectedKnowledgeId={activeConversation.selectedKnowledgeId}
                   model={resources.model}
+                  models={resources.models}
+                  selectedModelId={activeConversation.selectedModelId}
                   onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
                   onSelectKnowledge={(id) => handleResourceChange('selectedKnowledgeId', id)}
+                  onSelectModel={(id) => handleResourceChange('selectedModelId', id)}
                   onSubmit={handleSend}
                   onStop={handleStop}
                 />
@@ -571,8 +606,11 @@ export default function App() {
             selectedDatabaseId={activeConversation.selectedDatabaseId}
             selectedKnowledgeId={activeConversation.selectedKnowledgeId}
             model={resources.model}
+            models={resources.models}
+            selectedModelId={activeConversation.selectedModelId}
             onSelectDatabase={(id) => handleResourceChange('selectedDatabaseId', id)}
             onSelectKnowledge={(id) => handleResourceChange('selectedKnowledgeId', id)}
+            onSelectModel={(id) => handleResourceChange('selectedModelId', id)}
             onSubmit={handleSend}
             onStop={handleStop}
           />
@@ -652,4 +690,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function isAbortError(error: unknown) {
   return error instanceof Error && error.name === 'AbortError';
+}
+
+function displayConversationTitle(title: string, t: (key: string) => string) {
+  return title === 'New chat' ? t('New chat') : title;
 }

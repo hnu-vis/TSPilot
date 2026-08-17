@@ -30,6 +30,7 @@ export function createConversation(): Conversation {
     selectedTraceStepId: null,
     selectedDatabaseId: null,
     selectedKnowledgeId: null,
+    selectedModelId: null,
   };
 }
 
@@ -39,7 +40,9 @@ export function loadConversations(): Conversation[] {
     if (!raw) return [createConversation()];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [createConversation()];
-    const conversations = parsed.filter((item): item is Conversation => Boolean(item?.id));
+    const conversations = parsed
+      .filter((item): item is Conversation => Boolean(item?.id))
+      .map((item) => ({ ...item, selectedModelId: item.selectedModelId ?? null }));
     return conversations.length ? conversations : [createConversation()];
   } catch {
     return [createConversation()];

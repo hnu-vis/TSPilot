@@ -294,9 +294,9 @@ function deduplicateReferences(references: AnswerReference[]): AnswerReference[]
   const seen = new Set<string>();
   return references.filter((reference) => {
     const evidence = asRecord(reference.evidence);
-    const factKey = reference.source_type === 'fact' ? asString(evidence?.fact_key) : undefined;
-    const identity = factKey
-      ? `fact:${comparableText(factKey)}`
+    const insightKey = reference.source_type === 'insight' ? asString(evidence?.insight_key) : undefined;
+    const identity = insightKey
+      ? `insight:${comparableText(insightKey)}`
       : reference.source_id
         ? `${reference.source_type}:${comparableText(reference.source_id)}`
         : `${reference.source_type}:${comparableText(reference.label)}:${comparableText(JSON.stringify(evidence || {}))}`;

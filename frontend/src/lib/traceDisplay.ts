@@ -1,4 +1,4 @@
-import type { DataFact, DataFactRequest, FactCoverage, FinalAnswer, TraceStep } from '../types';
+import type { KeyInsight, KeyInsightRequest, InsightCoverage, FinalAnswer, TraceStep } from '../types';
 
 export type DisplayMetric = {
   label: string;
@@ -103,10 +103,10 @@ export type AnomalyDetail = {
   spanCount: number | null;
 };
 
-export type FactDetail = {
-  requested: DataFactRequest[];
-  produced: DataFact[];
-  coverage: FactCoverage | null;
+export type InsightDetail = {
+  requested: KeyInsightRequest[];
+  produced: KeyInsight[];
+  coverage: InsightCoverage | null;
   contextSummary: Record<string, unknown> | null;
 };
 
@@ -130,7 +130,7 @@ export type DisplayStep = {
   codeInterpreterDetail: CodeInterpreterDetail | null;
   forecastDetail: ForecastDetail | null;
   anomalyDetail: AnomalyDetail | null;
-  factDetail: FactDetail | null;
+  insightDetail: InsightDetail | null;
   schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
   reactDetail: ReactDetail;
@@ -164,7 +164,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
   const codeInterpreterDetail = codeInterpreterDetailFor(tool, preview, call, step);
   const forecastDetail = forecastDetailFor(tool, preview);
   const anomalyDetail = anomalyDetailFor(tool, preview);
-  const factDetail = factDetailFor(preview, call, step);
+  const insightDetail = insightDetailFor(preview, call, step);
   const schemaLinkingDetail = schemaLinkingDetailFor(tool, preview);
   const hasPrimaryDetail = Boolean(
     planDetail ||
@@ -172,7 +172,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     codeInterpreterDetail ||
     forecastDetail ||
     anomalyDetail ||
-    factDetail ||
+    insightDetail ||
     schemaLinkingDetail ||
     completionDetail,
   );
@@ -190,7 +190,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     codeInterpreterDetail,
     forecastDetail,
     anomalyDetail,
-    factDetail,
+    insightDetail,
     schemaLinkingDetail,
     completionDetail,
     reactDetail,
@@ -264,7 +264,7 @@ export function buildRunOverview(steps: TraceStep[], answer?: FinalAnswer | null
     firstMetric(displaySteps, 'Rows'),
     firstMetric(displaySteps, 'Points'),
     firstMetric(displaySteps, 'Series'),
-    firstMetric(displaySteps, 'Facts'),
+    firstMetric(displaySteps, 'Key Insights'),
     firstMetric(displaySteps, 'Anomalies'),
     firstMetric(displaySteps, 'Forecast points'),
   ]);
@@ -346,10 +346,10 @@ function metricsForTool(
   addMetric(metrics, 'Rows', numberFrom(preview?.row_count) ?? nestedNumber(preview, ['result_preview', 'row_count']) ?? nestedNumber(preview, ['summary_stats', 'rows_count']));
   addMetric(metrics, 'Points', numberFrom(preview?.point_count) ?? nestedNumber(preview, ['result_preview', 'point_count']) ?? nestedNumber(preview, ['summary_stats', 'points_count']));
   addMetric(metrics, 'Series', numberFrom(preview?.series_count) ?? nestedNumber(preview, ['summary_stats', 'series_count']));
-  addMetric(metrics, 'Facts', numberFrom(preview?.verified_fact_count));
-  const producedFacts = factRecordsFrom(preview);
-  if (producedFacts.length > 0 && !metrics.some((metric) => metric.label === 'Facts')) {
-    addMetric(metrics, 'Facts', producedFacts.length);
+  addMetric(metrics, 'Key Insights', numberFrom(preview?.verified_insight_count));
+  const producedInsights = insightRecordsFrom(preview);
+  if (producedInsights.length > 0 && !metrics.some((metric) => metric.label === 'Key Insights')) {
+    addMetric(metrics, 'Key Insights', producedInsights.length);
   }
   addMetric(metrics, 'Samples', numberFrom(preview?.input_row_count));
   addMetric(metrics, 'Anomalies', numberFrom(preview?.anomaly_count) ?? numberFrom(preview?.anomaly_point_count));
@@ -368,19 +368,19 @@ function metricsForTool(
   return metrics;
 }
 
-function factDetailFor(
+function insightDetailFor(
   preview: Record<string, unknown> | null,
   call: Record<string, unknown> | null,
   step: TraceStep,
-): FactDetail | null {
+): InsightDetail | null {
   const actionInput = asRecord(step.actionInput) || asRecord(call?.action_input);
   const analysisRequest = asRecord(actionInput?.analysis_request);
-  const directRequests = recordsFrom(actionInput?.fact_requests);
-  const requested = (directRequests.length > 0 ? directRequests : recordsFrom(analysisRequest?.fact_requests))
+  const directRequests = recordsFrom(actionInput?.insight_requests);
+  const requested = (directRequests.length > 0 ? directRequests : recordsFrom(analysisRequest?.insight_requests))
     .map((item) => ({
-      fact_key: stringFrom(item.fact_key) || undefined,
+      insight_key: stringFrom(item.insight_key) || undefined,
       name: stringFrom(item.name) || '',
-      fact_type: stringFrom(item.fact_type) || 'custom',
+      insight_type: stringFrom(item.insight_type) || 'custom',
       subject: stringFrom(item.subject),
       time_range: asRecord(item.time_range),
       dimensions: asRecord(item.dimensions) || {},
@@ -388,11 +388,11 @@ function factDetailFor(
       derived_from: stringsFrom(item.derived_from),
     }))
     .filter((item) => item.name);
-  const produced = factRecordsFrom(preview)
-    .map((item) => dataFactFromRecord(item))
-    .filter((item): item is DataFact => Boolean(item));
-  const coverage = coverageFromRecord(asRecord(preview?.fact_coverage));
-  const contextSummary = asRecord(asRecord(preview?.data_fact_context)?.summary);
+  const produced = insightRecordsFrom(preview)
+    .map((item) => keyInsightFromRecord(item))
+    .filter((item): item is KeyInsight => Boolean(item));
+  const coverage = coverageFromRecord(asRecord(preview?.insight_coverage));
+  const contextSummary = asRecord(asRecord(preview?.key_insight_context)?.summary);
   if (requested.length === 0 && produced.length === 0 && !coverage) return null;
   return {
     requested,
@@ -402,15 +402,15 @@ function factDetailFor(
   };
 }
 
-function dataFactFromRecord(item: Record<string, unknown>): DataFact | null {
-  const factId = stringFrom(item.fact_id);
+function keyInsightFromRecord(item: Record<string, unknown>): KeyInsight | null {
+  const insightId = stringFrom(item.insight_id);
   const name = stringFrom(item.name);
-  if (!factId || !name) return null;
+  if (!insightId || !name) return null;
   return {
-    fact_id: factId,
-    fact_key: stringFrom(item.fact_key) || undefined,
+    insight_id: insightId,
+    insight_key: stringFrom(item.insight_key) || undefined,
     name,
-    fact_type: stringFrom(item.fact_type) || 'custom',
+    insight_type: stringFrom(item.insight_type) || 'custom',
     statement: stringFrom(item.statement) || name,
     value: item.value,
     unit: stringFrom(item.unit),
@@ -433,7 +433,7 @@ function dataFactFromRecord(item: Record<string, unknown>): DataFact | null {
   };
 }
 
-function coverageFromRecord(record: Record<string, unknown> | null): FactCoverage | null {
+function coverageFromRecord(record: Record<string, unknown> | null): InsightCoverage | null {
   if (!record) return null;
   const coverage = {
     requested: stringsFrom(record.requested),
@@ -705,9 +705,9 @@ function recordsFrom(value: unknown): Record<string, unknown>[] {
     : [];
 }
 
-function factRecordsFrom(preview: Record<string, unknown> | null | undefined) {
-  const complete = recordsFrom(preview?.produced_facts);
-  return complete.length > 0 ? complete : recordsFrom(preview?.produced_facts_preview);
+function insightRecordsFrom(preview: Record<string, unknown> | null | undefined) {
+  const complete = recordsFrom(preview?.produced_insights);
+  return complete.length > 0 ? complete : recordsFrom(preview?.produced_insights_preview);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

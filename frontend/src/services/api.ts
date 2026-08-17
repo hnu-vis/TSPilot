@@ -3,11 +3,17 @@ import type {
   DatabaseConnectionTest,
   DatabasePreviewResponse,
   DatabaseResource,
-  FactMemoryDetailResponse,
-  FactMemoryResponse,
+  InsightMemoryDetailResponse,
+  InsightMemoryLearningSettingsResponse,
+  InsightMemoryResponse,
   FinalAnswer,
   KnowledgeResource,
+  AIModelConfigInput,
+  ModelConnectionTest,
+  ModelsConfig,
+  ExternalMachineModelInput,
   StreamEvent,
+  Visualization,
 } from '../types';
 
 const API_BASE = '/api/v1';
@@ -33,6 +39,88 @@ export async function fetchModel(): Promise<string> {
   return payload.model || 'backend model';
 }
 
+export async function fetchModelsConfig(): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/config`);
+  if (!response.ok) throw new Error(`Failed to load model configuration: ${response.status}`);
+  return response.json();
+}
+
+export async function updateAIModelConfig(section: 'llm' | 'embedding', config: AIModelConfigInput): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/ai/${section}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to save model configuration'));
+  return response.json();
+}
+
+export async function activateAIModelConfig(section: 'llm' | 'embedding', connectionId: string): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/ai/${section}/${encodeURIComponent(connectionId)}/activate`, { method: 'PATCH' });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to activate model'));
+  return response.json();
+}
+
+export async function deleteAIModelConfig(section: 'llm' | 'embedding', connectionId: string): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/ai/${section}/${encodeURIComponent(connectionId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to remove model'));
+  return response.json();
+}
+
+export async function updateMachineLearningConfig(config: { forecast_model: string; anomaly_detector: string }): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/machine-learning`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to save machine learning configuration'));
+  return response.json();
+}
+
+export async function updateExternalMachineModel(task: 'forecast' | 'anomaly', config: ExternalMachineModelInput): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/machine-learning/external/${task}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config),
+  });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to save external model'));
+  return response.json();
+}
+
+export async function activateMachineModel(task: 'forecast' | 'anomaly', name: string): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/machine-learning/${task}/${encodeURIComponent(name)}/activate`, { method: 'PATCH' });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to activate machine learning model'));
+  return response.json();
+}
+
+export async function deleteExternalMachineModel(task: 'forecast' | 'anomaly', name: string): Promise<ModelsConfig> {
+  const response = await fetch(`${API_BASE}/resources/models/machine-learning/external/${task}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to remove external model'));
+  return response.json();
+}
+
+export async function testExternalMachineModel(input: ExternalMachineModelInput & { task: 'forecast' | 'anomaly' }): Promise<ModelConnectionTest> {
+  const response = await fetch(`${API_BASE}/resources/models/machine-learning/test`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to test external model'));
+  return response.json();
+}
+
+export async function testModelConnection(input: {
+  kind: 'llm' | 'embedding';
+  connection_id?: string;
+  api_base: string;
+  model: string;
+  api_key?: string;
+}): Promise<ModelConnectionTest> {
+  const response = await fetch(`${API_BASE}/resources/models/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await responseError(response, 'Failed to test model connection'));
+  return response.json();
+}
+
 export async function fetchDatabasePreview(databaseId: string, options?: { refresh?: boolean }): Promise<DatabasePreviewResponse> {
   const search = options?.refresh ? '?refresh=true' : '';
   const response = await fetch(`${API_BASE}/resources/databases/${encodeURIComponent(databaseId)}/preview${search}`);
@@ -40,22 +128,38 @@ export async function fetchDatabasePreview(databaseId: string, options?: { refre
   return response.json();
 }
 
-export async function fetchFactMemory(databaseId?: string | null): Promise<FactMemoryResponse> {
+export async function fetchInsightMemory(databaseId?: string | null): Promise<InsightMemoryResponse> {
   const path = databaseId
-    ? `/resources/databases/${encodeURIComponent(databaseId)}/fact-memory`
-    : '/resources/fact-memory';
+    ? `/resources/databases/${encodeURIComponent(databaseId)}/insight-memory`
+    : '/resources/insight-memory';
   const response = await fetch(`${API_BASE}${path}`);
-  if (!response.ok) throw new Error(`Failed to load fact memory: ${response.status}`);
+  if (!response.ok) throw new Error(`Failed to load key insight memory: ${response.status}`);
   return response.json();
 }
 
-export async function fetchFactMemoryDetail(memoryId: string, databaseId?: string | null): Promise<FactMemoryDetailResponse> {
+export async function fetchInsightMemoryDetail(memoryId: string, databaseId?: string | null): Promise<InsightMemoryDetailResponse> {
   const encodedId = encodeURIComponent(memoryId);
   const path = databaseId
-    ? `/resources/databases/${encodeURIComponent(databaseId)}/fact-memory/${encodedId}`
-    : `/resources/fact-memory/${encodedId}`;
+    ? `/resources/databases/${encodeURIComponent(databaseId)}/insight-memory/${encodedId}`
+    : `/resources/insight-memory/${encodedId}`;
   const response = await fetch(`${API_BASE}${path}`);
-  if (!response.ok) throw new Error(`Failed to load fact memory detail: ${response.status}`);
+  if (!response.ok) throw new Error(`Failed to load key insight memory detail: ${response.status}`);
+  return response.json();
+}
+
+export async function fetchInsightMemoryLearningSettings(): Promise<InsightMemoryLearningSettingsResponse> {
+  const response = await fetch(`${API_BASE}/resources/insight-memory-learning-settings`);
+  if (!response.ok) throw new Error(`Failed to load Insight learning settings: ${response.status}`);
+  return response.json();
+}
+
+export async function updateInsightMemoryLearningSettings(maxWaitSeconds: number): Promise<InsightMemoryLearningSettingsResponse> {
+  const response = await fetch(`${API_BASE}/resources/insight-memory-learning-settings`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ max_wait_seconds: maxWaitSeconds }),
+  });
+  if (!response.ok) throw new Error(`Failed to update Insight learning settings: ${response.status}`);
   return response.json();
 }
 
@@ -101,6 +205,7 @@ export type ChatStreamRequest = {
   conversationId: string;
   database?: DatabaseResource | null;
   history: Array<{ role: string; content: string; timestamp?: string }>;
+  modelId?: string | null;
 };
 
 export async function streamChat(
@@ -115,6 +220,7 @@ export async function streamChat(
     body: JSON.stringify({
       message: request.message,
       conversation_id: request.conversationId,
+      model_id: request.modelId || null,
       stream: true,
       history: request.history,
       database_context: request.database
@@ -155,6 +261,12 @@ export async function streamChat(
   if (event) onEvent(event);
 }
 
+export async function fetchVisualizationData(dataRef: string): Promise<Visualization> {
+  const response = await fetch(dataRef);
+  if (!response.ok) throw new Error(`Failed to load visualization data: ${response.status}`);
+  return response.json();
+}
+
 function parseSseFrame(frame: string): StreamEvent | null {
   const lines = frame.split('\n');
   let event = '';
@@ -174,6 +286,15 @@ function parseSseFrame(frame: string): StreamEvent | null {
       event: 'error',
       data: { message: `Unable to parse ${event} event.` },
     };
+  }
+}
+
+async function responseError(response: Response, fallback: string) {
+  try {
+    const payload = await response.json();
+    return typeof payload.detail === 'string' ? payload.detail : `${fallback}: ${response.status}`;
+  } catch {
+    return `${fallback}: ${response.status}`;
   }
 }
 

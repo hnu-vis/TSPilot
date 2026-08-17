@@ -30,6 +30,8 @@ import type {
   DatabasePreviewResponse,
   DatabaseResource,
 } from '../types';
+import { useI18n } from '../i18n';
+import { NotificationToast, type NotificationNotice } from './NotificationToast';
 
 type Props = {
   databases: DatabaseResource[];
@@ -47,11 +49,6 @@ type PreviewState = {
 
 type FormMode = 'create' | 'edit' | null;
 
-type TestNotice = {
-  kind: 'success' | 'error';
-  message: string;
-};
-
 const emptyForm: DatabaseConfigInput = {
   name: '',
   type: 'timescaledb',
@@ -65,6 +62,7 @@ const emptyForm: DatabaseConfigInput = {
 };
 
 export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabase, onDatabasesChange }: Props) {
+  const { t } = useI18n();
   const firstAvailableId = databases[0]?.id || null;
   const selectedDatabaseExists = Boolean(selectedDatabaseId && databases.some((database) => database.id === selectedDatabaseId));
   const activeDatabaseId = selectedDatabaseExists ? selectedDatabaseId : firstAvailableId;
@@ -77,7 +75,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   const [testing, setTesting] = useState(false);
   const [refreshProfile, setRefreshProfile] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
+  const [testNotice, setTestNotice] = useState<NotificationNotice | null>(null);
   const [previewState, setPreviewState] = useState<PreviewState>({
     databaseId: null,
     loading: false,
@@ -113,7 +111,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
           setPreviewState({
             databaseId: activeDatabaseId,
             loading: false,
-            error: error instanceof Error ? error.message : 'Unable to load database schema.',
+            error: error instanceof Error ? error.message : t('Unable to load database schema.'),
             data: null,
           });
         }
@@ -179,8 +177,13 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
       onSelectDatabase(saved.id);
       setFormMode(null);
       setReloadToken((value) => value + 1);
+      setTestNotice({
+        tone: 'success',
+        title: t('Connection saved'),
+        message: t('{name} is ready to use.', { name: saved.display_name || saved.name }),
+      });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Unable to save database configuration.');
+      setActionError(error instanceof Error ? error.message : t('Unable to save database configuration.'));
     } finally {
       setSaving(false);
     }
@@ -188,7 +191,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
   const handleDeleteConfig = async () => {
     if (!activeDatabase) return;
-    const confirmed = window.confirm(`Delete database connection "${activeDatabase.display_name || activeDatabase.name}"?`);
+    const confirmed = window.confirm(t('Delete database connection "{name}"?', { name: activeDatabase.display_name || activeDatabase.name }));
     if (!confirmed) return;
     setSaving(true);
     setActionError(null);
@@ -198,8 +201,13 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
       onSelectDatabase(nextDatabases[0]?.id || null);
       setFormMode(null);
       setReloadToken((value) => value + 1);
+      setTestNotice({
+        tone: 'success',
+        title: t('Connection deleted'),
+        message: t('The database connection was removed from the workspace.'),
+      });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Unable to delete database configuration.');
+      setActionError(error instanceof Error ? error.message : t('Unable to delete database configuration.'));
     } finally {
       setSaving(false);
     }
@@ -214,12 +222,13 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
       const result = await testDatabaseConnection(activeDatabase.id);
       await onDatabasesChange();
       setTestNotice(result.success
-        ? { kind: 'success', message: `Connection succeeded${result.latency_ms ? ` in ${result.latency_ms}ms` : ''}.` }
-        : { kind: 'error', message: result.error || 'Connection failed.' });
+        ? { tone: 'success', title: t('Connection successful'), message: result.latency_ms ? t('Connection succeeded in {latency}ms.', { latency: result.latency_ms }) : t('Connection succeeded.') }
+        : { tone: 'error', title: t('Connection failed'), message: result.error || t('Connection failed.') });
     } catch (error) {
       setTestNotice({
-        kind: 'error',
-        message: error instanceof Error ? error.message : 'Unable to test database connection.',
+        tone: 'error',
+        title: t('Connection failed'),
+        message: error instanceof Error ? error.message : t('Unable to test database connection.'),
       });
     } finally {
       setTesting(false);
@@ -243,16 +252,16 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   }, [schemaObjects, selectedObjectKey]);
 
   return (
-    <section className="database-manager" aria-label="Database management">
+    <section className="database-manager" aria-label={t('Database management')}>
       <div className="database-sidebar-panel">
         <div className="database-panel-heading">
-          <span><Database size={16} /> Sources</span>
+          <span><Database size={16} /> {t('Sources')}</span>
           <strong>{databases.length}</strong>
         </div>
-        <div className="database-source-actions" aria-label="Source actions">
+        <div className="database-source-actions" aria-label={t('Source actions')}>
           <button className="database-add-button" type="button" onClick={openCreateForm}>
             <Plus size={14} />
-            <span>Add connection</span>
+            <span>{t('Add connection')}</span>
           </button>
         </div>
         <div className="database-source-list">
@@ -275,7 +284,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
           {databases.length === 0 && (
             <div className="database-empty-state">
               <AlertCircle size={18} />
-              <span>No configured databases.</span>
+              <span>{t('No configured databases.')}</span>
             </div>
           )}
         </div>
@@ -290,23 +299,23 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                   <h2>{activeDatabase.display_name || activeDatabase.name}</h2>
                   <span className="database-kicker">{activeDatabase.type}</span>
                 </div>
-                <div className="database-header-meta" aria-label="Database summary">
+                <div className="database-header-meta" aria-label={t('Database summary')}>
                   <span><Server size={13} /> {formatEndpoint(activeDatabase)}</span>
                   <span className={`database-status-pill ${statusClass(activeDatabase.status)}`}>
                     <CheckCircle2 size={13} /> {statusLabel(activeDatabase.status)}
                   </span>
-                  <span><Table2 size={13} /> {schemaObjects.length} objects</span>
-                  <span><Columns3 size={13} /> {fields.length || totalColumns(schemaObjects)} fields</span>
+                  <span><Table2 size={13} /> {schemaObjects.length} {t('objects')}</span>
+                  <span><Columns3 size={13} /> {fields.length || totalColumns(schemaObjects)} {t('fields')}</span>
                 </div>
               </div>
               <div className="database-header-actions">
                 <button className="icon-text-button" type="button" onClick={openEditForm}>
                   <Pencil size={14} />
-                  <span>Edit</span>
+                  <span>{t('Edit')}</span>
                 </button>
                 <button className="icon-text-button" type="button" disabled={testing} onClick={handleTestConnection}>
                   <PlugZap size={14} />
-                  <span>{testing ? 'Testing' : 'Test'}</span>
+                  <span>{t(testing ? 'Testing' : 'Test')}</span>
                 </button>
                 <button
                   className="icon-text-button"
@@ -318,11 +327,11 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                   }}
                 >
                   <RefreshCw size={14} />
-                  <span>{previewState.loading ? 'Loading' : 'Refresh'}</span>
+                  <span>{t(previewState.loading ? 'Loading' : 'Refresh')}</span>
                 </button>
                 <button className="icon-text-button danger" type="button" disabled={saving} onClick={handleDeleteConfig}>
                   <Trash2 size={15} />
-                  <span>Delete</span>
+                  <span>{t('Delete')}</span>
                 </button>
               </div>
             </div>
@@ -350,7 +359,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
             <div className="database-content-stack">
               <section className="database-section database-schema-browser">
-                <SectionTitle icon={Table2} title="Schema objects" count={schemaObjects.length} />
+                <SectionTitle icon={Table2} title={t('Schema objects')} count={schemaObjects.length} />
                 <SchemaObjectTable
                   items={schemaObjects}
                   activeKey={schemaObjectKey(activeObject)}
@@ -368,7 +377,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
                     metadataEntries={metadataEntries}
                   />
                 ) : (
-                  <EmptyPreview label="Select a schema object to inspect details." />
+                  <EmptyPreview label={t('Select a schema object to inspect details.')} />
                 )}
               </section>
             </div>
@@ -376,11 +385,11 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
         ) : (
           <div className="database-empty-main">
             <Database size={24} />
-            <h2>No database selected</h2>
-            <p>Add a database connection, then inspect its schema here.</p>
+            <h2>{t('No database selected')}</h2>
+            <p>{t('Add a database connection, then inspect its schema here.')}</p>
             <button className="icon-text-button" type="button" onClick={openCreateForm}>
               <Plus size={14} />
-              <span>Add connection</span>
+              <span>{t('Add connection')}</span>
             </button>
           </div>
         )}
@@ -388,7 +397,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
 
       {formMode && (
         <div className="database-modal-backdrop" role="presentation">
-          <div className={`database-modal ${formMode === 'create' && createStep === 'catalog' ? 'database-catalog-modal' : ''}`} role="dialog" aria-modal="true" aria-label={formMode === 'create' ? 'Add database connection' : 'Edit database connection'}>
+          <div className={`database-modal ${formMode === 'create' && createStep === 'catalog' ? 'database-catalog-modal' : ''}`} role="dialog" aria-modal="true" aria-label={t(formMode === 'create' ? 'Add database connection' : 'Edit database connection')}>
             {actionError && (
               <div className="database-inline-error">
                 <AlertCircle size={16} />
@@ -413,34 +422,29 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
       )}
 
       {testNotice && (
-        <div className={`database-toast ${testNotice.kind}`} role={testNotice.kind === 'error' ? 'alert' : 'status'} aria-live="polite">
-          {testNotice.kind === 'success' ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
-          <div>
-            <strong>{testNotice.kind === 'success' ? 'Connection successful' : 'Connection failed'}</strong>
-            <span>{testNotice.message}</span>
-          </div>
-          <button type="button" aria-label="Dismiss notification" onClick={() => setTestNotice(null)}>
-            <X size={15} />
-          </button>
-        </div>
+        <NotificationToast
+          {...testNotice}
+          onDismiss={() => setTestNotice(null)}
+        />
       )}
     </section>
   );
 }
 
 function DatabaseTypeCatalog({ onSelect, onCancel }: { onSelect: (type: string) => void; onCancel: () => void }) {
+  const { t } = useI18n();
   return (
     <div className="database-type-catalog">
       <div className="database-catalog-header">
         <div>
-          <strong>Add a database connection</strong>
-          <span>Choose a time-series database to configure.</span>
+          <strong>{t('Add a database connection')}</strong>
+          <span>{t('Choose a time-series database to configure.')}</span>
         </div>
-        <button type="button" className="database-form-icon-button" aria-label="Close database selector" onClick={onCancel}>
+        <button type="button" className="database-form-icon-button" aria-label={t('Close database selector')} onClick={onCancel}>
           <X size={15} />
         </button>
       </div>
-      <div className="database-type-grid" aria-label="Supported time-series databases">
+      <div className="database-type-grid" aria-label={t('Supported time-series databases')}>
         {DATABASE_CATALOG.map((database) => (
           <button key={database.type} type="button" className="database-type-card" onClick={() => onSelect(database.type)}>
             <span className="database-type-logo" aria-hidden="true">
@@ -483,6 +487,7 @@ function DatabaseConfigForm({
   onCancel: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
+  const { t } = useI18n();
   const updateField = <Key extends keyof DatabaseConfigInput>(key: Key, nextValue: DatabaseConfigInput[Key]) => {
     onChange({ ...value, [key]: nextValue });
   };
@@ -492,23 +497,23 @@ function DatabaseConfigForm({
       <div className="database-config-form-header">
         <div className="database-config-title">
           {onBack && (
-            <button type="button" className="database-form-icon-button" aria-label="Back to database types" onClick={onBack}>
+            <button type="button" className="database-form-icon-button" aria-label={t('Back to database types')} onClick={onBack}>
               <ArrowLeft size={15} />
             </button>
           )}
           <div>
-            <strong>{mode === 'create' ? 'Add connection' : 'Edit connection'}</strong>
-            <span>{mode === 'create' ? `Configure ${databaseTypeLabel(value.type)}.` : 'Update the selected database source config.'}</span>
+            <strong>{t(mode === 'create' ? 'Add connection' : 'Edit connection')}</strong>
+            <span>{mode === 'create' ? t('Configure {type}.', { type: databaseTypeLabel(value.type) }) : t('Update the selected database source config.')}</span>
           </div>
         </div>
-        <button type="button" className="database-form-icon-button" aria-label="Close form" onClick={onCancel}>
+        <button type="button" className="database-form-icon-button" aria-label={t('Close form')} onClick={onCancel}>
           <X size={15} />
         </button>
       </div>
 
       <div className="database-form-grid">
         <label>
-          <span>Name</span>
+          <span>{t('Name')}</span>
           <input
             required
             value={value.name}
@@ -517,7 +522,7 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Display name</span>
+          <span>{t('Display name')}</span>
           <input
             value={value.display_name || ''}
             onChange={(event) => updateField('display_name', event.target.value)}
@@ -525,7 +530,7 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Type</span>
+          <span>{t('Type')}</span>
           {mode === 'create' ? (
             <span className="database-selected-type">{databaseTypeLabel(value.type)}</span>
           ) : (
@@ -535,7 +540,7 @@ function DatabaseConfigForm({
           )}
         </label>
         <label>
-          <span>Host</span>
+          <span>{t('Host')}</span>
           <input
             value={value.host || ''}
             onChange={(event) => updateField('host', event.target.value)}
@@ -543,7 +548,7 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Port</span>
+          <span>{t('Port')}</span>
           <input
             min={0}
             type="number"
@@ -553,7 +558,7 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Database</span>
+          <span>{t('Database')}</span>
           <input
             value={value.database || ''}
             onChange={(event) => updateField('database', event.target.value)}
@@ -561,7 +566,7 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Username</span>
+          <span>{t('Username')}</span>
           <input
             value={value.username || ''}
             onChange={(event) => updateField('username', event.target.value)}
@@ -569,13 +574,13 @@ function DatabaseConfigForm({
           />
         </label>
         <label>
-          <span>Password</span>
+          <span>{t('Password')}</span>
           <input
             value={value.password || ''}
             type="password"
             onChange={(event) => updateField('password', event.target.value)}
             autoComplete={mode === 'create' ? 'new-password' : 'current-password'}
-            placeholder={mode === 'edit' ? 'Leave blank to keep existing password' : ''}
+            placeholder={mode === 'edit' ? t('Leave blank to keep existing password') : ''}
           />
         </label>
       </div>
@@ -586,17 +591,17 @@ function DatabaseConfigForm({
           checked={Boolean(value.ssl_enabled)}
           onChange={(event) => updateField('ssl_enabled', event.target.checked)}
         />
-        <span>Use SSL/TLS</span>
+        <span>{t('Use SSL/TLS')}</span>
       </label>
 
       <div className="database-form-actions">
         <button type="button" className="icon-text-button" onClick={onCancel}>
           <X size={14} />
-          <span>Cancel</span>
+          <span>{t('Cancel')}</span>
         </button>
         <button type="submit" className="icon-text-button primary" disabled={saving}>
           <CheckCircle2 size={14} />
-          <span>{saving ? 'Saving' : 'Save connection'}</span>
+          <span>{t(saving ? 'Saving' : 'Save connection')}</span>
         </button>
       </div>
     </form>
@@ -614,8 +619,9 @@ function SchemaObjectTable({
   loading: boolean;
   onSelect: (item: DatabasePreviewObject) => void;
 }) {
-  if (loading) return <EmptyPreview label="Loading schema preview." />;
-  if (items.length === 0) return <EmptyPreview label="No schema objects returned." />;
+  const { t } = useI18n();
+  if (loading) return <EmptyPreview label={t('Loading schema preview.')} />;
+  if (items.length === 0) return <EmptyPreview label={t('No schema objects returned.')} />;
 
   return (
     <div className="schema-object-list">
@@ -638,7 +644,7 @@ function SchemaObjectTable({
             </span>
             <span className="schema-object-row-counts">
               <strong>{fieldCount}</strong>
-              <small>fields</small>
+              <small>{t('fields')}</small>
             </span>
           </button>
         );
@@ -658,6 +664,7 @@ function ObjectDetail({
   labelsOrTags: Array<Record<string, unknown>>;
   metadataEntries: Array<[string, unknown]>;
 }) {
+  const { t, locale } = useI18n();
   const columns = item.columns || [];
   const fieldValues = item.field_values || [];
   const sampleRows = item.sample_rows || [];
@@ -670,27 +677,27 @@ function ObjectDetail({
     <>
       <div className="object-detail-header">
         <div>
-          <span>{[item.schema, item.type].filter(Boolean).join(' / ') || 'schema object'}</span>
+          <span>{[item.schema, item.type].filter(Boolean).join(' / ') || t('schema object')}</span>
           <h3>{item.name}</h3>
         </div>
         {typeof item.row_count === 'number' && (
-          <div className="object-detail-stats"><strong>{item.row_count.toLocaleString()} rows</strong></div>
+          <div className="object-detail-stats"><strong>{item.row_count.toLocaleString(locale)} {t('rows')}</strong></div>
         )}
       </div>
 
       <div className="object-detail-grid">
         <section className="object-detail-block columns-panel">
-          <SectionTitle icon={Columns3} title="Columns" count={columns.length || fieldValues.length} />
+          <SectionTitle icon={Columns3} title={t('Columns')} count={columns.length || fieldValues.length} />
           <ColumnList columns={columns} fieldValues={fieldValues} />
         </section>
 
         <section className="object-detail-block samples-panel">
-          <SectionTitle icon={Rows3} title="Sample Rows" count={sampleRows.length} />
+          <SectionTitle icon={Rows3} title={t('Sample Rows')} count={sampleRows.length} />
           <SampleRows rows={sampleRows} />
         </section>
 
         <section className="object-detail-block insights-panel">
-          <SectionTitle icon={Database} title="Field Metadata" count={contextValues.length} />
+          <SectionTitle icon={Database} title={t('Field Metadata')} count={contextValues.length} />
           <FieldMetadataList values={contextValues} />
         </section>
       </div>
@@ -699,6 +706,7 @@ function ObjectDetail({
 }
 
 function FieldMetadataList({ values }: { values: Array<Record<string, unknown>> }) {
+  const { t } = useI18n();
   return (
     <div className="database-field-metadata-list">
       {values.length ? values.map((value, index) => {
@@ -718,7 +726,7 @@ function FieldMetadataList({ values }: { values: Array<Record<string, unknown>> 
           </div>
         );
       }) : (
-        <div className="database-tree-empty">No field metadata returned.</div>
+        <div className="database-tree-empty">{t('No field metadata returned.')}</div>
       )}
     </div>
   );
@@ -731,7 +739,8 @@ function ColumnList({
   columns: NonNullable<DatabasePreviewObject['columns']>;
   fieldValues: string[];
 }) {
-  if (columns.length === 0 && fieldValues.length === 0) return <EmptyPreview label="No columns returned." />;
+  const { t } = useI18n();
+  if (columns.length === 0 && fieldValues.length === 0) return <EmptyPreview label={t('No columns returned.')} />;
   return (
     <div className="object-column-list">
       {columns.map((column) => (
@@ -743,7 +752,7 @@ function ColumnList({
       {columns.length === 0 && fieldValues.map((field) => (
         <div key={field} className="object-column-row">
           <strong title={field}>{field}</strong>
-          <span>field</span>
+          <span>{t('field')}</span>
         </div>
       ))}
     </div>
@@ -751,7 +760,8 @@ function ColumnList({
 }
 
 function SampleRows({ rows }: { rows: Array<Record<string, unknown>> }) {
-  if (rows.length === 0) return <EmptyPreview label="No sample rows returned." />;
+  const { t } = useI18n();
+  if (rows.length === 0) return <EmptyPreview label={t('No sample rows returned.')} />;
   const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
   return (
     <div className="database-sample-wrap">

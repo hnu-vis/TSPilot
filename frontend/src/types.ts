@@ -50,7 +50,7 @@ export type FinalAnswer = {
 export type AnswerClaim = {
   claim_id: string;
   text: string;
-  fact_ids?: string[];
+  insight_ids?: string[];
   item_ids?: string[];
   analysis_ids?: string[];
   artifact_type?: string | null;
@@ -62,7 +62,7 @@ export type AnswerClaim = {
 export type VisualizationBinding = {
   binding_id: string;
   source_type: string;
-  fact_id?: string | null;
+  insight_id?: string | null;
   item_id?: string | null;
   related_item_ids?: string[];
   evidence_id?: string | null;
@@ -83,31 +83,40 @@ export type VisualizationPoint = {
 export type VisualizationSeries = {
   series_id: string;
   name: string;
-  role: 'historical' | 'forecast' | 'comparison' | 'ranking' | 'distribution' | 'relationship';
+  role: string;
   unit?: string | null;
   points?: VisualizationPoint[];
 };
 
 export type Visualization = {
-  schema_version: '2';
+  schema_version: '3';
   visualization_id: string;
-  template_id: string;
+  data_ref?: string | null;
   purpose: string;
   priority: 'primary' | 'supporting';
   title: string;
   summary?: string | null;
   source_refs?: string[];
-  fact_refs?: string[];
-  dataset: {
+  required_roles?: string[];
+  datasets: Array<{
+    dataset_id: string;
+    source_ref: string;
+    data_ref?: string | null;
+    row_count?: number | null;
+    time_range?: { start?: unknown; end?: unknown } | null;
     dimensions?: Array<{ name: string; data_type: string; role: string; unit?: string | null }>;
     series?: VisualizationSeries[];
     rows?: Array<Record<string, unknown>>;
     columns?: string[];
     metric?: Record<string, unknown> | null;
-  };
+  }>;
   layers?: Array<{
-    kind: string;
+    layer_id: string;
+    mark: string;
     role: string;
+    source_ref: string;
+    encoding?: Record<string, string>;
+    dataset_id: string;
     series_id?: string | null;
     points?: VisualizationPoint[];
     label?: string | null;
@@ -121,20 +130,20 @@ export type Visualization = {
   };
 };
 
-export type FactStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;
+export type InsightStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;
 
-export type FactEvidenceRef = {
+export type InsightEvidenceRef = {
   source_type: string;
   source_id: string;
   label?: string | null;
   locator?: Record<string, unknown>;
 };
 
-export type DataFact = {
-  fact_id: string;
-  fact_key?: string;
+export type KeyInsight = {
+  insight_id: string;
+  insight_key?: string;
   name: string;
-  fact_type: string;
+  insight_type: string;
   statement: string;
   value?: unknown;
   unit?: string | null;
@@ -142,19 +151,19 @@ export type DataFact = {
   dimensions?: Record<string, unknown>;
   time_range?: Record<string, unknown> | null;
   method: string;
-  evidence_refs?: FactEvidenceRef[];
+  evidence_refs?: InsightEvidenceRef[];
   calculation_trace?: Record<string, unknown>;
-  status: FactStatus;
+  status: InsightStatus;
   confidence?: number | null;
   quality_flags?: string[];
   unavailable_reason?: string | null;
   derived_from?: string[];
 };
 
-export type DataFactRequest = {
-  fact_key?: string;
+export type KeyInsightRequest = {
+  insight_key?: string;
   name: string;
-  fact_type: string;
+  insight_type: string;
   subject?: string | null;
   time_range?: Record<string, unknown> | null;
   dimensions?: Record<string, unknown>;
@@ -162,7 +171,7 @@ export type DataFactRequest = {
   derived_from?: string[];
 };
 
-export type FactCoverage = {
+export type InsightCoverage = {
   requested?: string[];
   verified?: string[];
   missing?: string[];
@@ -183,27 +192,37 @@ export type MemoryCard = {
 export type MemoryDetail = {
   id: string;
   card: MemoryCard;
-  fact_request?: Record<string, unknown> | null;
+  insight_request?: Record<string, unknown> | null;
   preferred_tool?: string | null;
   guidance?: string | null;
   examples?: string[];
 };
 
-export type FactMemory = {
+export type InsightMemory = {
   cards: MemoryCard[];
   storage_path?: string | null;
   updated_at?: string | null;
 };
 
-export type FactMemoryResponse = {
+export type InsightMemoryResponse = {
   database?: DatabaseResource;
-  memory: FactMemory;
+  memory: InsightMemory;
   prompt_view?: Record<string, unknown>;
 };
 
-export type FactMemoryDetailResponse = {
+export type InsightMemoryDetailResponse = {
   database?: DatabaseResource;
   detail: MemoryDetail;
+};
+
+export type InsightMemoryLearningSettings = {
+  max_wait_seconds: number;
+  enabled: boolean;
+  batch_size: number;
+};
+
+export type InsightMemoryLearningSettingsResponse = {
+  settings: InsightMemoryLearningSettings;
 };
 
 export type TraceStatus = 'running' | 'complete' | 'error';
@@ -240,7 +259,7 @@ export type DatabaseResource = {
   config_source?: string | null;
   username?: string | null;
   ssl_enabled?: boolean;
-  fact_memory_summary?: {
+  insight_memory_summary?: {
     definition_count: number;
     recipe_count: number;
     card_count: number;
@@ -323,12 +342,77 @@ export type Conversation = {
   selectedTraceStepId: string | null;
   selectedDatabaseId: string | null;
   selectedKnowledgeId: string | null;
+  selectedModelId: string | null;
 };
 
 export type ResourceState = {
   databases: DatabaseResource[];
   knowledge: KnowledgeResource[];
   model: string;
+  models: AIModelEndpointConfig[];
+};
+
+export type AIModelEndpointConfig = {
+  id: string;
+  provider: string;
+  api_base: string;
+  model: string;
+  api_key_configured: boolean;
+  is_active: boolean;
+  source: 'environment' | 'workspace';
+  config_path?: string | null;
+};
+
+export type AIModelEndpointGroup = {
+  active_id: string;
+  models: AIModelEndpointConfig[];
+};
+
+export type ModelsConfig = {
+  ai: {
+    llm: AIModelEndpointGroup;
+    embedding: AIModelEndpointGroup;
+  };
+  machine_learning: {
+    forecast_model: string;
+    anomaly_detector: string;
+    forecast_options: string[];
+    anomaly_options: string[];
+    forecast_models: MachineModelConfig[];
+    anomaly_models: MachineModelConfig[];
+  };
+  saved_id?: string;
+};
+
+export type MachineModelConfig = {
+  id: string;
+  name: string;
+  source: 'built_in' | 'api';
+  endpoint?: string | null;
+  timeout_seconds?: number | null;
+  api_key_configured: boolean;
+  is_active: boolean;
+  config_path?: string | null;
+};
+
+export type ExternalMachineModelInput = {
+  name: string;
+  endpoint: string;
+  api_key?: string;
+  timeout_seconds: number;
+};
+
+export type AIModelConfigInput = {
+  id?: string;
+  api_base: string;
+  model: string;
+  api_key?: string;
+};
+
+export type ModelConnectionTest = {
+  success: boolean;
+  latency_ms: number;
+  message: string;
 };
 
 export type StreamEvent = {

@@ -13,7 +13,7 @@ function answer(overrides: Partial<FinalAnswerType> = {}): FinalAnswerType {
 describe('FinalAnswer', () => {
   it('does not expose internal claim-linking state below the conclusion', () => {
     const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
-      claims: [{ claim_id: 'claim_1', text: '内部绑定文本', fact_ids: ['fact_1'] }],
+      claims: [{ claim_id: 'claim_1', text: '内部绑定文本', insight_ids: ['insight_1'] }],
     })} />);
 
     expect(markup).not.toContain('linked');
@@ -39,16 +39,16 @@ describe('FinalAnswer', () => {
     expect(markup).not.toContain('[truncated');
   });
 
-  it('deduplicates repeated logical fact references', () => {
-    const duplicateFact = {
-      source_type: 'fact',
+  it('deduplicates repeated logical insight references', () => {
+    const duplicateInsight = {
+      source_type: 'insight',
       label: '最大 7 天窗口标准差',
-      evidence: { fact_key: 'max_7d_window_std', statement: '最大窗口。' },
+      evidence: { insight_key: 'max_7d_window_std', statement: '最大窗口。' },
     } as const;
     const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
       references: [
-        { ...duplicateFact, source_id: 'fact_1' },
-        { ...duplicateFact, source_id: 'fact_2' },
+        { ...duplicateInsight, source_id: 'insight_1' },
+        { ...duplicateInsight, source_id: 'insight_2' },
       ],
     })} />);
 

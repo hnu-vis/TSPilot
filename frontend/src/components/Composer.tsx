@@ -1,7 +1,8 @@
 import { Send, Square } from 'lucide-react';
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
-import type { DatabaseResource, KnowledgeResource } from '../types';
-import { ModelChip, ResourceSelect } from './ResourceSelect';
+import type { AIModelEndpointConfig, DatabaseResource, KnowledgeResource } from '../types';
+import { ModelSelect, ResourceSelect } from './ResourceSelect';
+import { useI18n } from '../i18n';
 
 type Props = {
   disabled: boolean;
@@ -11,8 +12,11 @@ type Props = {
   selectedDatabaseId: string | null;
   selectedKnowledgeId: string | null;
   model: string;
+  models: AIModelEndpointConfig[];
+  selectedModelId: string | null;
   onSelectDatabase: (id: string | null) => void;
   onSelectKnowledge: (id: string | null) => void;
+  onSelectModel: (id: string | null) => void;
   onSubmit: (message: string) => void;
   onStop?: () => void;
 };
@@ -25,11 +29,15 @@ export function Composer({
   selectedDatabaseId,
   selectedKnowledgeId,
   model,
+  models,
+  selectedModelId,
   onSelectDatabase,
   onSelectKnowledge,
+  onSelectModel,
   onSubmit,
   onStop,
 }: Props) {
+  const { t } = useI18n();
   const [value, setValue] = useState('');
   const [focused, setFocused] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -66,7 +74,7 @@ export function Composer({
         onKeyDown={handleKeyDown}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        placeholder="Ask TSPilot to retrieve, analyze, forecast, or explain your time-series data..."
+        placeholder={t('Ask TSPilot to retrieve, analyze, forecast, or explain your time-series data...')}
         disabled={disabled}
         rows={1}
       />
@@ -81,12 +89,12 @@ export function Composer({
           />
         </div>
         <div className="composer-actions">
-          <ModelChip model={model} />
+          <ModelSelect models={models} value={selectedModelId} fallbackLabel={model} onChange={onSelectModel} />
           <button
             className={`send-button ${running ? 'stop-button' : ''}`}
             type={running ? 'button' : 'submit'}
             disabled={!running && (disabled || !value.trim())}
-            aria-label={running ? 'Stop response' : 'Send message'}
+            aria-label={t(running ? 'Stop response' : 'Send message')}
             onClick={running ? onStop : undefined}
           >
             {running ? <Square size={15} fill="currentColor" /> : <Send size={18} />}

@@ -1,8 +1,9 @@
-import { BookOpen, BrainCircuit, Database, Edit3, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Search, Trash2 } from 'lucide-react';
+import { BookOpen, BrainCircuit, Cpu, Database, Edit3, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Search, Trash2 } from 'lucide-react';
 import { useState } from 'react';
+import { useI18n } from '../i18n';
 import type { Conversation } from '../types';
 
-export type WorkspaceView = 'chat' | 'database' | 'fact-memory';
+export type WorkspaceView = 'chat' | 'database' | 'insight-memory' | 'model';
 
 type Props = {
   conversations: Conversation[];
@@ -33,13 +34,14 @@ export function HistorySidebar({
   onRename,
   onDelete,
 }: Props) {
+  const { t, formatDate } = useI18n();
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
   const shown = conversations.filter((conversation) => {
     if (!normalizedQuery) return true;
-    const haystack = `${conversation.title} ${conversation.messages.map((item) => item.content).join(' ')}`.toLowerCase();
+    const haystack = `${displayConversationTitle(conversation.title, t)} ${conversation.messages.map((item) => item.content).join(' ')}`.toLowerCase();
     return haystack.includes(normalizedQuery);
   });
   const commitRename = (conversation: Conversation) => {
@@ -49,18 +51,18 @@ export function HistorySidebar({
   };
 
   return (
-    <aside className={`history-sidebar ${collapsed ? 'collapsed' : ''}`} aria-label="Chat history">
+    <aside className={`history-sidebar ${collapsed ? 'collapsed' : ''}`} aria-label={t('Chat history')}>
       <div className="sidebar-brand">
         <div className="brand-mark">TS</div>
         <div className="sidebar-brand-copy">
           <h1>TSPilot</h1>
-          <p>Time-series chat</p>
+          <p>{t('Time-series chat')}</p>
         </div>
-        <button className="history-collapse-button" type="button" aria-label={collapsed ? 'Expand history sidebar' : 'Collapse history sidebar'} onClick={onToggleCollapsed}>
+        <button className="history-collapse-button" type="button" aria-label={t(collapsed ? 'Expand history sidebar' : 'Collapse history sidebar')} onClick={onToggleCollapsed}>
           {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
         </button>
       </div>
-      <nav className="workspace-nav" aria-label="Workspace">
+      <nav className="workspace-nav" aria-label={t('Workspace')}>
         {workspaceNavItems.map((item) => {
           const Icon = item.icon;
           const isActive = item.view === activeView;
@@ -71,30 +73,30 @@ export function HistorySidebar({
               type="button"
               className={`workspace-nav-item ${isActive ? 'active' : ''}`}
               disabled={isDisabled}
-              title={isDisabled ? item.hint : item.label}
-              aria-label={item.label}
+              title={t(isDisabled ? item.hint : item.label)}
+              aria-label={t(item.label)}
               onClick={() => {
                 if (item.view) onViewChange(item.view);
               }}
             >
               <Icon size={16} />
-              <span>{item.label}</span>
-              {!item.enabled && <small>Soon</small>}
+              <span>{t(item.label)}</span>
+              {!item.enabled && <small>{t('Soon')}</small>}
             </button>
           );
         })}
       </nav>
       <button className="new-chat-button" type="button" onClick={onNew}>
         <MessageSquarePlus size={17} />
-        <span>New chat</span>
+        <span>{t('New chat')}</span>
       </button>
       <label className="search-box">
         <Search size={15} />
         <input
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="Search chats"
-          aria-label="Search conversations"
+          placeholder={t('Search chats')}
+          aria-label={t('Search conversations')}
         />
       </label>
       <div className="conversation-list">
@@ -120,19 +122,19 @@ export function HistorySidebar({
                       setRenamingId(null);
                     }
                   }}
-                  aria-label="Conversation title"
+                  aria-label={t('Conversation title')}
                 />
               </div>
             ) : (
               <button type="button" onClick={() => onSelect(conversation.id)} className="conversation-main">
-                <span>{conversation.title}</span>
-                <small>{formatConversationTime(conversation.updatedAt)}</small>
+                <span>{displayConversationTitle(conversation.title, t)}</span>
+                <small>{formatConversationTime(conversation.updatedAt, formatDate)}</small>
               </button>
             )}
             <div className="conversation-actions">
               <button
                 type="button"
-                aria-label="Rename conversation"
+                aria-label={t('Rename conversation')}
                 onClick={() => {
                   setDeleteConfirmId(null);
                   setRenamingId(conversation.id);
@@ -143,7 +145,7 @@ export function HistorySidebar({
               </button>
               <button
                 type="button"
-                aria-label="Delete conversation"
+                aria-label={t('Delete conversation')}
                 onClick={() => {
                   setRenamingId(null);
                   setDeleteConfirmId((current) => current === conversation.id ? null : conversation.id);
@@ -154,8 +156,8 @@ export function HistorySidebar({
             </div>
             {deleteConfirmId === conversation.id && (
               <div className="conversation-delete-popover">
-                <span>Delete chat?</span>
-                <button type="button" onClick={() => setDeleteConfirmId(null)}>Cancel</button>
+                <span>{t('Delete chat?')}</span>
+                <button type="button" onClick={() => setDeleteConfirmId(null)}>{t('Cancel')}</button>
                 <button
                   type="button"
                   className="danger"
@@ -164,7 +166,7 @@ export function HistorySidebar({
                     setDeleteConfirmId(null);
                   }}
                 >
-                  Delete
+                  {t('Delete')}
                 </button>
               </div>
             )}
@@ -192,12 +194,20 @@ const workspaceNavItems: Array<{
     view: 'database',
   },
   {
-    id: 'fact-memory',
-    label: 'Fact Memory',
-    hint: 'Manage fact definitions and recipes',
+    id: 'insight-memory',
+    label: 'Key Insight Memory',
+    hint: 'Manage Key Insight definitions and playbooks',
     icon: BrainCircuit,
     enabled: true,
-    view: 'fact-memory',
+    view: 'insight-memory',
+  },
+  {
+    id: 'model',
+    label: 'Model',
+    hint: 'Configure AI and machine learning models',
+    icon: Cpu,
+    enabled: true,
+    view: 'model',
   },
   {
     id: 'knowledge',
@@ -215,8 +225,12 @@ const workspaceNavItems: Array<{
   },
 ];
 
-function formatConversationTime(value: string) {
+function formatConversationTime(value: string, formatDate: (value: Date, options?: Intl.DateTimeFormatOptions) => string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return formatDate(date, { month: 'short', day: 'numeric' });
+}
+
+function displayConversationTitle(title: string, t: (key: string) => string) {
+  return title === 'New chat' ? t('New chat') : title;
 }

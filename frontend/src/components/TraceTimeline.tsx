@@ -2,6 +2,7 @@ import { AlertCircle, CheckCircle2, CircleDot, Loader2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { TraceStep } from '../types';
+import { useI18n } from '../i18n';
 
 type Props = {
   steps: TraceStep[];
@@ -10,6 +11,7 @@ type Props = {
 };
 
 export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
+  const { t } = useI18n();
   const hasRunningStep = useMemo(() => steps.some((step) => step.status === 'running'), [steps]);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
@@ -20,7 +22,7 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
 
   if (steps.length === 0) return null;
   return (
-    <section className="trace-timeline" aria-label="Execution process">
+    <section className="trace-timeline" aria-label={t('Execution process')}>
       {steps.map((step) => {
         const displayStep = toDisplayStep(step);
         const StatusIcon = displayStep.status === 'running'
@@ -39,7 +41,7 @@ export function TraceTimeline({ steps, selectedId, onSelect }: Props) {
               {displayStep.status === 'running' ? <StatusIcon className="spin" size={15} /> : <StatusIcon size={15} />}
             </span>
             <span className="trace-copy">
-              <strong>{displayStep.title}</strong>
+              <strong>{t(displayStep.title)}</strong>
               <small>{withDuration(displayStep.summary, step, nowMs)}</small>
             </span>
             <CircleDot size={13} className="trace-open-icon" />

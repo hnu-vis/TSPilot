@@ -2,6 +2,7 @@ import { Activity, AlertCircle, ArrowRight, CheckCircle2, ChevronDown, Clipboard
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import type { FinalAnswer, TraceStep } from '../types';
+import { useI18n } from '../i18n';
 
 type Props = {
   steps: TraceStep[];
@@ -12,6 +13,7 @@ type Props = {
 };
 
 export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onToggleCollapsed }: Props) {
+  const { t } = useI18n();
   if (steps.length === 0 && !answer) return null;
 
   const selectedStep = selectedStepId
@@ -23,37 +25,37 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
 
   if (collapsed) {
     return (
-      <aside className="inspector-panel collapsed" aria-label="Run details collapsed">
-        <button type="button" className="inspector-rail-button" onClick={onToggleCollapsed} aria-label="Show run details">
+      <aside className="inspector-panel collapsed" aria-label={t('Run details collapsed')}>
+        <button type="button" className="inspector-rail-button" onClick={onToggleCollapsed} aria-label={t('Show run details')}>
           <PanelRightOpen size={18} />
-          <span>Detail</span>
+          <span>{t('Detail')}</span>
         </button>
       </aside>
     );
   }
 
   return (
-    <aside className="inspector-panel" aria-label="Run details">
+    <aside className="inspector-panel" aria-label={t('Run details')}>
       <header className="inspector-header">
         <div className="inspector-heading">
           <div className="inspector-kicker">
-            <span>Inspector</span>
+            <span>{t('Inspector')}</span>
             {displayStep && <i aria-hidden="true" />}
-            {displayStep && <span>Step {activeStepIndex + 1} / {steps.length}</span>}
+            {displayStep && <span>{t('Step')} {activeStepIndex + 1} / {steps.length}</span>}
           </div>
           <div className="inspector-title-row">
             <span className="inspector-title-icon" aria-hidden="true">
               <Activity size={16} />
             </span>
             <div>
-              <h2>{displayStep?.title || 'Answer'}</h2>
-              <p>{displayStep?.category || 'Run detail'}</p>
+              <h2>{t(displayStep?.title || 'Answer')}</h2>
+              <p>{t(displayStep?.category || 'Run detail')}</p>
             </div>
           </div>
         </div>
         <div className="inspector-header-actions">
-          {displayStep && <span className={`status-line compact ${displayStep.status}`}>{statusLabel(displayStep.status)}</span>}
-          <button type="button" onClick={onToggleCollapsed} aria-label="Collapse run details">
+          {displayStep && <span className={`status-line compact ${displayStep.status}`}>{t(statusLabel(displayStep.status))}</span>}
+          <button type="button" onClick={onToggleCollapsed} aria-label={t('Collapse run details')}>
             <PanelRightClose size={18} />
           </button>
         </div>
@@ -70,11 +72,12 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
 }
 
 function ReferenceList({ answer }: { answer: FinalAnswer }) {
+  const { t } = useI18n();
   return (
     <section className="inspector-card">
       <div className="inspector-card-title">
         <FileText size={16} />
-        <h3>Answer references</h3>
+        <h3>{t('Answer references')}</h3>
       </div>
       <div className="reference-list">
         {answer.references?.map((reference, index) => (
@@ -104,12 +107,13 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.anomalyDetail && <AnomalyPreview detail={step.anomalyDetail} />}
 
-      {step.factDetail && <FactPreview detail={step.factDetail} />}
+      {step.insightDetail && <InsightPreview detail={step.insightDetail} />}
     </>
   );
 }
 
 function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
+  const { t } = useI18n();
   const detail = step.reactDetail;
   const actionInput = compactReactInput(detail.actionInput);
   const observation = detail.observation;
@@ -117,34 +121,34 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
     <section className="inspector-card react-step-card">
       <div className="inspector-card-title">
         <Activity size={16} />
-        <h3>Execution context</h3>
+        <h3>{t('Execution context')}</h3>
       </div>
       {detail.thought && (
         <div className="react-thought">
-          <span>Thought</span>
+          <span>{t('Thought')}</span>
           <p>{detail.thought}</p>
         </div>
       )}
-      <div className="react-transition" aria-label="ReAct action and observation">
+      <div className="react-transition" aria-label={t('ReAct action and observation')}>
         <div>
-          <span>Action</span>
+          <span>{t('Action')}</span>
           <strong>{detail.action || step.category}</strong>
         </div>
         <ArrowRight size={15} />
         <div>
-          <span>Observation</span>
+          <span>{t('Observation')}</span>
           <strong>{step.summary}</strong>
         </div>
       </div>
       {actionInput && (
         <details className="react-input-details">
-          <summary><ChevronDown size={14} className="collapsible-chevron" /> Action input</summary>
+          <summary><ChevronDown size={14} className="collapsible-chevron" /> {t('Action input')}</summary>
           <pre>{JSON.stringify(actionInput, null, 2)}</pre>
         </details>
       )}
       {observation && Object.keys(observation).length > 0 && (
         <details className="react-input-details react-observation-details">
-          <summary><ChevronDown size={14} className="collapsible-chevron" /> Observation details</summary>
+          <summary><ChevronDown size={14} className="collapsible-chevron" /> {t('Observation details')}</summary>
           <pre>{JSON.stringify(observation, null, 2)}</pre>
         </details>
       )}
@@ -153,13 +157,14 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 }
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+  const { t } = useI18n();
   return (
     <details className="inspector-card sql-query-preview collapsible-card" open>
       <summary className="collapsible-summary">
         <span>
           <ChevronDown size={15} className="collapsible-chevron" />
           <Code2 size={16} />
-          <strong>Query</strong>
+          <strong>{t('Query')}</strong>
         </span>
         <span className="query-summary-actions">
           {detail.queryLanguage && <span className="query-language-badge">{detail.queryLanguage}</span>}
@@ -171,8 +176,8 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
               event.stopPropagation();
               void navigator.clipboard?.writeText(detail.query || '');
             }}
-            aria-label="Copy generated query"
-            title="Copy query"
+            aria-label={t('Copy generated query')}
+            title={t('Copy query')}
           >
             <Clipboard size={13} />
           </button>
@@ -184,18 +189,19 @@ function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisp
 }
 
 function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
+  const { t } = useI18n();
   const rows = detail.sampleRows.length > 0 ? detail.sampleRows : detail.samplePoints;
   const tableColumns = detail.columns.length > 0 ? detail.columns : inferColumns(rows);
   return (
     <section className="inspector-card data-preview">
       <div className="inspector-card-title sql-detail-title">
         <Table2 size={16} />
-        <h3>Query data</h3>
+        <h3>{t('Query data')}</h3>
         <span className="query-language-badge">{formatCounts(detail)}</span>
       </div>
 
       {detail.columns.length > 0 && (
-        <div className="column-chip-list" aria-label="Result columns">
+        <div className="column-chip-list" aria-label={t('Result columns')}>
           {detail.columns.map((column) => (
             <span key={column}>{column}</span>
           ))}
@@ -224,14 +230,14 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
               </tbody>
             </table>
           </div>
-          {detail.truncated && <p className="sample-note">Preview only</p>}
+          {detail.truncated && <p className="sample-note">{t('Preview only')}</p>}
         </div>
       )}
 
       {rows.length === 0 && (
         <div className="empty-data-preview">
           <Table2 size={16} />
-          <span>No sample rows are visible for this result.</span>
+          <span>{t('No sample rows are visible for this result.')}</span>
         </div>
       )}
     </section>
@@ -239,16 +245,17 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
 }
 
 function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']> }) {
+  const { t } = useI18n();
   return (
     <section className="inspector-card tool-detail-card code-detail-card">
       {detail.analysisGoal && (
         <div className="code-analysis-goal">
-          <span>Analysis goal</span>
+          <span>{t('Analysis goal')}</span>
           <p>{detail.analysisGoal}</p>
         </div>
       )}
 
-      <div className="query-run-facts" aria-label="Code interpreter facts">
+      <div className="query-run-insights" aria-label={t('Code interpreter insights')}>
         {detail.inputRowCount !== null && (
           <div>
             <Table2 size={14} />
@@ -265,7 +272,7 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
 
       {detail.code && (
         <ToolCodeBlock
-          title="Source"
+          title={t('Source')}
           language="python"
           code={detail.code}
           copyLabel="Copy code"
@@ -274,7 +281,7 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
 
       {hasStructuredResult(detail) && (
         <StructuredResult
-          title="Result"
+          title={t('Result')}
           summary={detail.summary}
           metrics={detail.metrics}
           details={detail.details}
@@ -286,16 +293,17 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
 }
 
 function ForecastPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['forecastDetail']> }) {
+  const { t } = useI18n();
   const rows = detail.points;
   return (
     <section className="inspector-card tool-detail-card">
       <div className="inspector-card-title sql-detail-title">
         <LineChart size={16} />
-        <h3>Forecast result</h3>
+        <h3>{t('Forecast result')}</h3>
         {detail.status && <span className="query-language-badge">{detail.status}</span>}
       </div>
 
-      <div className="query-run-facts" aria-label="Forecast facts">
+      <div className="query-run-insights" aria-label={t('Forecast insights')}>
         {detail.horizon !== null && (
           <div>
             <LineChart size={14} />
@@ -316,27 +324,28 @@ function ForecastPreview({ detail }: { detail: NonNullable<ReturnType<typeof toD
         )}
       </div>
 
-      {detail.plan && <KeyValuePreview title="Forecast plan" data={detail.plan} />}
+      {detail.plan && <KeyValuePreview title={t('Forecast plan')} data={detail.plan} />}
 
       {rows.length > 0 ? (
-        <SimpleRecordsTable title="Forecast points" records={rows} />
+        <SimpleRecordsTable title={t('Forecast points')} records={rows} />
       ) : (
-        <p className="sample-note">No direct forecast points were returned for this step.</p>
+        <p className="sample-note">{t('No direct forecast points were returned for this step.')}</p>
       )}
     </section>
   );
 }
 
 function AnomalyPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['anomalyDetail']> }) {
+  const { t } = useI18n();
   return (
     <section className="inspector-card tool-detail-card">
       <div className="inspector-card-title sql-detail-title">
         <AlertCircle size={16} />
-        <h3>Anomaly result</h3>
+        <h3>{t('Anomaly result')}</h3>
         {detail.detectorName && <span className="query-language-badge">{detail.detectorName}</span>}
       </div>
 
-      <div className="query-run-facts" aria-label="Anomaly facts">
+      <div className="query-run-insights" aria-label={t('Anomaly insights')}>
         {detail.pointCount !== null && (
           <div>
             <AlertCircle size={14} />
@@ -352,23 +361,24 @@ function AnomalyPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
       </div>
 
       {detail.points.length > 0 ? (
-        <SimpleRecordsTable title="Anomaly points" records={detail.points} />
+        <SimpleRecordsTable title={t('Anomaly points')} records={detail.points} />
       ) : (
-        <p className="sample-note">No anomaly points are visible for this step.</p>
+        <p className="sample-note">{t('No anomaly points are visible for this step.')}</p>
       )}
-      {detail.scores.length > 0 && <SimpleRecordsTable title="Scores" records={detail.scores} />}
+      {detail.scores.length > 0 && <SimpleRecordsTable title={t('Scores')} records={detail.scores} />}
     </section>
   );
 }
 
-function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['factDetail']> }) {
-  const coverageItems = factCoverageItems(detail.coverage);
+function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']> }) {
+  const { t } = useI18n();
+  const coverageItems = insightCoverageItems(detail.coverage);
   return (
-    <section className="inspector-card data-fact-preview">
+    <section className="inspector-card key-insight-preview">
       <div className="inspector-card-title sql-detail-title">
         <CheckCircle2 size={16} />
-        <h3>Fact selection</h3>
-        {detail.produced.length > 0 && <span className="query-language-badge">{detail.produced.length} facts</span>}
+        <h3>{t('Key Insight selection')}</h3>
+        {detail.produced.length > 0 && <span className="query-language-badge">{detail.produced.length} {t('key insights')}</span>}
       </div>
 
       {detail.requested.length > 0 && (
@@ -376,13 +386,13 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
           <div className="sample-table-caption">
             <span>
               <ListChecks size={14} />
-              Requested facts
+              {t('Requested key insights')}
             </span>
           </div>
           <div className="chip-list compact">
             {detail.requested.slice(0, 16).map((request) => (
-              <span key={request.fact_key || `${request.name}-${request.fact_type}`}>
-                {request.name} · {request.fact_type}
+              <span key={request.insight_key || `${request.name}-${request.insight_type}`}>
+                {request.name} · {request.insight_type}
                 {request.derived_from?.length ? ` ← ${request.derived_from.join(', ')}` : ''}
               </span>
             ))}
@@ -391,9 +401,9 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
       )}
 
       {coverageItems.length > 0 && (
-        <div className="fact-coverage-grid" aria-label="Fact coverage">
+        <div className="insight-coverage-grid" aria-label={t('Key Insight coverage')}>
           {coverageItems.map((item) => (
-            <div key={item.label} className={`fact-coverage-tile ${item.status}`}>
+            <div key={item.label} className={`insight-coverage-tile ${item.status}`}>
               <span>{item.label}</span>
               <strong>{item.values.length}</strong>
               {item.values.length > 0 && <small>{item.values.slice(0, 4).join(', ')}</small>}
@@ -403,76 +413,76 @@ function FactPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
       )}
 
       {detail.produced.length > 0 ? (
-        <div className="data-fact-list">
-          {detail.produced.map((fact) => (
-            <details key={fact.fact_id} className={`data-fact-card ${fact.status}`} open={fact.status !== 'verified'}>
+        <div className="key-insight-list">
+          {detail.produced.map((insight) => (
+            <details key={insight.insight_id} className={`key-insight-card ${insight.status}`} open={insight.status !== 'verified'}>
               <summary>
                 <span>
-                  <StatusIcon status={fact.status === 'verified' ? 'complete' : fact.status === 'unavailable' ? 'attention' : 'error'} />
-                  <strong>{fact.name}</strong>
-                  <code>{fact.fact_key || fact.fact_type}</code>
+                  <StatusIcon status={insight.status === 'verified' ? 'complete' : insight.status === 'unavailable' ? 'attention' : 'error'} />
+                  <strong>{insight.name}</strong>
+                  <code>{insight.insight_key || insight.insight_type}</code>
                 </span>
-                <span className="data-fact-summary-value">
-                  {fact.value !== undefined && <strong>{formatCell(fact.value)}</strong>}
-                  <span className={`status-line compact ${factStatusClass(fact.status)}`}>{formatLabel(fact.status)}</span>
+                <span className="key-insight-summary-value">
+                  {insight.value !== undefined && <strong>{formatCell(insight.value)}</strong>}
+                  <span className={`status-line compact ${insightStatusClass(insight.status)}`}>{formatLabel(insight.status)}</span>
                 </span>
               </summary>
-              <p className="step-summary">{fact.statement}</p>
+              <p className="step-summary">{insight.statement}</p>
               <dl className="answer-metric-grid">
                 <div>
-                  <dt>Method</dt>
-                  <dd>{fact.method}</dd>
+                  <dt>{t('Method')}</dt>
+                  <dd>{insight.method}</dd>
                 </div>
-                {fact.fact_key && (
+                {insight.insight_key && (
                   <div>
-                    <dt>Fact key</dt>
-                    <dd>{fact.fact_key}</dd>
+                    <dt>{t('Key Insight key')}</dt>
+                    <dd>{insight.insight_key}</dd>
                   </div>
                 )}
-                {fact.value !== undefined && (
+                {insight.value !== undefined && (
                   <div>
-                    <dt>Value</dt>
-                    <dd>{formatCell(fact.value)}</dd>
+                    <dt>{t('Value')}</dt>
+                    <dd>{formatCell(insight.value)}</dd>
                   </div>
                 )}
-                {fact.unavailable_reason && (
+                {insight.unavailable_reason && (
                   <div>
-                    <dt>Reason</dt>
-                    <dd>{fact.unavailable_reason}</dd>
+                    <dt>{t('Reason')}</dt>
+                    <dd>{insight.unavailable_reason}</dd>
                   </div>
                 )}
-                {fact.derived_from && fact.derived_from.length > 0 && (
+                {insight.derived_from && insight.derived_from.length > 0 && (
                   <div>
-                    <dt>Derived from</dt>
-                    <dd>{fact.derived_from.join(', ')}</dd>
+                    <dt>{t('Derived from')}</dt>
+                    <dd>{insight.derived_from.join(', ')}</dd>
                   </div>
                 )}
               </dl>
-              {fact.evidence_refs && fact.evidence_refs.length > 0 && (
+              {insight.evidence_refs && insight.evidence_refs.length > 0 && (
                 <div className="chip-list compact">
-                  {fact.evidence_refs.map((reference) => (
+                  {insight.evidence_refs.map((reference) => (
                     <span key={`${reference.source_type}-${reference.source_id}`}>
                       {reference.source_type}:{reference.source_id}
                     </span>
                   ))}
                 </div>
               )}
-              {fact.calculation_trace && Object.keys(fact.calculation_trace).length > 0 && (
+              {insight.calculation_trace && Object.keys(insight.calculation_trace).length > 0 && (
                 <div className="tool-result-section">
                   <div className="sample-table-caption">
                     <span>
                       <Code2 size={14} />
-                      Calculation trace
+                      {t('Calculation trace')}
                     </span>
                   </div>
-                  <pre className="debug-json">{JSON.stringify(fact.calculation_trace, null, 2)}</pre>
+                  <pre className="debug-json">{JSON.stringify(insight.calculation_trace, null, 2)}</pre>
                 </div>
               )}
             </details>
           ))}
         </div>
       ) : (
-        <p className="sample-note">No structured facts were produced for this step.</p>
+        <p className="sample-note">{t('No structured key insights were produced for this step.')}</p>
       )}
     </section>
   );
@@ -491,6 +501,7 @@ function StructuredResult({
   details: Record<string, unknown>;
   fallback: Record<string, unknown> | null;
 }) {
+  const { t } = useI18n();
   const visibleMetrics = deduplicateStructuredEntries(metrics);
   const visibleDetails = deduplicateStructuredEntries(details, visibleMetrics.map(([, value]) => value));
   const hasMetrics = visibleMetrics.length > 0;
@@ -505,7 +516,7 @@ function StructuredResult({
       </div>
       {summary && <MarkdownContent content={summary} />}
       {hasMetrics && <InspectorMetricGroup entries={visibleMetrics} />}
-      {hasDetails && <KeyValuePreview title="Details" data={Object.fromEntries(visibleDetails)} />}
+      {hasDetails && <KeyValuePreview title={t('Details')} data={Object.fromEntries(visibleDetails)} />}
       {!summary && !hasMetrics && !hasDetails && fallback && <pre className="debug-json">{JSON.stringify(fallback, null, 2)}</pre>}
     </div>
   );
@@ -682,7 +693,7 @@ function hasStructuredResult(detail: NonNullable<ReturnType<typeof toDisplayStep
 
 function compactReactInput(value: Record<string, unknown> | null) {
   if (!value) return null;
-  const omitted = new Set(['code', 'analysis_code', 'database_evidence', 'history', 'fact_requests']);
+  const omitted = new Set(['code', 'analysis_code', 'database_evidence', 'history', 'insight_requests']);
   const entries = Object.entries(value).filter(([key, entryValue]) => (
     !omitted.has(key)
     && entryValue !== null
@@ -694,7 +705,7 @@ function compactReactInput(value: Record<string, unknown> | null) {
   return entries.length > 0 ? Object.fromEntries(entries) : null;
 }
 
-function factCoverageItems(coverage: NonNullable<ReturnType<typeof toDisplayStep>['factDetail']>['coverage']) {
+function insightCoverageItems(coverage: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']>['coverage']) {
   if (!coverage) return [];
   return [
     { label: 'Verified', status: 'complete', values: coverage.verified || [] },
@@ -705,7 +716,7 @@ function factCoverageItems(coverage: NonNullable<ReturnType<typeof toDisplayStep
   ].filter((item) => item.values.length > 0 || item.label === 'Verified');
 }
 
-function factStatusClass(status: string) {
+function insightStatusClass(status: string) {
   if (status === 'verified') return 'complete';
   if (status === 'unavailable' || status === 'partial') return 'attention';
   if (status === 'rejected') return 'error';

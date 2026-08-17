@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage, TraceStep } from '../types';
 import { FinalAnswer } from './FinalAnswer';
 import { TraceTimeline } from './TraceTimeline';
+import { useI18n } from '../i18n';
 
 type Props = {
   messages: ChatMessage[];
@@ -12,6 +13,7 @@ type Props = {
 };
 
 export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelectTraceStep }: Props) {
+  const { t } = useI18n();
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const hasStreamingMessage = useMemo(() => messages.some((message) => message.isStreaming), [messages]);
   const hasRunningStep = useMemo(() => traceSteps.some((step) => step.status === 'running'), [traceSteps]);
@@ -49,8 +51,8 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
     return (
       <div className="empty-thread">
         <div className="empty-mark">TS</div>
-        <h2>Ask about your time-series data</h2>
-        <p>Retrieve data, inspect trends, detect anomalies, forecast future values, and review the execution process.</p>
+        <h2>{t('Ask about your time-series data')}</h2>
+        <p>{t('Retrieve data, inspect trends, detect anomalies, forecast future values, and review the execution process.')}</p>
       </div>
     );
   }
@@ -157,6 +159,7 @@ type TodoItem = {
 };
 
 function TodoList({ todos }: { todos: TodoItem[] }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(true);
   const completed = todos.filter((todo) => todo.status === 'completed').length;
   const active = todos.find((todo) => todo.status === 'in_progress');
@@ -166,7 +169,7 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
       <button className="todo-header" type="button" onClick={() => setOpen((value) => !value)}>
         <span className="todo-title">
           <ListChecks size={16} />
-          <span>Todo list</span>
+          <span>{t('Todo list')}</span>
         </span>
         <span className="todo-meta">
           {completed}/{todos.length}
@@ -181,7 +184,7 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
               <span className="todo-check" aria-hidden="true" />
               <span className="todo-copy">
                 <strong>{todo.content}</strong>
-                <small>{formatTodoStatus(todo.status, todo.task_type)}</small>
+                <small>{formatTodoStatus(todo.status, todo.task_type, t)}</small>
               </span>
             </li>
           ))}
@@ -218,7 +221,7 @@ function statusForTodo(todo: Record<string, unknown>, hasTerminalError: boolean)
   return hasTerminalError && status === 'in_progress' ? 'attention' : status;
 }
 
-function formatTodoStatus(status: string, taskType?: string) {
+function formatTodoStatus(status: string, taskType: string | undefined, t: (key: string) => string) {
   const label = status === 'in_progress'
     ? 'In progress'
     : status === 'completed'
@@ -226,7 +229,8 @@ function formatTodoStatus(status: string, taskType?: string) {
       : status === 'attention'
         ? 'Needs attention'
         : 'Pending';
-  return taskType ? `${label} · ${taskType}` : label;
+  const localized = t(label);
+  return taskType ? `${localized} · ${taskType}` : localized;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
