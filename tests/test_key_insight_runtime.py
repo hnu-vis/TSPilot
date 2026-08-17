@@ -332,19 +332,16 @@ def test_code_interpreter_registers_result_insights_and_conversation_memory():
         "analysis_goal": "Calculate change.",
         "input_evidence_id": "evi_btc",
         "code_hash": "abc123",
-        "result": {
-            "insights": [
+        "produced_insights": [
                 {
                     "name": "percentage_change",
                     "insight_type": "change",
                     "statement": "Bitcoin USD changed by 20%.",
                     "value": 20.0,
                     "calculation_trace": {"formula": "(end - start) / start * 100"},
+                    "evidence_refs": [{"source_type": "analysis", "source_id": "ana_btc"}, {"source_type": "query", "source_id": "evi_btc"}],
                 }
             ],
-            "metrics": {},
-            "details": {},
-        },
     }
 
     coverage = register_key_insights_from_payload(request_state, "code_interpreter", payload)
@@ -359,7 +356,7 @@ def test_code_interpreter_registers_result_insights_and_conversation_memory():
     assert "percentage_change: verified" in conversation_state.insight_memory_summary
 
 
-def test_code_interpreter_ignores_unrequested_analysis_metrics():
+def test_code_interpreter_does_not_promote_generic_metrics_to_insights():
     request_state = _request_state()
     request_state.message = "最大值和最小值的差异是多少？"
     request_state.iteration = 2
@@ -391,9 +388,8 @@ def test_code_interpreter_ignores_unrequested_analysis_metrics():
     coverage = register_key_insights_from_payload(request_state, "code_interpreter", payload)
 
     insights_by_name = {insight.name: insight for insight in request_state.insight_set.insights}
-    assert coverage.verified == ["max_min_difference"]
-    assert insights_by_name["max_min_difference"].value == 4.0
-    assert set(insights_by_name) == {"max_min_difference"}
+    assert coverage.missing == ["max_min_difference"]
+    assert insights_by_name == {}
 
 
 def test_insight_coverage_accumulates_across_sql_and_composite_analysis():
@@ -461,11 +457,7 @@ def test_insight_coverage_accumulates_across_sql_and_composite_analysis():
             "analysis_goal": "Calculate percentage change.",
             "input_evidence_id": "evi_prices",
             "code_hash": "change123",
-            "result": {
-                "summary": "Price increased by 20%.",
-                "metrics": {"percentage_change": 20.0},
-                "details": {},
-                "insights": [
+            "produced_insights": [
                     {
                         "insight_key": "price.percentage_change",
                         "name": "percentage_change",
@@ -474,9 +466,9 @@ def test_insight_coverage_accumulates_across_sql_and_composite_analysis():
                         "value": 20.0,
                         "derived_from": ["price.start", "price.end"],
                         "calculation_trace": {"formula": "(end - start) / start * 100"},
+                        "evidence_refs": [{"source_type": "analysis", "source_id": "ana_change"}, {"source_type": "query", "source_id": "evi_prices"}],
                     }
                 ],
-            },
         },
     )
 
@@ -513,8 +505,7 @@ def test_composite_insight_with_missing_parent_is_partial():
         {
             "analysis_id": "ana_partial",
             "input_evidence_id": "evi_prices",
-            "result": {
-                "insights": [
+            "produced_insights": [
                     {
                         "insight_key": "price.change",
                         "name": "change",
@@ -523,11 +514,9 @@ def test_composite_insight_with_missing_parent_is_partial():
                         "value": 2.0,
                         "derived_from": ["price.start", "price.end"],
                         "calculation_trace": {"formula": "end - start"},
+                        "evidence_refs": [{"source_type": "analysis", "source_id": "ana_partial"}],
                     }
                 ],
-                "metrics": {},
-                "details": {},
-            },
         },
     )
 
@@ -537,7 +526,7 @@ def test_composite_insight_with_missing_parent_is_partial():
     assert "unverified_dependencies" in insight.quality_flags
 
 
-def test_code_insight_directly_computed_from_rows_does_not_inherit_planned_dependencies():
+def test_bound_code_insight_preserves_planned_dependencies():
     request_state = _request_state()
     request_state.tool_history.append(
         ToolCall(
@@ -562,8 +551,7 @@ def test_code_insight_directly_computed_from_rows_does_not_inherit_planned_depen
         {
             "analysis_id": "ana_direct_change",
             "input_evidence_id": "evi_prices",
-            "result": {
-                "insights": [
+            "produced_insights": [
                     {
                         "insight_key": "price.change",
                         "name": "change",
@@ -572,15 +560,13 @@ def test_code_insight_directly_computed_from_rows_does_not_inherit_planned_depen
                         "value": 2.0,
                         "derived_from": [],
                         "calculation_trace": {"formula": "last row - first row"},
+                        "evidence_refs": [{"source_type": "analysis", "source_id": "ana_direct_change"}, {"source_type": "query", "source_id": "evi_prices"}],
                     }
                 ],
-                "metrics": {},
-                "details": {},
-            },
         },
     )
 
     insight = request_state.insight_set.insights[0]
-    assert coverage.verified == ["change"]
-    assert insight.derived_from == []
-    assert insight.status == "verified"
+    assert coverage.partial == ["change"]
+    assert insight.derived_from == ["price.start", "price.end"]
+    assert insight.status == "partial"

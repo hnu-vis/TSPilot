@@ -48,18 +48,18 @@ class DataAgentPromptBuilder:
             "requirements.operator=min|max, and count. Use time_boundary for timestamps and point_value only for scalar measure values. "
             "Use count only when the requested insight is a row/record count. Tables, detail lists, and complete time series are query Evidence "
             "Artifacts, not scalar Key Insights, so leave insight_requests empty for those outputs. Do not request change, ratio, trend, or other derived Key Insight types from sql_query.\n"
-            "Code interpreter boundary: analysis_request without code is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences. "
-            "If requested analysis metrics require custom formulas, sequence/window calculations, returns, volatility, drawdown, correlation, or any metric not clearly template-covered, call code_interpreter with Python code.\n"
+            "Code interpreter boundary: use code_interpreter only to calculate derived or analytical Key Insights from grounded Evidence or verified parent Insights. "
+            "Every call must include the exact non-empty insight_requests it should calculate; every request object must contain insight_key, name, and insight_type, plus optional requirements or derived_from. "
+            "Do not use type as an alias for insight_type, and do not request unrelated supporting metrics. Python code is optional because the tool can generate it internally.\n"
             "Code interpreter sandbox contract: generated Python code receives canonical variables df, time, value, "
             "time_col, value_col, series, analysis_context, plus compatibility variables data, rows, points, columns, "
             "metadata, and diagnostics. Prefer value/time/df/series; do not guess business field names or index raw "
             "rows/points unless canonical inputs are unavailable. data supports both original rows/points and column arrays. "
             "Use pandas-compatible frequency aliases such as 'h' for hourly grouping. "
-            "The code must assign a dict named result with a non-empty summary string, a metrics dict, a details dict, a data_views list, and an insights list. "
-            "When a requested answer or visualization depends on filtered or derived rows, data_views must contain the complete named dataset with schema_fields, lineage, and transform_summary; never return only a preview. "
-            "For code_interpreter tasks that select semantic events or decision points, analysis_request must ask for the complete filtered base Data View and separate one-row Data Views for roles that need distinct visual marks, in addition to any combined summary view. "
+            "The tool returns computation-only candidates and binds them to formal Key Insights internally. Do not ask it to produce summaries, metrics/details containers, Data Views, chart roles, or final-answer prose. "
+            "When verification or reuse genuinely requires a complete calculated table or series, the tool publishes it as independent derived Evidence; visualization consumes that Evidence plus formal Insight refs. "
             "When the user requires anomaly exclusion and no rule is supplied, call anomaly before code_interpreter. The Anomaly Artifact is authoritative; code_interpreter and visualization must use that exact anomaly set rather than detecting a second set. Do not author deterministic fallback branches for a missing artifact or failed business calculation; return a structured unavailable output after the allowed repair path instead. "
-            "When insight_requests is non-empty, insights must preserve each satisfied request's insight_key, name, insight_type, and derived_from and include value, statement, and calculation_trace.\n"
+            "The computation must preserve each requested insight_key and provide a calculation trace; the independent LLM Insight Binder owns statements and semantic binding.\n"
             "Tool-internal rules live inside tools. Do not recreate schema linking, query generation, validation, forecasting, anomaly detection, or code execution logic in the outer prompt.\n"
             "If a tool returns structured failure diagnostics, choose the recommended next action or a materially different action that addresses the diagnostics.\n"
             "Do not output markdown fences."
@@ -116,7 +116,7 @@ class DataAgentPromptBuilder:
         if action == "todowrite":
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
-            return ["database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "insight_requests?"]
+            return ["database_evidence", "analysis_goal", "insight_requests", "code?", "constraints?"]
         if action == "forecast":
             return ["database_evidence", "horizon", "constraints?"]
         if action == "anomaly":
@@ -311,6 +311,7 @@ class DataAgentPromptBuilder:
         return {
             "database_evidence_count": len(request_state.database_evidence_artifacts),
             "analysis_count": len(request_state.analysis_artifacts),
+            "derived_evidence_count": len(request_state.derived_evidence_artifacts),
             "has_forecast": request_state.latest_forecast is not None,
             "has_anomaly": request_state.latest_anomaly is not None,
             "verified_insight_count": sum(
@@ -408,6 +409,10 @@ class DataAgentPromptBuilder:
         return {
             "database_evidence": evidence_refs,
             "analysis": analysis_refs,
+            "latest_analysis": f"analysis:{request_state.latest_analysis_id}" if request_state.latest_analysis_id else None,
+            "derived_evidence": [
+                f"derived_evidence:{item}" for item in list(request_state.derived_evidence_artifacts.keys())[-8:]
+            ],
             "forecast": [f"forecast:{item}" for item in list(request_state.forecast_artifacts.keys())[-8:]],
             "anomaly": [f"anomaly:{item}" for item in list(request_state.anomaly_artifacts.keys())[-8:]],
             "visualization": [
@@ -710,12 +715,17 @@ class DataAgentPromptBuilder:
                     "code_hash": payload.get("code_hash"),
                     "input_ref": f"evidence:{payload.get('input_evidence_id')}",
                     "input_row_count": payload.get("input_row_count"),
-                    "result_preview": self._bounded_value(
-                        payload.get("result") or {},
+                    "computed_insights": self._bounded_value(
+                        payload.get("computed_insights") or [],
                         max_string_chars=1000,
                         max_list_items=8,
                         max_dict_items=16,
                     ),
+                    "derived_evidence_refs": [
+                        f"derived_evidence:{item.get('evidence_id')}"
+                        for item in payload.get("derived_evidence", [])
+                        if isinstance(item, dict) and item.get("evidence_id")
+                    ],
                 }
             )
         return {

@@ -9,7 +9,6 @@ import pytest
 from core.timeseries.anomaly_registry import register_api_anomaly_detector
 from core.timeseries.forecast_registry import register_api_forecast_model
 from schemas.database import DatabaseEvidence
-from schemas.analysis import AnalysisResult
 from schemas.state import RequestStateModel
 from schemas.timeseries import AnomalyResult
 from tools.anomaly import AnomalyInput, AnomalyTool
@@ -172,35 +171,13 @@ async def test_forecast_can_keep_selected_raw_points_when_requested():
 
 
 @pytest.mark.asyncio
-async def test_forecast_excludes_code_interpreter_outlier_rows_when_matching_anomaly_is_unavailable():
+async def test_forecast_does_not_use_code_interpreter_as_anomaly_fallback():
     evidence = _bitcoin_evidence(count=6)
     unrelated_anomaly = AnomalyResult(
         anomaly_id="anomaly_other_evidence",
         detector_name="zscore",
         anomaly_points=[],
         diagnostics={"resolved_evidence_id": "other_evidence"},
-    )
-    analysis = AnalysisResult(
-        analysis_id="ana_outlier_rows",
-        analysis_goal="transparent outlier treatment",
-        code_hash="sha256:test",
-        input_evidence_id=evidence.evidence_id,
-        input_row_count=6,
-        status="succeeded",
-        summary="excluded one outlier",
-        result={
-            "summary": "excluded one outlier",
-            "metrics": {},
-            "details": {
-                "excluded_rows": [
-                    {
-                        "timestamp": evidence.data["points"][0]["timestamp"],
-                        "value": evidence.data["points"][0]["value"],
-                    }
-                ]
-            },
-        },
-        diagnostics={},
     )
     request_state = RequestStateModel(
         request_id="req_forecast_exclude_analysis_outliers",
@@ -210,8 +187,6 @@ async def test_forecast_excludes_code_interpreter_outlier_rows_when_matching_ano
         database_evidence_artifacts={evidence.evidence_id: evidence},
         latest_anomaly=unrelated_anomaly,
         anomaly_artifacts={unrelated_anomaly.anomaly_id: unrelated_anomaly},
-        latest_analysis_id=analysis.analysis_id,
-        analysis_artifacts={analysis.analysis_id: analysis},
     )
 
     result = await ForecastTool().execute(
@@ -219,10 +194,9 @@ async def test_forecast_excludes_code_interpreter_outlier_rows_when_matching_ano
         request_state=request_state,
     )
 
-    assert result["diagnostics"]["excluded_anomaly_count"] == 1
-    assert result["diagnostics"]["source_analysis_id"] == "ana_outlier_rows"
+    assert result["diagnostics"]["excluded_anomaly_count"] == 0
     assert result["diagnostics"]["training_point_count_before_policy"] == 6
-    assert result["diagnostics"]["training_point_count_after_policy"] == 5
+    assert result["diagnostics"]["training_point_count_after_policy"] == 6
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,8 @@ Provide the stable result contract and validation errors for Python row analysis
 ## Responsibilities
 
 - Execute row-oriented analysis helpers used by tests and sandbox-compatible flows.
-- Validate that analysis code produces a dictionary result with summary, metrics,
-  and details.
+- Validate that analysis code produces computation-only `computed_insights` and
+  optional `derived_evidence` collections.
 - Raise `AnalysisCodeError` for invalid imports, malformed results, unsafe behavior,
   or execution failures.
 

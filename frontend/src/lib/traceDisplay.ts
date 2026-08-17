@@ -80,9 +80,8 @@ export type CodeInterpreterDetail = {
   inputRowCount: number | null;
   runtimeMs: number | null;
   summary: string | null;
-  metrics: Record<string, unknown>;
-  details: Record<string, unknown>;
-  result: Record<string, unknown> | null;
+  computedInsights: Record<string, unknown>[];
+  derivedEvidence: Record<string, unknown>[];
   inputColumns: string[];
 };
 
@@ -506,16 +505,9 @@ function codeInterpreterDetailFor(
     || stringFrom(actionInput?.code)
     || stringFrom(actionInput?.analysis_code)
     || '';
-  const result = asRecord(preview?.analysis_result) || asRecord(preview?.result_preview);
-  const metrics = asRecord(preview?.analysis_metrics)
-    || asRecord(preview?.metrics_preview)
-    || asRecord(result?.metrics)
-    || {};
-  const details = asRecord(preview?.analysis_details)
-    || asRecord(preview?.details_preview)
-    || asRecord(result?.details)
-    || {};
-  if (!code && !result && !preview) return null;
+  const computedInsights = recordsFrom(preview?.computed_insights);
+  const derivedEvidence = recordsFrom(preview?.derived_evidence);
+  if (!code && computedInsights.length === 0 && !preview) return null;
   return {
     analysisGoal: stringFrom(preview?.analysis_goal) || stringFrom(inputPreview?.analysis_goal) || stringFrom(actionInput?.analysis_goal),
     code,
@@ -524,10 +516,9 @@ function codeInterpreterDetailFor(
     inputEvidenceId: stringFrom(preview?.input_evidence_id) || stringFrom(inputPreview?.evidence_id) || stringFrom(actionInput?.database_evidence),
     inputRowCount: numberFrom(preview?.input_row_count),
     runtimeMs: numberFrom(preview?.runtime_ms),
-    summary: stringFrom(preview?.analysis_summary) || stringFrom(result?.summary) || stringFrom(preview?.summary),
-    metrics,
-    details,
-    result,
+    summary: stringFrom(preview?.analysis_summary) || stringFrom(preview?.summary),
+    computedInsights,
+    derivedEvidence,
     inputColumns: stringsFrom(preview?.input_columns),
   };
 }

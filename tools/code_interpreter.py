@@ -1,69 +1,44 @@
-"""Subprocess code interpreter tool for grounded data analysis."""
+"""Computation-only Code Interpreter over grounded evidence."""
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.analysis.python_runner import AnalysisCodeError
+from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
+from runtime.prompt_locale import prompt_locale_instruction
 from sandbox import execute_python_sandbox_v1
 from sandbox.analysis_context import build_canonical_analysis_context
-from schemas.analysis import AnalysisDataView, AnalysisResult
+from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from schemas.database import DatabaseEvidence
-from schemas.key_insight import KeyInsightRequest, normalize_insight_key
-from runtime.prompt_locale import prompt_locale_instruction
-from tools.base import BaseTool, StructuredToolError
-
-
-TEMPLATE_SUPPORTED_METRICS = {
-    "record_count",
-    "start_value",
-    "end_value",
-    "highest_value",
-    "lowest_value",
-    "max_value",
-    "min_value",
-    "max_min_difference",
-    "difference",
-    "start_end_change",
-    "change",
-}
+from schemas.key_insight import KeyInsightRequest
+from tools.base import BaseTool
 
 
 class CodeInterpreterInput(BaseModel):
-    mode: str | None = None
-    repair_contract: dict | None = None
     database_evidence: DatabaseEvidence | dict | str | None = None
-    analysis_goal: str | None = None
+    analysis_goal: str
     code: str | None = None
-    analysis_request: dict | None = None
-    required_outputs: list[str] = Field(default_factory=list)
-    expected_result_schema: dict | None = None
-    constraints: dict | None = Field(default_factory=dict)
-    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
+    constraints: dict = Field(default_factory=dict)
+    insight_requests: list[KeyInsightRequest] = Field(min_length=1)
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_code_aliases(cls, data):
+    def normalize_aliases(cls, data):
         if isinstance(data, dict):
             data = dict(data)
             if not data.get("code") and data.get("analysis_code"):
                 data["code"] = data["analysis_code"]
-            data["analysis_request"] = _normalize_analysis_request(data.get("analysis_request"))
-            data["required_outputs"] = _normalize_required_outputs(data.get("required_outputs"))
             if not isinstance(data.get("constraints"), dict):
-                data["constraints"] = (
-                    {"value": data.get("constraints")}
-                    if data.get("constraints") not in (None, "", [], {})
-                    else {}
-                )
+                data["constraints"] = {}
         return data
 
     @model_validator(mode="after")
@@ -75,1288 +50,297 @@ class CodeInterpreterInput(BaseModel):
         ]
         if errors:
             raise ValueError(" ".join(errors))
+        keys = [request.insight_key for request in self.insight_requests]
+        if len(keys) != len(set(keys)):
+            raise ValueError("code_interpreter insight_requests must have unique insight_key values")
         return self
 
 
+class _GeneratedCode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1)
+
+
 class CodeInterpreterTool(BaseTool):
-    def __init__(self, llm=None):
+    """Calculate requested Insight values; semantic binding is a separate LLM stage."""
+
+    def __init__(self, llm=None, binder: LLMInsightBinder | None = None):
         self._llm = llm
+        self._binder = binder or LLMInsightBinder(llm)
 
     async def execute(self, validated_input: CodeInterpreterInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
-        database_evidence = validated_input.database_evidence
-        if request_state is not None:
-            database_evidence = _resolve_database_evidence(database_evidence, request_state)
-        if database_evidence is None:
-            raise ValueError("code_interpreter requires database_evidence or a latest_database_evidence in request state.")
-        rows, points, columns = _analysis_inputs(database_evidence)
-        goal = validated_input.analysis_goal or "Code interpreter analysis"
-        constraints = validated_input.constraints or {}
-        analysis_request = validated_input.analysis_request or {}
-        repair_contract = validated_input.repair_contract
-        if repair_contract is None and isinstance(analysis_request.get("repair_contract"), dict):
-            repair_contract = analysis_request.get("repair_contract")
-        if repair_contract is None and isinstance(constraints.get("_repair_contract"), dict):
-            repair_contract = constraints.get("_repair_contract")
-        code_text = str(validated_input.code or "").strip()
-        generated_code_preview = None
-        executed_code_preview = None
-        canonical_context = build_canonical_analysis_context(
+        evidence = _resolve_database_evidence(validated_input.database_evidence, request_state)
+        if evidence is None:
+            raise ValueError("code_interpreter requires grounded database_evidence")
+        rows, points, columns = _analysis_inputs(evidence)
+        input_insights = _input_insights(request_state, validated_input.insight_requests)
+        context = build_canonical_analysis_context(
             rows=rows,
             points=points,
             columns=columns,
-            metadata=database_evidence.metadata,
-            diagnostics=database_evidence.diagnostics,
+            metadata=evidence.metadata,
+            diagnostics=evidence.diagnostics,
         )
-        anomaly_context = _authoritative_anomaly_context(request_state, database_evidence.evidence_id)
-        if anomaly_context is not None:
-            canonical_context["anomaly_context"] = anomaly_context
-        input_insights = _input_insights_for_requests(request_state, validated_input.insight_requests)
-        allowed_lineage_refs = _allowed_data_view_lineage_refs(
-            database_evidence=database_evidence,
-            anomaly_context=anomaly_context,
+        context["input_insights"] = input_insights
+        anomaly_context = _authoritative_anomaly_context(request_state, evidence.evidence_id)
+        if anomaly_context:
+            context["anomaly_context"] = anomaly_context
+
+        response_language = getattr(request_state, "response_language", "en")
+        code = str(validated_input.code or "").strip()
+        if not code:
+            code = await self._generate_code(
+                goal=validated_input.analysis_goal,
+                requests=validated_input.insight_requests,
+                context=context,
+                response_language=response_language,
+            )
+        preflight_error = _preflight_analysis_code(code)
+        if preflight_error:
+            raise AnalysisCodeError(preflight_error)
+
+        code_hash = _code_hash(code)
+        sandbox_output = execute_python_sandbox_v1(
+            code=code,
+            rows=rows,
+            points=points,
+            columns=columns,
+            metadata=evidence.metadata,
+            diagnostics=evidence.diagnostics,
+            input_insights=input_insights,
+            analysis_context=context,
+            timeout_seconds=int(validated_input.constraints.get("timeout_seconds", 5)),
+            work_dir=_work_dir(request_state, code_hash),
+        )
+        analysis_id = _analysis_id(evidence.evidence_id, validated_input.analysis_goal, code_hash)
+        derived_evidence, derived_name_map = _materialize_derived_evidence(
+            sandbox_output.result.get("derived_evidence", []),
+            analysis_id=analysis_id,
+            input_evidence_id=evidence.evidence_id,
             input_insights=input_insights,
         )
-        canonical_context["lineage_refs"] = allowed_lineage_refs
-        canonical_context["insight_contracts"] = [
-            request.model_dump(mode="json", exclude_none=True)
-            for request in validated_input.insight_requests
-        ]
-        canonical_context["input_insights"] = input_insights
-        if not code_text:
-            missing_metrics = _missing_template_metrics(
-                goal=goal,
-                required_outputs=validated_input.required_outputs,
-                analysis_request=validated_input.analysis_request,
-            )
-            if missing_metrics:
-                if self._llm is not None:
-                    try:
-                        code_text = await self._generate_analysis_code(
-                            goal=goal,
-                            required_outputs=validated_input.required_outputs,
-                            required_metrics=_requested_metric_labels(
-                                goal=goal,
-                                required_outputs=validated_input.required_outputs,
-                                analysis_request=validated_input.analysis_request,
-                            ),
-                            canonical_context=canonical_context,
-                            insight_requests=validated_input.insight_requests,
-                            analysis_request=analysis_request,
-                            expected_result_schema=validated_input.expected_result_schema or {},
-                            repair_contract=repair_contract,
-                            response_language=request_state.response_language,
-                        )
-                        generated_code_preview = _failed_code_summary(code_text)
-                    except (AnalysisCodeError, asyncio.TimeoutError):
-                        raise _structured_code_required_error(
-                            goal=goal,
-                            database_evidence=database_evidence,
-                            required_metrics=_requested_metric_labels(
-                                goal=goal,
-                                required_outputs=validated_input.required_outputs,
-                                analysis_request=validated_input.analysis_request,
-                            ),
-                            missing_metrics=missing_metrics,
-                        )
-                else:
-                    raise _structured_code_required_error(
-                        goal=goal,
-                        database_evidence=database_evidence,
-                        required_metrics=_requested_metric_labels(
-                            goal=goal,
-                            required_outputs=validated_input.required_outputs,
-                            analysis_request=validated_input.analysis_request,
-                        ),
-                        missing_metrics=missing_metrics,
-                    )
-            if not code_text:
-                output = _execute_analysis_request(
-                    rows=rows,
-                    points=points,
-                    columns=columns,
-                    goal=goal,
-                    required_outputs=validated_input.required_outputs,
-                    analysis_request=validated_input.analysis_request,
-                    constraints=constraints,
-                    insight_requests=validated_input.insight_requests,
-                    input_insights=input_insights,
-                )
-                code_type = "analysis_request_v1"
-                code_hash = _code_hash(json.dumps(output.get("diagnostics", {}), ensure_ascii=False, sort_keys=True, default=str))
-                runtime_ms = 0
-        if code_text:
-            code_hash = _code_hash(code_text)
-            requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
-            if requires_numeric_series and rows and not points:
-                raise AnalysisCodeError(
-                    "code_interpreter analysis requires numeric time-series values, but the selected evidence "
-                    "does not expose a usable timestamp/value pair. Query evidence with a numeric value column first."
-                )
-            sandbox_output, final_code_text = await self._execute_code_once(
-                code=code_text,
-                goal=goal,
-                database_evidence=database_evidence,
-                rows=rows,
-                points=points,
-                columns=columns,
-                canonical_context=canonical_context,
-                constraints=constraints,
-                request_state=request_state,
-                required_outputs=validated_input.required_outputs,
-                analysis_request=validated_input.analysis_request,
-                expected_result_schema=validated_input.expected_result_schema or {},
-                input_insights=input_insights,
-            )
-            code_hash = _code_hash(final_code_text)
-            executed_code_preview = _failed_code_summary(final_code_text)
-            generated_code_preview = _failed_code_summary(final_code_text) if generated_code_preview else None
-            output = {"result": sandbox_output.result, "diagnostics": {"runtime_ms": sandbox_output.runtime_ms}}
-            code_type = "code_interpreter_v1"
-            runtime_ms = sandbox_output.runtime_ms
-        elif not validated_input.code and missing_metrics:
-            # Kept for static analyzers; all branches above either set code_text,
-            # execute the template path, or raise a structured code-required error.
-            raise _structured_code_required_error(
-                goal=goal,
-                database_evidence=database_evidence,
-                required_metrics=_requested_metric_labels(
-                    goal=goal,
-                    required_outputs=validated_input.required_outputs,
-                    analysis_request=validated_input.analysis_request,
-                ),
-                missing_metrics=missing_metrics,
-            )
-        else:
-            # Template path has already populated output/code_type/runtime_ms.
-            pass
-        requires_numeric_series = _analysis_requires_numeric_series(goal, validated_input.expected_result_schema or {})
-        result_payload = output["result"]
-        try:
-            _validate_expected_result_schema(result_payload, validated_input.expected_result_schema or {})
-            _validate_data_views_contract(result_payload, allowed_lineage_refs=allowed_lineage_refs)
-            _validate_outlier_treatment_transparency(result_payload, anomaly_context=anomaly_context)
-            _validate_result_has_numeric_analysis(result_payload, requires_numeric_series=requires_numeric_series, input_rows=len(rows))
-            insight_binding = _validate_insight_output_contract(
-                result_payload,
-                validated_input.insight_requests,
-                input_row_count=len(rows),
-                input_insights=input_insights,
-            )
-        except AnalysisCodeError as exc:
-            raise _structured_analysis_validation_error(
-                exc,
-                goal=goal,
-                database_evidence=database_evidence,
-                result_payload=result_payload,
-                failed_code=final_code_text if code_text else None,
-                allowed_lineage_refs=allowed_lineage_refs,
-            ) from exc
+        computed = _validate_computed_insights(
+            sandbox_output.result.get("computed_insights", []),
+            requests=validated_input.insight_requests,
+            derived_name_map=derived_name_map,
+        )
+        produced = await self._binder.bind(
+            requests=validated_input.insight_requests,
+            computed=computed,
+            analysis_id=analysis_id,
+            analysis_goal=validated_input.analysis_goal,
+            input_evidence_id=evidence.evidence_id,
+            response_language=response_language,
+        )
         result = AnalysisResult(
-            analysis_id=_analysis_id(database_evidence.evidence_id, goal, code_hash),
-            analysis_goal=goal,
-            code_type=code_type,
+            analysis_id=analysis_id,
+            analysis_goal=validated_input.analysis_goal,
             code_hash=code_hash,
-            input_evidence_id=database_evidence.evidence_id,
+            input_evidence_id=evidence.evidence_id,
             input_row_count=len(rows),
             status="succeeded",
-            summary=str(result_payload["summary"]),
-            result=result_payload,
+            summary=f"Computed {len(computed)} requested insight value(s).",
+            computed_insights=computed,
+            derived_evidence=derived_evidence,
+            produced_insights=produced,
             diagnostics={
-                "runtime_ms": runtime_ms,
-                "expected_result_schema": validated_input.expected_result_schema or {},
+                "runtime_ms": sandbox_output.runtime_ms,
+                "sandbox": "subprocess_code_interpreter_v2",
+                "executed_code": code,
                 "input_columns": columns,
-                "input_points_count": len(points),
-                "sandbox": "subprocess_code_interpreter_v1" if code_type == "code_interpreter_v1" else "analysis_request_template_v1",
-                "executed_code": final_code_text if code_text else None,
-                "generated_code_preview": generated_code_preview,
-                "executed_code_preview": executed_code_preview,
-                "execution_attempts": 1 if code_text else 0,
-                "insight_binding": insight_binding,
-                "canonical_inputs": canonical_context.get("schema"),
-                **output.get("diagnostics", {}),
+                "canonical_inputs": context.get("schema"),
+                "binder": "llm_insight_binder_v1",
             },
         )
         return result.model_dump(mode="json")
 
-    async def _execute_code_once(
-        self,
-        *,
-        code: str,
-        goal: str,
-        database_evidence: DatabaseEvidence,
-        rows: list[dict],
-        points: list[dict],
-        columns: list[str],
-        canonical_context: dict,
-        constraints: dict,
-        request_state,
-        required_outputs: list[str],
-        analysis_request: dict | None,
-        expected_result_schema: dict,
-        input_insights: list[dict],
-    ):
-        preflight_error = _preflight_analysis_code(code, canonical_context)
-        if preflight_error is None:
-            try:
-                sandbox_output = execute_python_sandbox_v1(
-                    code=code,
-                    rows=rows,
-                    points=points,
-                    columns=columns,
-                    metadata=database_evidence.metadata,
-                    diagnostics=database_evidence.diagnostics,
-                    input_insights=input_insights,
-                    analysis_context=canonical_context,
-                    timeout_seconds=int(constraints.get("timeout_seconds", 5)),
-                    work_dir=_code_interpreter_work_dir(request_state, _code_hash(code)),
-                )
-                return sandbox_output, code
-            except AnalysisCodeError as exc:
-                execution_error = exc
-        else:
-            execution_error = AnalysisCodeError(preflight_error)
-        raise _structured_code_execution_error(
-            execution_error,
-            goal=goal,
-            database_evidence=database_evidence,
-            columns=columns,
-            required_outputs=required_outputs,
-            analysis_request=analysis_request,
-            expected_result_schema=expected_result_schema,
-            failed_code=code,
-            canonical_context=canonical_context,
-        )
-
-    async def _generate_analysis_code(
+    async def _generate_code(
         self,
         *,
         goal: str,
-        required_outputs: list[str],
-        required_metrics: list[str],
-        canonical_context: dict,
-        insight_requests: list[KeyInsightRequest],
-        analysis_request: dict,
-        expected_result_schema: dict,
-        repair_contract: dict | None,
+        requests: list[KeyInsightRequest],
+        context: dict,
         response_language: str,
     ) -> str:
-        return await self._invoke_code_llm(
-            {
-                "mode": "repair" if repair_contract else "generate",
-                "goal": goal,
-                "required_outputs": required_outputs,
-                "required_metrics": required_metrics,
-                "analysis_request": analysis_request,
-                "expected_result_schema": expected_result_schema,
-                "data_view_contract": {
-                    "view_id": "stable_string",
-                    "name": "human_readable_string",
-                    "shape": "timeseries|records|scalar|intervals",
-                    "rows": "complete_list_of_JSON_objects_for_non_scalar_views",
-                    "scalar": "JSON_object_for_scalar_view_only",
-                    "schema_fields": [{"name": "field_name", "data_type": "time|number|category|string|boolean|object"}],
-                    "lineage": "non-empty list containing only exact refs from available_lineage_refs",
-                    "transform_summary": "string",
-                },
-                "available_lineage_refs": canonical_context.get("lineage_refs", []),
-                "repair_contract": repair_contract,
-                "canonical_inputs": canonical_context.get("schema", {}),
-                "insight_contracts": [request.model_dump(mode="json", exclude_none=True) for request in insight_requests],
-                "input_insights": canonical_context.get("input_insights", []),
-            },
-            response_language=response_language,
-        )
-
-    async def _invoke_code_llm(self, payload: dict, *, response_language: str = "en") -> str:
         if self._llm is None:
-            raise AnalysisCodeError("code_interpreter has no LLM available for code generation.")
+            raise AnalysisCodeError("code_interpreter requires code or an LLM code generator")
         system = prompt_locale_instruction(response_language) + (
-            "You generate Python code for TSPilot code_interpreter. Return exactly one JSON object "
-            "with key code and no markdown. The sandbox already provides df, time, value, time_col, "
-            "value_col, series, analysis_context, data, rows, points, columns, metadata, diagnostics, input_insights, insight_by_key, "
-            "math, statistics, pd, and np. Prefer value/time/df/series. For multi-series input, inspect "
-            "analysis_context['schema']['dimension_cols'] and group by an available dimension; never assume a field, metric, or series column name. "
-            "Do not use pd.np or ellipsis placeholders. Do not invent field names. The code must assign result as one dict containing the stable contract fields "
-            "summary, metrics, details, data_views, and insights. summary must be a non-empty string. metrics must be a dict/object and may be empty "
-            "when the requested answer is primarily table/list/detail output. details must be a dict/object. Prefer details "
-            "for row records, top-k tables, time/value pairs, intermediate arrays, and calculation traces. All metric/detail "
-            "values must be JSON-serializable plain Python scalars, lists, or dicts. insights must be a list with one object per "
-            "satisfied insight_contract, preserving its insight_key, name, insight_type, result_shape, semantic_class, derivation, selection, and derived_from. Key Insights calculated directly from database rows may have empty derived_from; "
-            "derived_from is reserved for verified parent Key Insights. Each insight must include value, "
-            "statement, and calculation_trace. Collection Key Insights must include items with stable item_id values; preserve rank, timestamp, source_item_ids, and locator when applicable. Use input_insights or insight_by_key for dependencies; never invent a dependency value. "
-            "Treat analysis_request, expected_result_schema, and repair_contract as authoritative output requirements. When a "
-            "repair_contract lists required_details_fields, result.details must contain every listed field with the requested types. "
-            "When the goal or analysis_request performs outlier/anomaly treatment, result.details must include outlier_rule, "
-            "threshold_or_formula, rationale, excluded_rows as a row list, raw_metrics, and adjusted_metrics. "
-            "If analysis_context.anomaly_context exists, it is authoritative: use exactly its anomaly_points for exclusion, "
-            "do not run a second detector, do not add a no-anomaly or alternate-calculation fallback, and include its exact source_ref in filtered-view lineage. "
-            "data_views must contain every complete dataset needed by requested visual outputs. Each view has view_id, name, "
-            "shape (timeseries|records|scalar|intervals), rows or scalar, optional schema_fields, lineage, and transform_summary. "
-            "Every Data View lineage must be non-empty and contain only exact refs from available_lineage_refs; never invent or rename an evidence, anomaly, analysis, or Key Insight ref. "
-            "Omit schema_fields unless you can use only the canonical data_type values time, number, category, string, boolean, or object; never derive them with type() or pandas dtype names. "
-            "Convert pandas/numpy scalars and Timestamp values to plain JSON numbers and ISO strings in metrics, details, insights, and data_views. "
-            "For timezone normalization use pd.to_datetime(..., utc=True); never pass tz= for a value that may already be timezone-aware. "
-            "When the analysis selects multiple semantic events or decision points with compatible coordinates, publish a combined records Data View and also a dedicated one-row records Data View for each role that needs a distinct visual mark. Always publish the complete filtered/derived base series used by the calculation as its own Data View. Do not expose visual inputs only as unrelated scalar Key Insights. "
-            "Never emit only a sample when a complete filtered or derived series is needed for visualization."
+            "You generate Python for a computation-only Code Interpreter. Return exactly one JSON object with key code. "
+            "The sandbox provides df, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
+            "metadata, diagnostics, input_insights, insight_by_key, pd, np, math, and statistics. Do not import or access files, "
+            "network, processes, environment variables, or clocks. Assign one dict to result with exactly two keys: "
+            "computed_insights and derived_evidence. computed_insights must contain exactly one object per requested insight_key. "
+            "Each object contains insight_key, value or items, a non-empty calculation_trace describing formula/inputs as concise text or JSON, and optional "
+            "unavailable_reason only when the grounded inputs make the requested calculation impossible. Never invent a placeholder value. "
+            "derived_evidence_names. Do not produce statements, names, semantic classes, display roles, Key Insight objects, Data Views, "
+            "charts, summaries, repair policies, or final-answer prose. derived_evidence is normally empty; include a named artifact only "
+            "when a complete calculated table or series is needed to verify or reuse an Insight. Each artifact contains name, shape, rows "
+            "or scalar, and transform_summary. Use exact authoritative anomaly_context points when present; do not run another detector. "
+            "When anomaly_context is used, include its exact source_ref in every affected calculation_trace. "
+            "Convert numpy/pandas values and timestamps to JSON-native scalars and ISO strings. Never return NaN or Infinity."
         )
-        messages = [
-            ("system", system),
-            ("human", json.dumps(payload, ensure_ascii=False, default=str)),
-        ]
-        response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
-        content = _llm_content(response)
+        payload = {
+            "goal": goal,
+            "insight_requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
+            "canonical_inputs": context.get("schema", {}),
+            "input_insights": context.get("input_insights", []),
+            "anomaly_context": context.get("anomaly_context"),
+        }
+        messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
         try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise AnalysisCodeError(f"code generation LLM returned invalid JSON: {exc}") from exc
-        code = parsed.get("code") if isinstance(parsed, dict) else None
-        if not isinstance(code, str) or not code.strip():
-            raise AnalysisCodeError("code generation LLM returned empty code.")
-        return code.strip()
+            if hasattr(self._llm, "with_structured_output"):
+                runnable = self._llm.with_structured_output(_GeneratedCode, method="json_schema")
+                response = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                generated = response if isinstance(response, _GeneratedCode) else _GeneratedCode.model_validate(response)
+            else:
+                response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                generated = _GeneratedCode.model_validate_json(_llm_content(response))
+        except Exception as exc:
+            raise AnalysisCodeError(f"code generation LLM violated its output contract: {exc}") from exc
+        return generated.code.strip()
 
 
-def _resolve_database_evidence(database_evidence, request_state):
-    if database_evidence is None:
-        latest = request_state.latest_database_evidence
-        if latest is None:
-            return None
-        return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
-    if isinstance(database_evidence, str):
-        evidence_ref = database_evidence.strip()
-        if evidence_ref in {"latest", "latest_database_evidence", "current"}:
-            return _resolve_database_evidence(None, request_state)
-        if evidence_ref.startswith("evidence:"):
-            evidence_ref = evidence_ref.split(":", 1)[1]
-        elif evidence_ref.startswith("anomaly:"):
-            anomaly_id = evidence_ref.split(":", 1)[1]
-            anomaly = request_state.anomaly_artifacts.get(anomaly_id)
-            if anomaly is None:
-                raise ValueError(f"code_interpreter could not resolve anomaly reference: {database_evidence}")
-            diagnostics = anomaly.diagnostics if isinstance(anomaly.diagnostics, dict) else {}
-            evidence_ref = next(
-                (
-                    str(diagnostics.get(key) or "").removeprefix("evidence:")
-                    for key in ("resolved_evidence_id", "selected_evidence_id", "input_evidence_id")
-                    if diagnostics.get(key)
-                ),
-                "",
-            )
-            if not evidence_ref:
-                raise ValueError(f"anomaly reference has no input evidence lineage: {database_evidence}")
-        resolved = request_state.database_evidence_artifacts.get(evidence_ref)
-        if resolved is None:
-            raise ValueError(f"code_interpreter could not resolve database_evidence reference: {database_evidence}")
-        return resolved
-    if isinstance(database_evidence, dict):
-        evidence_id = database_evidence.get("evidence_id")
-        if evidence_id:
-            return request_state.database_evidence_artifacts.get(evidence_id) or DatabaseEvidence.model_validate(database_evidence)
-        latest = getattr(request_state, "latest_database_evidence", None)
-        if latest is not None:
-            return request_state.database_evidence_artifacts.get(latest.evidence_id, latest)
-        return DatabaseEvidence.model_validate(database_evidence)
-    return request_state.database_evidence_artifacts.get(database_evidence.evidence_id, database_evidence)
-
-
-def _input_insights_for_requests(request_state, requests: list[KeyInsightRequest]) -> list[dict]:
-    if request_state is None:
-        return []
-    required_keys = {dependency for request in requests for dependency in request.derived_from}
-    if not required_keys:
-        return []
-    result: list[dict] = []
-    for insight in request_state.insight_set.insights:
-        if insight.status != "verified" or insight.insight_key not in required_keys:
-            continue
-        result.append(
-            insight.model_dump(
-                mode="json",
-                include={
-                    "insight_id",
-                    "insight_key",
-                    "name",
-                    "insight_type",
-                    "value",
-                    "unit",
-                    "subject",
-                    "dimensions",
-                    "time_range",
-                    "derived_from",
-                    "calculation_trace",
-                },
-            )
+def _validate_computed_insights(raw: Any, *, requests: list[KeyInsightRequest], derived_name_map: dict[str, str]) -> list[ComputedInsight]:
+    if not isinstance(raw, list):
+        raise AnalysisCodeError("computed_insights must be a list")
+    requested_keys = [request.insight_key for request in requests]
+    result: list[ComputedInsight] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise AnalysisCodeError("each computed insight must be an object")
+        payload = dict(item)
+        names = payload.pop("derived_evidence_names", [])
+        if not isinstance(names, list):
+            raise AnalysisCodeError("derived_evidence_names must be a list")
+        unknown = [name for name in names if str(name) not in derived_name_map]
+        if unknown:
+            raise AnalysisCodeError(f"computed insight references unknown derived evidence names: {unknown}")
+        payload["derived_evidence_ids"] = [derived_name_map[str(name)] for name in names]
+        try:
+            result.append(ComputedInsight.model_validate(payload))
+        except Exception as exc:
+            raise AnalysisCodeError(f"invalid computed insight: {exc}") from exc
+    actual_keys = [item.insight_key for item in result]
+    if actual_keys != requested_keys:
+        raise AnalysisCodeError(
+            "computed_insights must preserve request order and exactly match requested keys; "
+            f"requested={requested_keys}, computed={actual_keys}"
         )
     return result
 
 
-def _validate_insight_output_contract(
-    result: dict,
-    requests: list[KeyInsightRequest],
+def _materialize_derived_evidence(
+    raw: Any,
     *,
-    input_row_count: int = 0,
-    input_insights: list[dict] | None = None,
-) -> dict:
-    """Bind candidate insights without converting coverage gaps into code failures."""
-
-    diagnostics = {"bound": [], "missing": [], "rejected": [], "partial": []}
-    if not requests:
-        return diagnostics
-    insights = result.get("insights")
-    if insights is None:
-        insights = []
-    if not isinstance(insights, list):
-        diagnostics["rejected"].append({"reason": "result.insights must be a list"})
-        insights = []
-    requests_by_alias: dict[str, KeyInsightRequest] = {}
-    for request in requests:
-        requests_by_alias[request.insight_key] = request
-        requests_by_alias[normalize_insight_key(request.name)] = request
-    verified_input_keys = {
-        normalize_insight_key(insight.get("insight_key") or insight.get("insight_id") or insight.get("name") or "")
-        for insight in (input_insights or [])
-        if isinstance(insight, dict) and insight.get("status", "verified") == "verified"
-    }
-    candidate_keys = {
-        request.insight_key
-        for raw in insights
-        if isinstance(raw, dict)
-        and (request := requests_by_alias.get(normalize_insight_key(raw.get("insight_key") or raw.get("name") or "")))
-    }
-    bound_insights: list[dict] = []
-    seen: set[str] = set()
-    for raw in insights:
-        if not isinstance(raw, dict):
-            diagnostics["rejected"].append({"reason": "candidate insight must be an object"})
-            continue
-        candidate = dict(raw)
-        candidate_key = normalize_insight_key(candidate.get("insight_key") or candidate.get("name") or "")
-        request = requests_by_alias.get(candidate_key)
-        if request is None:
-            diagnostics["rejected"].append({"insight_key": candidate_key, "reason": "unrequested candidate insight"})
-            continue
-        if request.insight_key in seen:
-            diagnostics["rejected"].append({"insight_key": request.insight_key, "reason": "duplicate candidate insight"})
-            continue
-        if candidate.get("value") is None or not str(candidate.get("statement") or "").strip():
-            diagnostics["rejected"].append(
-                {"insight_key": request.insight_key, "reason": "candidate insight requires value and statement"}
-            )
-            continue
-        dependencies = [
-            normalize_insight_key(item)
-            for item in (candidate.get("derived_from") if "derived_from" in candidate else request.derived_from) or []
-            if item
-        ]
-        quality_flags = list(candidate.get("quality_flags") or [])
-        missing_parents = [
-            key
-            for key in dependencies
-            if key not in verified_input_keys and key not in candidate_keys
-        ]
-        if request.insight_key in dependencies:
-            missing_parents.append(request.insight_key)
-        if missing_parents and "unverified_dependencies" not in quality_flags:
-            quality_flags.append("unverified_dependencies")
-        if input_row_count <= 0 and not dependencies and "ungrounded_candidate" not in quality_flags:
-            quality_flags.append("ungrounded_candidate")
-        if (
-            not isinstance(candidate.get("calculation_trace"), dict)
-            or not candidate.get("calculation_trace")
-        ) and "missing_calculation_trace" not in quality_flags:
-            quality_flags.append("missing_calculation_trace")
-        value_shape = candidate.get("value_shape") or request.result_shape
-        item_payloads = candidate.get("items")
-        if not isinstance(item_payloads, list) and isinstance(candidate.get("value"), list):
-            item_payloads = candidate.get("value")
-        items = _normalize_insight_items(request.insight_key, item_payloads)
-        expected_item_count = request.expected_item_count
-        if expected_item_count is None and isinstance(request.requirements, dict):
-            expected_item_count = request.requirements.get("expected_item_count")
-        if expected_item_count is None and isinstance(request.requirements, dict):
-            expected_item_count = request.requirements.get("limit")
-        if expected_item_count is not None:
-            try:
-                expected_item_count = int(expected_item_count)
-            except (TypeError, ValueError):
-                expected_item_count = None
-        if expected_item_count is not None and len(items) != expected_item_count:
-            quality_flags.append("item_count_mismatch")
-        selection = {
-            **(request.requirements if isinstance(request.requirements, dict) else {}),
-            **(request.selection if isinstance(request.selection, dict) else {}),
-        }
-        item_ids = [item.get("item_id") for item in items if isinstance(item, dict)]
-        if len(item_ids) != len(set(item_ids)):
-            quality_flags.append("duplicate_item_id")
-        if value_shape in {"ranked_set", "ranking"}:
-            ranks = [item.get("rank") for item in items if isinstance(item, dict)]
-            if ranks != list(range(1, len(items) + 1)):
-                quality_flags.append("invalid_rank_sequence")
-        order_by = str(selection.get("order_by") or "").strip()
-        direction = str(selection.get("direction") or "asc").strip().lower()
-        if order_by and len(items) > 1 and all(isinstance(item, dict) and item.get(order_by) is not None for item in items):
-            ordered_values = [item[order_by] for item in items]
-            expected_values = sorted(ordered_values, reverse=direction == "desc")
-            if ordered_values != expected_values:
-                quality_flags.append("invalid_item_order")
-        distinct_by = str(selection.get("distinct_by") or "").strip()
-        if distinct_by and len(items) > 1:
-            distinct_values = [item.get(distinct_by) for item in items if isinstance(item, dict)]
-            if len(distinct_values) != len(set(map(str, distinct_values))) and "duplicate_distinct_key" not in quality_flags:
-                quality_flags.append("duplicate_distinct_key")
-        source_item_ids = {
-            item_id
-            for item in items
-            if isinstance(item, dict)
-            for item_id in (item.get("source_item_ids") or [])
-        }
-        if source_item_ids and not source_item_ids.issubset(set(item_ids)):
-            quality_flags.append("unresolved_source_item")
-        candidate.update(
-            {
-                "insight_key": request.insight_key,
-                "name": request.name,
-                "insight_type": request.insight_type,
-                "derived_from": dependencies,
-                "value_shape": value_shape or ("collection" if items else None),
-                "semantic_class": candidate.get("semantic_class") or request.semantic_class,
-                "derivation": candidate.get("derivation") or request.derivation,
-                "selection": candidate.get("selection") or request.selection,
-                "items": items,
-                "quality_flags": quality_flags,
-                "status": "partial" if quality_flags else candidate.get("status", "verified"),
-            }
-        )
-        seen.add(request.insight_key)
-        bound_insights.append(candidate)
-        diagnostics["bound"].append(request.insight_key)
-        if quality_flags:
-            diagnostics["partial"].append(
-                {"insight_key": request.insight_key, "quality_flags": quality_flags}
-            )
-    result["insights"] = bound_insights
-    diagnostics["missing"] = [request.insight_key for request in requests if request.insight_key not in seen]
-    return diagnostics
+    analysis_id: str,
+    input_evidence_id: str,
+    input_insights: list[dict],
+) -> tuple[list[DerivedEvidence], dict[str, str]]:
+    if not isinstance(raw, list):
+        raise AnalysisCodeError("derived_evidence must be a list")
+    lineage = [
+        f"evidence:{input_evidence_id}",
+        *[
+            f"insight:{item['insight_id']}"
+            for item in input_insights
+            if isinstance(item, dict) and item.get("insight_id")
+        ],
+    ]
+    result: list[DerivedEvidence] = []
+    name_map: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise AnalysisCodeError("each derived evidence artifact must be an object")
+        name = str(item.get("name") or "").strip()
+        if not name or name in name_map:
+            raise AnalysisCodeError("derived evidence names must be non-empty and unique")
+        evidence_id = f"dev_{analysis_id}_{_slug(name)}"
+        try:
+            artifact = DerivedEvidence.model_validate({**item, "evidence_id": evidence_id, "lineage": lineage})
+        except Exception as exc:
+            raise AnalysisCodeError(f"invalid derived evidence '{name}': {exc}") from exc
+        result.append(artifact)
+        name_map[name] = evidence_id
+    return result, name_map
 
 
-def _normalize_insight_items(insight_key: str, raw_items: Any) -> list[dict]:
-    """Normalize collection members into stable, evidence-addressable items."""
-
-    if not isinstance(raw_items, list):
-        return []
-    normalized: list[dict] = []
-    for index, raw_item in enumerate(raw_items):
-        payload = dict(raw_item) if isinstance(raw_item, dict) else {"value": raw_item}
-        item_id = str(payload.get("item_id") or "").strip()
-        if not item_id:
-            identity = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-            item_id = f"{normalize_insight_key(insight_key)}:{index}:{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:10]}"
-        payload["item_id"] = item_id
-        normalized.append(payload)
-    return normalized
-
-
-def _normalize_analysis_request(value) -> dict | None:
-    if value in (None, "", [], {}):
+def _resolve_database_evidence(value, request_state) -> DatabaseEvidence | None:
+    if isinstance(value, DatabaseEvidence):
+        if request_state is None:
+            return value
+        return request_state.database_evidence_artifacts.get(value.evidence_id, value)
+    if isinstance(value, dict):
+        return DatabaseEvidence.model_validate(value)
+    if request_state is None:
         return None
-    if isinstance(value, dict):
-        normalized = dict(value)
-        if "required_outputs" in normalized:
-            normalized["required_outputs"] = _normalize_required_outputs(normalized.get("required_outputs"))
-        return normalized
-    if isinstance(value, list):
-        return {"required_outputs": _normalize_required_outputs(value)}
-    return {"goal": str(value)}
-
-
-def _normalize_required_outputs(value) -> list[str]:
-    if value in (None, "", False):
-        return []
-    if isinstance(value, list):
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                label = item.get("id") or item.get("description") or item.get("output_type") or item.get("evidence_kind")
-            else:
-                label = item
-            if str(label or "").strip():
-                result.append(str(label).strip())
-        return result
-    if isinstance(value, dict):
-        label = value.get("id") or value.get("description") or value.get("output_type") or value.get("evidence_kind")
-        return [str(label).strip()] if str(label or "").strip() else []
-    return [str(value).strip()] if str(value).strip() else []
-
-
-def _requested_metric_labels(*, goal: str, required_outputs: list[str], analysis_request: dict | None) -> list[str]:
-    labels = _string_list(required_outputs)
-    if isinstance(analysis_request, dict):
-        labels.extend(_string_list(analysis_request.get("required_outputs")))
-    deduped: list[str] = []
-    for label in labels:
-        if label not in deduped:
-            deduped.append(label)
-    if deduped:
-        return deduped
-    text_labels = []
-    if goal:
-        text_labels.append(goal)
-    if isinstance(analysis_request, dict) and analysis_request.get("goal"):
-        text_labels.append(str(analysis_request.get("goal")))
-    return text_labels
-
-
-def _missing_template_metrics(*, goal: str, required_outputs: list[str], analysis_request: dict | None) -> list[str]:
-    labels = _requested_metric_labels(
-        goal=goal,
-        required_outputs=required_outputs,
-        analysis_request=analysis_request,
-    )
-    missing: list[str] = []
-    for label in labels:
-        coverage = _template_metric_coverage(label)
-        for metric in coverage["missing"]:
-            if metric not in missing:
-                missing.append(metric)
-    return _sort_missing_metrics(missing)
-
-
-def _sort_missing_metrics(metrics: list[str]) -> list[str]:
-    priority = {
-        "total_return": 0,
-        "volatility": 1,
-        "max_drawdown": 2,
-    }
-    return sorted(metrics, key=lambda item: (priority.get(item, 100), item))
-
-
-def _template_metric_coverage(label: str) -> dict[str, list[str]]:
-    text = str(label or "").strip().lower()
-    if not text:
-        return {"covered": [], "missing": []}
-    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
-    missing = _unsupported_metric_names(text, compact)
-    if missing:
-        return {"covered": [], "missing": missing}
-    covered = _supported_metric_names(text, compact)
-    if covered:
-        return {"covered": covered, "missing": []}
-    return {"covered": [], "missing": [str(label).strip()]}
-
-
-def _unsupported_metric_names(text: str, compact: str) -> list[str]:
-    missing: list[str] = []
-    metric_markers = (
-        ("total_return", ("totalreturn", "cumulativereturn", "returnrate", "收益率", "总收益", "累计收益")),
-        ("volatility", ("volatility", "stdreturn", "波动率", "波动")),
-        ("max_drawdown", ("maxdrawdown", "maximumdrawdown", "drawdown", "最大回撤", "回撤")),
-    )
-    for name, markers in metric_markers:
-        if any(marker in compact or marker in text for marker in markers) and name not in missing:
-            missing.append(name)
-    if "returns" in text and "total_return" not in missing:
-        missing.append("total_return")
-    return missing
-
-
-def _supported_metric_names(text: str, compact: str) -> list[str]:
-    exact = {
-        "recordcount": "record_count",
-        "rowcount": "record_count",
-        "count": "record_count",
-        "startvalue": "start_value",
-        "firstvalue": "start_value",
-        "endvalue": "end_value",
-        "lastvalue": "end_value",
-        "highestvalue": "highest_value",
-        "maxvalue": "max_value",
-        "maximumvalue": "max_value",
-        "lowestvalue": "lowest_value",
-        "minvalue": "min_value",
-        "minimumvalue": "min_value",
-        "maxmindifference": "max_min_difference",
-        "difference": "difference",
-        "startendchange": "start_end_change",
-        "change": "change",
-        "最大值": "max_value",
-        "最高值": "highest_value",
-        "最小值": "min_value",
-        "最低值": "lowest_value",
-        "最大值和最小值的差异": "max_min_difference",
-        "最大最小差异": "max_min_difference",
-        "差异": "difference",
-        "差值": "difference",
-        "起始值": "start_value",
-        "开始值": "start_value",
-        "结束值": "end_value",
-        "最终值": "end_value",
-        "记录数": "record_count",
-        "条数": "record_count",
-    }
-    covered: list[str] = []
-    for key, metric in exact.items():
-        normalized_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", key.lower())
-        if compact == normalized_key or normalized_key in compact:
-            if metric not in covered:
-                covered.append(metric)
-    if ("最大" in text or "最高" in text or "max" in text or "maximum" in text) and "max_drawdown" not in compact:
-        metric = "max_value"
-        if metric not in covered:
-            covered.append(metric)
-    if "最小" in text or "最低" in text or "min" in text or "minimum" in text:
-        metric = "min_value"
-        if metric not in covered:
-            covered.append(metric)
-    if any(marker in text for marker in ("差异", "差值", "difference")):
-        metric = "max_min_difference" if (("最大" in text and "最小" in text) or "max" in text and "min" in text) else "difference"
-        if metric not in covered:
-            covered.append(metric)
-    return [metric for metric in covered if metric in TEMPLATE_SUPPORTED_METRICS]
+    if value in (None, "", "latest", "latest_database_evidence", "current"):
+        return request_state.latest_database_evidence
+    ref = str(value).removeprefix("evidence:")
+    return request_state.database_evidence_artifacts.get(ref)
 
 
 def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict], list[str]]:
     data = evidence.data or {}
-    time_field = str(data.get("time_field") or "timestamp")
-    value_field = str(data.get("value_field") or "value")
-    raw_rows = data.get("rows")
-    if isinstance(raw_rows, list) and raw_rows:
-        rows = [dict(row) for row in raw_rows if isinstance(row, dict)]
-    else:
-        rows = []
-        for point in data.get("points", []) or []:
-            if not isinstance(point, dict):
-                continue
-            row = {
-                time_field: point.get("timestamp"),
-                value_field: point.get("value"),
-            }
-            for key, value in point.items():
-                if key not in {"timestamp", "value"}:
-                    row[key] = value
-            rows.append(row)
-    points = [dict(point) for point in data.get("points", []) or [] if isinstance(point, dict)]
-    if not points and rows:
-        inferred_time_field = _first_present_key(rows, [time_field, "timestamp", "_time", "time"])
-        inferred_value_field = _first_present_key(rows, [value_field, "value", "price", "_value"])
-        if inferred_time_field and inferred_value_field:
-            points = []
-            for row in rows:
-                point = {
-                    "timestamp": row.get(inferred_time_field),
-                    "value": row.get(inferred_value_field),
-                }
-                for key, value in row.items():
-                    if key not in {inferred_time_field, inferred_value_field}:
-                        point[key] = value
-                points.append(point)
+    rows = [dict(item) for item in data.get("rows", []) if isinstance(item, dict)]
+    points = [dict(item) for item in data.get("points", []) if isinstance(item, dict)]
+    if not rows:
+        rows = [dict(item) for item in points]
     columns = list(evidence.columns or [])
     if not columns and rows:
-        columns = []
-        for row in rows:
-            for key in row:
-                if key not in columns:
-                    columns.append(key)
+        columns = list(dict.fromkeys(key for row in rows for key in row))
     return rows, points, columns
 
 
-def _execute_analysis_request(
-    *,
-    rows: list[dict],
-    points: list[dict],
-    columns: list[str],
-    goal: str,
-    required_outputs: list[str],
-    analysis_request: dict | None,
-    constraints: dict,
-    insight_requests: list[KeyInsightRequest],
-    input_insights: list[dict],
-) -> dict:
-    canonical_points = _canonical_numeric_points(rows=rows, points=points)
-    if not canonical_points:
-        raise AnalysisCodeError("analysis_request requires row or point evidence with numeric values.")
-    sorted_points = sorted(canonical_points, key=lambda item: str(item.get("timestamp") or ""))
-    values = [float(item["value"]) for item in sorted_points]
-    first = sorted_points[0]
-    last = sorted_points[-1]
-    max_point = max(sorted_points, key=lambda item: float(item["value"]))
-    min_point = min(sorted_points, key=lambda item: float(item["value"]))
-    all_metrics = {
-        "record_count": len(sorted_points),
-        "start_value": first["value"],
-        "end_value": last["value"],
-        "highest_value": max_point["value"],
-        "lowest_value": min_point["value"],
-        "max_value": max_point["value"],
-        "min_value": min_point["value"],
-        "max_min_difference": float(max_point["value"]) - float(min_point["value"]),
-        "difference": float(max_point["value"]) - float(min_point["value"]),
-        "start_end_change": float(last["value"]) - float(first["value"]),
-        "change": float(last["value"]) - float(first["value"]),
-    }
-    requested_outputs = _string_list(required_outputs or (analysis_request or {}).get("required_outputs"))
-    selected_metric_keys = _requested_metric_keys(requested_outputs, all_metrics)
-    goal_metric_keys = _metric_keys_implied_by_text(goal, all_metrics)
-    if goal_metric_keys:
-        selected_metric_keys = [
-            key for key in selected_metric_keys if key in goal_metric_keys
-        ] or goal_metric_keys
-    metrics = {key: all_metrics[key] for key in selected_metric_keys}
-    if not metrics and not requested_outputs:
-        metrics = dict(all_metrics)
-    details = _selected_analysis_details(
-        selected_metric_keys=list(metrics),
-        requested_outputs=requested_outputs,
-        first=first,
-        last=last,
-        max_point=max_point,
-        min_point=min_point,
-        columns=columns,
-    )
-    if _analysis_context_indicates_outlier_treatment(goal, analysis_request, constraints):
-        details.update(
-            {
-                "outlier_rule": "canonical_transparency_template_no_exclusion",
-                "threshold_or_formula": "No exclusion threshold was applied by the canonical metrics template.",
-                "rationale": (
-                    "The analysis goal requested anomaly/outlier handling. "
-                    "This template reports transparent raw and adjusted metrics; no rows are excluded unless a detector explicitly supplies excluded_rows."
-                ),
-                "excluded_rows": [],
-                "raw_metrics": {key: all_metrics[key] for key in metrics},
-                "adjusted_metrics": dict(metrics),
+def _input_insights(request_state, requests: list[KeyInsightRequest]) -> list[dict]:
+    if request_state is None:
+        return []
+    needed = {key for request in requests for key in request.derived_from}
+    return [
+        insight.model_dump(mode="json", exclude_none=True)
+        for insight in request_state.insight_set.insights
+        if insight.status == "verified" and insight.insight_key in needed
+    ]
+
+
+def _authoritative_anomaly_context(request_state, evidence_id: str) -> dict | None:
+    if request_state is None:
+        return None
+    for anomaly in reversed(list(request_state.anomaly_artifacts.values())):
+        diagnostics = anomaly.diagnostics if isinstance(anomaly.diagnostics, dict) else {}
+        resolved = str(diagnostics.get("resolved_evidence_id") or diagnostics.get("input_evidence_id") or "").removeprefix("evidence:")
+        if resolved == evidence_id:
+            return {
+                "source_ref": f"anomaly:{anomaly.anomaly_id}",
+                "anomaly_points": [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)],
             }
-        )
-    summary = _analysis_request_summary(goal, metrics, details)
-    insights = _template_insights_from_metrics(insight_requests, metrics, input_insights, details)
-    return {
-        "result": {
-            "summary": summary,
-            "metrics": metrics,
-            "details": details,
-            "insights": insights,
-        },
-        "diagnostics": {
-            "analysis_request": analysis_request or {},
-            "template": "canonical_timeseries_metrics_v1",
-            "constraints": constraints,
-            "input_point_count": len(sorted_points),
-        },
-    }
-
-
-def _template_insights_from_metrics(
-    requests: list[KeyInsightRequest],
-    metrics: dict,
-    input_insights: list[dict],
-    details: dict,
-) -> list[dict]:
-    input_keys = {
-        normalize_insight_key(insight.get("insight_key") or insight.get("insight_id") or insight.get("name") or "")
-        for insight in input_insights
-    }
-    insights: list[dict] = []
-    for request in requests:
-        metric_key = str(request.requirements.get("metric_key") or request.name)
-        if metric_key not in metrics:
-            semantic_hints = [
-                request.insight_key,
-                request.name,
-                str(request.requirements.get("operator") or ""),
-                request.insight_type,
-            ]
-            matches = _requested_metric_keys(semantic_hints, metrics)
-            if not matches:
-                continue
-            metric_key = matches[0]
-        if any(dependency not in input_keys for dependency in request.derived_from):
-            continue
-        value = metrics[metric_key]
-        trace = {
-            "template": "canonical_timeseries_metrics_v1",
-            "metric_key": metric_key,
-        }
-        if metric_key in {"max_value", "highest_value"} and isinstance(details.get("max_point"), dict):
-            point = details["max_point"]
-            locator_row = point.get("row") if isinstance(point.get("row"), dict) else point
-            trace.update({"row": locator_row, "time_key": "timestamp", "value_key": "value", "operator": "max"})
-        elif metric_key in {"min_value", "lowest_value"} and isinstance(details.get("min_point"), dict):
-            point = details["min_point"]
-            locator_row = point.get("row") if isinstance(point.get("row"), dict) else point
-            trace.update({"row": locator_row, "time_key": "timestamp", "value_key": "value", "operator": "min"})
-        insights.append(
-            {
-                "insight_key": request.insight_key,
-                "name": request.name,
-                "insight_type": request.insight_type,
-                "statement": f"{request.name} is {value}.",
-                "value": value,
-                "subject": request.subject,
-                "dimensions": request.dimensions,
-                "time_range": request.time_range,
-                "derived_from": request.derived_from,
-                "calculation_trace": trace,
-            }
-        )
-    return insights
-
-
-def _analysis_context_indicates_outlier_treatment(goal: str, analysis_request: dict | None, constraints: dict | None) -> bool:
-    repair_contract = None
-    if isinstance(constraints, dict):
-        repair_contract = constraints.get("_repair_contract")
-    text = " ".join(
-        [
-            goal or "",
-            _flatten_text(analysis_request or {}),
-            _flatten_text(repair_contract or {}),
-        ]
-    ).lower()
-    return any(
-        marker in text
-        for marker in (
-            "outlier",
-            "anomaly",
-            "anomalous",
-            "excluded",
-            "异常",
-            "离群",
-            "剔除",
-            "排除",
-        )
-    )
-
-
-def _structured_code_required_error(
-    *,
-    goal: str,
-    database_evidence: DatabaseEvidence,
-    required_metrics: list[str],
-    missing_metrics: list[str],
-) -> StructuredToolError:
-    repair_contract = {
-        "mode": "generated_code_required",
-        "input_evidence": database_evidence.evidence_id,
-        "analysis_goal": goal,
-        "required_metrics": required_metrics,
-        "missing_metrics": missing_metrics,
-        "instruction": (
-            "Call code_interpreter again with Python code. The code must compute the missing metrics "
-            "from rows/points and return result = {'summary': str, 'metrics': dict, 'details': dict}."
-        ),
-        "expected_result_shape": {
-            "summary": "string",
-            "metrics": {metric: "number_or_null" for metric in missing_metrics},
-            "details": "object",
-        },
-    }
-    message = (
-        "analysis_request_v1 cannot cover requested metrics without generated code: "
-        + ", ".join(missing_metrics)
-    )
-    validation_failure = {
-        "scope": "tool_input",
-        "capability": "analysis",
-        "tool": "code_interpreter",
-        "error_code": "code_required_for_metrics",
-        "message": message,
-        "required_contract": {
-            "template_supported_metrics": sorted(TEMPLATE_SUPPORTED_METRICS),
-            "required_metrics": required_metrics,
-            "missing_metrics": missing_metrics,
-        },
-        "repair_contract": repair_contract,
-        "retry_policy": {
-            "required_action": "code_interpreter",
-            "max_equivalent_retries": 2,
-            "allow_same_action": True,
-            "terminal_after_exhausted": True,
-        },
-    }
-    return StructuredToolError(
-        message,
-        error_type="code_required_for_metrics",
-        retryable=True,
-        recommended_next_action="code_interpreter",
-        diagnostics={
-            "template_supported_metrics": sorted(TEMPLATE_SUPPORTED_METRICS),
-            "required_metrics": required_metrics,
-            "missing_metrics": missing_metrics,
-            "repair_contract": repair_contract,
-        },
-        validation_failure=validation_failure,
-    )
-
-
-def _structured_code_execution_error(
-    exc: AnalysisCodeError,
-    *,
-    goal: str,
-    database_evidence: DatabaseEvidence,
-    columns: list[str],
-    required_outputs: list[str],
-    analysis_request: dict | None,
-    expected_result_schema: dict,
-    failed_code: str | None = None,
-    canonical_context: dict | None = None,
-) -> StructuredToolError:
-    required_metrics = _requested_metric_labels(
-        goal=goal,
-        required_outputs=required_outputs,
-        analysis_request=analysis_request,
-    )
-    if canonical_context is None:
-        rows, points, context_columns = _analysis_inputs(database_evidence)
-        canonical_context = build_canonical_analysis_context(
-            rows=rows,
-            points=points,
-            columns=columns or context_columns,
-            metadata=database_evidence.metadata,
-            diagnostics=database_evidence.diagnostics,
-        )
-    repair_contract = {
-        "mode": "code_execution_repair",
-        "input_evidence": database_evidence.evidence_id,
-        "analysis_goal": goal,
-        "required_metrics": required_metrics,
-        "expected_result_shape": expected_result_schema
-        or {"summary": "string", "metrics": "object", "details": "object"},
-        "available_inputs": {
-            "rows": "list[dict]",
-            "points": "list[dict]",
-            "columns": columns,
-            "data": "dict with rows, points, and series",
-            "metadata": "dict",
-            "diagnostics": "dict",
-            "canonical": "df, time, value, time_col, value_col, series, analysis_context; analysis_context.schema.dimension_cols lists grouping dimensions",
-        },
-        "canonical_inputs": canonical_context.get("schema") if isinstance(canonical_context, dict) else {},
-        "failed_code": str(failed_code or ""),
-        "failed_code_summary": _failed_code_summary(failed_code),
-        "error_classification": _classify_analysis_code_error(str(exc)),
-        "instruction": (
-            "Call code_interpreter again with corrected Python code. The sandbox provides variables "
-            "df, data, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
-            "metadata, and diagnostics. Prefer df and inspect analysis_context['schema']['dimension_cols'] "
-            "before grouping multi-series evidence; do not assume a field/metric/series column name. Use pandas frequency aliases compatible with current "
-            "pandas, for example 'h' for hourly grouping. Convert pandas/numpy values and timestamps to JSON-native values; "
-            "use pd.to_datetime(..., utc=True) instead of passing tz= to possibly aware timestamps. For Data Views, omit "
-            "schema_fields or use only time, number, category, string, boolean, and object; do not call type() or emit pandas dtypes. "
-            "When analysis_context contains anomaly_context, use its exact anomaly_points and exact source_ref with no alternate detector or fallback. "
-            "The code must assign a dict to result with non-empty result['summary'], result['metrics'], and result['details']."
-        ),
-    }
-    raw_message = str(exc)
-    message = raw_message if raw_message.startswith("analysis_code sandbox failed:") else f"analysis_code sandbox failed: {raw_message}"
-    validation_failure = {
-        "scope": "tool_input",
-        "capability": "analysis",
-        "tool": "code_interpreter",
-        "error_code": "analysis_code_execution_failed",
-        "message": message,
-        "required_contract": {
-            "available_inputs": repair_contract["available_inputs"],
-            "required_metrics": required_metrics,
-            "expected_result_shape": repair_contract["expected_result_shape"],
-        },
-        "repair_contract": repair_contract,
-        "retry_policy": {
-            "required_action": "code_interpreter",
-            "max_equivalent_retries": 2,
-            "allow_same_action": True,
-            "terminal_after_exhausted": True,
-        },
-    }
-    return StructuredToolError(
-        message,
-        error_type="analysis_code_execution_failed",
-        retryable=True,
-        recommended_next_action="code_interpreter",
-        diagnostics={
-            "available_inputs": repair_contract["available_inputs"],
-            "required_metrics": required_metrics,
-            "repair_contract": repair_contract,
-        },
-        validation_failure=validation_failure,
-    )
-
-
-def _preflight_analysis_code(code: str | None, canonical_context: dict | None = None) -> str | None:
-    text = str(code or "")
-    if not text.strip():
-        return "analysis_code cannot be empty."
-    try:
-        tree = ast.parse(text)
-    except SyntaxError as exc:
-        return f"analysis_code syntax error before sandbox execution: {exc.msg} at line {exc.lineno}."
-    if not _assigns_result(tree):
-        return "analysis_code must assign a dict named result with summary, metrics, and details."
-    if re.search(r"freq\s*=\s*['\"]H['\"]", text) or re.search(r"resample\s*\(\s*['\"]H['\"]", text):
-        return "analysis_code uses pandas hourly frequency 'H'; use lowercase 'h' for current pandas compatibility."
-    missing_names = sorted(_missing_runtime_names(tree, canonical_context or {}))
-    if missing_names:
-        return (
-            "analysis_code references unavailable runtime variables: "
-            + ", ".join(missing_names[:8])
-            + ". Use provided variables df, time, value, time_col, value_col, series, rows, points, columns, metadata, diagnostics, input_insights, insight_by_key, or define variables before use."
-        )
     return None
 
 
-def _assigns_result(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "result":
-                    return True
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "result":
-            return True
-    return False
-
-
-def _missing_runtime_names(tree: ast.AST, canonical_context: dict) -> set[str]:
-    provided = {
-        "rows",
-        "points",
-        "columns",
-        "database_evidence",
-        "data",
-        "metadata",
-        "diagnostics",
-        "math",
-        "statistics",
-        "mean",
-        "median",
-        "stdev",
-        "pstdev",
-        "sqrt",
-        "analysis_context",
-        "series",
-        "df",
-        "time",
-        "value",
-        "time_col",
-        "value_col",
-        "input_insights",
-        "insight_by_key",
-        "pd",
-        "np",
-    }
-    builtins = {
-        "abs",
-        "all",
-        "any",
-        "bool",
-        "dict",
-        "enumerate",
-        "filter",
-        "float",
-        "globals",
-        "hasattr",
-        "int",
-        "isinstance",
-        "len",
-        "list",
-        "max",
-        "min",
-        "pow",
-        "print",
-        "range",
-        "repr",
-        "round",
-        "set",
-        "sorted",
-        "str",
-        "sum",
-        "tuple",
-        "zip",
-        "BaseException",
-        "Exception",
-        "ArithmeticError",
-        "LookupError",
-        "IndexError",
-        "KeyError",
-        "NameError",
-        "TypeError",
-        "ValueError",
-        "ZeroDivisionError",
-    }
-    assigned: set[str] = set()
-    imported: set[str] = set()
-    loaded: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            assigned.add(node.name)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                assigned.update(_argument_names(node.args))
-        elif isinstance(node, ast.Lambda):
-            assigned.update(_argument_names(node.args))
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                imported.add(alias.asname or alias.name.split(".", 1)[0])
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                imported.add(alias.asname or alias.name)
-        elif isinstance(node, ast.comprehension):
-            assigned.update(_store_names(node.target))
-        elif isinstance(node, ast.Name):
-            if isinstance(node.ctx, ast.Store):
-                assigned.add(node.id)
-            elif isinstance(node.ctx, ast.Load):
-                loaded.add(node.id)
-    available = provided | builtins | assigned | imported
-    schema = canonical_context.get("schema") if isinstance(canonical_context.get("schema"), dict) else {}
-    if schema.get("value_col"):
-        available.add(str(schema["value_col"]))
-    if schema.get("time_col"):
-        available.add(str(schema["time_col"]))
-    return {name for name in loaded if name not in available and not name.startswith("__")}
-
-
-def _argument_names(args: ast.arguments) -> set[str]:
-    names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
-    if args.vararg is not None:
-        names.add(args.vararg.arg)
-    if args.kwarg is not None:
-        names.add(args.kwarg.arg)
-    return names
-
-
-def _store_names(node: ast.AST) -> set[str]:
-    names: set[str] = set()
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-            names.add(child.id)
-    return names
-
-
-def _classify_analysis_code_error(message: str) -> dict:
-    lowered = str(message or "").lower()
-    if "syntax" in lowered:
-        code = "syntax_error"
-    elif "not defined" in lowered or "unavailable runtime variables" in lowered:
-        code = "undefined_variable"
-    elif "keyerror" in lowered or "list indices must be integers" in lowered or "field" in lowered:
-        code = "input_shape_error"
-    elif "frequency" in lowered or "freq" in lowered:
-        code = "pandas_frequency_error"
-    elif "result" in lowered:
-        code = "result_contract_error"
-    else:
-        code = "execution_error"
-    return {"code": code, "message": str(message or "")[:800]}
-
-
-def _failed_code_summary(code: str | None) -> dict:
+def _preflight_analysis_code(code: str | None) -> str | None:
     text = str(code or "")
-    if not text.strip():
-        return {}
-    lines = text.splitlines()
-    return {
-        "line_count": len(lines),
-        "char_count": len(text),
-        "preview": "\n".join(lines[:24])[:2000],
-    }
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return f"analysis code is invalid Python: {exc}"
+    if not any(isinstance(node, (ast.Assign, ast.AnnAssign)) and _assigns_result(node) for node in ast.walk(tree)):
+        return "analysis code must assign a dict to result"
+    blocked_nodes = (ast.Import, ast.ImportFrom, ast.With, ast.AsyncWith, ast.Try, ast.Raise, ast.Global, ast.Nonlocal)
+    blocked_calls = {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint"}
+    for node in ast.walk(tree):
+        if isinstance(node, blocked_nodes):
+            return f"analysis code contains blocked syntax: {type(node).__name__}"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in blocked_calls:
+            return f"analysis code calls blocked function: {node.func.id}"
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            return "analysis code cannot access dunder attributes"
+    return None
+
+
+def _assigns_result(node: ast.Assign | ast.AnnAssign) -> bool:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return any(isinstance(target, ast.Name) and target.id == "result" for target in targets)
 
 
 def _llm_content(response) -> str:
@@ -1364,706 +348,28 @@ def _llm_content(response) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(parts).strip()
+        return "\n".join(
+            str(item.get("text") or item.get("content") or "") if isinstance(item, dict) else str(item)
+            for item in content
+        ).strip()
     return str(content or "").strip()
 
 
-def _structured_analysis_validation_error(
-    exc: AnalysisCodeError,
-    *,
-    goal: str,
-    database_evidence: DatabaseEvidence,
-    result_payload: dict,
-    failed_code: str | None = None,
-    allowed_lineage_refs: list[str] | None = None,
-) -> StructuredToolError:
-    message = str(exc)
-    required_fields = [
-        "outlier_rule",
-        "threshold_or_formula",
-        "rationale",
-        "excluded_rows",
-        "raw_metrics",
-        "adjusted_metrics",
-    ]
-    if "data_views" in message or "Data View contract" in message:
-        data_view_contract = {
-            "required_fields": ["view_id", "name", "shape", "lineage"],
-            "shape": "timeseries|records|scalar|intervals",
-            "rows": "non-empty list[JSON object] for non-scalar views",
-            "scalar": "non-empty JSON object for scalar views",
-            "schema_fields": "optional list of {name, data_type}; data_type is time|number|category|string|boolean|object",
-            "lineage": "non-empty list containing only exact refs from allowed_lineage_refs",
-            "allowed_lineage_refs": list(allowed_lineage_refs or []),
-        }
-        repair_contract = {
-            "mode": "analysis_artifact_repair",
-            "input_evidence": database_evidence.evidence_id,
-            "analysis_goal": goal,
-            "data_view_contract": data_view_contract,
-            "allowed_lineage_refs": list(allowed_lineage_refs or []),
-            "failed_code": str(failed_code or ""),
-            "instruction": "Correct the typed Data View objects without weakening or removing required visualization datasets.",
-        }
-        return StructuredToolError(
-            message,
-            error_type="analysis_data_view_invalid",
-            retryable=True,
-            recommended_next_action="code_interpreter",
-            diagnostics={"repair_contract": repair_contract, "data_view_contract": data_view_contract},
-            validation_failure={
-                "scope": "artifact_output",
-                "capability": "analysis",
-                "tool": "code_interpreter",
-                "error_code": "analysis_data_view_invalid",
-                "message": message,
-                "required_contract": {"data_view_contract": data_view_contract},
-                "repair_contract": repair_contract,
-                "retry_policy": {
-                    "required_action": "code_interpreter",
-                    "max_equivalent_retries": 2,
-                    "allow_same_action": True,
-                    "terminal_after_exhausted": True,
-                },
-            },
-        )
-    if "transparent details fields" in message or "outlier treatment" in message:
-        error_code = "analysis_transparency_missing"
-        repair_contract = {
-            "mode": "analysis_artifact_repair",
-            "input_evidence": database_evidence.evidence_id,
-            "analysis_goal": goal,
-            "required_details_fields": required_fields,
-            "previous_result_summary": result_payload.get("summary") if isinstance(result_payload, dict) else None,
-            "failed_code": str(failed_code or ""),
-            "expected_result_shape": {"summary": "string", "metrics": "object", "details": "object"},
-        }
-        validation_failure = {
-            "scope": "artifact_output",
-            "capability": "analysis",
-            "tool": "code_interpreter",
-            "error_code": error_code,
-            "message": message,
-            "failed_artifact": {
-                "input_evidence_id": database_evidence.evidence_id,
-                "result_summary": result_payload.get("summary") if isinstance(result_payload, dict) else None,
-            },
-            "required_contract": {"required_details_fields": required_fields},
-            "repair_contract": repair_contract,
-            "retry_policy": {
-                "required_action": "code_interpreter",
-                "max_equivalent_retries": 2,
-                "allow_same_action": True,
-                "terminal_after_exhausted": True,
-            },
-        }
-        return StructuredToolError(
-            message,
-            error_type=error_code,
-            retryable=True,
-            recommended_next_action="code_interpreter",
-            diagnostics={"repair_contract": repair_contract, "required_details_fields": required_fields},
-            validation_failure=validation_failure,
-        )
-    return StructuredToolError(
-        message,
-        error_type="analysis_validation_failed",
-        retryable=True,
-        recommended_next_action="code_interpreter",
-        diagnostics={},
-        validation_failure={
-            "scope": "artifact_output",
-            "capability": "analysis",
-            "tool": "code_interpreter",
-            "error_code": "analysis_validation_failed",
-            "message": message,
-            "failed_artifact": {"input_evidence_id": database_evidence.evidence_id},
-            "required_contract": {},
-            "repair_contract": {
-                "mode": "analysis_artifact_repair",
-                "input_evidence": database_evidence.evidence_id,
-                "analysis_goal": goal,
-                "failed_code": str(failed_code or ""),
-            },
-            "retry_policy": {
-                "required_action": "code_interpreter",
-                "max_equivalent_retries": 2,
-                "allow_same_action": True,
-                "terminal_after_exhausted": True,
-            },
-        },
-    )
-
-
-def _canonical_numeric_points(*, rows: list[dict], points: list[dict]) -> list[dict]:
-    candidates = points if points else rows
-    time_key = _first_present_key(candidates, ["timestamp", "_time", "time", "date"])
-    value_key = _first_present_key(candidates, ["value", "_value", "price", "close", "amount"])
-    if not value_key:
-        value_key = _first_numeric_key(candidates)
-    normalized = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        value = _number(item.get(value_key)) if value_key else None
-        if value is None:
-            continue
-        normalized.append(
-            {
-                "timestamp": item.get(time_key) if time_key else None,
-                "value": value,
-                "row": item,
-            }
-        )
-    return normalized
-
-
-def _first_numeric_key(rows: list[dict]) -> str | None:
-    keys = []
-    for row in rows[:20]:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    for key in keys:
-        if any(_number(row.get(key)) is not None for row in rows[:20]):
-            return key
-    return None
-
-
-def _number(value) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        text = str(value).strip()
-        if not text:
-            return None
-        return float(text)
-    except Exception:
-        return None
-
-
-def _analysis_request_summary(goal: str, metrics: dict, details: dict) -> str:
-    if not metrics:
-        return goal
-    parts = []
-    for key, value in metrics.items():
-        if key in {"max_value", "highest_value"}:
-            parts.append(f"{key}={value} at {details.get('max_time')}")
-        elif key in {"min_value", "lowest_value"}:
-            parts.append(f"{key}={value} at {details.get('min_time')}")
-        elif key == "start_value":
-            parts.append(f"{key}={value} at {details.get('start_time')}")
-        elif key == "end_value":
-            parts.append(f"{key}={value} at {details.get('end_time')}")
-        else:
-            parts.append(f"{key}={value}")
-    return f"{goal}: " + ", ".join(parts) + "."
-
-
-def _requested_metric_keys(requested_outputs: list[str], available_metrics: dict) -> list[str]:
-    if not requested_outputs:
-        return []
-    selected: list[str] = []
-    for output in requested_outputs:
-        text = str(output or "").strip().lower()
-        compact = text.replace("_", "").replace("-", "").replace(" ", "")
-        candidates: list[str] = []
-        if output in available_metrics:
-            candidates.append(output)
-        if "difference" in text or "差" in text or "差异" in text:
-            candidates.extend(["max_min_difference", "difference"])
-        if "highest" in text or "maximum" in text or "max" in text or "最大" in text or "最高" in text:
-            if "time" in text or "时间" in text:
-                continue
-            candidates.extend(["max_value", "highest_value"])
-        if "lowest" in text or "minimum" in text or "min" in text or "最小" in text or "最低" in text:
-            if "time" in text or "时间" in text:
-                continue
-            candidates.extend(["min_value", "lowest_value"])
-        if "start" in text or "first" in text or "起始" in text or "开始" in text:
-            candidates.append("start_value")
-        if "end" in text or "last" in text or "结束" in text or "最终" in text or "最后" in text:
-            candidates.append("end_value")
-        if "count" in text or "record" in text or "数量" in text or "条数" in text:
-            candidates.append("record_count")
-        for key in available_metrics:
-            key_compact = key.replace("_", "")
-            if compact and (compact == key_compact or compact in key_compact or key_compact in compact):
-                candidates.append(key)
-        for key in candidates:
-            if key in available_metrics and key not in selected:
-                selected.append(key)
-                break
-    return selected
-
-
-def _metric_keys_implied_by_text(text: str, available_metrics: dict) -> list[str]:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return []
-    result: list[str] = []
-    asks_difference = any(marker in lowered for marker in ("difference", "差异", "差值", "相差", "之差"))
-    asks_change = any(marker in lowered for marker in ("change", "变化", "涨跌", "增减", "percentage", "百分比"))
-    if asks_difference:
-        for candidates in (("max_value", "highest_value"), ("min_value", "lowest_value"), ("max_min_difference", "difference")):
-            for key in candidates:
-                if key in available_metrics and key not in result:
-                    result.append(key)
-                    break
-        return result
-    for markers, candidates in (
-        (("highest", "maximum", "max", "最大", "最高"), ("max_value", "highest_value")),
-        (("lowest", "minimum", "min", "最小", "最低"), ("min_value", "lowest_value")),
-        (("start", "first", "起始", "开始", "首个"), ("start_value",)),
-        (("end", "last", "结束", "最终", "最后", "最晚"), ("end_value",)),
-        (("count", "record", "数量", "条数", "多少条"), ("record_count",)),
-    ):
-        if any(marker in lowered for marker in markers):
-            for key in candidates:
-                if key in available_metrics and key not in result:
-                    result.append(key)
-                    break
-    if asks_change:
-        for key in ("percentage_change", "start_end_change", "change"):
-            if key in available_metrics and key not in result:
-                result.append(key)
-                break
-    return result
-
-
-def _selected_analysis_details(
-    *,
-    selected_metric_keys: list[str],
-    requested_outputs: list[str],
-    first: dict,
-    last: dict,
-    max_point: dict,
-    min_point: dict,
-    columns: list[str],
-) -> dict:
-    if not selected_metric_keys and not requested_outputs:
-        return {
-            "start_time": first.get("timestamp"),
-            "end_time": last.get("timestamp"),
-            "max_time": max_point.get("timestamp"),
-            "min_time": min_point.get("timestamp"),
-            "first_point": first,
-            "last_point": last,
-            "max_point": max_point,
-            "min_point": min_point,
-            "columns": columns,
-            "requested_outputs": requested_outputs,
-        }
-    details: dict = {
-        "columns": columns,
-        "requested_outputs": requested_outputs,
-    }
-    selected = set(selected_metric_keys)
-    if selected & {"max_value", "highest_value", "max_min_difference", "difference"}:
-        details["max_time"] = max_point.get("timestamp")
-        details["max_point"] = max_point
-    if selected & {"min_value", "lowest_value", "max_min_difference", "difference"}:
-        details["min_time"] = min_point.get("timestamp")
-        details["min_point"] = min_point
-    if selected & {"start_value", "start_end_change", "change"}:
-        details["start_time"] = first.get("timestamp")
-        details["first_point"] = first
-    if selected & {"end_value", "start_end_change", "change"}:
-        details["end_time"] = last.get("timestamp")
-        details["last_point"] = last
-    return details
-
-
-def _string_list(value) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _first_present_key(rows: list[dict], candidates: list[str]) -> str | None:
-    for key in candidates:
-        if any(key in row for row in rows):
-            return key
-    return None
-
-
-def _validate_expected_result_schema(result: dict, schema: dict) -> None:
-    if not schema:
-        return
-    normalized_schema = _normalize_expected_result_schema(result, schema)
-    if normalized_schema is not schema:
-        schema = normalized_schema
-    _validate_schema_node(result, schema, path="result")
-
-
-def _normalize_expected_result_schema(result: dict, schema: dict) -> dict:
-    if not isinstance(schema, dict) or not isinstance(result, dict):
-        return schema
-    structural_keys = {"summary", "metrics", "details"}
-    if set(schema) & structural_keys:
-        return schema
-    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
-    details = result.get("details") if isinstance(result.get("details"), dict) else {}
-    schema_keys = {str(key) for key in schema}
-    if schema_keys and schema_keys <= set(metrics):
-        return {"metrics": schema}
-    if schema_keys and schema_keys <= set(details):
-        return {"details": schema}
-    return schema
-
-
-def _validate_outlier_treatment_transparency(result: dict, *, anomaly_context: dict | None = None) -> None:
-    if not _result_indicates_outlier_treatment(result) and anomaly_context is None:
-        return
-    details = result.get("details")
-    if not isinstance(details, dict):
-        raise AnalysisCodeError("analysis result using outlier treatment must include result.details.")
-    required = {
-        "outlier_rule",
-        "threshold_or_formula",
-        "rationale",
-        "excluded_rows",
-        "raw_metrics",
-        "adjusted_metrics",
-    }
-    missing = sorted(key for key in required if key not in details)
-    if missing:
-        raise AnalysisCodeError(
-            "analysis result using outlier treatment must include transparent details fields: "
-            + ", ".join(missing)
-        )
-    if not str(details.get("outlier_rule") or "").strip():
-        raise AnalysisCodeError("analysis result using outlier treatment must include non-empty details.outlier_rule.")
-    if not str(details.get("rationale") or "").strip():
-        raise AnalysisCodeError("analysis result using outlier treatment must include non-empty details.rationale.")
-    if not isinstance(details.get("excluded_rows"), list):
-        raise AnalysisCodeError("analysis result using outlier treatment must include details.excluded_rows as a list.")
-    duplicate_excluded_rows = _duplicate_json_rows(details["excluded_rows"])
-    if duplicate_excluded_rows:
-        raise AnalysisCodeError("analysis result using outlier treatment must not include duplicate details.excluded_rows.")
-    if not isinstance(details.get("raw_metrics"), dict):
-        raise AnalysisCodeError("analysis result using outlier treatment must include details.raw_metrics as an object.")
-    if not isinstance(details.get("adjusted_metrics"), dict):
-        raise AnalysisCodeError("analysis result using outlier treatment must include details.adjusted_metrics as an object.")
-    if anomaly_context is not None:
-        expected = {_row_identity(item) for item in anomaly_context.get("anomaly_points", []) if isinstance(item, dict)}
-        actual = {_row_identity(item) for item in details["excluded_rows"] if isinstance(item, dict)}
-        if expected != actual:
-            raise AnalysisCodeError("analysis excluded_rows must exactly match the authoritative Anomaly Artifact points.")
-        authoritative_ref = str(anomaly_context.get("source_ref") or "").strip()
-        views = result.get("data_views")
-        if not isinstance(views, list) or not any(
-            isinstance(view, dict)
-            and isinstance(view.get("rows"), list)
-            and bool(view.get("rows"))
-            and authoritative_ref in [str(ref) for ref in view.get("lineage", [])]
-            for view in views
-        ):
-            raise AnalysisCodeError(
-                "analysis using an authoritative Anomaly Artifact must publish a non-empty Data View "
-                "whose lineage includes that anomaly source_ref."
-            )
-
-
-def _validate_data_views_contract(result: dict, *, allowed_lineage_refs: list[str] | None = None) -> None:
-    views = result.get("data_views")
-    if views is None:
-        return
-    if not isinstance(views, list):
-        raise AnalysisCodeError("result.data_views must be a list of typed Data View objects.")
-    allowed = set(allowed_lineage_refs or [])
-    for index, view in enumerate(views):
-        try:
-            validated = AnalysisDataView.model_validate(view)
-        except ValidationError as exc:
-            errors = "; ".join(
-                f"{'.'.join(str(part) for part in item.get('loc', []))}: {item.get('msg')}"
-                for item in exc.errors()[:8]
-            )
-            raise AnalysisCodeError(
-                f"result.data_views[{index}] violates the typed Data View contract: {errors}"
-            ) from exc
-        if allowed_lineage_refs is not None:
-            unknown = sorted({str(ref) for ref in validated.lineage} - allowed)
-            if unknown:
-                raise AnalysisCodeError(
-                    f"result.data_views[{index}] contains unknown lineage refs {unknown}; "
-                    f"allowed_lineage_refs are {sorted(allowed)}."
-                )
-
-
-def _allowed_data_view_lineage_refs(
-    *,
-    database_evidence: DatabaseEvidence,
-    anomaly_context: dict | None,
-    input_insights: list[dict],
-) -> list[str]:
-    refs = [f"evidence:{database_evidence.evidence_id}"]
-    if isinstance(anomaly_context, dict) and str(anomaly_context.get("source_ref") or "").strip():
-        refs.append(str(anomaly_context["source_ref"]).strip())
-    refs.extend(
-        f"insight:{insight['insight_id']}"
-        for insight in input_insights
-        if isinstance(insight, dict) and str(insight.get("insight_id") or "").strip()
-    )
-    return list(dict.fromkeys(refs))
-
-
-def _row_identity(row: dict) -> tuple[str, str]:
-    timestamp = row.get("timestamp") or row.get("time") or row.get("date")
-    value = row.get("value") if "value" in row else row.get("y")
-    return str(timestamp or ""), str(value)
-
-
-def _authoritative_anomaly_context(request_state, evidence_id: str) -> dict | None:
-    if request_state is None:
-        return None
-    artifacts = list((getattr(request_state, "anomaly_artifacts", {}) or {}).values())
-    for anomaly in reversed(artifacts):
-        diagnostics = anomaly.diagnostics if isinstance(anomaly.diagnostics, dict) else {}
-        resolved = next(
-            (
-                str(diagnostics.get(key) or "").removeprefix("evidence:")
-                for key in ("resolved_evidence_id", "selected_evidence_id", "input_evidence_id")
-                if diagnostics.get(key)
-            ),
-            "",
-        )
-        if resolved != evidence_id:
-            continue
-        return {
-            "source_ref": f"anomaly:{anomaly.anomaly_id}",
-            "detector_name": anomaly.detector_name,
-            "anomaly_points": [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)],
-            "diagnostics": diagnostics,
-        }
-    return None
-
-
-def _analysis_requires_numeric_series(goal: str | None, expected_schema: dict) -> bool:
-    text = " ".join([goal or "", _flatten_text(expected_schema)]).lower()
-    markers = {
-        "return",
-        "returns",
-        "volatility",
-        "drawdown",
-        "yield",
-        "pct_change",
-        "percentage_change",
-        "price change",
-        "trend",
-        "收益",
-        "收益率",
-        "波动",
-        "回撤",
-        "涨跌",
-        "价格变化",
-        "趋势",
-    }
-    return any(marker in text for marker in markers)
-
-
-def _validate_result_has_numeric_analysis(result: dict, *, requires_numeric_series: bool, input_rows: int) -> None:
-    if not requires_numeric_series or input_rows == 0:
-        return
-    metrics = result.get("metrics") if isinstance(result, dict) else {}
-    details = result.get("details") if isinstance(result, dict) else {}
-    if not isinstance(metrics, dict):
-        metrics = {}
-    if not isinstance(details, dict):
-        details = {}
-
-    meaningful_values = [
-        value for key, value in metrics.items()
-        if str(key).lower() not in {"row_count", "count", "n", "series_length", "return_count"}
-    ]
-    if meaningful_values and any(value is not None for value in meaningful_values):
-        return
-
-    for key in ("raw_metrics", "adjusted_metrics"):
-        nested_metrics = details.get(key)
-        if isinstance(nested_metrics, dict) and any(value is not None for value in nested_metrics.values()):
-            return
-    if _has_non_empty_detail_output(details):
-        return
-
-    raise AnalysisCodeError(
-        "code_interpreter numeric analysis produced no non-empty computed output; "
-        "use evidence with numeric values and populate result.metrics or result.details with the requested computation."
-    )
-
-
-def _has_non_empty_detail_output(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, (str, bytes)):
-        return bool(value.strip())
-    if isinstance(value, (int, float, bool)):
-        return True
-    if isinstance(value, dict):
-        return any(_has_non_empty_detail_output(item) for item in value.values())
-    if isinstance(value, (list, tuple, set)):
-        return any(_has_non_empty_detail_output(item) for item in value)
-    return True
-
-
-def _result_indicates_outlier_treatment(result: dict) -> bool:
-    if not isinstance(result, dict):
-        return False
-    textual_markers = {
-        "outlier",
-        "anomaly",
-        "anomalous",
-        "excluded",
-        "exclude",
-        "winsor",
-        "adjusted",
-        "剔除",
-        "过滤",
-        "排除",
-        "异常",
-        "离群",
-        "调整",
-    }
-    text = _flatten_outlier_relevant_text(result).lower()
-    if any(marker in text for marker in textual_markers):
-        return True
-    metrics = result.get("metrics")
-    details = result.get("details")
-    if isinstance(metrics, dict):
-        if metrics.get("has_outlier_like_values") is True or metrics.get("has_outliers") is True:
-            return True
-        for key in metrics:
-            key_text = str(key).lower()
-            if key_text in {"used_point_count", "filtered_count", "excluded_count"}:
-                return True
-    if isinstance(details, dict):
-        for key in details:
-            key_text = str(key).lower()
-            if key_text in {"excluded_rows", "outlier_like_values", "outliers", "adjusted_metrics"}:
-                return True
-    return False
-
-
-def _duplicate_json_rows(rows: list) -> bool:
-    seen: set[str] = set()
-    for row in rows:
-        key = json_dumps_stable(row)
-        if key in seen:
-            return True
-        seen.add(key)
-    return False
-
-
-def json_dumps_stable(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    except TypeError:
-        return str(value)
-
-
-def _flatten_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        return " ".join(_flatten_text(item) for item in value.values())
-    if isinstance(value, list):
-        return " ".join(_flatten_text(item) for item in value)
-    return ""
-
-
-def _flatten_outlier_relevant_text(value: Any, *, key: str | None = None) -> str:
-    if key is not None and key.strip().lower() in {"assumption", "assumptions", "input_assumption", "input_assumptions"}:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        return " ".join(
-            _flatten_outlier_relevant_text(item, key=str(child_key))
-            for child_key, item in value.items()
-        )
-    if isinstance(value, list):
-        return " ".join(_flatten_outlier_relevant_text(item, key=key) for item in value)
-    return ""
-
-
-def _validate_schema_node(value: Any, schema: Any, *, path: str) -> None:
-    if isinstance(schema, dict):
-        if not isinstance(value, dict):
-            raise AnalysisCodeError(f"analysis result field '{path}' must be an object.")
-        for key, child_schema in schema.items():
-            if key not in value:
-                raise AnalysisCodeError(f"analysis result is missing required field '{path}.{key}'.")
-            _validate_schema_node(value[key], child_schema, path=f"{path}.{key}")
-        return
-
-    if isinstance(schema, list):
-        if not isinstance(value, list):
-            raise AnalysisCodeError(f"analysis result field '{path}' must be an array.")
-        if schema:
-            item_schema = schema[0]
-            for index, item in enumerate(value):
-                _validate_schema_node(item, item_schema, path=f"{path}[{index}]")
-        return
-
-    if isinstance(schema, str):
-        _validate_type_name(value, schema, path=path)
-
-
-def _validate_type_name(value: Any, type_name: str, *, path: str) -> None:
-    normalized = type_name.strip().lower()
-    if not normalized or normalized == "any":
-        return
-    if "|" in normalized:
-        allowed = [item.strip() for item in normalized.split("|") if item.strip()]
-        if any(_matches_type(value, item) for item in allowed):
-            return
-        raise AnalysisCodeError(f"analysis result field '{path}' must match one of: {', '.join(allowed)}.")
-    if not _matches_type(value, normalized):
-        raise AnalysisCodeError(f"analysis result field '{path}' must be {normalized}.")
-
-
-def _matches_type(value: Any, type_name: str) -> bool:
-    if type_name in {"str", "string"}:
-        return isinstance(value, str)
-    if type_name in {"int", "integer"}:
-        return isinstance(value, int) and not isinstance(value, bool)
-    if type_name in {"float", "number", "numeric"}:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if type_name in {"bool", "boolean"}:
-        return isinstance(value, bool)
-    if type_name in {"dict", "object"}:
-        return isinstance(value, dict)
-    if type_name in {"list", "array"}:
-        return isinstance(value, list)
-    if type_name in {"none", "null"}:
-        return value is None
-    return True
-
-
 def _code_hash(code: str) -> str:
-    return "sha256:" + hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
-
-
-def _code_interpreter_work_dir(request_state, code_hash: str):
-    if request_state is None or not getattr(request_state, "request_log_dir", None):
-        return None
-    safe_hash = code_hash.replace(":", "_")
-    return Path(request_state.request_log_dir) / "artifacts" / "code_interpreter" / safe_hash
+    return hashlib.sha256(code.encode()).hexdigest()
 
 
 def _analysis_id(evidence_id: str, goal: str, code_hash: str) -> str:
-    raw = f"{evidence_id}:{goal}:{code_hash}:code_interpreter"
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", goal.strip().lower())[:32].strip("_")
-    return f"ana_{slug or 'code_interpreter'}_{digest}"
+    digest = hashlib.sha1(f"{evidence_id}:{goal}:{code_hash}".encode()).hexdigest()[:16]
+    return f"ana_{digest}"
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_")[:48] or "derived"
+
+
+def _work_dir(request_state, code_hash: str) -> Path | None:
+    log_dir = getattr(request_state, "request_log_dir", None)
+    if not log_dir:
+        return None
+    return Path(log_dir) / "artifacts" / "code_interpreter" / code_hash[:16]

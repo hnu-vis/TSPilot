@@ -1363,38 +1363,22 @@ def _analysis_conflicts_with_detected_anomalies(request_state: RequestStateModel
         return False
     for anomaly in request_state.anomaly_artifacts.values():
         if _anomaly_matches_evidence(anomaly, input_evidence_id):
-            if not _analysis_has_transparent_outlier_treatment(analysis):
-                return _anomaly_has_points(anomaly)
-            result = getattr(analysis, "result", None)
-            details = result.get("details") if isinstance(result, dict) else {}
-            actual = {
-                _anomaly_row_identity(item)
-                for item in details.get("excluded_rows", [])
-                if isinstance(item, dict)
-            }
-            expected = {
-                _anomaly_row_identity(item)
-                for item in getattr(anomaly, "anomaly_points", []) or []
-                if isinstance(item, dict)
-            }
-            return actual != expected
+            if not _anomaly_has_points(anomaly):
+                return False
+            anomaly_ref = f"anomaly:{anomaly.anomaly_id}"
+            return not any(
+                anomaly_ref in _flatten_analysis_trace(item.calculation_trace)
+                for item in getattr(analysis, "computed_insights", [])
+            )
     return False
 
 
-def _analysis_has_transparent_outlier_treatment(analysis) -> bool:
-    result = getattr(analysis, "result", None)
-    details = result.get("details") if isinstance(result, dict) else None
-    if not isinstance(details, dict):
-        return False
-    required = {
-        "outlier_rule",
-        "threshold_or_formula",
-        "rationale",
-        "excluded_rows",
-        "raw_metrics",
-        "adjusted_metrics",
-    }
-    return required <= set(details)
+def _flatten_analysis_trace(value) -> str:
+    if isinstance(value, dict):
+        return " ".join(f"{key} {_flatten_analysis_trace(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return " ".join(_flatten_analysis_trace(item) for item in value)
+    return str(value or "")
 
 
 def _anomaly_has_points(anomaly) -> bool:

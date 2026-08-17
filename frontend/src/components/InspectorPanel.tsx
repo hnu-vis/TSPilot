@@ -283,9 +283,9 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
         <StructuredResult
           title={t('Result')}
           summary={detail.summary}
-          metrics={detail.metrics}
-          details={detail.details}
-          fallback={detail.result}
+          metrics={{}}
+          details={{ computed_insights: detail.computedInsights, derived_evidence: detail.derivedEvidence }}
+          fallback={null}
         />
       )}
     </section>
@@ -685,9 +685,8 @@ function hasQueryData(detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlD
 function hasStructuredResult(detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']>) {
   return Boolean(
     detail.summary
-    || Object.keys(detail.metrics).length > 0
-    || Object.keys(detail.details).length > 0
-    || detail.result,
+    || detail.computedInsights.length > 0
+    || detail.derivedEvidence.length > 0,
   );
 }
 

@@ -132,17 +132,14 @@ class ToolExecutor:
             self._drop_unselected_optional_choice(normalized, "detector_name")
         if action_name == "forecast":
             self._drop_unselected_optional_choice(normalized, "model_name")
-        if action_name == "code_interpreter" and not str(normalized.get("code") or "").strip():
-            for key, value in self._capability_registry.default_input_for_action(action_name).items():
-                normalized.setdefault(key, value)
+        if action_name == "code_interpreter":
             normalized.setdefault("analysis_goal", request_state.message)
-            analysis_request = self._normalize_analysis_request(normalized.get("analysis_request"))
-            analysis_request.setdefault("goal", request_state.message)
-            analysis_request.setdefault("required_outputs", self._action_required_outputs(request_state, action_name))
-            analysis_request.setdefault("mode", "canonical_timeseries_metrics")
-            normalized["analysis_request"] = analysis_request
-            if not normalized.get("required_outputs"):
-                normalized["required_outputs"] = self._action_required_outputs(request_state, action_name)
+            normalized.setdefault("database_evidence", "latest")
+            return {
+                key: value
+                for key, value in normalized.items()
+                if key in {"database_evidence", "analysis_goal", "insight_requests", "code", "constraints"}
+            }
         if action_name == "todowrite":
             normalized.setdefault("message", request_state.message)
             normalized.setdefault("focus", request_state.focus or request_state.message)
@@ -353,7 +350,10 @@ class ToolExecutor:
         merged = dict(normalized_input)
         explicit = self._normalize_insight_requests(merged.get("insight_requests"), merged)
         selected_card_ids = [hit.card_id for hit in retrieval.hits]
-        retrieved_requests = [
+        # A Code Interpreter call is an exact computation contract. Memory may
+        # help plan a missing contract, but it must never expand or replace an
+        # explicit one after the outer agent has selected the required outputs.
+        retrieved_requests = [] if action_name == "code_interpreter" and explicit else [
             self._retrieved_insight_request_payload(
                 item,
                 retrieval.insight_request_sources.get(item.insight_key, [])
@@ -366,6 +366,8 @@ class ToolExecutor:
         diagnostics["source"] = "tool_scoped_memory_retrieval"
         diagnostics["selected_card_ids"] = selected_card_ids
         diagnostics["insight_request_count"] = len(retrieved_requests)
+        if action_name == "code_interpreter" and explicit:
+            diagnostics["explicit_contract_authoritative"] = True
         constraints = merged.setdefault("constraints", {})
         if isinstance(constraints, dict) and diagnostics:
             constraints["memory_diagnostics"] = diagnostics
@@ -488,6 +490,15 @@ class ToolExecutor:
             visible["anomaly_points"] = visible["anomaly_points"][:12]
         if isinstance(visible.get("scores"), list):
             visible["scores"] = visible["scores"][:12]
+        if isinstance(visible.get("derived_evidence"), list):
+            visible["derived_evidence"] = [
+                {
+                    **item,
+                    "rows": item.get("rows", [])[:8] if isinstance(item.get("rows"), list) else item.get("rows"),
+                }
+                for item in visible["derived_evidence"][:6]
+                if isinstance(item, dict)
+            ]
         if isinstance(visible.get("result"), dict):
             result = dict(visible["result"])
             if isinstance(result.get("details"), list):

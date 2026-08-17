@@ -83,7 +83,7 @@ class KeyInsight(BaseModel):
     time_range: dict | None = None
     method: str
     evidence_refs: list[InsightEvidenceRef] = Field(default_factory=list)
-    calculation_trace: dict = Field(default_factory=dict)
+    calculation_trace: str | dict | list = Field(default_factory=dict)
     status: InsightStatus = "verified"
     confidence: float | None = None
     quality_flags: list[str] = Field(default_factory=list)

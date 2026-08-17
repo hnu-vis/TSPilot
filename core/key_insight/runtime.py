@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from hashlib import sha1
-import json
 from typing import Any
 
 from schemas.key_insight import (
@@ -42,7 +41,10 @@ def register_key_insights_from_payload(request_state, tool_name: str, full_paylo
     if tool_name == "sql_query":
         produced.extend(_insights_from_database_evidence(full_payload, requests))
     elif tool_name == "code_interpreter":
-        produced.extend(_insights_from_analysis(full_payload, requests))
+        # Code Interpreter outputs are already semantically bound by the LLM
+        # binder. Re-deriving them from generic metrics would restore the old
+        # computation/semantics coupling.
+        pass
     # Forecast and anomaly outputs remain analysis artifacts. They can be
     # referenced by answers and visualizations, but are not Key Insights by default.
 
@@ -361,75 +363,6 @@ def _dimension_value_matches(actual: Any, expected: Any) -> bool:
     return str(actual).strip() == str(expected).strip()
 
 
-def _insights_from_analysis(payload: dict, requests: list[KeyInsightRequest]) -> list[KeyInsight]:
-    analysis_id = str(payload.get("analysis_id") or "")
-    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-    evidence_refs = [
-        InsightEvidenceRef(source_type="analysis", source_id=analysis_id, label=payload.get("analysis_goal")),
-    ]
-    input_evidence_id = payload.get("input_evidence_id")
-    if input_evidence_id:
-        evidence_refs.append(InsightEvidenceRef(source_type="query", source_id=str(input_evidence_id)))
-    insights: list[KeyInsight] = []
-    requested_keys = {request.insight_key for request in requests}
-    for raw in result.get("insights") or []:
-        if not isinstance(raw, dict):
-            continue
-        raw_key = normalize_insight_key(raw.get("insight_key") or raw.get("name") or "")
-        if requested_keys and raw_key not in requested_keys:
-            continue
-        raw_payload = dict(raw)
-        if not isinstance(raw_payload.get("items"), list) and isinstance(raw_payload.get("value"), list):
-            raw_payload["items"] = _insight_items_from_value(raw_key, raw_payload["value"])
-        insight = _validate_insight(
-            {
-                **raw_payload,
-                "method": raw_payload.get("method") or "code_interpreter",
-                "evidence_refs": raw_payload.get("evidence_refs") or [ref.model_dump(mode="json") for ref in evidence_refs],
-            },
-            default_method="code_interpreter",
-        )
-        insight = _bind_insight_contract(insight, requests, preserve_dependencies="derived_from" in raw_payload)
-        if insight is not None:
-            insight = _validate_registered_insight(insight, next(
-                (request for request in requests if request.insight_key == insight.insight_key),
-                None,
-            ))
-            if insight.items:
-                insight = insight.model_copy(
-                    update={
-                        "items": [
-                            item.model_copy(update={"evidence_refs": item.evidence_refs or evidence_refs})
-                            for item in insight.items
-                        ]
-                    }
-                )
-            insights.append(insight)
-    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
-    metrics_by_key = {normalize_insight_key(key): (key, value) for key, value in metrics.items()}
-    native_keys = {insight.insight_key for insight in insights}
-    for request in requests:
-        metric_match = metrics_by_key.get(request.insight_key) or metrics_by_key.get(normalize_insight_key(request.name))
-        if request.insight_key not in native_keys and metric_match is not None:
-            metric_key, value = metric_match
-            insight = KeyInsight(
-                    insight_id=_insight_id(analysis_id, request.name, value),
-                    name=request.name,
-                    insight_type=request.insight_type,
-                    insight_key=request.insight_key,
-                    statement=f"{request.name} is {value}.",
-                    value=value,
-                    subject=request.subject,
-                    time_range=request.time_range,
-                    method="code_interpreter",
-                    evidence_refs=evidence_refs,
-                    calculation_trace={"metric_key": metric_key, "code_hash": payload.get("code_hash")},
-                    derived_from=request.derived_from,
-                )
-            insights.append(_bind_insight_contract(insight, [request]) or insight)
-    return insights
-
-
 def _validate_registered_insight(insight: KeyInsight, request: KeyInsightRequest | None) -> KeyInsight:
     """Apply the Key Insight contract again at registration, the final trust boundary."""
 
@@ -480,19 +413,6 @@ def _validate_registered_insight(insight: KeyInsight, request: KeyInsightRequest
         "quality_flags": flags,
         "status": "partial" if flags and insight.status == "verified" else insight.status,
     })
-
-
-def _insight_items_from_value(insight_key: str, value: list) -> list[dict]:
-    items: list[dict] = []
-    for index, item in enumerate(value):
-        payload = dict(item) if isinstance(item, dict) else {"value": item}
-        item_id = str(payload.get("item_id") or "").strip()
-        if not item_id:
-            fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-            item_id = f"{insight_key}:{index}:{sha1(fingerprint.encode('utf-8')).hexdigest()[:10]}"
-        payload["item_id"] = item_id
-        items.append(payload)
-    return items
 
 
 def _unavailable_insight(request: KeyInsightRequest, evidence_ref: InsightEvidenceRef, reason: str) -> KeyInsight:

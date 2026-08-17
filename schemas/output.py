@@ -82,7 +82,7 @@ class AnswerSection(BaseModel):
 
 
 class AnswerReference(BaseModel):
-    source_type: Literal["query", "statistics", "insight", "analysis", "forecast", "anomaly", "rag", "skill"]
+    source_type: Literal["query", "statistics", "insight", "analysis", "derived_evidence", "forecast", "anomaly", "rag", "skill"]
     source_id: str | None = None
     label: str
     evidence: dict | None = None

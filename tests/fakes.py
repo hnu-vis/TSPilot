@@ -153,8 +153,8 @@ class SandboxAnalysisLLM:
                 {
                     "database_evidence": latest_evidence,
                     "analysis_goal": "compute pairwise deltas with the code interpreter",
+                    "insight_requests": [{"insight_key": "pairwise_deltas", "name": "Pairwise deltas", "insight_type": "distribution"}],
                     "code": (
-                        "import itertools\n"
                         "values = []\n"
                         "for row in rows:\n"
                         "    for key, raw_value in row.items():\n"
@@ -165,23 +165,12 @@ class SandboxAnalysisLLM:
                         "            break\n"
                         "        except (TypeError, ValueError):\n"
                         "            continue\n"
-                        "deltas = [right - left for left, right in itertools.pairwise(values)]\n"
+                        "deltas = [right - left for left, right in zip(values, values[1:])]\n"
                         "result = {\n"
-                        "    'summary': f'Code interpreter computed {len(deltas)} pairwise deltas from {len(values)} values.',\n"
-                        "    'metrics': {\n"
-                        "        'value_count': len(values),\n"
-                        "        'delta_count': len(deltas),\n"
-                        "        'max_delta': max(deltas) if deltas else 0,\n"
-                        "        'min_delta': min(deltas) if deltas else 0,\n"
-                        "    },\n"
-                        "    'details': {'first_three_deltas': deltas[:3]},\n"
+                        "    'computed_insights': [{'insight_key': 'pairwise_deltas', 'value': {'value_count': len(values), 'delta_count': len(deltas), 'max_delta': max(deltas) if deltas else None, 'min_delta': min(deltas) if deltas else None, 'first_three_deltas': deltas[:3]}, 'calculation_trace': {'operation': 'adjacent difference'}}],\n"
+                        "    'derived_evidence': [],\n"
                         "}\n"
                     ),
-                    "expected_result_schema": {
-                        "summary": "str",
-                        "metrics": {"value_count": "int", "delta_count": "int"},
-                        "details": "dict",
-                    },
                     "constraints": {"timeout_seconds": 5},
                 },
             )
@@ -255,17 +244,8 @@ class CodeRequiredRepairLLM:
                 {
                     "database_evidence": "latest",
                     "analysis_goal": "compute total return volatility and max drawdown",
-                    "required_outputs": ["total_return", "volatility", "max_drawdown"],
+                    "insight_requests": _financial_insight_requests(),
                     "code": _financial_metrics_code(),
-                    "expected_result_schema": {
-                        "summary": "str",
-                        "metrics": {
-                            "total_return": "float",
-                            "volatility": "float",
-                            "max_drawdown": "float",
-                        },
-                        "details": "dict",
-                    },
                     "constraints": {"timeout_seconds": 5},
                 },
             )
@@ -288,8 +268,8 @@ class CodeRequiredRepairLLM:
             {
                 "database_evidence": "latest",
                 "analysis_goal": "compute total return volatility and max drawdown",
-                "analysis_request": {"required_outputs": ["returns_volatility_max_drawdown"]},
-                "required_outputs": ["returns_volatility_max_drawdown"],
+                "insight_requests": _financial_insight_requests(),
+                "code": _financial_metrics_code(),
             },
         )
 
@@ -793,6 +773,22 @@ def _evidence_refs_from_payload(payload: dict) -> list[str]:
 
 
 def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
+    try:
+        internal_payload = json.loads(user_prompt)
+    except (TypeError, json.JSONDecodeError):
+        internal_payload = None
+    if isinstance(internal_payload, dict) and isinstance(internal_payload.get("computed_insights"), list):
+        return _FakeResponse(json.dumps({
+            "bindings": [
+                {
+                    "insight_key": item.get("insight_key"),
+                    "statement": f"Computed {item.get('insight_key')} from grounded evidence.",
+                    "item_annotations": [],
+                }
+                for item in internal_payload["computed_insights"]
+                if isinstance(item, dict) and item.get("insight_key")
+            ]
+        }, ensure_ascii=False))
     if "LLM Schema Linking JSON:" in user_prompt:
         payload = json.loads(user_prompt.split("LLM Schema Linking JSON:\n", 1)[1])
         schema_preview = payload.get("schema_preview") or {}
@@ -1082,7 +1078,7 @@ def _analysis_action_input(evidence, goal: str) -> dict:
     return {
         "database_evidence": evidence,
         "analysis_goal": goal,
-        "code_type": "python_rows_v1",
+        "insight_requests": [{"insight_key": "series_summary", "name": "Series summary", "insight_type": "custom"}],
         "analysis_code": (
             "value_keys = ('value', '_value', 'price', 'appliances_energy_wh')\n"
             "values = []\n"
@@ -1095,18 +1091,13 @@ def _analysis_action_input(evidence, goal: str) -> dict:
             "            break\n"
             "        except (TypeError, ValueError):\n"
             "            continue\n"
-            "summary = f'Analyzed {len(rows)} rows.'\n"
-            "if values:\n"
-            "    summary = f'Analyzed {len(rows)} rows; first={values[0]:.2f}, last={values[-1]:.2f}.'\n"
-            "result = {'summary': summary, 'metrics': {'row_count': len(rows), 'first_value': values[0] if values else None, 'last_value': values[-1] if values else None}, 'details': {}}\n"
+            "result = {'computed_insights': [{'insight_key': 'series_summary', 'value': {'row_count': len(rows), 'first_value': values[0] if values else None, 'last_value': values[-1] if values else None}, 'calculation_trace': {'operation': 'summarize canonical values', 'input_row_count': len(rows)}}], 'derived_evidence': []}\n"
         ),
-        "expected_result_schema": {"summary": "str", "metrics": "dict", "details": "dict"},
     }
 
 
 def _financial_metrics_code() -> str:
     return (
-        "import statistics\n"
         "values = []\n"
         "value_columns = [column for column in columns if column != 'timestamp']\n"
         "for row in rows:\n"
@@ -1129,19 +1120,19 @@ def _financial_metrics_code() -> str:
         "    if peak:\n"
         "        max_drawdown = min(max_drawdown, value / peak - 1)\n"
         "result = {\n"
-        "    'summary': 'Computed total return, volatility, and max drawdown.',\n"
-        "    'metrics': {\n"
-        "        'total_return': float(total_return) if total_return is not None else None,\n"
-        "        'volatility': float(volatility),\n"
-        "        'max_drawdown': float(max_drawdown),\n"
-        "    },\n"
-        "    'details': {\n"
-        "        'formula': {\n"
-        "            'period_return': 'price_t / price_t_minus_1 - 1',\n"
-        "            'volatility': 'sample standard deviation of period returns',\n"
-        "            'max_drawdown': 'min(price_t / running_peak - 1)',\n"
-        "        },\n"
-        "        'return_count': len(returns),\n"
-        "    },\n"
+        "    'computed_insights': [\n"
+        "        {'insight_key': 'total_return', 'value': float(total_return) if total_return is not None else None, 'unavailable_reason': None if total_return is not None else 'Insufficient nonzero values.', 'calculation_trace': {'formula': 'last / first - 1'}},\n"
+        "        {'insight_key': 'volatility', 'value': float(volatility), 'calculation_trace': {'formula': 'sample standard deviation of period returns', 'return_count': len(returns)}},\n"
+        "        {'insight_key': 'max_drawdown', 'value': float(max_drawdown), 'calculation_trace': {'formula': 'min(value / running_peak - 1)'}},\n"
+        "    ],\n"
+        "    'derived_evidence': [],\n"
         "}\n"
     )
+
+
+def _financial_insight_requests() -> list[dict]:
+    return [
+        {"insight_key": "total_return", "name": "Total return", "insight_type": "return"},
+        {"insight_key": "volatility", "name": "Volatility", "insight_type": "volatility"},
+        {"insight_key": "max_drawdown", "name": "Maximum drawdown", "insight_type": "drawdown"},
+    ]

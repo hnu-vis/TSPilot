@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from schemas.action_output import ActionOutput
-from schemas.analysis import AnalysisResult
+from schemas.analysis import AnalysisResult, DerivedEvidence
 from schemas.api import Message
 from schemas.database import DatabaseEvidence
 from schemas.database_context import DatabaseContext
@@ -52,6 +52,7 @@ class RequestStateModel(BaseModel):
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
     latest_analysis_id: str | None = None
     analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
+    derived_evidence_artifacts: dict[str, DerivedEvidence] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None
     forecast_artifacts: dict[str, ForecastResult] = Field(default_factory=dict)
     latest_anomaly: AnomalyResult | None = None
@@ -90,6 +91,7 @@ class ConversationStateModel(BaseModel):
     database_evidence_artifacts: dict[str, DatabaseEvidence] = Field(default_factory=dict)
     latest_analysis_id: str | None = None
     analysis_artifacts: dict[str, AnalysisResult] = Field(default_factory=dict)
+    derived_evidence_artifacts: dict[str, DerivedEvidence] = Field(default_factory=dict)
     latest_forecast: ForecastResult | None = None
     forecast_artifacts: dict[str, ForecastResult] = Field(default_factory=dict)
     latest_anomaly: AnomalyResult | None = None

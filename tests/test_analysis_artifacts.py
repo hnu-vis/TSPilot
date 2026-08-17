@@ -32,27 +32,17 @@ def test_analysis_payloads_are_snapshotted_and_summarized():
     analysis_payload = {
         "analysis_id": "ana_demo",
         "analysis_goal": "seasonality",
-        "code_type": "python_rows_v1",
+        "code_type": "code_interpreter_v2",
         "code_hash": "sha256:demo",
         "input_evidence_id": "evi_demo",
         "input_row_count": 20,
         "status": "succeeded",
         "summary": "analysis summary",
-        "result": {"summary": "analysis summary", "metrics": {"row_count": 20}, "details": {}},
-        "visualizations": [
-            {
-                "visualization_id": "viz1",
-                "visualization_type": "chart",
-                "visualization_kind": "line",
-                "renderer": "linechart",
-                "title": "trend",
-                "summary": "trend",
-                "chart": {
-                    "x_axis_data": [f"2023-01-01T00:{i:02d}:00Z" for i in range(20)],
-                    "series_data": [{"name": "price", "data": list(range(20))}],
-                },
-            }
-        ],
+        "computed_insights": [{
+            "insight_key": "row_count", "value": 20,
+            "calculation_trace": {"operation": "len(rows)"},
+        }],
+        "derived_evidence": [],
         "diagnostics": {},
     }
     apply_observation(

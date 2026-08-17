@@ -410,34 +410,7 @@ def _forecast_exclusion_keys(
     else:
         anomaly_note = None
 
-    analysis = _latest_analysis_for_evidence(database_evidence, request_state)
-    if analysis is not None:
-        details = analysis.result.get("details") if isinstance(analysis.result, dict) else None
-        excluded_rows = details.get("excluded_rows") if isinstance(details, dict) else None
-        keys = _keys_from_rows(excluded_rows)
-        if keys:
-            return keys, {
-                "source_analysis_id": analysis.analysis_id,
-                "input_policy_note": "forecast training excluded rows reported by code_interpreter outlier treatment",
-            }
     return set(), anomaly_note
-
-
-def _latest_analysis_for_evidence(database_evidence: DatabaseEvidence, request_state):
-    artifacts = getattr(request_state, "analysis_artifacts", {}) or {}
-    latest_analysis_id = getattr(request_state, "latest_analysis_id", None)
-    ordered = []
-    if latest_analysis_id and latest_analysis_id in artifacts:
-        ordered.append(artifacts[latest_analysis_id])
-    ordered.extend(
-        analysis
-        for analysis_id, analysis in artifacts.items()
-        if analysis_id != latest_analysis_id
-    )
-    for analysis in ordered:
-        if getattr(analysis, "input_evidence_id", None) == database_evidence.evidence_id:
-            return analysis
-    return None
 
 
 def _keys_from_rows(rows: Any) -> set[tuple[str, float]]:

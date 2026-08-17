@@ -210,18 +210,17 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
             and event["payload"]["tool"] == "code_interpreter"
         )
         code_payload = code_observation["payload"]["payload_preview"]
-        assert code_payload["code_type"] == "code_interpreter_v1"
-        assert code_payload["code_preview"]
-        assert code_payload["metrics_preview"]["value_count"] > 1
-        assert code_payload["metrics_preview"]["delta_count"] == code_payload["metrics_preview"]["value_count"] - 1
-        assert "Code interpreter computed" in code_observation["payload"]["summary"]
-        assert "Code interpreter computed" in code_payload["summary"]
+        assert code_payload["code_type"] == "code_interpreter_v2"
+        computed = code_payload["computed_insights"][0]["value"]
+        assert computed["value_count"] > 1
+        assert computed["delta_count"] == computed["value_count"] - 1
+        assert "Computed 1 requested insight" in code_observation["payload"]["summary"]
 
         section_types = [section["section_type"] for section in payload["answer"]["sections"]]
         assert "analysis" in section_types
-        assert f"Code interpreter computed {code_payload['metrics_preview']['delta_count']} pairwise deltas" in payload["answer"]["summary"]
+        assert str(computed["delta_count"]) in payload["answer"]["summary"]
         conclusion = next(section for section in payload["answer"]["sections"] if section["section_type"] == "conclusion")
-        assert f"Code interpreter computed {code_payload['metrics_preview']['delta_count']} pairwise deltas" in conclusion["content"]
+        assert str(computed["delta_count"]) in conclusion["content"]
         assert any(reference["source_type"] == "analysis" for reference in payload["answer"]["references"])
 
         request_dir = next(tmp_path.glob(f"*_{payload['conversation_id']}/requests/{payload['request_id']}"))
@@ -229,7 +228,7 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         assert len(code_outputs) == 1
         code_output = json.loads(code_outputs[0].read_text(encoding="utf-8"))
         assert code_output["status"] == "succeeded"
-        assert code_output["result"]["metrics"]["delta_count"] == code_payload["metrics_preview"]["delta_count"]
+        assert code_output["computed_insights"][0]["value"]["delta_count"] == computed["delta_count"]
     finally:
         settings.conversation_log_dir = old_log_dir
         settings.conversation_log_enabled = old_enabled
@@ -273,10 +272,10 @@ def test_code_required_metrics_repair_generates_code():
         and event["payload"].get("tool") == "code_interpreter"
         and event["payload"].get("success") is True
     ][-1]
-    assert successful_code["code_type"] == "code_interpreter_v1"
-    assert successful_code["code_preview"]
-    metrics = successful_code["metrics_preview"]
-    assert set(metrics) == {"total_return", "volatility", "max_drawdown"}
+    assert successful_code["code_type"] == "code_interpreter_v2"
+    assert {item["insight_key"] for item in successful_code["computed_insights"]} == {
+        "total_return", "volatility", "max_drawdown"
+    }
 
 
 def test_first_visible_action_does_not_wait_for_separate_intent_llm_call():
@@ -556,14 +555,14 @@ def test_sql_tool_result_preview_keeps_complete_long_query():
     assert preview["query"] == long_query
 
 
-def test_code_interpreter_trace_preview_exposes_code_and_result():
+def test_code_interpreter_trace_preview_exposes_code_and_computed_insights():
     loop = ReActLoop.__new__(ReActLoop)
     input_preview = loop._input_preview(
         "code_interpreter",
         {
             "database_evidence": "latest",
             "analysis_goal": "compute stats",
-            "code": "result = {'summary': 'ok', 'metrics': {'mean': 1.2}, 'details': {'n': 3}}",
+            "code": "result = {'computed_insights': [], 'derived_evidence': []}",
         },
     )
     payload_preview = loop._payload_preview(
@@ -574,17 +573,17 @@ def test_code_interpreter_trace_preview_exposes_code_and_result():
             "payload": {
                 "analysis_id": "ana_stats",
                 "analysis_goal": "compute stats",
-                "code_type": "code_interpreter_v1",
+                "code_type": "code_interpreter_v2",
                 "code_hash": "sha256:abc",
                 "input_evidence_id": "evi_sql",
                 "input_row_count": 3,
                 "status": "succeeded",
                 "summary": "ok",
-                "result": {
-                    "summary": "ok",
-                    "metrics": {"mean": 1.2},
-                    "details": {"n": 3},
-                },
+                "computed_insights": [{
+                    "insight_key": "mean", "value": 1.2,
+                    "calculation_trace": {"operation": "mean", "n": 3},
+                }],
+                "derived_evidence": [],
                 "diagnostics": {
                     "runtime_ms": 12.4,
                     "input_columns": ["timestamp", "value"],
@@ -595,8 +594,7 @@ def test_code_interpreter_trace_preview_exposes_code_and_result():
 
     assert input_preview["code_preview"].startswith("result =")
     assert input_preview["analysis_code_chars"] > 0
-    assert payload_preview["analysis_metrics"] == {"mean": 1.2}
-    assert payload_preview["analysis_details"] == {"n": 3}
+    assert payload_preview["computed_insights"][0]["value"] == 1.2
     assert payload_preview["runtime_ms"] == 12.4
     assert payload_preview["input_columns"] == ["timestamp", "value"]
 

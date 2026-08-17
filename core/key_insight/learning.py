@@ -176,7 +176,11 @@ def extract_learning_candidates(request_state: RequestStateModel) -> list[Insigh
             dependency_insight_keys=list(insight.derived_from),
             calculation_semantics={
                 "derivation": insight.derivation,
-                "trace_fields": sorted((insight.calculation_trace or {}).keys()),
+                "trace_fields": (
+                    sorted(insight.calculation_trace.keys())
+                    if isinstance(insight.calculation_trace, dict)
+                    else []
+                ),
             },
             created_at=utc_now_iso(),
         ))

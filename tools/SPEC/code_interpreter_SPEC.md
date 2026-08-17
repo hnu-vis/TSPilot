@@ -2,38 +2,36 @@
 
 ## Purpose
 
-Run request-scoped analysis over database evidence and return a normalized
-analysis artifact.
+Calculate exactly the requested analytical Key Insight values over grounded Evidence.
 
 ## Inputs
 
-- `database_evidence`: evidence object or reference, defaulting to latest evidence
-  from request state when available.
-- `analysis_goal`: natural-language analysis goal.
-- `analysis_request`: structured request for template-driven analysis.
-- `code`: optional Python code for sandbox execution.
-- `required_outputs`: output labels requested by the current task.
-- `expected_result_schema`: optional validation contract.
-- `constraints`: execution constraints such as timeout.
-- `insight_requests`: semantic Insight contracts. Each request has a stable `insight_key`;
-  composite requests list parent Insight keys in `derived_from`.
+- `database_evidence`: an existing database Evidence object or reference.
+- `analysis_goal`: natural-language computation goal.
+- `insight_requests`: non-empty semantic contracts; output keys must match them exactly.
+- `code`: optional Python. When absent, the internal LLM generates computation-only code.
+- `constraints`: sandbox execution constraints such as timeout.
 
 ## Outputs
 
-- `AnalysisResult` payload with stable `analysis_id`, input evidence id, row count,
-  summary, metrics/details, diagnostics, and code type.
-- `result.insights` contains structured insights satisfying `insight_requests`, including
-  `insight_key`, `value`, `statement`, `derived_from`, and `calculation_trace`.
-- Verified parent Insights are available to generated code as `input_insights` and
-  `insight_by_key`.
+- `computed_insights`: immutable values/items, calculation traces, unavailable reasons,
+  and optional derived Evidence references keyed by `insight_key`.
+- `derived_evidence`: independently addressable complete tables or series needed to
+  verify or reuse a calculation; absent for ordinary scalar/collection Insights.
+- `produced_insights`: formal Key Insights created by the independent LLM Insight Binder.
+- Execution identity, provenance, runtime diagnostics, and code hash.
 
 ## Rules
 
-- Must not query databases directly.
-- Must not assemble final answers.
-- Must only analyze evidence already present in request state or passed in input.
-- Must preserve executable code only when code is actually supplied.
-- Template-driven analysis should keep outputs scoped to requested insights and
-  supporting values needed for those insights.
-- A composite Insight is verified only when all parents are verified and its
-  calculation trace is present.
+- Python must not write statements, Key Insight semantics, presentation objects,
+  Data Views, chart roles, final-answer prose, or repair policy.
+- The LLM Binder may add statements and item labels but must never calculate or
+  modify Python-produced values.
+- Output keys must preserve request order and exactly match `insight_requests`.
+- Impossible calculations return `unavailable_reason`; placeholder values are forbidden.
+- Complete derived datasets are registered as `derived_evidence:*` artifacts rather
+  than embedded into an Insight or visualization contract.
+- Authoritative Anomaly Artifacts must be consumed directly and cited in the affected
+  calculation trace; Code Interpreter must not repeat anomaly detection or its audit schema.
+- Must not query databases, assemble final answers, choose charts, or use deterministic
+  business fallbacks.

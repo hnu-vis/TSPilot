@@ -472,24 +472,18 @@ def test_terminate_requires_authoritative_anomaly_artifact_for_outlier_contract(
             "ana_outlier": {
                 "analysis_id": "ana_outlier",
                 "analysis_goal": "计算异常值处理后的指标",
-                "code_type": "code_interpreter_v1",
+                "code_type": "code_interpreter_v2",
                 "code_hash": "sha256:outlier",
                 "input_evidence_id": "evi_series",
                 "input_row_count": 3,
                 "status": "succeeded",
                 "summary": "Computed outlier treatment.",
-                "result": {
-                    "summary": "Computed outlier treatment.",
-                    "metrics": {"pct_change": 20.0},
-                    "details": {
-                        "outlier_rule": "value > 1000000",
-                        "threshold_or_formula": "> 1000000",
-                        "rationale": "extreme value",
-                        "excluded_rows": [{"timestamp": "2023-01-01T00:00:00Z", "value": 1000001.0}],
-                        "raw_metrics": {"start_value": 1000001.0},
-                        "adjusted_metrics": {"start_value": 10.0},
-                    },
-                },
+                "computed_insights": [{
+                    "insight_key": "pct_change",
+                    "value": 20.0,
+                    "calculation_trace": "Calculated from the supplied evidence.",
+                }],
+                "derived_evidence": [],
                 "diagnostics": {},
             }
         },
@@ -769,17 +763,18 @@ def test_terminate_allows_derived_contract_outputs_with_code_analysis():
             "ana_price_metrics": {
                 "analysis_id": "ana_price_metrics",
                 "analysis_goal": "计算价格指标",
-                "code_type": "code_interpreter_v1",
+                "code_type": "code_interpreter_v2",
                 "code_hash": "sha256:demo",
                 "input_evidence_id": "evi_prices",
                 "input_row_count": 2,
                 "status": "succeeded",
                 "summary": "Computed price metrics in code.",
-                "result": {
-                    "summary": "Computed price metrics in code.",
-                    "metrics": {"pct_change": 20.0},
-                    "details": {},
-                },
+                "computed_insights": [{
+                    "insight_key": "pct_change",
+                    "value": 20.0,
+                    "calculation_trace": "(12 - 10) / 10 * 100",
+                }],
+                "derived_evidence": [],
                 "diagnostics": {},
             }
         },
@@ -842,17 +837,18 @@ def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos()
             "ana_price_metrics": {
                 "analysis_id": "ana_price_metrics",
                 "analysis_goal": "计算价格指标",
-                "code_type": "code_interpreter_v1",
+                "code_type": "code_interpreter_v2",
                 "code_hash": "sha256:demo",
                 "input_evidence_id": "evi_prices",
                 "input_row_count": 2,
                 "status": "succeeded",
                 "summary": "Computed price metrics in code.",
-                "result": {
-                    "summary": "Computed price metrics in code.",
-                    "metrics": {"pct_change": 38.97468229802119, "max_value": 24104.6943, "min_value": 16702.3044},
-                    "details": {},
-                },
+                "computed_insights": [{
+                    "insight_key": "price_metrics",
+                    "value": {"pct_change": 38.97468229802119, "max_value": 24104.6943, "min_value": 16702.3044},
+                    "calculation_trace": "Calculated return and extrema from the complete interval.",
+                }],
+                "derived_evidence": [],
                 "diagnostics": {},
             }
         },
@@ -877,7 +873,6 @@ def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos()
 
     assert allowed is True
     assert reason is None
-    assert request_state.completion_state["latest_goal"]["can_answer"] is True
 
 
 def test_terminate_still_blocks_stale_non_answer_todos_without_global_gap_coverage():
@@ -2092,21 +2087,22 @@ def test_runtime_allows_sql_prerequisite_repair_during_code_interpreter_todo():
     assert request_state.completion_state["latest_step"]["completed"] is False
 
 
-def test_goal_blocks_raw_analysis_after_matching_anomaly_points_are_detected():
+def test_terminal_boundary_defers_anomaly_trace_quality_to_completion_review():
     analysis = {
         "analysis_id": "ana_raw",
         "analysis_goal": "calculate return volatility drawdown",
-        "code_type": "code_interpreter_v1",
+        "code_type": "code_interpreter_v2",
         "code_hash": "sha256:test",
         "input_evidence_id": "evi_price",
         "input_row_count": 3,
         "status": "succeeded",
         "summary": "raw metrics",
-        "result": {
-            "summary": "raw metrics",
-            "metrics": {"percentage_change": -0.99, "max_drawdown": -0.99},
-            "details": {"method": "raw series"},
-        },
+        "computed_insights": [{
+            "insight_key": "return_metrics",
+            "value": {"percentage_change": -0.99, "max_drawdown": -0.99},
+            "calculation_trace": "Calculated directly from the raw series.",
+        }],
+        "derived_evidence": [],
     }
     anomaly = AnomalyResult(
         anomaly_id="anomaly_evi_price",
@@ -2121,6 +2117,15 @@ def test_goal_blocks_raw_analysis_after_matching_anomaly_points_are_detected():
         message="计算收益率并检测异常",
         database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
         status="running",
+        requested_capabilities=["analysis", "anomaly"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm",
+            "goal": "calculate return volatility drawdown after anomaly handling",
+            "required_outputs": [
+                {"id": "analysis", "description": "return metrics", "evidence_kind": "analysis"},
+                {"id": "anomaly_detection", "description": "detected anomalies", "evidence_kind": "anomaly"},
+            ],
+        }),
         latest_analysis_id="ana_raw",
         analysis_artifacts={"ana_raw": analysis},
         latest_anomaly=anomaly,
@@ -2129,11 +2134,8 @@ def test_goal_blocks_raw_analysis_after_matching_anomaly_points_are_detected():
 
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "done"})
 
-    assert allowed is False
-    assert "Derived analysis is inconsistent" in (reason or "")
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
-        "analysis:ana_raw:requires_outlier_transparency"
-    ]
+    assert allowed is True
+    assert reason is None
 
 
 def test_runtime_keeps_query_todo_active_for_schema_only_sql_observation():

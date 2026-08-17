@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
 
-from schemas.analysis import AnalysisDataView
 from schemas.key_insight import KeyInsight, InsightItem
 from schemas.output import VisualGoal, VisualLayerPlan
 from schemas.state import RequestStateModel
@@ -69,8 +68,13 @@ class PresentationCatalog:
             )
         for analysis_id, analysis in request_state.analysis_artifacts.items():
             self._register_artifact("analysis", analysis_id, analysis)
-            for view in analysis.data_views:
-                self._register_analysis_view(analysis_id, view)
+        for evidence_id, evidence in request_state.derived_evidence_artifacts.items():
+            self._register_artifact("derived_evidence", evidence_id, evidence)
+            self._register_view(
+                f"view:derived_evidence:{evidence_id}", name=evidence.name, shape=evidence.shape,
+                rows=[dict(row) for row in evidence.rows], scalar=evidence.scalar,
+                lineage=[f"derived_evidence:{evidence_id}", *evidence.lineage],
+            )
         for forecast_id, forecast in request_state.forecast_artifacts.items():
             self._register_artifact("forecast", forecast_id, forecast)
             rows = [{"timestamp": point.timestamp, "value": point.value} for point in forecast.forecast_points]
@@ -117,14 +121,6 @@ class PresentationCatalog:
         source = PresentationSource(ref, kind, value)
         self._sources[ref] = source
         self._sources.setdefault(source_id, source)
-
-    def _register_analysis_view(self, analysis_id: str, view: AnalysisDataView) -> None:
-        self._register_view(
-            f"view:analysis:{analysis_id}:{view.view_id}", name=view.name, shape=view.shape,
-            rows=[dict(row) for row in view.rows], scalar=view.scalar,
-            lineage=list(dict.fromkeys([f"analysis:{analysis_id}", *view.lineage])),
-            schema_fields=[item.model_dump(mode="json") for item in view.schema_fields],
-        )
 
     def _register_view(
         self, ref: str, *, name: str, shape: str, rows: list[dict], scalar: dict | None,

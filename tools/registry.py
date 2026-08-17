@@ -102,7 +102,7 @@ def build_tool_registry(
         ),
         ToolSpec(
             tool_name="code_interpreter",
-            description="Execute Python code in a subprocess code interpreter over full evidence artifacts for complex analysis.",
+            description="Calculate requested Key Insight values over grounded evidence; semantic binding and derived evidence publication are internal.",
             input_model=CodeInterpreterInput,
             output_model=AnalysisResult,
             tool=CodeInterpreterTool(llm=llm),

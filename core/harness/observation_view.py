@@ -172,8 +172,9 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
 
 
 def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
-    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
     diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    computed = payload.get("computed_insights") if isinstance(payload.get("computed_insights"), list) else []
+    derived = payload.get("derived_evidence") if isinstance(payload.get("derived_evidence"), list) else []
     view = {
         "analysis_id": payload.get("analysis_id"),
         "status": payload.get("status"),
@@ -183,12 +184,12 @@ def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
         "input_row_count": payload.get("input_row_count"),
         "code_type": payload.get("code_type"),
         "code_hash": payload.get("code_hash"),
-        "metrics_preview": _bounded_value(result.get("metrics") if isinstance(result.get("metrics"), dict) else {}, max_dict_items=16),
-        "details_preview": _bounded_value(result.get("details") if isinstance(result.get("details"), dict) else {}, max_dict_items=12),
-        "data_views": _bounded_value(
-            payload.get("data_views") if isinstance(payload.get("data_views"), list) else [],
-            max_dict_items=12,
-        ),
+        "computed_insights": _bounded_value(computed, max_dict_items=12),
+        "derived_evidence": _bounded_value([
+            {"evidence_id": item.get("evidence_id"), "name": item.get("name"), "shape": item.get("shape"),
+             "row_count": len(item.get("rows", [])) if isinstance(item.get("rows"), list) else int(item.get("scalar") is not None)}
+            for item in derived if isinstance(item, dict)
+        ], max_dict_items=12),
         "diagnostics": _diagnostics_view(diagnostics),
     }
     executed_code = diagnostics.get("executed_code_preview") if isinstance(diagnostics.get("executed_code_preview"), dict) else {}

@@ -72,10 +72,10 @@ The model must treat anything outside that window as unavailable.
 - After each observation, write `previous_observation_assessment` as the gap between the task output contract and current evidence: `covered`, `missing`, `can_answer`, and `next_action_reason`.
 - Choose tools to produce missing contract fields from grounded evidence; do not hard-code a tool chain for a task phrase.
 - Database-computable work should be satisfied by `sql_query` when returned columns or result shape explicitly cover the contract.
-- Use `code_interpreter` after SQL evidence is grounded when requested metrics require custom formulas, sequence/window calculations, or metrics not clearly covered by the simple analysis template.
-- `analysis_request` without `code` is only for simple template-covered metrics such as counts, start/end values, extrema, and simple differences.
-- For returns, volatility, drawdown, correlation, rolling/window metrics, or ambiguous unsupported metrics, provide Python `code` in `code_interpreter`.
-- Generated `code_interpreter` Python runs with canonical variables `df`, `time`, `value`, `time_col`, `value_col`, `series`, and `analysis_context`, plus compatibility variables `data`, `rows`, `points`, `columns`, `metadata`, and `diagnostics`. It should prefer canonical variables instead of guessing raw field names, and must assign a dict named `result` with `summary`, `metrics`, and `details`.
+- Use `code_interpreter` after SQL evidence is grounded for requested derived or analytical Key Insights.
+- Every call must carry exact, non-empty `insight_requests`; Python code is optional because generation is internal.
+- Generated Python receives canonical variables `df`, `time`, `value`, `time_col`, `value_col`, `series`, and `analysis_context`, plus compatibility variables. It emits only `computed_insights` and optional `derived_evidence`.
+- Formal statements and Insight semantics are added by the independent LLM Insight Binder without changing computed values.
 - `missing` is only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in `missing`.
 - Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`; both fields must remain visible in the compact terminate action contract.
 

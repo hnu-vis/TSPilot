@@ -284,25 +284,25 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
             full_payload={
                 "analysis_id": "ana_demo",
                 "analysis_goal": "compute stats",
-                "code_type": "code_interpreter_v1",
+                "code_type": "code_interpreter_v2",
                 "code_hash": "sha256:abc",
                 "input_evidence_id": "evi_demo",
                 "input_row_count": 2,
                 "status": "succeeded",
                 "summary": "computed",
-                "result": {
-                    "summary": "computed",
-                    "metrics": {"mean": 1.5},
-                    "details": {"n": 2},
-                },
+                "computed_insights": [{
+                    "insight_key": "mean", "value": 1.5,
+                    "calculation_trace": {"operation": "mean", "n": 2},
+                }],
+                "derived_evidence": [],
                 "diagnostics": {
                     "runtime_ms": 12.5,
-                    "sandbox": "subprocess_code_interpreter_v1",
-                    "executed_code": "result = {'summary': 'computed', 'metrics': {'mean': 1.5}, 'details': {'n': 2}}",
+                    "sandbox": "subprocess_code_interpreter_v2",
+                    "executed_code": "result = {'computed_insights': [], 'derived_evidence': []}",
                     "executed_code_preview": {
                         "line_count": 1,
                         "char_count": 87,
-                        "preview": "result = {'summary': 'computed', 'metrics': {'mean': 1.5}, 'details': {'n': 2}}",
+                        "preview": "result = {'computed_insights': [], 'derived_evidence': []}",
                     },
                 },
             },
@@ -310,7 +310,7 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
             action_input={
                 "database_evidence": "latest",
                 "analysis_goal": "compute stats",
-                "analysis_code": "result = {'summary': 'computed', 'metrics': {'mean': 1.5}, 'details': {'n': 2}}",
+                "analysis_code": "result = {'computed_insights': [], 'derived_evidence': []}",
             },
             iteration=1,
             request_id="req_demo",
@@ -320,8 +320,7 @@ def test_public_code_interpreter_action_output_keeps_bounded_code_preview():
     payload = action_output.view["payload"]
     assert payload["code_preview"].startswith("result =")
     assert payload["analysis_code_chars"] > 0
-    assert payload["metrics_preview"] == {"mean": 1.5}
-    assert payload["details_preview"] == {"n": 2}
+    assert payload["computed_insights"][0]["value"] == 1.5
     assert payload["runtime_ms"] == 12.5
     assert payload["code_preview"].startswith("result =")
     assert payload["analysis_code_chars"] == len(payload["code_preview"])

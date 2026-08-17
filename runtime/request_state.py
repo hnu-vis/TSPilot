@@ -1206,14 +1206,12 @@ def _summarize_visualization_dict(payload: dict) -> dict:
 
 def _build_prompt_safe_analysis(analysis, request_state: RequestStateModel):
     payload = analysis.model_dump(mode="json")
-    persist_json_artifact(
+    snapshot_ref = persist_json_artifact(
         artifact_id=analysis.analysis_id,
         artifact_kind="analysis_result",
         payload=analysis.model_dump(mode="json"),
         directory=_artifact_directory(request_state, "analysis"),
     )
-    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-    data_views = payload.get("data_views") if isinstance(payload.get("data_views"), list) else []
     return {
         "analysis_id": payload.get("analysis_id"),
         "status": payload.get("status"),
@@ -1223,24 +1221,26 @@ def _build_prompt_safe_analysis(analysis, request_state: RequestStateModel):
         "input_row_count": payload.get("input_row_count"),
         "code_type": payload.get("code_type"),
         "code_hash": payload.get("code_hash"),
-        "result": {
-            "metrics": _compact_analysis_value(result.get("metrics", {})),
-            "details": _compact_analysis_value(result.get("details", {})),
-        },
-        "data_views": [
+        "computed_insights": [
             {
-                "view_id": view.get("view_id"),
-                "name": view.get("name"),
-                "shape": view.get("shape"),
-                "row_count": len(view.get("rows", [])) if isinstance(view.get("rows"), list) else int(view.get("scalar") is not None),
-                "schema_fields": view.get("schema_fields", []),
-                "lineage": view.get("lineage", []),
+                "insight_key": item.get("insight_key"),
+                "value": _compact_analysis_value(item.get("value")),
+                "item_count": len(item.get("items", [])) if isinstance(item.get("items"), list) else 0,
+                "derived_evidence_ids": item.get("derived_evidence_ids", []),
             }
-            for view in data_views
-            if isinstance(view, dict)
+            for item in payload.get("computed_insights", [])
+            if isinstance(item, dict)
+        ],
+        "derived_evidence_refs": [
+            f"derived_evidence:{item['evidence_id']}"
+            for item in payload.get("derived_evidence", [])
+            if isinstance(item, dict) and item.get("evidence_id")
         ],
         "insight_coverage": payload.get("insight_coverage"),
-        "diagnostics": {"artifact_ref": f"analysis:{analysis.analysis_id}"},
+        "diagnostics": {
+            "artifact_ref": f"analysis:{analysis.analysis_id}",
+            "snapshot_ref": snapshot_ref,
+        },
     }
 
 
@@ -1321,6 +1321,8 @@ def _apply_analysis_payload(request_state: RequestStateModel, full_payload: dict
 
         analysis = AnalysisResult.model_validate(full_payload)
         request_state.analysis_artifacts[analysis.analysis_id] = analysis
+        for artifact in analysis.derived_evidence:
+            request_state.derived_evidence_artifacts[artifact.evidence_id] = artifact
         request_state.latest_analysis_id = analysis.analysis_id
         return
 

@@ -245,6 +245,28 @@ async def test_tool_executor_skips_insight_memory_for_analysis_artifact_tools():
 
 
 @pytest.mark.asyncio
+async def test_code_interpreter_explicit_contract_is_not_expanded_by_memory():
+    retriever = ToolScopedRetriever()
+    executor = ToolExecutor(_registry(), memory_retriever=retriever)
+    explicit = {
+        "insight_key": "period.change",
+        "name": "Period change",
+        "insight_type": "difference",
+    }
+
+    merged = await executor._apply_insight_memory(
+        "code_interpreter",
+        {"analysis_goal": "calculate change", "insight_requests": [explicit], "constraints": {}},
+        _request_state("calculate change"),
+    )
+
+    assert merged["insight_requests"] == [explicit]
+    diagnostics = merged["constraints"]["memory_diagnostics"]
+    assert diagnostics["explicit_contract_authoritative"] is True
+    assert diagnostics["insight_request_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_memory_retriever_llm_failure_returns_empty_without_keyword_fallback():
     retriever = InsightMemoryRetriever(llm=BrokenLLM())
     result = await retriever.retrieve(

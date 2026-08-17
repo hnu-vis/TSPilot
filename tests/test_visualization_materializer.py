@@ -7,7 +7,7 @@ import pytest
 from app.settings import get_settings
 from core.visualization import PresentationCatalog, VisualizationMaterializer
 from runtime.request_state import build_request_state
-from schemas.analysis import AnalysisResult
+from schemas.analysis import DerivedEvidence
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
@@ -80,7 +80,7 @@ def test_layers_keep_base_series_and_semantic_insight_items_separate():
     assert all(layer.source_ref for layer in result.layers)
 
 
-def test_analysis_data_view_preserves_authoritative_anomaly_lineage():
+def test_derived_evidence_preserves_authoritative_anomaly_lineage():
     rows = [
         {"timestamp": "2026-01-01T00:00:00Z", "value": 10.0},
         {"timestamp": "2026-01-02T00:00:00Z", "value": 999.0},
@@ -92,29 +92,21 @@ def test_analysis_data_view_preserves_authoritative_anomaly_lineage():
         anomaly_points=[rows[1]], diagnostics={"resolved_evidence_id": "evi_series"},
     )
     state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
-    analysis = AnalysisResult(
-        analysis_id="ana_clean", analysis_goal="exclude anomalies", code_hash="sha256:test",
-        input_evidence_id="evi_series", input_row_count=3, status="succeeded", summary="Cleaned.",
-        result={
-            "summary": "Cleaned.", "metrics": {}, "details": {},
-            "data_views": [{
-                "view_id": "clean", "name": "Clean series", "shape": "timeseries",
-                "rows": [rows[0], rows[2]],
-                "schema_fields": [{"name": "timestamp", "data_type": "time"}, {"name": "value", "data_type": "number"}],
-                "lineage": ["evidence:evi_series", "anomaly:anomaly_evi_series"],
-                "transform_summary": "Excluded authoritative anomaly points.",
-            }],
-        },
+    derived = DerivedEvidence(
+        evidence_id="dev_clean", name="Clean series", shape="timeseries",
+        rows=[rows[0], rows[2]],
+        lineage=["evidence:evi_series", "anomaly:anomaly_evi_series"],
+        transform_summary="Excluded authoritative anomaly points.",
     )
-    state.analysis_artifacts[analysis.analysis_id] = analysis
+    state.derived_evidence_artifacts[derived.evidence_id] = derived
 
     result = VisualizationMaterializer(state).materialize(_goal(
-        VisualLayerPlan(role="clean_series", source_ref="view:analysis:ana_clean:clean", mark="line", encoding={"x": "timestamp", "y": "value"}),
+        VisualLayerPlan(role="clean_series", source_ref="view:derived_evidence:dev_clean", mark="line", encoding={"x": "timestamp", "y": "value"}),
         VisualLayerPlan(role="excluded_anomalies", source_ref="view:anomaly:anomaly_evi_series:points", mark="point", encoding={"x": "timestamp", "y": "value"}),
     ))
 
     assert [len(dataset.series[0].points) for dataset in result.datasets] == [2, 1]
-    assert result.source_refs == ["view:analysis:ana_clean:clean", "view:anomaly:anomaly_evi_series:points"]
+    assert result.source_refs == ["view:derived_evidence:dev_clean", "view:anomaly:anomaly_evi_series:points"]
 
 
 def test_semantic_validator_rejects_missing_required_role():

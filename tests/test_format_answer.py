@@ -7,7 +7,7 @@ import pytest
 from app.settings import get_settings
 from core.visualization import PresentationCatalog, VisualizationArtifactStore, VisualizationMaterializer
 from runtime.request_state import build_request_state
-from schemas.analysis import AnalysisResult
+from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightEvidenceRef
@@ -161,38 +161,35 @@ def test_format_answer_routes_unknown_prose_source_back_to_terminate():
     assert caught.value.validation_failure["retry_policy"]["required_action"] == "terminate"
 
 
-def test_analysis_artifact_requires_explicit_data_view_for_visualization():
+def test_analysis_and_derived_evidence_are_separate_answer_sources():
     state = _state()
     analysis = AnalysisResult(
         analysis_id="ana_returns", analysis_goal="daily returns", code_hash="sha256:returns",
         input_evidence_id="evi_prices", input_row_count=3, status="succeeded", summary="Computed.",
-        result={
-            "summary": "Computed.", "metrics": {"maximum_return": 0.25},
-            "details": {"diagnostic_rows": [{"value": index} for index in range(100)]},
-            "data_views": [{
-                "view_id": "returns", "name": "Daily returns", "shape": "timeseries",
-                "rows": [
-                    {"date": "2026-01-02", "return": 0.2},
-                    {"date": "2026-01-03", "return": 0.25},
-                ],
-                "schema_fields": [{"name": "date", "data_type": "time"}, {"name": "return", "data_type": "number"}],
-                "lineage": ["evidence:evi_prices"],
-            }],
-        },
+        computed_insights=[ComputedInsight(
+            insight_key="maximum_return", value=0.25,
+            calculation_trace={"formula": "max(returns)"}, derived_evidence_ids=["dev_returns"],
+        )],
     )
     state.analysis_artifacts[analysis.analysis_id] = analysis
+    state.derived_evidence_artifacts["dev_returns"] = DerivedEvidence(
+        evidence_id="dev_returns", name="Daily returns", shape="timeseries",
+        rows=[{"date": "2026-01-02", "return": 0.2}, {"date": "2026-01-03", "return": 0.25}],
+        lineage=["evidence:evi_prices"], transform_summary="Calculated daily returns.",
+    )
     plan = FinalResponsePlan(
         summary=analysis.summary,
-        sections=[PlannedAnswerSection(section_type="analysis", content=analysis.summary, source_refs=["analysis:ana_returns"])],
+        sections=[PlannedAnswerSection(
+            section_type="analysis", content=analysis.summary,
+            source_refs=["analysis:ana_returns", "derived_evidence:dev_returns"],
+        )],
     )
     result = asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
     assert result["visualizations"] == []
     assert result["references"][0]["source_type"] == "analysis"
-    reference = result["references"][0]["evidence"]
-    assert len(reference["result"]["details"]["diagnostic_rows"]) == 21
-    assert reference["result"]["details"]["diagnostic_rows"][-1] == {"_truncated_item_count": 80}
-    assert reference["data_views"][0]["row_count"] == 2
-    assert "rows" not in reference["data_views"][0]
+    assert [item["source_type"] for item in result["references"]] == ["analysis", "derived_evidence"]
+    assert result["references"][0]["evidence"]["computed_insights"][0]["value"] == 0.25
+    assert result["references"][1]["evidence"]["row_count"] == 2
 
 
 def test_format_answer_routes_poisoned_analysis_lineage_back_to_code_interpreter():
@@ -205,27 +202,24 @@ def test_format_answer_routes_poisoned_analysis_lineage_back_to_code_interpreter
         input_row_count=3,
         status="succeeded",
         summary="Computed.",
-        result={
-            "summary": "Computed.",
-            "metrics": {},
-            "details": {},
-            "data_views": [{
-                "view_id": "returns",
-                "name": "Returns",
-                "shape": "timeseries",
-                "rows": [{"date": "2026-01-02", "return": 0.2}],
-                "lineage": ["evidence:invented_alias"],
-            }],
-        },
-        diagnostics={"executed_code": "result = {'data_views': []}"},
+        computed_insights=[ComputedInsight(
+            insight_key="maximum_return", value=0.2,
+            calculation_trace={"formula": "max(returns)"}, derived_evidence_ids=["dev_poisoned"],
+        )],
+        diagnostics={"executed_code": "result = {'derived_evidence': []}"},
     )
     state.analysis_artifacts[analysis.analysis_id] = analysis
+    state.derived_evidence_artifacts["dev_poisoned"] = DerivedEvidence(
+        evidence_id="dev_poisoned", name="Returns", shape="timeseries",
+        rows=[{"date": "2026-01-02", "return": 0.2}],
+        lineage=["evidence:invented_alias"], transform_summary="Calculated returns.",
+    )
     plan = FinalResponsePlan(
         summary="Computed.",
         sections=[PlannedAnswerSection(
             section_type="analysis",
             content="Computed.",
-            source_refs=["view:analysis:ana_poisoned:returns"],
+            source_refs=["view:derived_evidence:dev_poisoned"],
         )],
     )
 

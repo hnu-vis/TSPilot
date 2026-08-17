@@ -166,27 +166,20 @@ def _safe_mapping(value) -> dict:
 
 
 def validate_analysis_result_payload(result) -> dict:
-    """Validate the stable result contract consumed by later harness stages."""
+    """Validate the computation-only payload emitted inside the sandbox."""
 
     if not isinstance(result, dict):
         raise AnalysisCodeError("analysis_code must assign a dict to variable 'result'.")
-    summary = result.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        raise AnalysisCodeError("analysis result must include non-empty string field 'summary'.")
-    metrics = result.get("metrics")
-    if not isinstance(metrics, dict):
-        raise AnalysisCodeError("analysis result must include object field 'metrics'.")
-    details = result.get("details")
-    if not isinstance(details, dict):
-        raise AnalysisCodeError("analysis result must include object field 'details'.")
-    normalized = dict(result)
-    normalized["summary"] = summary.strip()
-    normalized["metrics"] = _json_safe_value(dict(metrics), path="metrics")
-    normalized["details"] = _json_safe_value(dict(details), path="details")
-    insights = result.get("insights", [])
-    if not isinstance(insights, list) or any(not isinstance(insight, dict) for insight in insights):
-        raise AnalysisCodeError("analysis result field 'insights' must be a list of objects when provided.")
-    normalized["insights"] = _json_safe_value(insights, path="insights")
+    computed = result.get("computed_insights")
+    if not isinstance(computed, list) or not computed or any(not isinstance(item, dict) for item in computed):
+        raise AnalysisCodeError("analysis result must include non-empty computed_insights list.")
+    derived = result.get("derived_evidence", [])
+    if not isinstance(derived, list) or any(not isinstance(item, dict) for item in derived):
+        raise AnalysisCodeError("analysis result field derived_evidence must be a list of objects.")
+    normalized = {
+        "computed_insights": _json_safe_value(computed, path="computed_insights"),
+        "derived_evidence": _json_safe_value(derived, path="derived_evidence"),
+    }
     try:
         json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except TypeError as exc:

@@ -182,34 +182,40 @@ class FormatAnswerTool(BaseTool):
                 },
             )
         if source.kind == "analysis":
-            result = value.result if isinstance(value.result, dict) else {}
             return AnswerReference(
                 source_type="analysis",
                 source_id=value.analysis_id,
                 label=value.analysis_goal,
                 evidence={
                     "summary": value.summary,
-                    "result": {
-                        "summary": result.get("summary"),
-                        "metrics": _bounded_json(result.get("metrics", {})),
-                        "details": _bounded_json(result.get("details", {})),
-                    },
-                    "data_views": [
+                    "computed_insights": [
                         {
-                            "source_ref": f"view:analysis:{value.analysis_id}:{view.view_id}",
-                            "name": view.name,
-                            "shape": view.shape,
-                            "row_count": len(view.rows),
-                            "schema_fields": [field.model_dump(mode="json") for field in view.schema_fields],
-                            "lineage": view.lineage,
-                            "transform_summary": view.transform_summary,
+                            "insight_key": item.insight_key,
+                            "value": _bounded_json(item.value),
+                            "item_count": len(item.items),
+                            "calculation_trace": _bounded_json(item.calculation_trace),
                         }
-                        for view in value.data_views
+                        for item in value.computed_insights
+                    ],
+                    "derived_evidence_refs": [
+                        f"derived_evidence:{item.evidence_id}" for item in value.derived_evidence
                     ],
                     "input_evidence_id": value.input_evidence_id,
                     "input_row_count": value.input_row_count,
                     "code_hash": value.code_hash,
                     "code_type": value.code_type,
+                },
+            )
+        if source.kind == "derived_evidence":
+            return AnswerReference(
+                source_type="derived_evidence",
+                source_id=value.evidence_id,
+                label=value.name,
+                evidence={
+                    "shape": value.shape,
+                    "row_count": len(value.rows) or int(value.scalar is not None),
+                    "lineage": value.lineage,
+                    "transform_summary": value.transform_summary,
                 },
             )
         if source.kind == "forecast":
@@ -246,8 +252,8 @@ class FormatAnswerTool(BaseTool):
                 insight_ids=[source.value.insight_id for source in sources if source.kind == "insight"],
                 item_ids=[item.item_id for source in sources if source.kind == "insight" for item in source.value.items],
                 analysis_ids=[source.value.analysis_id for source in sources if source.kind == "analysis"],
-                artifact_ids=[source.ref.split(":", 1)[1] for source in sources if source.kind in {"forecast", "anomaly"}],
-                evidence_ids=[source.value.evidence_id for source in sources if source.kind == "evidence"],
+                artifact_ids=[source.ref.split(":", 1)[1] for source in sources if source.kind in {"forecast", "anomaly", "derived_evidence"}],
+                evidence_ids=[source.value.evidence_id for source in sources if source.kind in {"evidence", "derived_evidence"}],
                 visualization_ids=list(dict.fromkeys(
                     explicit_visualization_ids
                     + [
@@ -271,9 +277,9 @@ def _selected_visualization_id(ref: str, selected_ids: set[str]) -> str | None:
 def _bounded_json(value, *, depth: int = 0):
     """Keep answer references auditable without copying analysis-sized datasets.
 
-    Typed Data Views are the canonical transport for row-level presentation
-    data. Analysis references carry only a bounded diagnostic preview so a
-    large view cannot inflate every final response by megabytes.
+    Independent Derived Evidence artifacts are the canonical transport for
+    row-level calculated data. Analysis references carry only bounded
+    computation receipts so large artifacts cannot inflate final responses.
     """
     if depth >= 5:
         return "[depth limit]"
@@ -282,7 +288,6 @@ def _bounded_json(value, *, depth: int = 0):
         bounded = {
             str(key): _bounded_json(item, depth=depth + 1)
             for key, item in items[:30]
-            if str(key) != "data_views"
         }
         if len(items) > 30:
             bounded["_truncated_field_count"] = len(items) - 30
@@ -367,25 +372,36 @@ def _analysis_lineage_error(
     request_state: RequestStateModel,
     catalog: PresentationCatalog,
 ) -> StructuredToolError:
-    analysis_id = exc.view_ref.split(":", 3)[2] if exc.view_ref.startswith("view:analysis:") else None
-    analysis = request_state.analysis_artifacts.get(analysis_id) if analysis_id else None
-    evidence_id = getattr(analysis, "input_evidence_id", None)
+    derived_id = exc.view_ref.split(":", 2)[2] if exc.view_ref.startswith("view:derived_evidence:") else None
+    derived = request_state.derived_evidence_artifacts.get(derived_id) if derived_id else None
+    analysis = next(
+        (
+            item for item in request_state.analysis_artifacts.values()
+            if derived_id and any(derived_id in candidate.derived_evidence_ids for candidate in item.computed_insights)
+        ),
+        None,
+    )
+    analysis_id = getattr(analysis, "analysis_id", None)
+    evidence_id = getattr(analysis, "input_evidence_id", None) or next(
+        (ref.removeprefix("evidence:") for ref in getattr(derived, "lineage", []) if ref.startswith("evidence:")),
+        None,
+    )
     allowed_refs = [f"evidence:{evidence_id}"] if evidence_id else []
     repair_contract = {
         "mode": "analysis_artifact_repair",
         "input_evidence": evidence_id or "latest",
         "analysis_goal": getattr(analysis, "analysis_goal", None) or request_state.message,
         "failed_analysis_id": analysis_id,
+        "failed_derived_evidence_id": derived_id,
         "failed_view_ref": exc.view_ref,
         "unknown_lineage_ref": exc.lineage_ref,
         "allowed_lineage_refs": allowed_refs,
         "failed_code": str((getattr(analysis, "diagnostics", {}) or {}).get("executed_code") or ""),
         "instruction": (
-            "Regenerate the Analysis Artifact and its complete Data Views using only exact allowed_lineage_refs. "
-            "Preserve the requested calculation and visual datasets."
+            "Recompute the requested Insight and its derived Evidence using only grounded input refs."
         ),
     }
-    message = f"Analysis Data View lineage validation failed: {exc}"
+    message = f"Derived Evidence lineage validation failed: {exc}"
     return StructuredToolError(
         message,
         error_type="analysis_lineage_invalid",

@@ -584,6 +584,7 @@ class ReActLoop:
         return {
             "database_evidence": list(request_state.database_evidence_artifacts.keys()),
             "analysis": list(request_state.analysis_artifacts.keys()),
+            "derived_evidence": list(request_state.derived_evidence_artifacts.keys()),
             "forecast": list(request_state.forecast_artifacts.keys()),
             "anomaly": list(request_state.anomaly_artifacts.keys()),
         }
@@ -1141,8 +1142,8 @@ class ReActLoop:
             ):
                 if diagnostic_key in diagnostics_payload:
                     preview[diagnostic_key] = diagnostics_payload.get(diagnostic_key)
-        if isinstance(visible_payload.get("result"), dict):
-            preview["result_preview"] = visible_payload["result"]
+        if isinstance(visible_payload.get("computed_insights"), list):
+            preview["computed_insights"] = visible_payload["computed_insights"][:8]
         if "visualizations" in visible_payload:
             preview["visualization_count"] = len(visible_payload.get("visualizations", []))
         if "produced_insights" in visible_payload:
@@ -1350,15 +1351,13 @@ class ReActLoop:
         return preview
 
     def _code_interpreter_payload_preview(self, visible_payload: dict) -> dict:
-        result = visible_payload.get("result") if isinstance(visible_payload.get("result"), dict) else {}
         diagnostics = visible_payload.get("diagnostics") if isinstance(visible_payload.get("diagnostics"), dict) else {}
         return {
             "analysis_goal": visible_payload.get("analysis_goal"),
             "analysis_status": visible_payload.get("status"),
             "analysis_summary": visible_payload.get("summary"),
-            "analysis_result": result,
-            "analysis_metrics": result.get("metrics") if isinstance(result.get("metrics"), dict) else {},
-            "analysis_details": result.get("details") if isinstance(result.get("details"), dict) else {},
+            "computed_insights": visible_payload.get("computed_insights", []),
+            "derived_evidence": visible_payload.get("derived_evidence", []),
             "input_row_count": visible_payload.get("input_row_count"),
             "input_evidence_id": visible_payload.get("input_evidence_id"),
             "code_hash": visible_payload.get("code_hash"),

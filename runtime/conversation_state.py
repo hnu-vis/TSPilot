@@ -22,6 +22,7 @@ def sync_from_request(
     conversation_state.database_evidence_artifacts = request_state.database_evidence_artifacts
     conversation_state.latest_analysis_id = request_state.latest_analysis_id
     conversation_state.analysis_artifacts = request_state.analysis_artifacts
+    conversation_state.derived_evidence_artifacts = request_state.derived_evidence_artifacts
     conversation_state.latest_forecast = request_state.latest_forecast
     conversation_state.forecast_artifacts = request_state.forecast_artifacts
     conversation_state.latest_anomaly = request_state.latest_anomaly
