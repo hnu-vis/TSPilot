@@ -9,7 +9,7 @@ from app.server import create_app
 from app.settings import get_settings
 from core.completion import evaluate_goal_completion
 from core.harness.observation_view import model_observation_view
-from core.visualization import VisualizationArtifactStore
+from core.visualization import PresentationCatalog, VisualizationArtifactStore
 from core.harness import build_action_space, build_observation_frame
 from runtime.request_state import apply_observation, build_request_state
 from runtime.action_policy import validate_action
@@ -25,12 +25,18 @@ from tools.registry import build_tool_registry
 
 
 class _PlannerLlm:
-    def __init__(self, payload: str):
+    def __init__(self, payload: str, audit_payload: str | None = None):
         self.payload = payload
+        self.audit_payload = audit_payload or '{"approved":true,"revised_visual_goals":[],"required_data_request":null}'
         self.calls = 0
 
     async def ainvoke(self, _messages):
         self.calls += 1
+        if "independently audit" in str(_messages[0][1]):
+            return SimpleNamespace(
+                content=self.audit_payload,
+                response_metadata={},
+            )
         return SimpleNamespace(content=self.payload, response_metadata={})
 
 
@@ -40,6 +46,12 @@ class _SequencePlannerLlm:
         self.calls = 0
 
     async def ainvoke(self, _messages):
+        if "independently audit" in str(_messages[0][1]):
+            self.calls += 1
+            return SimpleNamespace(
+                content='{"approved":true,"revised_visual_goals":[],"required_data_request":null}',
+                response_metadata={},
+            )
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
         return SimpleNamespace(content=payload, response_metadata={})
@@ -71,6 +83,20 @@ def _state(point_count: int = 500):
     state.database_evidence_artifacts[evidence.evidence_id] = evidence
     state.latest_database_evidence = evidence
     return state
+
+
+def test_planner_inventory_distinguishes_materialization_from_interval_coverage():
+    inventory = PresentationCatalog(_state(25)).planner_inventory()
+    source = next(item for item in inventory["sources"] if item["source_ref"] == "view:evidence:evi_full:default")
+
+    assert source["materialization_complete"] is True
+    assert source["time_range"] == {
+        "field": "timestamp",
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-02T00:00:00Z",
+    }
+    assert source["query_context"][0]["query"] == "unit:full"
+    assert "full_fidelity" not in source
 
 
 @pytest.mark.asyncio
@@ -117,7 +143,7 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
         artifact_store=VisualizationArtifactStore(tmp_path),
     ).execute(VisualizationInput(message="Show the complete series."), request_state=_state(25))
 
-    assert llm.calls == 2
+    assert llm.calls == 3
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 25
 
 
@@ -135,9 +161,9 @@ def test_visualization_failure_receipt_does_not_expose_internal_inventory():
 @pytest.mark.asyncio
 async def test_visualization_tool_requests_full_sql_evidence_instead_of_falling_back(tmp_path):
     llm = _PlannerLlm(
-        '{"visual_goals":[],"required_data_request":{"purpose":"show complete series with max point",'
+        '{"visual_goals":[],"required_data_request":{"required_action":"sql_query","purpose":"show complete series with max point",'
         '"required_shape":"full_timeseries","required_fields":["timestamp","value"],'
-        '"required_properties":["complete requested time range","maximum row with timestamp"]}}'
+        '"required_properties":["complete requested time range","maximum row with timestamp"],"insight_requests":[]}}'
     )
     tool = VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path))
 
@@ -148,6 +174,55 @@ async def test_visualization_tool_requests_full_sql_evidence_instead_of_falling_
     assert caught.value.recommended_next_action == "sql_query"
     assert failure["retry_policy"]["required_action"] == "sql_query"
     assert failure["repair_contract"]["constraints"]["full_fidelity"] is True
+
+
+@pytest.mark.asyncio
+async def test_visualization_routes_missing_calculated_layer_to_code_interpreter(tmp_path):
+    llm = _PlannerLlm(
+        '{"visual_goals":[],"required_data_request":{"required_action":"code_interpreter",'
+        '"purpose":"calculate the optimal single-trade decision points",'
+        '"required_shape":"decision_points","required_fields":["timestamp","value"],'
+        '"required_properties":["buy precedes sell","exclude authoritative anomalies"],'
+        '"insight_requests":[{"insight_key":"optimal_trade","name":"Optimal single trade",'
+        '"insight_type":"optimization"}]}}'
+    )
+    tool = VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path))
+
+    with pytest.raises(StructuredToolError) as caught:
+        await tool.execute(VisualizationInput(message="Show the full series and optimal trade."), request_state=_state(25))
+
+    failure = caught.value.validation_failure
+    assert caught.value.recommended_next_action == "code_interpreter"
+    assert failure["retry_policy"]["required_action"] == "code_interpreter"
+    assert failure["repair_contract"]["insight_requests"][0]["insight_key"] == "optimal_trade"
+
+
+@pytest.mark.asyncio
+async def test_visualization_audit_rejects_plan_that_omits_requested_decision_points(tmp_path):
+    plan = (
+        '{"visual_goals":[{"purpose":"trend","title":"Trend","priority":"primary","summary":null,'
+        '"required_roles":["base_series"],"layers":[{"role":"base_series",'
+        '"source_ref":"view:evidence:evi_full:default","mark":"line",'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
+    )
+    audit = (
+        '{"approved":false,"revised_visual_goals":[],"required_data_request":{'
+        '"required_action":"code_interpreter","purpose":"calculate requested buy and sell points",'
+        '"required_shape":"decision_points","required_fields":["timestamp","value"],'
+        '"required_properties":["buy precedes sell"],"insight_requests":[{'
+        '"insight_key":"optimal_trade","name":"Optimal single trade","insight_type":"optimization"}]}}'
+    )
+    tool = VisualizationTool(
+        llm=_PlannerLlm(plan, audit_payload=audit), artifact_store=VisualizationArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(StructuredToolError) as caught:
+        await tool.execute(
+            VisualizationInput(message="Show the complete series with buy and sell points."),
+            request_state=_state(25),
+        )
+
+    assert caught.value.recommended_next_action == "code_interpreter"
 
 
 def test_visualization_data_endpoint_returns_complete_artifact(tmp_path, monkeypatch):

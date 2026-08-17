@@ -204,6 +204,8 @@ class ToolExecutor:
                         normalized["analysis_request"] = analysis_request
                     elif normalized.get("code"):
                         normalized.pop("analysis_request", None)
+                if action_name in {"anomaly", "forecast"} and guidance["repair_contract"].get("input_evidence"):
+                    normalized.setdefault("database_evidence", guidance["repair_contract"]["input_evidence"])
             guidance_constraints = guidance.get("constraints") if isinstance(guidance.get("constraints"), dict) else {}
             if guidance_constraints:
                 merged_constraints = dict(normalized.get("constraints") or {})

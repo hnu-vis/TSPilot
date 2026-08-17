@@ -167,6 +167,8 @@ class PresentationCatalog:
                 "Use typed view:* sources for chart data and insight:*#item sources for semantic decision points.",
                 "Use only listed fields in encoding and never invent rows, field names, renderer options, or colors.",
                 "Business filtering and calculations must already exist in a Data View; presentation does not recompute them.",
+                "materialization_complete only describes whether the executed query result was stored without truncation; it does not prove coverage of the user's analysis interval.",
+                "Use time_range, query_context, lineage, and the user request together to judge whether a source is complete enough for visual verification.",
             ],
         }
 
@@ -179,11 +181,18 @@ class PresentationCatalog:
                 resolved = self._sources.get(ref)
                 if resolved is not None:
                     lineage_sources.append(resolved)
+            materialization_complete = _full_fidelity_status(lineage_sources)
             return {
                 "source_ref": source.ref, "kind": "data_view", "name": value.name, "shape": value.shape,
                 "row_count": len(value.rows) or int(value.scalar is not None), "schema_fields": value.schema_fields,
                 "lineage": value.lineage,
-                "full_fidelity": _full_fidelity_status(lineage_sources),
+                "time_range": _row_time_range(value.rows),
+                "materialization_complete": materialization_complete,
+                "query_context": [
+                    context
+                    for item in lineage_sources
+                    if (context := _query_context(item)) is not None
+                ],
                 "preview": [_bounded_row(item) for item in preview if item],
             }
         if source.kind == "insight":
@@ -568,6 +577,41 @@ def _full_fidelity_status(sources: list[PresentationSource]) -> bool | None:
     if not values:
         return None
     return all(values)
+
+
+def _query_context(source: PresentationSource) -> dict | None:
+    if source.kind != "evidence":
+        return None
+    evidence = source.value
+    diagnostics = evidence.diagnostics if isinstance(evidence.diagnostics, dict) else {}
+    coverage = diagnostics.get("task_coverage") if isinstance(diagnostics.get("task_coverage"), dict) else {}
+    result = {
+        "evidence_ref": source.ref,
+        "result_type": evidence.result_type,
+        "summary": evidence.summary,
+        "query_language": evidence.query_language,
+        "query": str(evidence.query or "")[:1600] or None,
+        "columns": list(evidence.columns or [])[:40],
+        "query_task_contract": coverage.get("query_task_contract"),
+        "satisfied": coverage.get("satisfied"),
+        "missing": coverage.get("missing"),
+        "result_summary": coverage.get("result_summary"),
+        "materialization_complete": diagnostics.get("is_full_fidelity"),
+        "truncated": diagnostics.get("truncated"),
+    }
+    return {key: _bounded_value(value) for key, value in result.items() if value not in (None, "", [], {})}
+
+
+def _row_time_range(rows: list[dict]) -> dict | None:
+    time_fields = _candidate_fields(rows, "time")
+    if not time_fields:
+        return None
+    field = time_fields[0]
+    values = [row.get(field) for row in rows if row.get(field) not in (None, "")]
+    if not values:
+        return None
+    ordered = sorted(values, key=_x_sort_key)
+    return {"field": field, "start": ordered[0], "end": ordered[-1]}
 
 
 def _rows_from_evidence(evidence) -> list[dict]:
