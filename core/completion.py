@@ -192,16 +192,39 @@ def _requires_specialized_capability(
     requirements: set[str],
     capability: str,
 ) -> bool:
-    if capability not in requirements:
-        return False
     contract = request_state.task_contract
     if contract is None:
-        return True
+        if capability == "visualization" and _timeseries_analysis_requires_visual_verification(request_state):
+            return True
+        return capability in requirements
     if capability == "anomaly":
-        return _contract_requires_outlier_treatment(request_state)
-    return any(
+        return capability in requirements or _contract_requires_outlier_treatment(request_state)
+    contract_requires = any(
         output.required
         and capability in _contract_output_semantic_capabilities(output)
+        for output in contract.required_outputs
+    )
+    if capability == "visualization":
+        return (
+            capability in requirements
+            or contract_requires
+            or _timeseries_analysis_requires_visual_verification(request_state)
+        )
+    return capability in requirements or contract_requires
+
+
+def _timeseries_analysis_requires_visual_verification(request_state: RequestStateModel) -> bool:
+    evidence = request_state.latest_database_evidence
+    if evidence is None or evidence.result_type != "timeseries" or _latest_database_evidence_is_empty(request_state):
+        return False
+    if request_state.latest_analysis_id or request_state.latest_anomaly is not None or request_state.latest_forecast is not None:
+        return True
+    contract = request_state.task_contract
+    if contract is None:
+        return False
+    return any(
+        output.required
+        and bool(_contract_output_semantic_capabilities(output).intersection({"analysis", "forecast", "anomaly"}))
         for output in contract.required_outputs
     )
 

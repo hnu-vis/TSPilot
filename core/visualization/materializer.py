@@ -141,6 +141,60 @@ class PresentationCatalog:
     def canonical_refs(self) -> list[str]:
         return sorted(key for key, source in self._sources.items() if key == source.ref and ":" in key)
 
+    def renderable_refs(self) -> list[str]:
+        return sorted(
+            ref
+            for ref, source in self._sources.items()
+            if ref == source.ref and source.kind in {"view", "insight", "insight_item"}
+        )
+
+    def expand_preferences(self, refs: list[str]) -> tuple[set[str], set[str]]:
+        """Expand stable artifact refs into renderable sources without exposing storage refs."""
+
+        renderable = set(self.renderable_refs())
+        expanded: set[str] = set()
+        unknown: set[str] = set()
+        for raw_ref in refs:
+            ref = str(raw_ref or "").strip()
+            if not ref:
+                continue
+            source = self._sources.get(ref)
+            if source is None:
+                unknown.add(ref)
+                continue
+            if source.ref in renderable:
+                expanded.add(source.ref)
+                continue
+            expanded.update(self._views_for_lineage_ref(source.ref, renderable))
+            if source.kind == "analysis":
+                expanded.update(self._analysis_renderable_refs(source.value, renderable))
+        return expanded, unknown
+
+    def _views_for_lineage_ref(self, artifact_ref: str, renderable: set[str]) -> set[str]:
+        return {
+            ref
+            for ref in renderable
+            if (source := self._sources.get(ref)) is not None
+            and source.kind == "view"
+            and artifact_ref in source.value.lineage
+        }
+
+    def _analysis_renderable_refs(self, analysis, renderable: set[str]) -> set[str]:
+        refs: set[str] = set()
+        evidence_id = str(getattr(analysis, "input_evidence_id", "") or "").removeprefix("evidence:")
+        if evidence_id:
+            refs.update(self._views_for_lineage_ref(f"evidence:{evidence_id}", renderable))
+        for derived in getattr(analysis, "derived_evidence", []) or []:
+            derived_id = str(getattr(derived, "evidence_id", "") or "")
+            if derived_id:
+                refs.update(self._views_for_lineage_ref(f"derived_evidence:{derived_id}", renderable))
+        for insight in getattr(analysis, "produced_insights", []) or []:
+            candidate = f"insight:{getattr(insight, 'insight_id', '')}"
+            if candidate in renderable:
+                refs.add(candidate)
+            refs.update(ref for ref in renderable if ref.startswith(f"{candidate}#"))
+        return refs
+
     def resolve_lineage(self, source: PresentationSource) -> list[PresentationSource]:
         if source.kind != "view":
             return []
@@ -159,12 +213,13 @@ class PresentationCatalog:
             "sources": [
                 self._source_inventory(source)
                 for ref, source in sorted(self._sources.items())
-                if ref == source.ref
+                if ref == source.ref and source.kind in {"view", "insight", "insight_item"}
             ],
             "rules": [
                 "Plan visual_goals around the user's purpose and declare every required semantic role.",
                 "Each layer owns exactly one grounded source_ref; never replace a base series with an annotation collection.",
                 "Use typed view:* sources for chart data and insight:*#item sources for semantic decision points.",
+                "Artifact refs are lineage only and are intentionally absent; outer artifact preferences have already been expanded into renderable sources.",
                 "Use only listed fields in encoding and never invent rows, field names, renderer options, or colors.",
                 "Business filtering and calculations must already exist in a Data View; presentation does not recompute them.",
                 "materialization_complete only describes whether the executed query result was stored without truncation; it does not prove coverage of the user's analysis interval.",
@@ -182,9 +237,11 @@ class PresentationCatalog:
                 if resolved is not None:
                     lineage_sources.append(resolved)
             materialization_complete = _full_fidelity_status(lineage_sources)
+            capabilities = _render_capabilities(value.schema_fields, scalar=value.scalar is not None)
             return {
                 "source_ref": source.ref, "kind": "data_view", "name": value.name, "shape": value.shape,
                 "row_count": len(value.rows) or int(value.scalar is not None), "schema_fields": value.schema_fields,
+                "render_capabilities": capabilities,
                 "lineage": value.lineage,
                 "time_range": _row_time_range(value.rows),
                 "materialization_complete": materialization_complete,
@@ -198,18 +255,26 @@ class PresentationCatalog:
         if source.kind == "insight":
             insight: KeyInsight = source.value
             locator_row = _insight_locator_row(insight)
+            fields = _schema_fields(
+                [_insight_item_row(item) for item in insight.items]
+                or ([locator_row] if locator_row else [])
+            )
             return {
                 "source_ref": source.ref, "kind": "insight", "status": insight.status, "insight_type": insight.insight_type,
                 "semantic_class": insight.semantic_class, "statement": insight.statement, "value_shape": insight.value_shape,
                 "item_refs": [f"{source.ref}#{item.item_id}" for item in insight.items[:12]],
                 "locator_fields": list(locator_row) if locator_row else [],
                 "locator_preview": _bounded_row(locator_row) if locator_row else None,
+                "render_capabilities": _render_capabilities(fields, scalar=not bool(fields)),
             }
         if source.kind == "insight_item":
             insight, item = source.value
+            fields = _schema_fields([_insight_item_row(item)])
             return {
                 "source_ref": source.ref, "kind": "insight_item", "status": insight.status,
                 "label": item.label or insight.name, "timestamp": item.timestamp, "value": item.value,
+                "schema_fields": fields,
+                "render_capabilities": _render_capabilities(fields, scalar=False),
             }
         value = source.value
         return {
@@ -387,9 +452,15 @@ def _source_data(source: PresentationSource) -> tuple[list[dict], dict | None]:
 def _insight_locator_row(insight: KeyInsight) -> dict:
     trace = insight.calculation_trace if isinstance(insight.calculation_trace, dict) else {}
     row = trace.get("row")
-    if not isinstance(row, dict):
-        return {}
-    return {str(key): value for key, value in row.items() if value is not None}
+    if isinstance(row, dict):
+        candidate = {str(key): value for key, value in row.items() if value is not None}
+        if _candidate_fields([candidate], "time") and _candidate_fields([candidate], "number"):
+            return candidate
+    if isinstance(insight.value, dict):
+        candidate = {str(key): value for key, value in insight.value.items() if value is not None}
+        if _candidate_fields([candidate], "time") and _candidate_fields([candidate], "number"):
+            return candidate
+    return {}
 
 
 def _encoding_fields(encoding: dict) -> dict[str, str]:
@@ -577,6 +648,22 @@ def _full_fidelity_status(sources: list[PresentationSource]) -> bool | None:
     if not values:
         return None
     return all(values)
+
+
+def _render_capabilities(schema_fields: list[dict], *, scalar: bool) -> dict:
+    data_types = {str(item.get("data_type") or "") for item in schema_fields if isinstance(item, dict)}
+    timestamped_numeric = "time" in data_types and "number" in data_types
+    if scalar:
+        marks = ["text", "table"]
+    elif timestamped_numeric:
+        marks = ["line", "point", "area", "band", "bar", "rule", "rect", "text", "table"]
+    else:
+        marks = ["bar", "point", "text", "table"]
+    return {
+        "timestamped_numeric": timestamped_numeric,
+        "scalar_only": scalar,
+        "supported_marks": marks,
+    }
 
 
 def _query_context(source: PresentationSource) -> dict | None:

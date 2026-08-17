@@ -324,6 +324,36 @@ def test_visual_verification_must_be_newer_than_analytical_sources():
     assert current.can_answer is True
 
 
+def test_timeseries_analysis_requires_visual_verification_even_when_contract_omits_delivery_output():
+    request_state = RequestStateModel(
+        request_id="req-inferred-visual-verification",
+        message="分析区间整体变化并计算涨跌幅",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "analysis"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm", "goal": "分析区间变化",
+            "required_outputs": [
+                {"id": "series", "description": "完整时间序列", "evidence_kind": "database"},
+                {"id": "change", "description": "计算区间涨跌幅", "evidence_kind": "analysis"},
+            ],
+        }),
+        latest_database_evidence=DatabaseEvidence(
+            evidence_id="evi_energy", result_type="timeseries", database="demo",
+            summary="Loaded rows.", data={"points": [
+                {"timestamp": "2016-01-11T17:00:00Z", "value": 60.0},
+                {"timestamp": "2016-01-12T23:50:00Z", "value": 50.0},
+            ]},
+        ),
+        latest_analysis_id="ana_change",
+    )
+
+    completion = evaluate_goal_completion(request_state)
+
+    assert completion.can_answer is False
+    assert completion.missing_evidence == ["visualization"]
+
+
 def test_output_selector_filters_task_contract_by_action_capability():
     request_state = RequestStateModel(
         request_id="req-output-selector-contract",
