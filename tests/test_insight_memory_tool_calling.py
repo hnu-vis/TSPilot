@@ -5,18 +5,18 @@ import json
 import pytest
 from pydantic import BaseModel, Field
 
-from core.data_fact.embedding_store import FactMemoryEmbeddingStore, memory_card_embedding_text
-from core.data_fact.retriever import (
-    EmbeddingFactMemoryRetriever,
-    FactMemoryRetriever,
-    HybridFactMemoryRetriever,
+from core.key_insight.embedding_store import InsightMemoryEmbeddingStore, memory_card_embedding_text
+from core.key_insight.retriever import (
+    EmbeddingInsightMemoryRetriever,
+    InsightMemoryRetriever,
+    HybridInsightMemoryRetriever,
     MemoryHit,
     MemoryRetrievalResult,
     _contract_anchor_details,
     _recipe_dependency_closure,
 )
 from runtime.tool_executor import ToolExecutor
-from schemas.data_fact import DataFact, DataFactRequest, MemoryCard, MemoryDetail
+from schemas.key_insight import KeyInsight, KeyInsightRequest, MemoryCard, MemoryDetail
 from schemas.task_contract import TaskContract, TaskContractOutput
 from schemas.state import ConversationStateModel, RequestStateModel
 from tools.base import BaseTool
@@ -26,12 +26,12 @@ from tools.registry import ToolRegistry, ToolSpec
 class EchoInput(BaseModel):
     message: str
     constraints: dict = Field(default_factory=dict)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
 
 
 class EchoOutput(BaseModel):
     summary: str
-    fact_requests: list[dict] = Field(default_factory=list)
+    insight_requests: list[dict] = Field(default_factory=list)
     constraints: dict = Field(default_factory=dict)
 
 
@@ -39,7 +39,7 @@ class EchoTool(BaseTool):
     async def execute(self, validated_input: EchoInput, **kwargs) -> dict:
         return {
             "summary": "ok",
-            "fact_requests": [item.model_dump(mode="json") for item in validated_input.fact_requests],
+            "insight_requests": [item.model_dump(mode="json") for item in validated_input.insight_requests],
             "constraints": validated_input.constraints,
         }
 
@@ -62,8 +62,8 @@ class SelectingLLM:
 class ReconcilingLLM:
     async def ainvoke(self, messages):
         prompt = str(messages[-1][1])
-        if "explicit_fact_contracts" in prompt:
-            return Message(json.dumps({"selected_memory_fact_keys": []}))
+        if "explicit_insight_contracts" in prompt:
+            return Message(json.dumps({"selected_memory_insight_keys": []}))
         return Message(json.dumps({"selected": [{"card_id": "recipe.sql_query.extreme.max_value", "confidence": 0.9}]}))
 
 
@@ -72,17 +72,17 @@ class PlanningLLM:
         return Message(
             json.dumps(
                 {
-                    "fact_requests": [
+                    "insight_requests": [
                         {
-                            "fact_key": "price.change",
+                            "insight_key": "price.change",
                             "name": "price_change",
-                            "fact_type": "difference",
+                            "insight_type": "difference",
                             "derived_from": ["price.start", "price.end"],
                         },
                         {
-                            "fact_key": "price.fabricated",
+                            "insight_key": "price.fabricated",
                             "name": "fabricated_price",
-                            "fact_type": "point_value",
+                            "insight_type": "point_value",
                         },
                     ]
                 }
@@ -98,10 +98,10 @@ class ToolScopedRetriever:
         self.calls.append((tool_name, action_input))
         return MemoryRetrievalResult(
             hits=[MemoryHit(card_id="recipe.sql_query.extreme.max_value", confidence=0.9)],
-            fact_requests=[
-                DataFactRequest(
+            insight_requests=[
+                KeyInsightRequest(
                     name="max_value",
-                    fact_type="extreme",
+                    insight_type="extreme",
                     requirements={"operator": "max"},
                 )
             ],
@@ -140,7 +140,7 @@ class HybridSelectingLLM:
                 "selected": [{"card_id": self.selected_card_id, "reason": "matches required output", "confidence": 0.98}],
                 "needs_planning": False,
             }))
-        return Message(json.dumps({"fact_requests": []}))
+        return Message(json.dumps({"insight_requests": []}))
 
 
 class DomainEmbeddingProvider:
@@ -164,10 +164,10 @@ class BrokenEmbeddingProvider:
 class FallbackPlanningLLM:
     async def ainvoke(self, messages):
         return Message(json.dumps({
-            "fact_requests": [{
-                "fact_key": "price.maximum",
+            "insight_requests": [{
+                "insight_key": "price.maximum",
                 "name": "maximum price",
-                "fact_type": "extreme",
+                "insight_type": "extreme",
                 "requirements": {"operator": "max"},
             }]
         }))
@@ -202,7 +202,7 @@ def _request_state(message: str = "bitcoin 的 usd 最大值是多少") -> Reque
 
 
 @pytest.mark.asyncio
-async def test_tool_executor_injects_memory_fact_requests_into_tool_call():
+async def test_tool_executor_injects_memory_insight_requests_into_tool_call():
     retriever = ToolScopedRetriever()
     executor = ToolExecutor(_registry(), memory_retriever=retriever)
     request_state = _request_state()
@@ -214,11 +214,11 @@ async def test_tool_executor_injects_memory_fact_requests_into_tool_call():
         ConversationStateModel(conversation_id="conv_memory"),
     )
 
-    fact_requests = result.full_payload["fact_requests"]
-    assert fact_requests[0]["name"] == "max_value"
-    assert fact_requests[0]["fact_type"] == "extreme"
-    assert fact_requests[0]["requirements"]["source"] == "memory"
-    assert request_state.tool_history[-1].tool_input["fact_requests"] == fact_requests
+    insight_requests = result.full_payload["insight_requests"]
+    assert insight_requests[0]["name"] == "max_value"
+    assert insight_requests[0]["insight_type"] == "extreme"
+    assert insight_requests[0]["requirements"]["source"] == "memory"
+    assert request_state.tool_history[-1].tool_input["insight_requests"] == insight_requests
     assert request_state.tool_history[-1].tool_input["constraints"]["memory_diagnostics"]["selected_card_ids"] == [
         "recipe.sql_query.extreme.max_value"
     ]
@@ -227,7 +227,7 @@ async def test_tool_executor_injects_memory_fact_requests_into_tool_call():
 
 
 @pytest.mark.asyncio
-async def test_tool_executor_skips_fact_memory_for_analysis_artifact_tools():
+async def test_tool_executor_skips_insight_memory_for_analysis_artifact_tools():
     retriever = ToolScopedRetriever()
     executor = ToolExecutor(_registry("forecast"), memory_retriever=retriever)
     request_state = _request_state("预测未来 7 个点")
@@ -240,26 +240,26 @@ async def test_tool_executor_skips_fact_memory_for_analysis_artifact_tools():
     )
 
     assert retriever.calls == []
-    assert result.full_payload["fact_requests"] == []
+    assert result.full_payload["insight_requests"] == []
     assert "memory_diagnostics" not in result.full_payload["constraints"]
 
 
 @pytest.mark.asyncio
 async def test_memory_retriever_llm_failure_returns_empty_without_keyword_fallback():
-    retriever = FactMemoryRetriever(llm=BrokenLLM())
+    retriever = InsightMemoryRetriever(llm=BrokenLLM())
     result = await retriever.retrieve(
         request_state=_request_state("最大值是多少"),
         tool_name="sql_query",
         action_input={"message": "最大值是多少"},
     )
 
-    assert result.fact_requests == []
+    assert result.insight_requests == []
     assert result.diagnostics["error_type"] == "memory_retrieval_failed"
 
 
 @pytest.mark.asyncio
 async def test_memory_retriever_selects_card_then_loads_detail():
-    retriever = FactMemoryRetriever(llm=SelectingLLM())
+    retriever = InsightMemoryRetriever(llm=SelectingLLM())
     result = await retriever.retrieve(
         request_state=_request_state(),
         tool_name="sql_query",
@@ -267,71 +267,71 @@ async def test_memory_retriever_selects_card_then_loads_detail():
     )
 
     assert [hit.card_id for hit in result.hits] == ["recipe.sql_query.extreme.max_value"]
-    assert any(request.name == "max_value" and request.fact_type == "extreme" for request in result.fact_requests)
+    assert any(request.name == "max_value" and request.insight_type == "extreme" for request in result.insight_requests)
 
 
 @pytest.mark.asyncio
-async def test_memory_retriever_uses_llm_to_remove_semantic_duplicate_of_explicit_fact():
-    retriever = FactMemoryRetriever(llm=ReconcilingLLM())
+async def test_memory_retriever_uses_llm_to_remove_semantic_duplicate_of_explicit_insight():
+    retriever = InsightMemoryRetriever(llm=ReconcilingLLM())
     result = await retriever.retrieve(
         request_state=_request_state(),
         tool_name="sql_query",
         action_input={
             "message": "bitcoin 的 usd 最大值是多少",
-            "fact_requests": [
+            "insight_requests": [
                 {
-                    "fact_key": "bitcoin.maximum_price",
+                    "insight_key": "bitcoin.maximum_price",
                     "name": "Bitcoin maximum price",
-                    "fact_type": "extreme",
+                    "insight_type": "extreme",
                     "requirements": {"operator": "max"},
                 }
             ],
         },
     )
 
-    assert result.fact_requests == []
+    assert result.insight_requests == []
 
 
 @pytest.mark.asyncio
-async def test_code_fact_planner_keeps_only_contracts_grounded_in_verified_parents():
+async def test_code_insight_planner_keeps_only_contracts_grounded_in_verified_parents():
     state = _request_state("calculate the price change")
-    state.fact_set.facts = [
-        DataFact(
-            fact_id="fact_start",
-            fact_key="price.start",
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_start",
+            insight_key="price.start",
             name="start_price",
-            fact_type="point_value",
+            insight_type="point_value",
             statement="Start is 10.",
             value=10,
             method="sql_query",
         ),
-        DataFact(
-            fact_id="fact_end",
-            fact_key="price.end",
+        KeyInsight(
+            insight_id="insight_end",
+            insight_key="price.end",
             name="end_price",
-            fact_type="point_value",
+            insight_type="point_value",
             statement="End is 12.",
             value=12,
             method="sql_query",
         ),
     ]
-    retriever = FactMemoryRetriever(llm=PlanningLLM())
+    retriever = InsightMemoryRetriever(llm=PlanningLLM())
 
-    requests = await retriever._plan_tool_fact_requests(
+    requests = await retriever._plan_tool_insight_requests(
         request_state=state,
         tool_name="code_interpreter",
         action_input={"analysis_goal": "calculate the price change"},
     )
 
-    assert [request.fact_key for request in requests] == ["price.change"]
+    assert [request.insight_key for request in requests] == ["price.change"]
 
 
 @pytest.mark.asyncio
 async def test_embedding_memory_retriever_selects_card_and_uses_local_cache(tmp_path):
     provider = FakeEmbeddingProvider()
-    retriever = EmbeddingFactMemoryRetriever(
+    retriever = EmbeddingInsightMemoryRetriever(
         embedding_provider=provider,
-        embedding_store=FactMemoryEmbeddingStore(tmp_path),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path),
         top_k=3,
         score_threshold=0.2,
     )
@@ -339,7 +339,7 @@ async def test_embedding_memory_retriever_selects_card_and_uses_local_cache(tmp_
     result = await retriever.retrieve_once(request_state=_request_state("bitcoin 的 usd 最大值是多少"))
 
     assert any(hit.card_id == "recipe.sql_query.extreme.max_value" for hit in result.hits)
-    assert any(request.name == "max_value" for request in result.fact_requests)
+    assert any(request.name == "max_value" for request in result.insight_requests)
     assert result.diagnostics["retriever_type"] == "embedding"
     assert result.diagnostics["cache_misses"] > 0
 
@@ -349,10 +349,10 @@ async def test_embedding_memory_retriever_selects_card_and_uses_local_cache(tmp_
 
 
 def test_embedding_store_invalidates_when_card_text_changes(tmp_path):
-    store = FactMemoryEmbeddingStore(tmp_path)
+    store = InsightMemoryEmbeddingStore(tmp_path)
     card = MemoryCard(
         id="recipe.sql_query.extreme.max_value",
-        kind="fact_recipe",
+        kind="insight_recipe",
         title="max_value",
         description="Generate max value.",
         tags=["extreme"],
@@ -379,47 +379,47 @@ async def test_hybrid_retriever_recalls_tool_recipe_beyond_first_24(monkeypatch,
     cards: list[MemoryCard] = []
     details: dict[str, MemoryDetail] = {}
     for index in range(30):
-        fact_key = "domain_metric" if index == 29 else f"generic_{index}"
+        insight_key = "domain_metric" if index == 29 else f"generic_{index}"
         card = MemoryCard(
-            id=f"recipe.sql_query.extreme.{fact_key}",
-            kind="fact_recipe",
-            title=fact_key,
-            description=f"Generate {fact_key}.",
-            tags=["extreme", fact_key, "sql_query"],
+            id=f"recipe.sql_query.extreme.{insight_key}",
+            kind="insight_recipe",
+            title=insight_key,
+            description=f"Generate {insight_key}.",
+            tags=["extreme", insight_key, "sql_query"],
         )
         cards.append(card)
         details[card.id] = MemoryDetail(
             id=card.id,
             card=card,
             preferred_tool="sql_query",
-            fact_request=DataFactRequest(
-                fact_key=fact_key,
-                name=fact_key,
-                fact_type="extreme",
+            insight_request=KeyInsightRequest(
+                insight_key=insight_key,
+                name=insight_key,
+                insight_type="extreme",
                 requirements={"operator": "max"},
             ),
         )
 
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_cards_view",
+        "core.key_insight.retriever.memory_cards_view",
         lambda database_id=None, max_cards=24: {
             "cards": [card.model_dump(mode="json") for card in (cards if max_cards is None else cards[:max_cards])],
             "updated_at": None,
         },
     )
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_details",
+        "core.key_insight.retriever.memory_details",
         lambda database_id, ids: [details[item] for item in ids if item in details],
     )
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_detail",
+        "core.key_insight.retriever.memory_detail",
         lambda database_id, memory_id: details.get(memory_id),
     )
     provider = DomainEmbeddingProvider()
-    retriever = HybridFactMemoryRetriever(
+    retriever = HybridInsightMemoryRetriever(
         llm=HybridSelectingLLM(cards[-1].id),
         embedding_provider=provider,
-        embedding_store=FactMemoryEmbeddingStore(tmp_path),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path),
         top_k=5,
         score_threshold=0.2,
     )
@@ -438,8 +438,8 @@ async def test_hybrid_retriever_recalls_tool_recipe_beyond_first_24(monkeypatch,
     assert result.diagnostics["all_card_count"] == 30
     assert result.diagnostics["eligible_recipe_count"] == 30
     assert result.hits[0].card_id == cards[-1].id
-    assert result.fact_requests[0].fact_key == "domain_metric"
-    assert result.fact_request_sources == {"domain_metric": [cards[-1].id]}
+    assert result.insight_requests[0].insight_key == "domain_metric"
+    assert result.insight_request_sources == {"domain_metric": [cards[-1].id]}
     assert len(provider.calls[0]) == 30
     assert "task_contract" in provider.calls[1][0]
     assert "domain_metric" in provider.calls[1][0]
@@ -449,7 +449,7 @@ async def test_hybrid_retriever_recalls_tool_recipe_beyond_first_24(monkeypatch,
 async def test_hybrid_retriever_uses_llm_planner_when_embedding_fails(monkeypatch, tmp_path):
     card = MemoryCard(
         id="recipe.sql_query.extreme.max_value",
-        kind="fact_recipe",
+        kind="insight_recipe",
         title="max_value",
         description="Generate max value.",
         tags=["extreme", "sql_query"],
@@ -458,29 +458,29 @@ async def test_hybrid_retriever_uses_llm_planner_when_embedding_fails(monkeypatc
         id=card.id,
         card=card,
         preferred_tool="sql_query",
-        fact_request=DataFactRequest(
-            fact_key="max_value",
+        insight_request=KeyInsightRequest(
+            insight_key="max_value",
             name="max_value",
-            fact_type="extreme",
+            insight_type="extreme",
             requirements={"operator": "max"},
         ),
     )
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_cards_view",
+        "core.key_insight.retriever.memory_cards_view",
         lambda database_id=None, max_cards=24: {"cards": [card.model_dump(mode="json")], "updated_at": None},
     )
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_details",
+        "core.key_insight.retriever.memory_details",
         lambda database_id, ids: [detail] if card.id in ids else [],
     )
     monkeypatch.setattr(
-        "core.data_fact.retriever.memory_detail",
+        "core.key_insight.retriever.memory_detail",
         lambda database_id, memory_id: detail if memory_id == card.id else None,
     )
-    retriever = HybridFactMemoryRetriever(
+    retriever = HybridInsightMemoryRetriever(
         llm=FallbackPlanningLLM(),
         embedding_provider=BrokenEmbeddingProvider(),
-        embedding_store=FactMemoryEmbeddingStore(tmp_path),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path),
     )
 
     result = await retriever.retrieve(
@@ -491,20 +491,20 @@ async def test_hybrid_retriever_uses_llm_planner_when_embedding_fails(monkeypatc
 
     assert result.diagnostics["failure_stage"] == "embedding_recall"
     assert result.diagnostics["planner_used"] is True
-    assert result.fact_requests[0].fact_key == "price.maximum"
-    assert result.fact_request_sources == {}
+    assert result.insight_requests[0].insight_key == "price.maximum"
+    assert result.insight_request_sources == {}
 
 
 def test_task_contract_anchors_recipe_and_expands_unverified_dependency():
     parent_card = MemoryCard(
         id="recipe.code_interpreter.time_series.daily_return_series",
-        kind="fact_recipe",
+        kind="insight_recipe",
         title="daily_return_series",
         description="Generate daily returns.",
     )
     child_card = MemoryCard(
         id="recipe.code_interpreter.metric.max_7d_vol_window",
-        kind="fact_recipe",
+        kind="insight_recipe",
         title="max_7d_vol_window",
         description="Generate the maximum rolling volatility window.",
     )
@@ -512,20 +512,20 @@ def test_task_contract_anchors_recipe_and_expands_unverified_dependency():
         id=parent_card.id,
         card=parent_card,
         preferred_tool="code_interpreter",
-        fact_request=DataFactRequest(
-            fact_key="daily_return_series",
+        insight_request=KeyInsightRequest(
+            insight_key="daily_return_series",
             name="daily_return_series",
-            fact_type="time_series",
+            insight_type="time_series",
         ),
     )
     child = MemoryDetail(
         id=child_card.id,
         card=child_card,
         preferred_tool="code_interpreter",
-        fact_request=DataFactRequest(
-            fact_key="max_7d_vol_window",
+        insight_request=KeyInsightRequest(
+            insight_key="max_7d_vol_window",
             name="max_7d_vol_window",
-            fact_type="metric",
+            insight_type="metric",
             derived_from=["daily_return_series"],
         ),
     )
@@ -545,19 +545,19 @@ def test_task_contract_anchors_recipe_and_expands_unverified_dependency():
     assert {detail.id for detail in expanded} == {parent.id, child.id}
 
 
-def test_tool_executor_keeps_authoritative_first_contract_for_same_fact_key():
+def test_tool_executor_keeps_authoritative_first_contract_for_same_insight_key():
     executor = ToolExecutor(_registry())
-    requests = executor._dedupe_fact_requests([
+    requests = executor._dedupe_insight_requests([
         {
-            "fact_key": "latest.value",
+            "insight_key": "latest.value",
             "name": "explicit latest value",
-            "fact_type": "point_value",
+            "insight_type": "point_value",
             "requirements": {"time_position": "end"},
         },
         {
-            "fact_key": "latest.value",
+            "insight_key": "latest.value",
             "name": "memory last value",
-            "fact_type": "point_value",
+            "insight_type": "point_value",
             "requirements": {"time_position": "end", "source": "memory"},
         },
     ])

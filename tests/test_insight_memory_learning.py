@@ -6,26 +6,28 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.settings import Settings
-from core.data_fact import learning
-from core.data_fact.learning import (
-    FactLearningOutbox,
-    FactMemoryLearner,
-    FactMemoryLearningWorker,
+from core.key_insight import learning
+from core.key_insight.learning import (
+    InsightLearningOutbox,
+    InsightLearningSchedule,
+    InsightLearningScheduleStore,
+    InsightMemoryLearner,
+    InsightMemoryLearningWorker,
     extract_learning_candidates,
-    reset_legacy_fact_memory_once,
-    separate_fact_memory_scopes_once,
+    reset_legacy_insight_memory_once,
+    separate_insight_memory_scopes_once,
 )
-from core.data_fact.embedding_store import FactMemoryEmbeddingStore
+from core.key_insight.embedding_store import InsightMemoryEmbeddingStore
 from runtime.request_state import build_request_state
 from schemas.api import ChatRequest
-from schemas.data_fact import (
-    DataFact,
-    DataFactRequest,
-    FactDefinition,
-    FactEvidenceRef,
-    FactEvent,
-    FactMemory,
-    FactRecipe,
+from schemas.key_insight import (
+    KeyInsight,
+    KeyInsightRequest,
+    InsightDefinition,
+    InsightEvidenceRef,
+    InsightEvent,
+    InsightMemory,
+    InsightRecipe,
     MemoryCard,
     MemoryDetail,
 )
@@ -44,10 +46,10 @@ def _terminal_state(tmp_path, *, request_id: str = "req-learning"):
     )
     state.request_id = request_id
     state.status = "completed"
-    request = DataFactRequest(
-        fact_key="energy.latest",
+    request = KeyInsightRequest(
+        insight_key="energy.latest",
         name="latest_energy",
-        fact_type="point_value",
+        insight_type="point_value",
         subject="appliances_energy_wh",
         time_range={"start": "2016-01-01", "end": "2016-02-01"},
         dimensions={"building": "A"},
@@ -58,25 +60,25 @@ def _terminal_state(tmp_path, *, request_id: str = "req-learning"):
             "memory_card_ids": ["old"],
         },
     )
-    fact = DataFact(
-        fact_id="fact_latest_energy",
-        fact_key=request.fact_key,
+    insight = KeyInsight(
+        insight_id="insight_latest_energy",
+        insight_key=request.insight_key,
         name=request.name,
-        fact_type=request.fact_type,
+        insight_type=request.insight_type,
         statement="The latest value is 420.",
         value=420,
         subject=request.subject,
         method="sql_query",
-        evidence_refs=[FactEvidenceRef(source_type="query", source_id="evi-secret")],
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi-secret")],
         calculation_trace={"row": {"value": 420}, "value_key": "value", "time_key": "time"},
     )
-    state.fact_set.requests = [request]
-    state.fact_set.facts = [fact]
-    state.fact_events = [FactEvent(iteration=1, tool_name="sql_query", produced_fact_ids=[fact.fact_id])]
+    state.insight_set.requests = [request]
+    state.insight_set.insights = [insight]
+    state.insight_events = [InsightEvent(iteration=1, tool_name="sql_query", produced_insight_ids=[insight.insight_id])]
     state.final_answer_draft = FinalAnswer(
         summary="最后一个值是 420。",
-        claims=[AnswerClaim(claim_id="claim-1", text="最后值", fact_ids=[fact.fact_id])],
-        references=[AnswerReference(source_type="fact", source_id=fact.fact_id, label="最后值")],
+        claims=[AnswerClaim(claim_id="claim-1", text="最后值", insight_ids=[insight.insight_id])],
+        references=[AnswerReference(source_type="insight", source_id=insight.insight_id, label="最后值")],
     )
     return state
 
@@ -91,22 +93,22 @@ def test_terminal_learning_candidate_is_referenced_verified_and_value_free(tmp_p
     payload = candidate.model_dump(mode="json")
     serialized = json.dumps(payload, ensure_ascii=False)
     assert candidate.database_id == "energy"
-    assert candidate.fact_request.time_range is None
-    assert candidate.fact_request.dimensions == {"building": "<instance-value-omitted>"}
-    assert candidate.fact_request.requirements["row_filters"]["building"] == "<instance-value-omitted>"
-    assert candidate.fact_request.requirements["time_position"] == "end"
+    assert candidate.insight_request.time_range is None
+    assert candidate.insight_request.dimensions == {"building": "<instance-value-omitted>"}
+    assert candidate.insight_request.requirements["row_filters"]["building"] == "<instance-value-omitted>"
+    assert candidate.insight_request.requirements["time_position"] == "end"
     assert "420" not in serialized
     assert "evi-secret" not in serialized
     assert "memory_card_ids" not in serialized
 
 
-def test_unreferenced_partial_or_failed_fact_is_not_queued(tmp_path):
+def test_unreferenced_partial_or_failed_insight_is_not_queued(tmp_path):
     state = _terminal_state(tmp_path)
     state.final_answer_draft = FinalAnswer(summary="answer")
     assert extract_learning_candidates(state) == []
     state.final_answer_draft = FinalAnswer(
         summary="answer",
-        claims=[AnswerClaim(claim_id="c", text="x", fact_ids=["fact_latest_energy"])],
+        claims=[AnswerClaim(claim_id="c", text="x", insight_ids=["insight_latest_energy"])],
     )
     state.status = "partial"
     assert extract_learning_candidates(state) == []
@@ -114,7 +116,7 @@ def test_unreferenced_partial_or_failed_fact_is_not_queued(tmp_path):
 
 @pytest.mark.asyncio
 async def test_outbox_triggers_at_twenty_and_worker_chunks_llm_batches(tmp_path):
-    outbox = FactLearningOutbox(tmp_path / "learning")
+    outbox = InsightLearningOutbox(tmp_path / "learning")
     for index in range(20):
         assert outbox.enqueue_request(_terminal_state(tmp_path, request_id=f"req-{index}"))
     assert outbox.due_databases(batch_size=20, max_wait_seconds=600) == ["energy"]
@@ -130,14 +132,14 @@ async def test_outbox_triggers_at_twenty_and_worker_chunks_llm_batches(tmp_path)
                 outbox.finish(job, status="completed", reason="test")
 
     learner = _Learner()
-    worker = FactMemoryLearningWorker(learner, batch_size=20, llm_chunk_size=5)
+    worker = InsightMemoryLearningWorker(learner, batch_size=20, llm_chunk_size=5)
     assert await worker.process_due_once() == 20
     assert learner.batch_sizes == [5, 5, 5, 5]
     assert len(list((tmp_path / "learning" / "completed").glob("*.json"))) == 20
 
 
 def test_outbox_triggers_when_oldest_candidate_waited_ten_minutes(tmp_path):
-    outbox = FactLearningOutbox(tmp_path / "learning")
+    outbox = InsightLearningOutbox(tmp_path / "learning")
     job_id = outbox.enqueue_request(_terminal_state(tmp_path))[0]
     path = tmp_path / "learning" / "pending" / f"{job_id}.json"
     payload = json.loads(path.read_text())
@@ -145,6 +147,41 @@ def test_outbox_triggers_when_oldest_candidate_waited_ten_minutes(tmp_path):
     outbox._write_atomic(path, payload)
 
     assert outbox.due_databases(batch_size=20, max_wait_seconds=600) == ["energy"]
+
+
+def test_learning_schedule_store_persists_validated_runtime_value(tmp_path):
+    store = InsightLearningScheduleStore(tmp_path / "learning", default_max_wait_seconds=600)
+    assert store.read().max_wait_seconds == 600
+
+    store.write(InsightLearningSchedule(max_wait_seconds=90))
+
+    reloaded = InsightLearningScheduleStore(tmp_path / "learning", default_max_wait_seconds=600)
+    assert reloaded.read().max_wait_seconds == 90
+
+
+@pytest.mark.asyncio
+async def test_worker_observes_schedule_changes_without_restart(tmp_path):
+    outbox = InsightLearningOutbox(tmp_path / "learning")
+    job_id = outbox.enqueue_request(_terminal_state(tmp_path))[0]
+    path = tmp_path / "learning" / "pending" / f"{job_id}.json"
+    payload = json.loads(path.read_text())
+    payload["queued_at"] = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+    outbox._write_atomic(path, payload)
+
+    class _Learner:
+        def __init__(self):
+            self.outbox = outbox
+
+        async def process(self, jobs):
+            for job in jobs:
+                outbox.finish(job, status="completed", reason="test")
+
+    store = InsightLearningScheduleStore(tmp_path / "learning", default_max_wait_seconds=600)
+    worker = InsightMemoryLearningWorker(_Learner(), batch_size=20, schedule_store=store)
+    assert await worker.process_due_once() == 0
+
+    store.write(InsightLearningSchedule(max_wait_seconds=1))
+    assert await worker.process_due_once() == 1
 
 
 class _EmbeddingProvider:
@@ -172,31 +209,31 @@ class _LearningLLM:
             return _Response({"abstracted": [{
                 "candidate_ids": [candidate_id],
                 "definition": {
-                    "fact_type": "point_value",
+                    "insight_type": "point_value",
                     "description": "Latest scalar observation for a database metric.",
                     "required_evidence": ["database_evidence"],
                     "preferred_tool": "sql_query",
                     "output_schema": {"value": "number|string"},
                     "verification_requirements": ["must reference current request evidence"],
                     "scope": "energy",
-                    "source": "verified_data_fact",
+                    "source": "verified_key_insight",
                 },
                 "recipe": {
                     "recipe_id": "",
-                    "fact_type": "point_value",
+                    "insight_type": "point_value",
                     "name": "latest_energy",
                     "preferred_tool": "sql_query",
-                    "fact_request_template": {
-                        "fact_key": "energy.latest",
+                    "insight_request_template": {
+                        "insight_key": "energy.latest",
                         "name": "latest_energy",
-                        "fact_type": "point_value",
+                        "insight_type": "point_value",
                         "subject": "appliances_energy_wh",
                         "requirements": {"time_position": "end"},
                     },
                     "expected_result_schema": {"value": "scalar"},
                     "verification_notes": ["must reference current request evidence"],
                     "scope": "energy",
-                    "source": "verified_data_fact",
+                    "source": "verified_key_insight",
                     "description": "Generate the latest appliances energy observation.",
                 },
             }]})
@@ -210,18 +247,129 @@ class _LearningLLM:
         }]})
 
 
+class _RejectingAtomicEvidenceLLM:
+    def __init__(self):
+        self.system_prompt = ""
+
+    async def ainvoke(self, messages):
+        self.system_prompt = messages[0][1]
+        return _Response({"abstracted": []})
+
+
+@pytest.mark.asyncio
+async def test_learning_semantically_rejects_reusable_atomic_evidence(monkeypatch, tmp_path):
+    outbox = InsightLearningOutbox(tmp_path / "learning")
+    job_id = outbox.enqueue_request(_terminal_state(tmp_path))[0]
+    jobs = outbox.claim("energy", limit=20, lease_seconds=60)
+    written = []
+    monkeypatch.setattr(learning, "write_insight_memory", lambda memory, database_id=None: written.append(memory))
+    llm = _RejectingAtomicEvidenceLLM()
+    learner = InsightMemoryLearner(
+        llm=llm,
+        embedding_provider=_EmbeddingProvider(),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
+        outbox=outbox,
+    )
+
+    await learner.process(jobs)
+
+    assert written == []
+    rejected = json.loads((tmp_path / "learning" / "rejected" / f"{job_id}.json").read_text())
+    assert "request evidence only" in rejected["error_summary"]
+    assert "scalar value" in llm.system_prompt
+    assert "not a\nhistory of requested outputs" in llm.system_prompt
+    assert "concise canonical noun" in llm.system_prompt
+
+
+def test_learning_requires_one_canonical_name_across_recipe_and_contract(tmp_path):
+    learner = InsightMemoryLearner(
+        llm=_LearningLLM(),
+        embedding_provider=_EmbeddingProvider(),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
+        outbox=InsightLearningOutbox(tmp_path / "learning"),
+    )
+    payload = {
+        "abstracted": [{
+            "candidate_ids": ["candidate-a"],
+            "definition": {"insight_type": "change", "description": "Material directional change."},
+            "recipe": {
+                "recipe_id": "",
+                "insight_type": "change",
+                "name": "material directional change",
+                "preferred_tool": "code_interpreter",
+                "insight_request_template": {
+                    "name": "Compute the full-period directional change and explain whether it is material",
+                    "insight_type": "change",
+                },
+            },
+        }],
+    }
+
+    with pytest.raises(ValueError, match="same canonical Key Insight name"):
+        learner._validate_abstracted_payload(
+            payload,
+            valid_ids={"candidate-a"},
+            database_id="energy",
+        )
+
+
+def test_learning_canonicalizes_llm_request_template_to_the_schema(tmp_path):
+    learner = InsightMemoryLearner(
+        llm=_LearningLLM(),
+        embedding_provider=_EmbeddingProvider(),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
+        outbox=InsightLearningOutbox(tmp_path / "learning"),
+    )
+    payload = {
+        "abstracted": [{
+            "candidate_ids": ["candidate-a"],
+            "definition": {"insight_type": "analytical", "description": "Peak volatility regime."},
+            "recipe": {
+                "recipe_id": "",
+                "insight_type": "analytical",
+                "name": "peak rolling volatility window",
+                "preferred_tool": "code_interpreter",
+                "insight_request_template": {
+                    "name": "peak rolling volatility window",
+                    "insight_type": "analytical",
+                    "semantic_class": "volatility_regime",
+                    "description": "Model-invented field that is not part of KeyInsightRequest.",
+                    "verification_notes": ["Also belongs outside the request template."],
+                },
+            },
+        }],
+    }
+
+    result = learner._validate_abstracted_payload(
+        payload,
+        valid_ids={"candidate-a"},
+        database_id="energy",
+    )
+
+    assert result[0].recipe.insight_request_template == {
+        "name": "peak rolling volatility window",
+        "insight_type": "analytical",
+        "insight_key": "peak_rolling_volatility_window",
+        "derived_from": [],
+        "dimensions": {},
+        "requirements": {},
+        "selection": {},
+        "semantic_class": "volatility_regime",
+    }
+
+
 @pytest.mark.asyncio
 async def test_batch_learner_abstracts_reviews_and_commits(monkeypatch, tmp_path):
-    outbox = FactLearningOutbox(tmp_path / "learning")
+    outbox = InsightLearningOutbox(tmp_path / "learning")
     outbox.enqueue_request(_terminal_state(tmp_path))
     jobs = outbox.claim("energy", limit=20, lease_seconds=60)
     written = []
-    monkeypatch.setattr(learning, "read_persisted_fact_memory", lambda database_id: FactMemory())
-    monkeypatch.setattr(learning, "write_fact_memory", lambda memory, database_id=None: written.append((database_id, memory)))
-    learner = FactMemoryLearner(
+    monkeypatch.setattr(learning, "read_persisted_insight_memory", lambda database_id: InsightMemory())
+    monkeypatch.setattr(learning, "write_insight_memory", lambda memory, database_id=None: written.append((database_id, memory)))
+    learner = InsightMemoryLearner(
         llm=_LearningLLM(),
         embedding_provider=_EmbeddingProvider(),
-        embedding_store=FactMemoryEmbeddingStore(tmp_path / "embeddings"),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
         outbox=outbox,
     )
 
@@ -245,18 +393,18 @@ class _RepairingMergeLLM(_LearningLLM):
             return _Response({"abstracted": [{
                 "candidate_ids": [candidate_id],
                 "definition": {
-                    "fact_type": "point_value",
+                    "insight_type": "point_value",
                     "description": "Latest scalar observation for a database metric.",
                     "preferred_tool": "sql_query",
                 },
                 "recipe": {
                     "recipe_id": "",
-                    "fact_type": "point_value",
+                    "insight_type": "point_value",
                     "name": "Latest appliances value",
                     "preferred_tool": "sql_query",
-                    "fact_request_template": {
+                    "insight_request_template": {
                         "name": "Latest appliances value",
-                        "fact_type": "point_value",
+                        "insight_type": "point_value",
                         "subject": "appliances_energy_wh",
                         "requirements": {"time_position": "end"},
                     },
@@ -278,7 +426,7 @@ class _RepairingMergeLLM(_LearningLLM):
             "candidate_ids": item["candidate_ids"],
             "action": "merge",
             "target_recipe_id": target,
-            "reason": "Equivalent full Fact contract.",
+            "reason": "Equivalent full Insight contract.",
             "definition": item["definition"],
             "recipe": item["recipe"],
         }]})
@@ -286,29 +434,29 @@ class _RepairingMergeLLM(_LearningLLM):
 
 @pytest.mark.asyncio
 async def test_learning_repairs_invented_merge_target_and_updates_existing_recipe(monkeypatch, tmp_path):
-    outbox = FactLearningOutbox(tmp_path / "learning")
+    outbox = InsightLearningOutbox(tmp_path / "learning")
     outbox.enqueue_request(_terminal_state(tmp_path))
     jobs = outbox.claim("energy", limit=20, lease_seconds=60)
-    existing_recipe = FactRecipe(
+    existing_recipe = InsightRecipe(
         recipe_id="recipe_existing_latest_energy",
-        fact_type="point_value",
+        insight_type="point_value",
         name="appliances_energy_wh latest observed value",
         preferred_tool="sql_query",
-        fact_request_template={
+        insight_request_template={
             "name": "appliances_energy_wh latest observed value",
-            "fact_type": "point_value",
+            "insight_type": "point_value",
             "subject": "appliances_energy_wh",
             "requirements": {"time_position": "end"},
         },
-        source="verified_data_fact",
+        source="verified_key_insight",
         scope="energy",
     )
-    persisted = FactMemory(
-        definitions=[FactDefinition(fact_type="point_value", description="Latest value")],
+    persisted = InsightMemory(
+        definitions=[InsightDefinition(insight_type="point_value", description="Latest value")],
         recipes=[existing_recipe],
         cards=[MemoryCard(
             id="recipe.sql_query.point_value.appliances_energy_wh_latest_observed_value",
-            kind="fact_recipe",
+            kind="insight_recipe",
             title=existing_recipe.name,
             description="Equivalent latest observation recipe.",
         )],
@@ -316,22 +464,22 @@ async def test_learning_repairs_invented_merge_target_and_updates_existing_recip
             id="recipe.sql_query.point_value.appliances_energy_wh_latest_observed_value",
             card=MemoryCard(
                 id="recipe.sql_query.point_value.appliances_energy_wh_latest_observed_value",
-                kind="fact_recipe",
+                kind="insight_recipe",
                 title=existing_recipe.name,
                 description="Equivalent latest observation recipe.",
             ),
-            fact_request=DataFactRequest.model_validate(existing_recipe.fact_request_template),
+            insight_request=KeyInsightRequest.model_validate(existing_recipe.insight_request_template),
             preferred_tool="sql_query",
         )],
         updated_at="revision-1",
     )
     written = []
-    monkeypatch.setattr(learning, "read_persisted_fact_memory", lambda database_id: persisted)
-    monkeypatch.setattr(learning, "write_fact_memory", lambda memory, database_id=None: written.append(memory))
-    learner = FactMemoryLearner(
+    monkeypatch.setattr(learning, "read_persisted_insight_memory", lambda database_id: persisted)
+    monkeypatch.setattr(learning, "write_insight_memory", lambda memory, database_id=None: written.append(memory))
+    learner = InsightMemoryLearner(
         llm=_RepairingMergeLLM(),
         embedding_provider=_EmbeddingProvider(),
-        embedding_store=FactMemoryEmbeddingStore(tmp_path / "embeddings"),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
         outbox=outbox,
         neighbor_threshold=0.0,
     )
@@ -345,11 +493,11 @@ async def test_learning_repairs_invented_merge_target_and_updates_existing_recip
 
 
 def test_neighbors_are_available_to_every_candidate_in_merged_abstraction(tmp_path):
-    learner = FactMemoryLearner(
+    learner = InsightMemoryLearner(
         llm=_LearningLLM(),
         embedding_provider=_EmbeddingProvider(),
-        embedding_store=FactMemoryEmbeddingStore(tmp_path / "embeddings"),
-        outbox=FactLearningOutbox(tmp_path / "learning"),
+        embedding_store=InsightMemoryEmbeddingStore(tmp_path / "embeddings"),
+        outbox=InsightLearningOutbox(tmp_path / "learning"),
     )
     payload = {
         "decisions": [{
@@ -357,15 +505,15 @@ def test_neighbors_are_available_to_every_candidate_in_merged_abstraction(tmp_pa
             "action": "merge",
             "target_recipe_id": "recipe-shared",
             "reason": "Same full contract.",
-            "definition": {"fact_type": "point_value", "description": "Latest value"},
+            "definition": {"insight_type": "point_value", "description": "Latest value"},
             "recipe": {
                 "recipe_id": "",
-                "fact_type": "point_value",
+                "insight_type": "point_value",
                 "name": "latest value",
                 "preferred_tool": "sql_query",
-                "fact_request_template": {
+                "insight_request_template": {
                     "name": "latest value",
-                    "fact_type": "point_value",
+                    "insight_type": "point_value",
                     "requirements": {"time_position": "end"},
                 },
             },
@@ -387,7 +535,7 @@ def test_neighbors_are_available_to_every_candidate_in_merged_abstraction(tmp_pa
 
 
 def test_legacy_reset_backs_up_then_clears_runtime_memory(tmp_path):
-    memory_root = tmp_path / "fact_memory"
+    memory_root = tmp_path / "insight_memory"
     embedding_root = tmp_path / "embeddings"
     learning_root = tmp_path / "learning"
     memory_root.mkdir()
@@ -395,7 +543,7 @@ def test_legacy_reset_backs_up_then_clears_runtime_memory(tmp_path):
     (memory_root / "demo.json").write_text(json.dumps({"recipes": [{"recipe_id": "legacy"}]}))
     (embedding_root / "legacy.json").write_text("{}")
 
-    assert reset_legacy_fact_memory_once(
+    assert reset_legacy_insight_memory_once(
         root=learning_root,
         embedding_root=embedding_root,
         memory_root=memory_root,
@@ -404,7 +552,7 @@ def test_legacy_reset_backs_up_then_clears_runtime_memory(tmp_path):
     assert payload["recipes"] == []
     assert not list(embedding_root.rglob("*.json"))
     assert list((learning_root / "backups").rglob("demo.json"))
-    assert reset_legacy_fact_memory_once(
+    assert reset_legacy_insight_memory_once(
         root=learning_root,
         embedding_root=embedding_root,
         memory_root=memory_root,
@@ -412,7 +560,7 @@ def test_legacy_reset_backs_up_then_clears_runtime_memory(tmp_path):
 
 
 def test_scope_separation_preserves_only_learned_entries(tmp_path):
-    memory_root = tmp_path / "fact_memory"
+    memory_root = tmp_path / "insight_memory"
     embedding_root = tmp_path / "embeddings"
     migration_root = tmp_path / "learning"
     memory_root.mkdir()
@@ -420,30 +568,30 @@ def test_scope_separation_preserves_only_learned_entries(tmp_path):
     (embedding_root / "cached.json").write_text("{}")
     (memory_root / "demo.json").write_text(json.dumps({
         "definitions": [
-            {"fact_type": "point_value", "description": "system", "source": "system"},
-            {"fact_type": "domain_value", "description": "learned", "source": "verified_data_fact"},
+            {"insight_type": "point_value", "description": "system", "source": "system"},
+            {"insight_type": "domain_value", "description": "learned", "source": "verified_key_insight"},
         ],
         "recipes": [
             {
-                "recipe_id": "system_recipe", "fact_type": "extreme", "name": "max",
+                "recipe_id": "system_recipe", "insight_type": "extreme", "name": "max",
                 "preferred_tool": "sql_query", "source": "system",
             },
             {
-                "recipe_id": "learned_recipe", "fact_type": "domain_value", "name": "domain value",
-                "preferred_tool": "code_interpreter", "source": "verified_data_fact",
+                "recipe_id": "learned_recipe", "insight_type": "domain_value", "name": "domain value",
+                "preferred_tool": "code_interpreter", "source": "verified_key_insight",
             },
         ],
-        "cards": [{"id": "stale", "kind": "fact_recipe", "title": "stale", "description": "stale"}],
+        "cards": [{"id": "stale", "kind": "insight_recipe", "title": "stale", "description": "stale"}],
         "details": [],
     }))
 
-    assert separate_fact_memory_scopes_once(
+    assert separate_insight_memory_scopes_once(
         root=migration_root,
         embedding_root=embedding_root,
         memory_root=memory_root,
     ) is True
     payload = json.loads((memory_root / "demo.json").read_text())
-    assert [item["fact_type"] for item in payload["definitions"]] == ["domain_value"]
+    assert [item["insight_type"] for item in payload["definitions"]] == ["domain_value"]
     assert [item["recipe_id"] for item in payload["recipes"]] == ["learned_recipe"]
     assert payload["cards"] == []
     assert not list(embedding_root.glob("*.json"))

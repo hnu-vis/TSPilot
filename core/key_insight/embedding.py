@@ -1,4 +1,4 @@
-"""Embedding provider abstractions for fact-memory retrieval."""
+"""Embedding provider abstractions for insight-memory retrieval."""
 from __future__ import annotations
 
 from dataclasses import dataclass

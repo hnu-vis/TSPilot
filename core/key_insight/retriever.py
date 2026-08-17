@@ -1,4 +1,4 @@
-"""Fact-memory retrieval for tool input planning."""
+"""Key Insight-memory retrieval for tool input planning."""
 from __future__ import annotations
 
 import json
@@ -8,16 +8,17 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from core.data_fact.embedding import EmbeddingProvider
-from core.data_fact.embedding_store import (
-    FactMemoryEmbeddingStore,
+from core.key_insight.embedding import EmbeddingProvider
+from core.key_insight.embedding_store import (
+    InsightMemoryEmbeddingStore,
     memory_card_embedding_text,
     top_similar_cards,
 )
-from core.data_fact.memory import memory_cards_view, memory_detail, memory_details
-from core.data_fact.contracts import fact_request_contract_error
-from schemas.data_fact import DataFactRequest, MemoryCard, MemoryDetail, normalize_fact_key
+from core.key_insight.memory import memory_cards_view, memory_detail, memory_details
+from core.key_insight.contracts import insight_request_contract_error
+from schemas.key_insight import KeyInsightRequest, MemoryCard, MemoryDetail, normalize_insight_key
 from schemas.state import RequestStateModel
+from runtime.prompt_locale import prompt_locale_instruction
 
 
 class MemoryHit(BaseModel):
@@ -28,17 +29,17 @@ class MemoryHit(BaseModel):
 
 class MemoryRetrievalResult(BaseModel):
     hits: list[MemoryHit] = Field(default_factory=list)
-    fact_requests: list[DataFactRequest] = Field(default_factory=list)
-    fact_request_sources: dict[str, list[str]] = Field(default_factory=dict)
+    insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
+    insight_request_sources: dict[str, list[str]] = Field(default_factory=dict)
     diagnostics: dict = Field(default_factory=dict)
 
 
 @dataclass
-class EmbeddingFactMemoryRetriever:
+class EmbeddingInsightMemoryRetriever:
     """Retrieve memory cards with embeddings, then load details by id."""
 
     embedding_provider: EmbeddingProvider
-    embedding_store: FactMemoryEmbeddingStore
+    embedding_store: InsightMemoryEmbeddingStore
     top_k: int = 6
     score_threshold: float = 0.25
     max_cards: int = 64
@@ -78,10 +79,10 @@ class EmbeddingFactMemoryRetriever:
                 for item, score in selected
             ]
             details = memory_details(database_id, [hit.card_id for hit in hits])
-            fact_requests = _fact_requests_from_details(details)
+            insight_requests = _insight_requests_from_details(details)
             return MemoryRetrievalResult(
                 hits=hits,
-                fact_requests=fact_requests,
+                insight_requests=insight_requests,
                 diagnostics={
                     "memory_enabled": True,
                     "retriever_type": "embedding",
@@ -91,7 +92,7 @@ class EmbeddingFactMemoryRetriever:
                     "cache_misses": cache_misses,
                     "selected_card_ids": [hit.card_id for hit in hits],
                     "scores": {hit.card_id: hit.confidence for hit in hits},
-                    "fact_request_count": len(fact_requests),
+                    "insight_request_count": len(insight_requests),
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                 },
             )
@@ -119,14 +120,14 @@ class EmbeddingFactMemoryRetriever:
         missing: list[tuple[MemoryCard, str]] = []
         for card in cards:
             detail = details_by_id.get(card.id) if details_by_id is not None else memory_detail(database_id, card.id)
-            fact_request = (
-                detail.fact_request.model_dump(mode="json", exclude_none=True)
-                if detail is not None and detail.fact_request is not None
+            insight_request = (
+                detail.insight_request.model_dump(mode="json", exclude_none=True)
+                if detail is not None and detail.insight_request is not None
                 else None
             )
             text = memory_card_embedding_text(
                 card,
-                fact_request=fact_request,
+                insight_request=insight_request,
                 guidance=detail.guidance if detail is not None else None,
             )
             hit = self.embedding_store.load(
@@ -157,12 +158,12 @@ class EmbeddingFactMemoryRetriever:
 
 
 @dataclass
-class HybridFactMemoryRetriever:
+class HybridInsightMemoryRetriever:
     """Tool-scoped full-recipe retrieval with embedding recall and LLM reranking."""
 
     llm: Any
     embedding_provider: EmbeddingProvider
-    embedding_store: FactMemoryEmbeddingStore
+    embedding_store: InsightMemoryEmbeddingStore
     top_k: int = 6
     score_threshold: float = 0.25
     max_selected: int = 5
@@ -181,7 +182,7 @@ class HybridFactMemoryRetriever:
 
         started = time.perf_counter()
         database_id = _database_id(request_state)
-        explicit_requests = _validated_fact_requests(action_input.get("fact_requests"))
+        explicit_requests = _validated_insight_requests(action_input.get("insight_requests"))
         cards_payload = memory_cards_view(database_id, max_cards=None)
         all_cards = [
             MemoryCard.model_validate(item)
@@ -199,23 +200,23 @@ class HybridFactMemoryRetriever:
         }
 
         if not eligible_details:
-            planned = await self._planner()._plan_tool_fact_requests(
+            planned = await self._planner()._plan_tool_insight_requests(
                 request_state=request_state,
                 tool_name=tool_name,
                 action_input=action_input,
             )
             return MemoryRetrievalResult(
-                fact_requests=planned,
+                insight_requests=planned,
                 diagnostics={
                     **base_diagnostics,
                     "planner_used": True,
                     "planner_reason": "no_eligible_recipe",
-                    "planned_fact_request_count": len(planned),
+                    "planned_insight_request_count": len(planned),
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                 },
             )
 
-        embedding_retriever = EmbeddingFactMemoryRetriever(
+        embedding_retriever = EmbeddingInsightMemoryRetriever(
             embedding_provider=self.embedding_provider,
             embedding_store=self.embedding_store,
             top_k=self.top_k,
@@ -280,7 +281,7 @@ class HybridFactMemoryRetriever:
         for detail in recalled_details:
             if detail.id in recalled_ids:
                 continue
-            recalled_hits.append(MemoryHit(card_id=detail.id, reason="fact_dependency"))
+            recalled_hits.append(MemoryHit(card_id=detail.id, reason="insight_dependency"))
             recalled_ids.add(detail.id)
         recall_diagnostics = {
             **base_diagnostics,
@@ -334,20 +335,20 @@ class HybridFactMemoryRetriever:
             )
 
         selected_details = [details_by_id[hit.card_id] for hit in selected_hits if hit.card_id in details_by_id]
-        memory_requests = _fact_requests_from_details(selected_details, tool_name=tool_name)
+        memory_requests = _insight_requests_from_details(selected_details, tool_name=tool_name)
         sources: dict[str, list[str]] = {}
         for detail in selected_details:
-            if detail.fact_request is None:
+            if detail.insight_request is None:
                 continue
-            sources.setdefault(detail.fact_request.fact_key, []).append(detail.id)
-        planned_requests: list[DataFactRequest] = []
+            sources.setdefault(detail.insight_request.insight_key, []).append(detail.id)
+        planned_requests: list[KeyInsightRequest] = []
         if needs_planning:
-            planned_requests = await self._planner()._plan_tool_fact_requests(
+            planned_requests = await self._planner()._plan_tool_insight_requests(
                 request_state=request_state,
                 tool_name=tool_name,
                 action_input={
                     **action_input,
-                    "retrieved_fact_requests": [
+                    "retrieved_insight_requests": [
                         item.model_dump(mode="json", exclude_none=True) for item in memory_requests
                     ],
                 },
@@ -360,20 +361,20 @@ class HybridFactMemoryRetriever:
                 explicit_requests=reconciliation_inputs,
                 memory_requests=memory_requests,
             )
-            retained_keys = {request.fact_key for request in memory_requests}
+            retained_keys = {request.insight_key for request in memory_requests}
             selected_hits = [
                 hit
                 for hit in selected_hits
                 if (details_by_id.get(hit.card_id) is not None)
-                and (details_by_id[hit.card_id].fact_request is not None)
-                and (details_by_id[hit.card_id].fact_request.fact_key in retained_keys)
+                and (details_by_id[hit.card_id].insight_request is not None)
+                and (details_by_id[hit.card_id].insight_request.insight_key in retained_keys)
             ]
             sources = {key: value for key, value in sources.items() if key in retained_keys}
         combined = _dedupe_request_models([*memory_requests, *planned_requests])
         return MemoryRetrievalResult(
             hits=selected_hits,
-            fact_requests=combined,
-            fact_request_sources=sources,
+            insight_requests=combined,
+            insight_request_sources=sources,
             diagnostics={
                 **recall_diagnostics,
                 "selected_card_ids": [hit.card_id for hit in selected_hits],
@@ -383,15 +384,15 @@ class HybridFactMemoryRetriever:
                     for hit in selected_hits
                     if hit.confidence is not None
                 },
-                "memory_fact_request_count": len(memory_requests),
-                "planned_fact_request_count": len(planned_requests),
+                "memory_insight_request_count": len(memory_requests),
+                "planned_insight_request_count": len(planned_requests),
                 "planner_used": needs_planning,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
 
-    def _planner(self) -> "LlmFactMemoryRetriever":
-        return LlmFactMemoryRetriever(llm=self.llm, max_selected=self.max_selected)
+    def _planner(self) -> "LlmInsightMemoryRetriever":
+        return LlmInsightMemoryRetriever(llm=self.llm, max_selected=self.max_selected)
 
     async def _planner_result(
         self,
@@ -402,17 +403,17 @@ class HybridFactMemoryRetriever:
         diagnostics: dict,
         started: float,
     ) -> MemoryRetrievalResult:
-        planned = await self._planner()._plan_tool_fact_requests(
+        planned = await self._planner()._plan_tool_insight_requests(
             request_state=request_state,
             tool_name=tool_name,
             action_input=action_input,
         )
         return MemoryRetrievalResult(
-            fact_requests=planned,
+            insight_requests=planned,
             diagnostics={
                 **diagnostics,
                 "planner_used": True,
-                "planned_fact_request_count": len(planned),
+                "planned_insight_request_count": len(planned),
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
@@ -423,7 +424,7 @@ class HybridFactMemoryRetriever:
         request_state: RequestStateModel,
         tool_name: str,
         action_input: dict,
-        explicit_requests: list[DataFactRequest],
+        explicit_requests: list[KeyInsightRequest],
         recalled_hits: list[MemoryHit],
         recalled_details: list[MemoryDetail],
     ) -> tuple[list[MemoryHit], bool]:
@@ -432,16 +433,16 @@ class HybridFactMemoryRetriever:
             (
                 "system",
                 (
-                    "You rerank retrieved Data Fact recipes for one tool call. Explicit fact contracts are authoritative. "
+                    "You rerank retrieved Key Insight recipes for one tool call. Explicit insight contracts are authoritative. "
                     "Select a recipe when its full contract is required by the user or task contract, or when it is a necessary "
                     "dependency of another selected recipe and is not already verified. It must fit the current "
                     "tool, subject, time range, dimensions, granularity, and calculation semantics, and is not semantically "
-                    "equivalent to an explicit or already verified fact. Different names or fact keys do not make facts "
+                    "equivalent to an explicit or already verified insight. Different names or insight keys do not make insights "
                     "distinct. Treat latest/last/current boundary synonyms and translated or reformatted names as equivalent. "
                     "Interpret SQL structure instead of display names: time_boundary returns only a timestamp, point_value "
                     "returns only a scalar measure, and extreme returns the selected extreme value. Never select a memory "
                     "contract for an output already covered by an equivalent explicit contract. "
-                    "Set needs_planning=true only when required facts remain uncovered after explicit and selected "
+                    "Set needs_planning=true only when required insights remain uncovered after explicit and selected "
                     "contracts. Return exactly this JSON object: {\"selected\":[{\"card_id\":string,\"reason\":string,\"confidence\":number}],"
                     "\"needs_planning\":boolean} and no markdown."
                 ),
@@ -453,10 +454,10 @@ class HybridFactMemoryRetriever:
                         "task_context": _retrieval_task_context(request_state),
                         "tool_name": tool_name,
                         "action_input": _bounded_action_input(action_input),
-                        "explicit_fact_contracts": [
+                        "explicit_insight_contracts": [
                             request.model_dump(mode="json", exclude_none=True) for request in explicit_requests
                         ],
-                        "verified_fact_dag": _verified_fact_dag(request_state),
+                        "verified_insight_dag": _verified_insight_dag(request_state),
                         "candidates": [
                             {
                                 "card_id": detail.id,
@@ -465,8 +466,8 @@ class HybridFactMemoryRetriever:
                                 "description": detail.card.description,
                                 "tags": detail.card.tags,
                                 "preferred_tool": detail.preferred_tool,
-                                "fact_request": detail.fact_request.model_dump(mode="json", exclude_none=True)
-                                if detail.fact_request is not None else None,
+                                "insight_request": detail.insight_request.model_dump(mode="json", exclude_none=True)
+                                if detail.insight_request is not None else None,
                                 "guidance": detail.guidance,
                             }
                             for detail in recalled_details
@@ -477,7 +478,7 @@ class HybridFactMemoryRetriever:
                 ),
             ),
         ]
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
         payload = _parse_json_response(getattr(response, "content", response))
         selected = payload.get("selected") if isinstance(payload, dict) else []
         valid_ids = {detail.id for detail in recalled_details}
@@ -499,7 +500,7 @@ class HybridFactMemoryRetriever:
 
 
 @dataclass
-class LlmFactMemoryRetriever:
+class LlmInsightMemoryRetriever:
     """Select small memory cards with an LLM, then load details by id."""
 
     llm: Any | None = None
@@ -527,20 +528,20 @@ class LlmFactMemoryRetriever:
             if isinstance(item, dict)
         ]
         if not cards:
-            explicit_requests = _validated_fact_requests(action_input.get("fact_requests"))
+            explicit_requests = _validated_insight_requests(action_input.get("insight_requests"))
             planned_requests = []
             if not explicit_requests:
-                planned_requests = await self._plan_tool_fact_requests(
+                planned_requests = await self._plan_tool_insight_requests(
                     request_state=request_state,
                     tool_name=tool_name,
                     action_input=action_input,
                 )
             return MemoryRetrievalResult(
-                fact_requests=planned_requests,
+                insight_requests=planned_requests,
                 diagnostics={
                     "memory_enabled": True,
                     "card_count": 0,
-                    "fact_request_count": len(planned_requests),
+                    "insight_request_count": len(planned_requests),
                 },
             )
 
@@ -565,29 +566,29 @@ class LlmFactMemoryRetriever:
 
         selected_ids = [hit.card_id for hit in selected[: self.max_selected] if hit.card_id]
         details = memory_details(database_id, selected_ids)
-        fact_requests = _fact_requests_from_details(details, tool_name=tool_name)
-        explicit_requests = _validated_fact_requests(action_input.get("fact_requests"))
-        if explicit_requests and fact_requests:
-            fact_requests = await self._reconcile_memory_requests(
+        insight_requests = _insight_requests_from_details(details, tool_name=tool_name)
+        explicit_requests = _validated_insight_requests(action_input.get("insight_requests"))
+        if explicit_requests and insight_requests:
+            insight_requests = await self._reconcile_memory_requests(
                 request_state=request_state,
                 tool_name=tool_name,
                 explicit_requests=explicit_requests,
-                memory_requests=fact_requests,
+                memory_requests=insight_requests,
             )
-        elif not explicit_requests and not fact_requests:
-            fact_requests = await self._plan_tool_fact_requests(
+        elif not explicit_requests and not insight_requests:
+            insight_requests = await self._plan_tool_insight_requests(
                 request_state=request_state,
                 tool_name=tool_name,
                 action_input=action_input,
             )
         return MemoryRetrievalResult(
             hits=selected[: self.max_selected],
-            fact_requests=fact_requests,
+            insight_requests=insight_requests,
             diagnostics={
                 "memory_enabled": True,
                 "card_count": len(cards),
                 "selected_card_ids": selected_ids,
-                "fact_request_count": len(fact_requests),
+                "insight_request_count": len(insight_requests),
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
@@ -597,26 +598,26 @@ class LlmFactMemoryRetriever:
         *,
         request_state: RequestStateModel,
         tool_name: str,
-        explicit_requests: list[DataFactRequest],
-        memory_requests: list[DataFactRequest],
-    ) -> list[DataFactRequest]:
+        explicit_requests: list[KeyInsightRequest],
+        memory_requests: list[KeyInsightRequest],
+    ) -> list[KeyInsightRequest]:
         """Use semantic reconciliation instead of name-based duplicate rules."""
 
         messages = [
             (
                 "system",
                 (
-                    "You reconcile explicit and retrieved Data Fact contracts for one tool call. "
+                    "You reconcile explicit and retrieved Key Insight contracts for one tool call. "
                     "Explicit contracts are authoritative and already selected. Select a memory contract only when it fills a "
                     "required semantic output that no explicit contract covers. Keep at most one contract per semantic output. "
                     "Treat latest/last/current boundary synonyms and translated or reformatted names as equivalent when their "
-                    "subject, fact type, requirements, dimensions, time scope, and derivation match. Different names or fact_key "
-                    "values never make facts distinct. Interpret SQL contract structure rather than an over-broad display name: "
+                    "subject, insight type, requirements, dimensions, time scope, and derivation match. Different names or insight_key "
+                    "values never make insights distinct. Interpret SQL contract structure rather than an over-broad display name: "
                     "time_boundary returns only a timestamp, point_value returns only a scalar measure, and extreme returns the "
                     "selected extreme value. Therefore an explicit time_boundary already covers an equivalent memory time_boundary, "
                     "even if its name also mentions a value. Do not select a memory duplicate as corroboration, and do not repair or "
                     "replace malformed explicit contracts here. "
-                    "Return exactly this JSON object: {\"selected_memory_fact_keys\": [string]} and no markdown."
+                    "Return exactly this JSON object: {\"selected_memory_insight_keys\": [string]} and no markdown."
                 ),
             ),
             (
@@ -625,10 +626,10 @@ class LlmFactMemoryRetriever:
                     {
                         "task_context": _retrieval_task_context(request_state),
                         "tool_name": tool_name,
-                        "explicit_fact_contracts": [
+                        "explicit_insight_contracts": [
                             request.model_dump(mode="json", exclude_none=True) for request in explicit_requests
                         ],
-                        "memory_fact_contracts": [
+                        "memory_insight_contracts": [
                             request.model_dump(mode="json", exclude_none=True) for request in memory_requests
                         ],
                     },
@@ -638,54 +639,54 @@ class LlmFactMemoryRetriever:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(messages)
+            response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
             payload = _parse_json_response(getattr(response, "content", response))
         except Exception:
             return []
-        selected = payload.get("selected_memory_fact_keys") if isinstance(payload, dict) else []
+        selected = payload.get("selected_memory_insight_keys") if isinstance(payload, dict) else []
         selected_keys = {str(item).strip() for item in selected if str(item).strip()} if isinstance(selected, list) else set()
-        return [request for request in memory_requests if request.fact_key in selected_keys]
+        return [request for request in memory_requests if request.insight_key in selected_keys]
 
-    async def _plan_tool_fact_requests(
+    async def _plan_tool_insight_requests(
         self,
         *,
         request_state: RequestStateModel,
         tool_name: str,
         action_input: dict,
-    ) -> list[DataFactRequest]:
-        current_facts = [
+    ) -> list[KeyInsightRequest]:
+        current_insights = [
             {
-                "fact_key": fact.fact_key,
-                "name": fact.name,
-                "fact_type": fact.fact_type,
-                "status": fact.status,
-                "derived_from": fact.derived_from,
+                "insight_key": insight.insight_key,
+                "name": insight.name,
+                "insight_type": insight.insight_type,
+                "status": insight.status,
+                "derived_from": insight.derived_from,
             }
-            for fact in request_state.fact_set.facts[-12:]
+            for insight in request_state.insight_set.insights[-12:]
         ]
         messages = [
             (
                 "system",
                 (
-                    "You create semantic Data Fact contracts for one tool call only when its intended outputs are numerical, "
-                    "statistical, analytical, or interpretive facts needed by the user. Return exactly this JSON object: "
-                    "{\"fact_requests\": [object]} and no markdown. Return an empty list when the tool does not produce a useful Fact. "
-                    "Each request requires fact_key, name, and fact_type. Set semantic_class for the claim family, derivation for the operation, and result_shape for the payload shape. Use derived_from only when the calculation consumes "
-                    "verified parent Facts; a code_interpreter calculation directly grounded in database rows does not need "
-                    "synthetic parent Fact keys. Parents are inputs, not duplicate output requests. For sql_query use only point_value or "
+                    "You create semantic Key Insight contracts for one tool call only when its intended outputs are numerical, "
+                    "statistical, analytical, or interpretive insights needed by the user. Return exactly this JSON object: "
+                    "{\"insight_requests\": [object]} and no markdown. Return an empty list when the tool does not produce a useful Key Insight. "
+                    "Each request requires insight_key, name, and insight_type. Set semantic_class for the claim family, derivation for the operation, and result_shape for the payload shape. Use derived_from only when the calculation consumes "
+                    "verified parent Key Insights; a code_interpreter calculation directly grounded in database rows does not need "
+                    "synthetic parent Key Insight keys. Parents are inputs, not duplicate output requests. For sql_query use only point_value or "
                     "time_boundary with requirements.time_position=start|end, extreme with requirements.operator=min|max, or count. "
                     "When query evidence can contain multiple series or groups, include every row-binding dimension in dimensions "
                     "or requirements using the physical result-column name and expected value. "
                     "Use time_boundary for timestamps, point_value only for scalar measure values, and count only when the user asks "
-                    "for a row/record count. Return no Fact request for raw tables or detail lists. When the user asks for a "
+                    "for a row/record count. Return no Key Insight request for raw tables or detail lists. When the user asks for a "
                     "semantic subset such as recent N observations, Top K, ranked items, pairwise comparisons, or a named "
-                    "set that will be cited or visualized, create a collection-valued Fact with result_shape and "
+                    "set that will be cited or visualized, create a collection-valued Key Insight with result_shape and "
                     "expected_item_count when the requested cardinality is explicit. The raw query Evidence Artifact "
-                    "remains the source; the Fact adds semantic selection and validation. For temporal subsets, "
+                    "remains the source; the Key Insight adds semantic selection and validation. For temporal subsets, "
                     "selection must encode the requested grain and distinct key (for example granularity=day, "
                     "distinct_by=date), together with order_by and direction. "
-                    "Use code_interpreter for change, ratio, trend, distribution, association, and multi-Fact composition. "
-                    "Do not invent parent keys and do not return already verified facts unless this call must replace them."
+                    "Use code_interpreter for change, ratio, trend, distribution, association, and multi-Key Insight composition. "
+                    "Do not invent parent keys and do not return already verified insights unless this call must replace them."
                 ),
             ),
             (
@@ -695,7 +696,7 @@ class LlmFactMemoryRetriever:
                         "task_context": _retrieval_task_context(request_state),
                         "tool_name": tool_name,
                         "action_input": _bounded_action_input(action_input),
-                        "current_fact_dag": current_facts,
+                        "current_insight_dag": current_insights,
                     },
                     ensure_ascii=False,
                     default=str,
@@ -703,19 +704,19 @@ class LlmFactMemoryRetriever:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(messages)
+            response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
             payload = _parse_json_response(getattr(response, "content", response))
         except Exception:
             return []
-        requests = _validated_fact_requests(payload.get("fact_requests") if isinstance(payload, dict) else None)
-        requests = [request for request in requests[:6] if not fact_request_contract_error(request, tool_name)]
+        requests = _validated_insight_requests(payload.get("insight_requests") if isinstance(payload, dict) else None)
+        requests = [request for request in requests[:6] if not insight_request_contract_error(request, tool_name)]
         if tool_name != "code_interpreter":
             return requests
 
         verified_keys = {
-            fact.fact_key
-            for fact in request_state.fact_set.facts
-            if fact.status == "verified" and fact.fact_key
+            insight.insight_key
+            for insight in request_state.insight_set.insights
+            if insight.status == "verified" and insight.insight_key
         }
         has_rows = _latest_evidence_row_count(request_state) > 0
         return [
@@ -740,18 +741,18 @@ class LlmFactMemoryRetriever:
             (
                 "system",
                 (
-                    "You select reusable fact-memory cards for the current tool call.\n"
+                    "You select reusable insight-memory cards for the current tool call.\n"
                     "Return exactly one JSON object and no markdown.\n"
-                    "Select only cards whose details should be loaded to construct fact_requests for the current tool.\n"
-                    "Do not select cards for facts that are unrelated to the user request or not useful for this tool call.\n"
-                    "Do not select a card when action_input.fact_requests already requests the same semantic fact, even if its name or key differs.\n"
-                    "Never return concrete historical fact values; memory only guides what current evidence should produce.\n"
+                    "Select only cards whose details should be loaded to construct insight_requests for the current tool.\n"
+                    "Do not select cards for insights that are unrelated to the user request or not useful for this tool call.\n"
+                    "Do not select a card when action_input.insight_requests already requests the same semantic insight, even if its name or key differs.\n"
+                    "Never return concrete historical insight values; memory only guides what current evidence should produce.\n"
                     "JSON schema: {\"selected\": [{\"card_id\": string, \"reason\": string, \"confidence\": number}]}."
                 ),
             ),
             (
                 "user",
-                "Fact Memory Card Selection JSON:\n"
+                "Key Insight Memory Card Selection JSON:\n"
                 + json.dumps(
                     {
                         "tool_name": tool_name,
@@ -774,7 +775,7 @@ class LlmFactMemoryRetriever:
                 ),
             ),
         ]
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
         payload = _parse_json_response(getattr(response, "content", response))
         selected = payload.get("selected") if isinstance(payload, dict) else []
         valid_ids = {card.id for card in cards}
@@ -796,19 +797,19 @@ class LlmFactMemoryRetriever:
 
 
 # Backward-compatible name for tests or experimental wiring.
-FactMemoryRetriever = LlmFactMemoryRetriever
+InsightMemoryRetriever = LlmInsightMemoryRetriever
 
 
-def _fact_requests_from_details(details: list[MemoryDetail], tool_name: str | None = None) -> list[DataFactRequest]:
-    result: list[DataFactRequest] = []
+def _insight_requests_from_details(details: list[MemoryDetail], tool_name: str | None = None) -> list[KeyInsightRequest]:
+    result: list[KeyInsightRequest] = []
     seen: set[str] = set()
     for detail in details:
-        request = detail.fact_request
+        request = detail.insight_request
         if request is None:
             continue
         if tool_name and detail.preferred_tool and detail.preferred_tool != tool_name:
             continue
-        if tool_name and fact_request_contract_error(request, tool_name):
+        if tool_name and insight_request_contract_error(request, tool_name):
             continue
         key = json.dumps(request.model_dump(mode="json", exclude_none=True), ensure_ascii=False, sort_keys=True, default=str)
         if key in seen:
@@ -823,14 +824,14 @@ def _eligible_recipe_details(
     cards: list[MemoryCard],
     tool_name: str,
 ) -> list[MemoryDetail]:
-    recipe_cards = [card for card in cards if card.kind == "fact_recipe"]
+    recipe_cards = [card for card in cards if card.kind == "insight_recipe"]
     details = memory_details(database_id, [card.id for card in recipe_cards])
     return [
         detail
         for detail in details
-        if detail.fact_request is not None
+        if detail.insight_request is not None
         and (not detail.preferred_tool or detail.preferred_tool == tool_name)
-        and not fact_request_contract_error(detail.fact_request, tool_name)
+        and not insight_request_contract_error(detail.insight_request, tool_name)
     ]
 
 
@@ -847,14 +848,14 @@ def _contract_anchor_details(
             continue
         for value in [output.id, *output.measures, *output.dimensions]:
             if str(value or "").strip():
-                output_keys.add(normalize_fact_key(str(value)))
+                output_keys.add(normalize_insight_key(str(value)))
     return [
         detail
         for detail in details
-        if detail.fact_request is not None
+        if detail.insight_request is not None
         and (
-            detail.fact_request.fact_key in output_keys
-            or normalize_fact_key(detail.fact_request.name) in output_keys
+            detail.insight_request.insight_key in output_keys
+            or normalize_insight_key(detail.insight_request.name) in output_keys
         )
     ]
 
@@ -864,27 +865,27 @@ def _recipe_dependency_closure(
     eligible: list[MemoryDetail],
     request_state: RequestStateModel,
 ) -> list[MemoryDetail]:
-    by_fact_key: dict[str, list[MemoryDetail]] = {}
+    by_insight_key: dict[str, list[MemoryDetail]] = {}
     for detail in eligible:
-        if detail.fact_request is not None:
-            by_fact_key.setdefault(detail.fact_request.fact_key, []).append(detail)
+        if detail.insight_request is not None:
+            by_insight_key.setdefault(detail.insight_request.insight_key, []).append(detail)
     verified = {
-        fact.fact_key
-        for fact in request_state.fact_set.facts
-        if fact.status == "verified" and fact.fact_key
+        insight.insight_key
+        for insight in request_state.insight_set.insights
+        if insight.status == "verified" and insight.insight_key
     }
     result = {detail.id: detail for detail in selected}
     pending = list(selected)
     while pending:
         detail = pending.pop()
-        request = detail.fact_request
+        request = detail.insight_request
         if request is None:
             continue
         for dependency in request.derived_from:
-            dependency_key = normalize_fact_key(dependency)
+            dependency_key = normalize_insight_key(dependency)
             if dependency_key in verified:
                 continue
-            for parent in by_fact_key.get(dependency_key, []):
+            for parent in by_insight_key.get(dependency_key, []):
                 if parent.id in result:
                     continue
                 result[parent.id] = parent
@@ -892,8 +893,8 @@ def _recipe_dependency_closure(
     return list(result.values())
 
 
-def _dedupe_request_models(requests: list[DataFactRequest]) -> list[DataFactRequest]:
-    result: list[DataFactRequest] = []
+def _dedupe_request_models(requests: list[KeyInsightRequest]) -> list[KeyInsightRequest]:
+    result: list[KeyInsightRequest] = []
     seen: set[str] = set()
     for request in requests:
         payload = request.model_dump(mode="json", exclude_none=True)
@@ -934,19 +935,19 @@ def _retrieval_task_context(request_state: RequestStateModel) -> dict:
     }
 
 
-def _verified_fact_dag(request_state: RequestStateModel) -> list[dict]:
+def _verified_insight_dag(request_state: RequestStateModel) -> list[dict]:
     return [
         {
-            "fact_key": fact.fact_key,
-            "name": fact.name,
-            "fact_type": fact.fact_type,
-            "subject": fact.subject,
-            "dimensions": fact.dimensions,
-            "time_range": fact.time_range,
-            "derived_from": fact.derived_from,
+            "insight_key": insight.insight_key,
+            "name": insight.name,
+            "insight_type": insight.insight_type,
+            "subject": insight.subject,
+            "dimensions": insight.dimensions,
+            "time_range": insight.time_range,
+            "derived_from": insight.derived_from,
         }
-        for fact in request_state.fact_set.facts[-20:]
-        if fact.status == "verified"
+        for insight in request_state.insight_set.insights[-20:]
+        if insight.status == "verified"
     ]
 
 
@@ -959,11 +960,11 @@ def _tool_retrieval_query_texts(
         "task": _retrieval_task_context(request_state),
         "tool_name": tool_name,
         "action_input": _bounded_action_input(action_input),
-        "explicit_fact_contracts": [
+        "explicit_insight_contracts": [
             request.model_dump(mode="json", exclude_none=True)
-            for request in _validated_fact_requests(action_input.get("fact_requests"))
+            for request in _validated_insight_requests(action_input.get("insight_requests"))
         ],
-        "verified_fact_dag": _verified_fact_dag(request_state),
+        "verified_insight_dag": _verified_insight_dag(request_state),
     }
     texts = [json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)]
     contract = request_state.task_contract
@@ -976,8 +977,8 @@ def _tool_retrieval_query_texts(
                     "task_message": request_state.message,
                     "tool_name": tool_name,
                     "required_output": output.model_dump(mode="json", exclude_none=True),
-                    "explicit_fact_contracts": payload["explicit_fact_contracts"],
-                    "verified_fact_dag": payload["verified_fact_dag"],
+                    "explicit_insight_contracts": payload["explicit_insight_contracts"],
+                    "verified_insight_dag": payload["verified_insight_dag"],
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -986,13 +987,13 @@ def _tool_retrieval_query_texts(
     return list(dict.fromkeys(texts))
 
 
-def _validated_fact_requests(value: Any) -> list[DataFactRequest]:
+def _validated_insight_requests(value: Any) -> list[KeyInsightRequest]:
     if not isinstance(value, list):
         return []
-    result: list[DataFactRequest] = []
+    result: list[KeyInsightRequest] = []
     for item in value:
         try:
-            result.append(item if isinstance(item, DataFactRequest) else DataFactRequest.model_validate(item))
+            result.append(item if isinstance(item, KeyInsightRequest) else KeyInsightRequest.model_validate(item))
         except Exception:
             continue
     return result
@@ -1050,6 +1051,17 @@ def _parse_json_response(content: Any) -> dict:
         if start >= 0 and end > start:
             return json.loads(text[start : end + 1])
         raise
+
+
+def _localized_prompt_messages(messages: list[tuple[str, str]], request_state: RequestStateModel) -> list[tuple[str, str]]:
+    """Attach the query locale without changing stable JSON/tool contracts."""
+
+    if not messages:
+        return messages
+    role, content = messages[0]
+    if role != "system":
+        return messages
+    return [(role, prompt_locale_instruction(request_state.response_language) + content), *messages[1:]]
 
 
 def _float_or_none(value: Any) -> float | None:

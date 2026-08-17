@@ -1,4 +1,4 @@
-"""Persistent embedding cache and similarity helpers for fact memory."""
+"""Persistent embedding cache and similarity helpers for insight memory."""
 from __future__ import annotations
 
 import hashlib
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from schemas.data_fact import MemoryCard
+from schemas.key_insight import MemoryCard
 
 
 @dataclass
@@ -25,7 +25,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def memory_card_embedding_text(card: MemoryCard, fact_request: dict | None = None, guidance: str | None = None) -> str:
+def memory_card_embedding_text(card: MemoryCard, insight_request: dict | None = None, guidance: str | None = None) -> str:
     """Build stable semantic text for a memory card embedding."""
     parts = [
         f"kind: {card.kind}",
@@ -33,8 +33,8 @@ def memory_card_embedding_text(card: MemoryCard, fact_request: dict | None = Non
         f"description: {card.description}",
         "tags: " + ", ".join(card.tags or []),
     ]
-    if fact_request:
-        parts.append("fact_request: " + json.dumps(fact_request, ensure_ascii=False, sort_keys=True, default=str))
+    if insight_request:
+        parts.append("insight_request: " + json.dumps(insight_request, ensure_ascii=False, sort_keys=True, default=str))
     if guidance:
         parts.append("guidance: " + str(guidance)[:500])
     return "\n".join(part for part in parts if part and part.strip())
@@ -55,7 +55,7 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-class FactMemoryEmbeddingStore:
+class InsightMemoryEmbeddingStore:
     """File-backed card embedding cache."""
 
     def __init__(self, root: Path):

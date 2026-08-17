@@ -1,4 +1,4 @@
-"""DataFact models for grounded data-analysis facts."""
+"""KeyInsight models for grounded data-analysis insights."""
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -6,15 +6,20 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-FactStatus = Literal["verified", "unavailable", "rejected", "partial"]
+InsightStatus = Literal["verified", "unavailable", "rejected", "partial"]
 
 
-class DataFactRequest(BaseModel):
-    """A semantic fact contract that one tool call may satisfy."""
+class KeyInsightRequest(BaseModel):
+    """A semantic insight contract that one tool call may satisfy."""
 
-    name: str
-    fact_type: str
-    fact_key: str | None = None
+    name: str = Field(
+        description=(
+            "Concise, reusable semantic label for the insight concept. Use a canonical noun phrase, "
+            "not a user instruction, full-sentence conclusion, time-scoped deliverable, or answer prose."
+        )
+    )
+    insight_type: str
+    insight_key: str | None = None
     subject: str | None = None
     time_range: dict | None = None
     dimensions: dict = Field(default_factory=dict)
@@ -28,8 +33,8 @@ class DataFactRequest(BaseModel):
 
     @model_validator(mode="after")
     def assign_semantic_key(self):
-        self.fact_key = normalize_fact_key(self.fact_key or self.name)
-        self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        self.insight_key = normalize_insight_key(self.insight_key or self.name)
+        self.derived_from = list(dict.fromkeys(normalize_insight_key(item) for item in self.derived_from if item))
         if self.result_shape:
             self.result_shape = str(self.result_shape).strip().lower()
         if self.expected_item_count is not None and self.expected_item_count < 0:
@@ -37,15 +42,15 @@ class DataFactRequest(BaseModel):
         return self
 
 
-class FactEvidenceRef(BaseModel):
+class InsightEvidenceRef(BaseModel):
     source_type: str
     source_id: str
     label: str | None = None
     locator: dict = Field(default_factory=dict)
 
 
-class FactItem(BaseModel):
-    """A concrete observation inside a collection-valued Fact."""
+class InsightItem(BaseModel):
+    """A concrete observation inside a collection-valued Insight."""
 
     item_id: str
     value: Any = None
@@ -54,21 +59,21 @@ class FactItem(BaseModel):
     timestamp: str | None = None
     source_item_ids: list[str] = Field(default_factory=list)
     dimensions: dict = Field(default_factory=dict)
-    evidence_refs: list[FactEvidenceRef] = Field(default_factory=list)
+    evidence_refs: list[InsightEvidenceRef] = Field(default_factory=list)
     locator: dict = Field(default_factory=dict)
 
 
-class DataFact(BaseModel):
-    """A grounded fact produced from a tool output or marked unavailable."""
+class KeyInsight(BaseModel):
+    """A grounded insight produced from a tool output or marked unavailable."""
 
-    fact_id: str
+    insight_id: str
     name: str
-    fact_type: str
-    fact_key: str | None = None
+    insight_type: str
+    insight_key: str | None = None
     statement: str
     value: Any = None
     value_shape: str | None = None
-    items: list[FactItem] = Field(default_factory=list)
+    items: list[InsightItem] = Field(default_factory=list)
     semantic_class: str | None = None
     derivation: str | None = None
     selection: dict = Field(default_factory=dict)
@@ -77,9 +82,9 @@ class DataFact(BaseModel):
     dimensions: dict = Field(default_factory=dict)
     time_range: dict | None = None
     method: str
-    evidence_refs: list[FactEvidenceRef] = Field(default_factory=list)
+    evidence_refs: list[InsightEvidenceRef] = Field(default_factory=list)
     calculation_trace: dict = Field(default_factory=dict)
-    status: FactStatus = "verified"
+    status: InsightStatus = "verified"
     confidence: float | None = None
     quality_flags: list[str] = Field(default_factory=list)
     unavailable_reason: str | None = None
@@ -87,14 +92,14 @@ class DataFact(BaseModel):
 
     @model_validator(mode="after")
     def assign_semantic_key(self):
-        self.fact_key = normalize_fact_key(self.fact_key or self.name)
-        self.derived_from = list(dict.fromkeys(normalize_fact_key(item) for item in self.derived_from if item))
+        self.insight_key = normalize_insight_key(self.insight_key or self.name)
+        self.derived_from = list(dict.fromkeys(normalize_insight_key(item) for item in self.derived_from if item))
         if self.value_shape:
             self.value_shape = str(self.value_shape).strip().lower()
         return self
 
 
-class FactCoverage(BaseModel):
+class InsightCoverage(BaseModel):
     requested: list[str] = Field(default_factory=list)
     verified: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
@@ -103,23 +108,23 @@ class FactCoverage(BaseModel):
     partial: list[str] = Field(default_factory=list)
 
 
-class FactSet(BaseModel):
-    requests: list[DataFactRequest] = Field(default_factory=list)
-    facts: list[DataFact] = Field(default_factory=list)
-    coverage: FactCoverage = Field(default_factory=FactCoverage)
+class InsightSet(BaseModel):
+    requests: list[KeyInsightRequest] = Field(default_factory=list)
+    insights: list[KeyInsight] = Field(default_factory=list)
+    coverage: InsightCoverage = Field(default_factory=InsightCoverage)
 
 
-class FactEvent(BaseModel):
+class InsightEvent(BaseModel):
     iteration: int
     tool_name: str
-    produced_fact_ids: list[str] = Field(default_factory=list)
-    rejected_fact_ids: list[str] = Field(default_factory=list)
-    unavailable_fact_ids: list[str] = Field(default_factory=list)
-    coverage: FactCoverage = Field(default_factory=FactCoverage)
+    produced_insight_ids: list[str] = Field(default_factory=list)
+    rejected_insight_ids: list[str] = Field(default_factory=list)
+    unavailable_insight_ids: list[str] = Field(default_factory=list)
+    coverage: InsightCoverage = Field(default_factory=InsightCoverage)
 
 
-class FactDefinition(BaseModel):
-    fact_type: str
+class InsightDefinition(BaseModel):
+    insight_type: str
     description: str
     required_evidence: list[str] = Field(default_factory=list)
     preferred_tool: str | None = None
@@ -131,12 +136,17 @@ class FactDefinition(BaseModel):
     updated_at: str | None = None
 
 
-class FactRecipe(BaseModel):
+class InsightRecipe(BaseModel):
     recipe_id: str
-    fact_type: str
-    name: str
+    insight_type: str
+    name: str = Field(
+        description=(
+            "Concise canonical name of the reusable Key Insight pattern. Put calculation detail in "
+            "description and insight_request_template rather than expanding the name into a sentence."
+        )
+    )
     preferred_tool: str
-    fact_request_template: dict = Field(default_factory=dict)
+    insight_request_template: dict = Field(default_factory=dict)
     expected_result_schema: dict = Field(default_factory=dict)
     verification_notes: list[str] = Field(default_factory=list)
     scope: str = "global"
@@ -145,28 +155,28 @@ class FactRecipe(BaseModel):
     description: str | None = None
 
 
-FactLearningStatus = Literal["pending", "processing", "completed", "rejected", "failed"]
+InsightLearningStatus = Literal["pending", "processing", "completed", "rejected", "failed"]
 
 
-class FactLearningCandidate(BaseModel):
-    """Value-free projection of one verified Fact usage."""
+class InsightLearningCandidate(BaseModel):
+    """Value-free projection of one verified Insight usage."""
 
     candidate_id: str
     request_id: str
     database_id: str
     tool_name: Literal["sql_query", "code_interpreter"]
-    fact_request: DataFactRequest
-    fact_shape: dict = Field(default_factory=dict)
+    insight_request: KeyInsightRequest
+    insight_shape: dict = Field(default_factory=dict)
     evidence_types: list[str] = Field(default_factory=list)
-    dependency_fact_keys: list[str] = Field(default_factory=list)
+    dependency_insight_keys: list[str] = Field(default_factory=list)
     calculation_semantics: dict = Field(default_factory=dict)
     created_at: str
 
 
-class FactLearningJob(BaseModel):
+class InsightLearningJob(BaseModel):
     job_id: str
-    status: FactLearningStatus = "pending"
-    candidate: FactLearningCandidate
+    status: InsightLearningStatus = "pending"
+    candidate: InsightLearningCandidate
     attempt_count: int = 0
     queued_at: str
     started_at: str | None = None
@@ -193,24 +203,24 @@ class MemoryDetail(BaseModel):
 
     id: str
     card: MemoryCard
-    fact_request: DataFactRequest | None = None
+    insight_request: KeyInsightRequest | None = None
     preferred_tool: str | None = None
     guidance: str | None = None
     examples: list[str] = Field(default_factory=list)
 
 
-class FactMemory(BaseModel):
-    definitions: list[FactDefinition] = Field(default_factory=list)
-    recipes: list[FactRecipe] = Field(default_factory=list)
+class InsightMemory(BaseModel):
+    definitions: list[InsightDefinition] = Field(default_factory=list)
+    recipes: list[InsightRecipe] = Field(default_factory=list)
     cards: list[MemoryCard] = Field(default_factory=list)
     details: list[MemoryDetail] = Field(default_factory=list)
     storage_path: str | None = None
     updated_at: str | None = None
 
 
-def normalize_fact_key(value: str) -> str:
+def normalize_insight_key(value: str) -> str:
     """Normalize a model-provided semantic key without inferring aliases."""
 
     text = str(value or "").strip().lower()
     normalized = "".join(character if character.isalnum() or character in {".", "_", "-"} else "_" for character in text)
-    return "_".join(part for part in normalized.split("_") if part) or "fact"
+    return "_".join(part for part in normalized.split("_") if part) or "insight"
