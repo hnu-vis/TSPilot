@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +18,7 @@ from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from runtime.action_policy import validate_action
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.key_insight import KeyInsight, InsightEvidenceRef
+from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
 from schemas.task_contract import TaskContract, TaskContractOutput
 from schemas.visualization import VisualizationPayload
 from schemas.tool import ToolObservation
@@ -26,12 +28,23 @@ from tools.registry import build_tool_registry
 
 
 class _PlannerLlm:
-    def __init__(self, payload: str, audit_payload: str | None = None):
+    def __init__(
+        self,
+        payload: str,
+        audit_payload: str | None = None,
+        projection_payload: str | None = None,
+    ):
         self.payload = payload
+        self.projection_payload = projection_payload
         self.audit_payload = audit_payload or '{"decision":"approve","revised_visual_goals":[],"required_data_request":null}'
         self.calls = 0
 
     async def ainvoke(self, _messages):
+        if _is_projection_prompt(_messages):
+            return SimpleNamespace(
+                content=self.projection_payload or _projection_for_chart_payload(self.payload),
+                response_metadata={},
+            )
         self.calls += 1
         if "independently audit" in str(_messages[0][1]):
             return SimpleNamespace(
@@ -47,6 +60,11 @@ class _SequencePlannerLlm:
         self.calls = 0
 
     async def ainvoke(self, _messages):
+        if _is_projection_prompt(_messages):
+            return SimpleNamespace(
+                content=_projection_for_chart_payload(self.payloads[-1]),
+                response_metadata={},
+            )
         if "independently audit" in str(_messages[0][1]):
             self.calls += 1
             return SimpleNamespace(
@@ -56,6 +74,52 @@ class _SequencePlannerLlm:
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
         return SimpleNamespace(content=payload, response_metadata={})
+
+
+def _is_projection_prompt(messages) -> bool:
+    return "You are the semantic projection stage" in str(messages[0][1])
+
+
+def _projection_for_chart_payload(payload: str) -> str:
+    decoded = json.loads(payload)
+    requirement = decoded.get("required_data_request")
+    if requirement:
+        return json.dumps({"semantic_views": [], "required_data_request": requirement})
+    layers = [
+        layer
+        for goal in decoded.get("visual_goals", [])
+        for layer in goal.get("layers", [])
+    ]
+    source_ref = next(
+        (layer.get("source_ref") for layer in layers if layer.get("source_ref")),
+        "view:evidence:evi_full:default",
+    )
+    fields = []
+    seen = set()
+    for layer in layers:
+        if layer.get("source_ref") != source_ref:
+            continue
+        for value in (layer.get("encoding") or {}).values():
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                field_name = item if isinstance(item, str) else item.get("field") if isinstance(item, dict) else None
+                if field_name and field_name not in seen:
+                    seen.add(field_name)
+                    fields.append({"name": field_name, "semantic_role": field_name, "source_path": f"$.{field_name}"})
+    if not fields:
+        fields = [{"name": "value", "semantic_role": "measure", "source_path": "$.value"}]
+    view_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source_ref))
+    return json.dumps({
+        "semantic_views": [{
+            "view_id": f"test_{view_id}",
+            "name": "Test semantic view",
+            "purpose": "Support the chart plan under test",
+            "grain": "records",
+            "source_ref": source_ref,
+            "fields": fields,
+        }],
+        "required_data_request": None,
+    })
 
 
 class _WorkflowPlannerLlm:
@@ -73,6 +137,41 @@ class _WorkflowPlannerLlm:
             payload = self.plans[min(self.plan_calls, len(self.plans) - 1)]
             self.plan_calls += 1
         return SimpleNamespace(content=payload, response_metadata={})
+
+
+class _TwoStagePlannerLlm:
+    def __init__(self, *, projection: dict, chart: dict):
+        self.projection = projection
+        self.chart = chart
+        self.projection_calls = 0
+        self.chart_calls = 0
+
+    async def ainvoke(self, messages):
+        if _is_projection_prompt(messages):
+            self.projection_calls += 1
+            payload = self.projection
+        else:
+            self.chart_calls += 1
+            payload = self.chart
+        return SimpleNamespace(content=json.dumps(payload), response_metadata={})
+
+
+class _RepairingTwoStagePlannerLlm:
+    def __init__(self, *, projections: list[dict], chart: dict | list[dict]):
+        self.projections = projections
+        self.charts = chart if isinstance(chart, list) else [chart]
+        self.projection_prompts = []
+        self.chart_calls = 0
+
+    async def ainvoke(self, messages):
+        if _is_projection_prompt(messages):
+            index = min(len(self.projection_prompts), len(self.projections) - 1)
+            self.projection_prompts.append(messages)
+            payload = self.projections[index]
+        else:
+            payload = self.charts[min(self.chart_calls, len(self.charts) - 1)]
+            self.chart_calls += 1
+        return SimpleNamespace(content=json.dumps(payload), response_metadata={})
 
 
 def _state(point_count: int = 500):
@@ -115,6 +214,44 @@ def test_planner_inventory_distinguishes_materialization_from_interval_coverage(
     }
     assert source["query_context"][0]["query"] == "unit:full"
     assert "full_fidelity" not in source
+
+
+def test_planner_inventory_hides_partial_insights_but_keeps_verified_ones():
+    state = _state(25)
+    partial = KeyInsight(
+        insight_id="ins_partial",
+        insight_key="partial_point",
+        name="Partial point",
+        insight_type="point_value",
+        statement="Unverified point.",
+        method="code_interpreter",
+        status="partial",
+        items=[InsightItem(item_id="p1", timestamp="2026-01-01T01:00:00Z", value=1.0)],
+    )
+    verified = partial.model_copy(update={
+        "insight_id": "ins_verified",
+        "insight_key": "verified_point",
+        "name": "Verified point",
+        "status": "verified",
+    })
+    state.insight_set.insights = [partial, verified]
+
+    refs = {
+        item["source_ref"]
+        for item in PresentationCatalog(state).planner_inventory()["sources"]
+    }
+
+    assert "insight:ins_partial" not in refs
+    assert "insight:ins_partial#p1" not in refs
+    assert "insight:ins_verified" in refs
+    assert "insight:ins_verified#p1" not in refs
+    verified_source = next(
+        item
+        for item in PresentationCatalog(state).planner_inventory()["sources"]
+        if item["source_ref"] == "insight:ins_verified"
+    )
+    assert verified_source["insight_key"] == "verified_point"
+    assert verified_source["name"] == "Verified point"
 
 
 def _state_with_analysis_views():
@@ -164,7 +301,7 @@ def test_planner_inventory_exposes_renderable_sources_not_storage_artifacts():
     assert "view:derived_evidence:dev_endpoints" in refs
 
 
-def test_scalar_insight_inventory_cannot_be_used_as_a_timestamped_layer():
+def test_verified_numeric_scalar_inventory_supports_only_lossless_graphical_marks():
     state = _state(25)
     state.insight_set.insights = [
         KeyInsight(
@@ -181,14 +318,14 @@ def test_scalar_insight_inventory_cannot_be_used_as_a_timestamped_layer():
     ]
     inventory = PresentationCatalog(state).planner_inventory()
     source = next(item for item in inventory["sources"] if item["source_ref"] == "insight:insight_change")
-
     assert source["render_capabilities"]["scalar_only"] is True
     assert source["render_capabilities"]["timestamped_numeric"] is False
-    assert source["render_capabilities"]["supported_marks"] == ["text", "table"]
+    assert source["render_capabilities"]["renderable"] is True
+    assert source["render_capabilities"]["renderer_series_type"] == "open"
 
 
 @pytest.mark.asyncio
-async def test_audit_can_verify_scalar_conclusion_with_context_series_without_new_analysis(tmp_path):
+async def test_temporal_context_is_preferred_over_isolated_scalar_layer(tmp_path):
     state = _state(25)
     state.insight_set.insights = [
         KeyInsight(
@@ -203,28 +340,14 @@ async def test_audit_can_verify_scalar_conclusion_with_context_series_without_ne
             calculation_trace={"formula": "(end-start)/start"},
         )
     ]
-    initial_plan = (
-        '{"visual_goals":[{"purpose":"verify interval change","title":"Change",'
-        '"priority":"primary","summary":null,"required_roles":["series","change_rate"],"layers":['
+    plan = (
+        '{"visual_goals":[{"purpose":"verify interval change","title":"Change","priority":"primary",'
+        '"summary":"The scalar rate remains in the answer while the chart preserves temporal context.",'
+        '"required_roles":["series"],"layers":['
         '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
-        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
-        '{"role":"change_rate","source_ref":"insight:insight_change_rate","mark":"point",'
         '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
     )
-    revised_goals = (
-        '[{"purpose":"verify interval change","title":"Change","priority":"primary",'
-        '"summary":"The full interval and computed rate are shown together.",'
-        '"required_roles":["series","change_rate"],"layers":['
-        '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
-        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
-        '{"role":"change_rate","source_ref":"insight:insight_change_rate","mark":"text",'
-        '"encoding":{"text":"value"},"label":"24%"}]}]'
-    )
-    audit = (
-        '{"decision":"revise","revised_visual_goals":' + revised_goals
-        + ',"required_data_request":null}'
-    )
-    llm = _WorkflowPlannerLlm(plans=[initial_plan], audits=[audit])
+    llm = _PlannerLlm(plan)
     store = VisualizationArtifactStore(tmp_path)
 
     result = await VisualizationTool(
@@ -238,16 +361,16 @@ async def test_audit_can_verify_scalar_conclusion_with_context_series_without_ne
     )
 
     visualization = result["visualizations"][0]
-    assert llm.plan_calls == 1
-    assert llm.audit_calls == 1
-    assert [layer["mark"] for layer in visualization["layers"]] == ["line", "text"]
+    assert llm.calls == 1
+    assert [layer["mark"] for layer in visualization["layers"]] == ["line"]
     complete = store.get(visualization["visualization_id"])
     assert complete is not None
-    assert complete.datasets[1].metric["value"] == 0.24
+    assert len(complete.datasets) == 1
+    assert state.insight_set.insights[0].value == 0.24
 
 
 @pytest.mark.asyncio
-async def test_structured_insight_supports_located_and_metric_projections(tmp_path):
+async def test_structured_insight_supports_multiple_located_projections(tmp_path):
     state = _state(25)
     state.insight_set.insights = [
         KeyInsight(
@@ -271,15 +394,13 @@ async def test_structured_insight_supports_located_and_metric_projections(tmp_pa
     ]
     plan = (
         '{"visual_goals":[{"purpose":"verify the optimal trade","title":"Optimal trade",'
-        '"priority":"primary","summary":null,"required_roles":["series","buy","sell","return"],"layers":['
+        '"priority":"primary","summary":null,"required_roles":["series","buy","sell"],"layers":['
         '{"role":"series","source_ref":"view:evidence:evi_full:default","mark":"line",'
         '"encoding":{"x":"timestamp","y":"value"},"label":null},'
         '{"role":"buy","source_ref":"insight:insight_trade","mark":"point",'
         '"encoding":{"x":"buy_time","y":"buy_price"},"label":"Buy"},'
         '{"role":"sell","source_ref":"insight:insight_trade","mark":"point",'
-        '"encoding":{"x":"sell_time","y":"sell_price"},"label":"Sell"},'
-        '{"role":"return","source_ref":"insight:insight_trade","mark":"text",'
-        '"encoding":{},"label":"Maximum return"}]}],"required_data_request":null}'
+        '"encoding":{"x":"sell_time","y":"sell_price"},"label":"Sell"}]}],"required_data_request":null}'
     )
     store = VisualizationArtifactStore(tmp_path)
 
@@ -297,7 +418,274 @@ async def test_structured_insight_supports_located_and_metric_projections(tmp_pa
     assert complete is not None
     assert complete.datasets[1].series[0].points[0].x == "2026-01-01T00:00:00Z"
     assert complete.datasets[2].series[0].points[0].x == "2026-01-02T00:00:00Z"
-    assert complete.datasets[3].metric["max_profit_amount"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_structured_insight_accepts_semantic_encoding_channel_aliases(tmp_path):
+    state = _state(25)
+    state.insight_set.insights = [
+        KeyInsight(
+            insight_id="insight_trade_aliases",
+            insight_key="max_trade_return_aliases",
+            name="maximum single-trade return",
+            insight_type="optimization",
+            statement="Buy at 10 and sell at 25 for a profit of 15.",
+            value={
+                "max_profit": 15.0,
+                "buy_time": "2026-01-01T00:00:00Z",
+                "sell_time": "2026-01-02T00:00:00Z",
+                "buy_price": 10.0,
+                "sell_price": 25.0,
+            },
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+            calculation_trace={"formula": "sell_price-buy_price"},
+        )
+    ]
+    plan = (
+        '{"visual_goals":[{"purpose":"verify trade aliases","title":"Optimal trade",'
+        '"priority":"primary","summary":null,"required_roles":["buy","sell"],"layers":['
+        '{"role":"buy","source_ref":"insight:insight_trade_aliases","mark":"point",'
+        '"encoding":{"timestamp":"buy_time","value":"buy_price"},"label":"Buy"},'
+        '{"role":"sell","source_ref":"insight:insight_trade_aliases","mark":"point",'
+        '"encoding":{"timestamp":"sell_time","value":"sell_price"},"label":"Sell"}]}],'
+        '"required_data_request":null}'
+    )
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(
+        llm=_PlannerLlm(plan), artifact_store=store,
+    ).execute(
+        VisualizationInput(message="Verify the trade."),
+        request_state=state,
+    )
+
+    complete = store.get(result["visualization_ids"][0])
+    assert complete is not None
+    buy_points = complete.datasets[0].series[0].points
+    sell_points = complete.datasets[1].series[0].points
+    assert [(point.x, point.y) for point in buy_points] == [("2026-01-01T00:00:00Z", 10.0)]
+    assert [(point.x, point.y) for point in sell_points] == [("2026-01-02T00:00:00Z", 25.0)]
+    assert complete.layers[0].encoding == {"x": "buy_time", "y": "buy_price"}
+    assert complete.layers[1].encoding == {"x": "sell_time", "y": "sell_price"}
+
+
+@pytest.mark.asyncio
+async def test_two_stage_llm_projects_nested_forecast_insight_and_composes_interval(tmp_path):
+    state = _state(25)
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_forecast_nested",
+        insight_key="week_ahead_forecast",
+        name="week ahead forecast",
+        insight_type="series",
+        statement="Daily forecast points with central price and lower/upper uncertainty bounds.",
+        value={"direction": "上涨", "change_pct": 8.0},
+        value_shape="collection",
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+        items=[
+            InsightItem(
+                item_id="f1", label="forecast_point", timestamp="2026-01-03T00:00:00Z",
+                value={"predicted_price": 25.0, "lower_price": 22.0, "upper_price": 28.0},
+            ),
+            InsightItem(
+                item_id="f2", label="forecast_point", timestamp="2026-01-04T00:00:00Z",
+                value={"predicted_price": 27.0, "lower_price": 23.0, "upper_price": 31.0},
+            ),
+        ],
+    )]
+    projection = {
+        "semantic_views": [
+            {
+                "view_id": "history",
+                "name": "Observed price history",
+                "purpose": "Provide temporal context for the forecast",
+                "grain": "observation",
+                "source_ref": "view:evidence:evi_full:default",
+                "record_path": "$.records",
+                "fields": [
+                    {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                    {"name": "observed_price", "semantic_role": "observed_price", "source_path": "$.value"},
+                ],
+            },
+            {
+                "view_id": "forecast",
+                "name": "Forecast path and interval",
+                "purpose": "Expose the central forecast and uncertainty interval",
+                "grain": "forecast_point",
+                "source_ref": "insight:insight_forecast_nested",
+                "record_path": "$.items",
+                "fields": [
+                    {"name": "time", "semantic_role": "forecast_time", "source_path": "$.timestamp"},
+                    {"name": "central", "semantic_role": "forecast_central", "source_path": "$.value.predicted_price"},
+                    {"name": "lower", "semantic_role": "forecast_lower", "source_path": "$.value.lower_price"},
+                    {"name": "upper", "semantic_role": "forecast_upper", "source_path": "$.value.upper_price"},
+                ],
+            },
+            {
+                "view_id": "forecast_summary",
+                "name": "Forecast direction summary",
+                "purpose": "Expose the overall direction and magnitude at summary grain",
+                "grain": "forecast_summary",
+                "source_ref": "insight:insight_forecast_nested",
+                "record_path": "$.value",
+                "fields": [
+                    {"name": "direction", "semantic_role": "forecast_direction", "source_path": "$.direction"},
+                    {"name": "change_pct", "semantic_role": "forecast_change_percent", "source_path": "$.change_pct"},
+                ],
+            },
+        ],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Verify the forecast in historical context",
+            "title": "Observed and forecast price",
+            "priority": "primary",
+            "summary": "History, central forecast, and uncertainty interval.",
+            "required_roles": ["history", "forecast", "uncertainty", "direction_summary"],
+            "layers": [
+                {"role": "history", "source_ref": "semantic:history", "mark": "line", "encoding": {"x": "time", "y": "observed_price"}},
+                {"role": "forecast", "source_ref": "semantic:forecast", "mark": "line", "encoding": {"x": "time", "y": "central"}},
+                {"role": "uncertainty", "source_ref": "semantic:forecast", "mark": "band", "encoding": {"x": "time", "lower": "lower", "upper": "upper"}},
+                {"role": "direction_summary", "source_ref": "semantic:forecast_summary", "mark": "bar", "encoding": {"x": "direction", "y": "change_pct"}},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    llm = _TwoStagePlannerLlm(projection=projection, chart=chart)
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(llm=llm, artifact_store=store).execute(
+        VisualizationInput(
+            message="Show the history, week-ahead forecast, and its interval.",
+            source_refs=["evidence:evi_full", "insight:insight_forecast_nested"],
+        ),
+        request_state=state,
+    )
+
+    complete = store.get(result["visualization_ids"][0])
+    assert complete is not None
+    assert llm.projection_calls == 1
+    assert llm.chart_calls == 1
+    assert [layer.source_ref for layer in complete.layers] == [
+        "semantic:history", "semantic:forecast", "semantic:forecast", "semantic:forecast_summary",
+    ]
+    forecast_points = complete.datasets[1].series[0].points
+    interval_points = complete.datasets[2].series[0].points
+    assert [point.y for point in forecast_points] == [25.0, 27.0]
+    assert [(point.lower, point.upper) for point in interval_points] == [(22.0, 28.0), (23.0, 31.0)]
+    assert {binding.item_id for binding in complete.bindings if binding.item_id} == {"f1", "f2"}
+    summary_points = complete.datasets[3].series[0].points
+    assert [(point.x, point.y) for point in summary_points] == [("上涨", 8.0)]
+    assert complete.source_refs == [
+        "view:evidence:evi_full:default",
+        "insight:insight_forecast_nested",
+    ]
+    fresh_catalog = PresentationCatalog(state)
+    assert all(fresh_catalog.resolve(ref) for ref in complete.source_refs)
+
+
+@pytest.mark.asyncio
+async def test_semantic_projection_repairs_from_path_execution_feedback_without_chart_fallback(tmp_path):
+    invalid_projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose the requested temporal measure",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.missing.measure"},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    repaired_projection = {
+        **invalid_projection,
+        "semantic_views": [{
+            **invalid_projection["semantic_views"][0],
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+        }],
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Show the observed series",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["observed_series"],
+            "layers": [{
+                "role": "observed_series",
+                "source_ref": "semantic:observations",
+                "mark": "line",
+                "encoding": {"x": "time", "y": "measure"},
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _RepairingTwoStagePlannerLlm(
+        projections=[invalid_projection, repaired_projection], chart=chart,
+    )
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(VisualizationInput(message="Show the observed series."), request_state=_state(5))
+
+    assert len(llm.projection_prompts) == 2
+    assert "semantic source path '$.missing.measure' is unavailable in every record" in llm.projection_prompts[1][0][1]
+    assert llm.chart_calls == 1
+    assert result["visualizations"][0]["datasets"][0]["row_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_chart_requirement_repairs_ungrounded_input_evidence_with_llm(tmp_path):
+    projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose observations",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": "$.records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    requirement = {
+        "required_action": "code_interpreter",
+        "purpose": "Calculate a missing interval",
+        "message": None,
+        "required_shape": "intervals",
+        "required_fields": ["time", "lower", "upper"],
+        "required_properties": ["aligned with observations"],
+        "insight_requests": [{
+            "name": "prediction interval",
+            "insight_type": "prediction_interval",
+            "insight_key": "prediction_interval",
+        }],
+    }
+    invalid = {"visual_goals": [], "required_data_request": {**requirement, "input_evidence": "the observed data"}}
+    repaired = {"visual_goals": [], "required_data_request": {**requirement, "input_evidence": "semantic:observations"}}
+    llm = _RepairingTwoStagePlannerLlm(
+        projections=[projection], chart=[invalid, repaired],
+    )
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(VisualizationInput(message="Show a real interval."), request_state=_state(5))
+
+    assert llm.chart_calls == 2
+    assert result["status"] == "needs_sources"
+    assert result["required_data_request"]["required_action"] == "code_interpreter"
+    assert result["required_data_request"]["input_source_refs"] == ["evidence:evi_full"]
 
 
 def test_direct_timestamp_value_insight_is_a_renderable_locator():
@@ -367,12 +755,12 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
         artifact_store=VisualizationArtifactStore(tmp_path),
     ).execute(VisualizationInput(message="Show the complete series."), request_state=_state(25))
 
-    assert llm.calls == 3
+    assert llm.calls == 2
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 25
 
 
 @pytest.mark.asyncio
-async def test_materialization_repair_reenters_independent_audit(tmp_path):
+async def test_chart_plan_is_not_rejected_by_an_independent_semantic_audit(tmp_path):
     state = _state_with_analysis_views()
     state.insight_set.insights = [
         KeyInsight(
@@ -397,16 +785,13 @@ async def test_materialization_repair_reenters_independent_audit(tmp_path):
     )
     repaired = (
         '{"visual_goals":[{"purpose":"verify change","title":"Change","priority":"primary",'
-        '"summary":null,"required_roles":["base_series","endpoints","change"],"layers":['
+        '"summary":null,"required_roles":["base_series","endpoints"],"layers":['
         '{"role":"base_series","source_ref":"view:evidence:evi_full:default","mark":"line",'
         '"encoding":{"x":"timestamp","y":"value"},"label":null},'
         '{"role":"endpoints","source_ref":"view:derived_evidence:dev_endpoints","mark":"point",'
-        '"encoding":{"x":"timestamp","y":"value"},"label":null},'
-        '{"role":"change","source_ref":"insight:insight_change","mark":"text",'
-        '"encoding":{"y":"value"},"label":null}]}],"required_data_request":null}'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
     )
-    approved = '{"decision":"approve","revised_visual_goals":[],"required_data_request":null}'
-    llm = _WorkflowPlannerLlm(plans=[invalid, repaired], audits=[approved, approved])
+    llm = _SequencePlannerLlm([invalid, repaired])
 
     result = await VisualizationTool(
         llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
@@ -418,9 +803,8 @@ async def test_materialization_repair_reenters_independent_audit(tmp_path):
         request_state=state,
     )
 
-    assert llm.plan_calls == 2
-    assert llm.audit_calls == 2
-    assert result["visualizations"][0]["required_roles"] == ["base_series", "endpoints", "change"]
+    assert llm.calls == 1
+    assert result["visualizations"][0]["required_roles"] == ["base_series", "change"]
 
 
 def test_visualization_failure_receipt_does_not_expose_internal_inventory():
@@ -443,13 +827,10 @@ async def test_visualization_tool_requests_full_sql_evidence_instead_of_falling_
     )
     tool = VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path))
 
-    with pytest.raises(StructuredToolError) as caught:
-        await tool.execute(VisualizationInput(message="Show all points and max."), request_state=_state(1))
+    result = await tool.execute(VisualizationInput(message="Show all points and max."), request_state=_state(1))
 
-    failure = caught.value.validation_failure
-    assert caught.value.recommended_next_action == "sql_query"
-    assert failure["retry_policy"]["required_action"] == "sql_query"
-    assert failure["repair_contract"]["constraints"]["full_fidelity"] is True
+    assert result["status"] == "needs_sources"
+    assert result["required_data_request"]["required_action"] == "sql_query"
 
 
 @pytest.mark.asyncio
@@ -464,41 +845,50 @@ async def test_visualization_routes_missing_calculated_layer_to_code_interpreter
     )
     tool = VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path))
 
-    with pytest.raises(StructuredToolError) as caught:
-        await tool.execute(VisualizationInput(message="Show the full series and optimal trade."), request_state=_state(25))
+    result = await tool.execute(VisualizationInput(message="Show the full series and optimal trade."), request_state=_state(25))
 
-    failure = caught.value.validation_failure
-    assert caught.value.recommended_next_action == "code_interpreter"
-    assert failure["retry_policy"]["required_action"] == "code_interpreter"
-    assert failure["repair_contract"]["insight_requests"][0]["insight_key"] == "optimal_trade"
+    request = result["required_data_request"]
+    assert result["status"] == "needs_sources"
+    assert request["required_action"] == "code_interpreter"
+    assert request["insight_requests"][0]["insight_key"] == "optimal_trade"
 
 
 @pytest.mark.asyncio
-async def test_visualization_audit_rejects_plan_that_omits_requested_decision_points(tmp_path):
-    plan = (
-        '{"visual_goals":[{"purpose":"trend","title":"Trend","priority":"primary","summary":null,'
-        '"required_roles":["base_series"],"layers":[{"role":"base_series",'
-        '"source_ref":"view:evidence:evi_full:default","mark":"line",'
-        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
+async def test_visualization_normalizes_view_ref_for_code_interpreter_repair_contract(tmp_path):
+    llm = _PlannerLlm(
+        '{"visual_goals":[],"required_data_request":{"required_action":"code_interpreter",'
+        '"purpose":"derive renderer-ready dimensions","required_shape":"records",'
+        '"required_fields":["timestamp","value"],"required_properties":["preserve values"],'
+        '"input_evidence":"view:evidence:evi_full:default","insight_requests":[{'
+        '"insight_key":"renderer_dimensions","name":"Renderer dimensions","insight_type":"series"}]}}'
     )
-    audit = (
-        '{"decision":"need_data","revised_visual_goals":[],"required_data_request":{'
+    tool = VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path))
+
+    result = await tool.execute(VisualizationInput(message="Show a specialized chart."), request_state=_state(25))
+
+    assert result["required_data_request"]["input_source_refs"] == ["evidence:evi_full"]
+
+
+@pytest.mark.asyncio
+async def test_visualization_planner_requests_missing_decision_points(tmp_path):
+    plan = (
+        '{"visual_goals":[],"required_data_request":{'
         '"required_action":"code_interpreter","purpose":"calculate requested buy and sell points",'
         '"required_shape":"decision_points","required_fields":["timestamp","value"],'
         '"required_properties":["buy precedes sell"],"insight_requests":[{'
         '"insight_key":"optimal_trade","name":"Optimal single trade","insight_type":"optimization"}]}}'
     )
     tool = VisualizationTool(
-        llm=_PlannerLlm(plan, audit_payload=audit), artifact_store=VisualizationArtifactStore(tmp_path),
+        llm=_PlannerLlm(plan), artifact_store=VisualizationArtifactStore(tmp_path),
     )
 
-    with pytest.raises(StructuredToolError) as caught:
-        await tool.execute(
-            VisualizationInput(message="Show the complete series with buy and sell points."),
-            request_state=_state(25),
-        )
+    result = await tool.execute(
+        VisualizationInput(message="Show the complete series with buy and sell points."),
+        request_state=_state(25),
+    )
 
-    assert caught.value.recommended_next_action == "code_interpreter"
+    assert result["status"] == "needs_sources"
+    assert result["required_data_request"]["required_action"] == "code_interpreter"
 
 
 def test_visualization_data_endpoint_returns_complete_artifact(tmp_path, monkeypatch):
@@ -566,7 +956,12 @@ async def test_completion_distinguishes_full_timeseries_evidence_from_visual_del
         '{"visual_goals":[{"purpose":"trend","title":"Trend","priority":"primary","summary":null,'
         '"required_roles":["series"],"layers":[{"role":"series",'
         '"source_ref":"view:evidence:evi_full:default","mark":"line",'
-        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}'
+        '"encoding":{"x":"timestamp","y":"value"},"label":null}]}],"required_data_request":null}',
+        audit_payload=(
+            '{"decision":"approve","requirement_assessments":[{"requirement_id":"visualization",'
+            '"status":"satisfied","evidence_roles":["series"],"explanation":"The complete series is drawn."}],'
+            '"revised_visual_goals":[],"required_data_request":null}'
+        ),
     )
     result = await VisualizationTool(
         llm=llm,

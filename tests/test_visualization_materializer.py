@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,12 +45,51 @@ def test_catalog_exposes_typed_bounded_data_views():
     inventory = PresentationCatalog(_state(rows)).planner_inventory()
 
     view = next(item for item in inventory["sources"] if item["source_ref"] == "view:evidence:evi_series:default")
-    assert inventory["schema_version"] == "3"
+    assert inventory["schema_version"] == "semantic-source-v1"
     assert view["shape"] == "timeseries"
     assert view["row_count"] == len(rows)
     assert {field["name"] for field in view["schema_fields"]} == {"timestamp", "value"}
     assert len(view["preview"]) == 4
     assert "rows" not in view
+
+
+def test_semantic_projection_supports_sparse_fields_in_heterogeneous_records():
+    state = _state([{"timestamp": "2026-01-01", "value": 10.0}])
+    state.derived_evidence_artifacts["dev_mixed"] = DerivedEvidence(
+        evidence_id="dev_mixed",
+        name="History and forecast",
+        shape="timeseries",
+        rows=[
+            {"timestamp": "2026-01-01", "value": 10.0, "type": "history"},
+            {
+                "timestamp": "2026-01-02", "value": 11.0, "type": "forecast",
+                "lower": 9.0, "upper": 13.0,
+            },
+        ],
+        lineage=["evidence:evi_series"],
+        transform_summary="Combined existing history and forecast rows.",
+    )
+    catalog = PresentationCatalog(state)
+    plan = SimpleNamespace(
+        view_id="mixed_interval",
+        name="Mixed interval",
+        grain="time_point",
+        source_ref="view:derived_evidence:dev_mixed",
+        record_path="$.records",
+        fields=[
+            SimpleNamespace(name="time", semantic_role="time", source_path="$.timestamp"),
+            SimpleNamespace(name="lower", semantic_role="prediction_lower", source_path="$.lower"),
+            SimpleNamespace(name="upper", semantic_role="prediction_upper", source_path="$.upper"),
+        ],
+    )
+
+    refs = catalog.materialize_semantic_views([plan])
+    rows = catalog.resolve(refs[0]).value.rows
+
+    assert rows == [
+        {"time": "2026-01-01", "lower": None, "upper": None},
+        {"time": "2026-01-02", "lower": 9.0, "upper": 13.0},
+    ]
 
 
 def test_layers_keep_base_series_and_semantic_insight_items_separate():
@@ -109,34 +149,31 @@ def test_derived_evidence_preserves_authoritative_anomaly_lineage():
     assert result.source_refs == ["view:derived_evidence:dev_clean", "view:anomaly:anomaly_evi_series:points"]
 
 
-def test_semantic_validator_rejects_missing_required_role():
+def test_materializer_preserves_llm_authored_roles_without_rematching_them():
     state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
     goal = _goal(
         VisualLayerPlan(role="series", source_ref="view:evidence:evi_series:default", mark="line", encoding={"x": "timestamp", "y": "value"}),
         required_roles=["series", "decision_point"],
     )
-    with pytest.raises(ValueError, match="missing required roles"):
-        VisualizationMaterializer(state).materialize(goal)
+    result = VisualizationMaterializer(state).materialize(goal)
+    assert result.required_roles == ["series", "decision_point"]
+    assert [layer.role for layer in result.layers] == ["series"]
 
 
-def test_semantic_validator_rejects_unavailable_encoding_field():
+def test_materializer_does_not_apply_a_second_business_field_matcher():
     state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
     goal = _goal(VisualLayerPlan(
         role="series", source_ref="view:evidence:evi_series:default", mark="line",
         encoding={"x": "invented_time", "y": "value"},
     ))
-    with pytest.raises(ValueError, match="unavailable fields"):
-        VisualizationMaterializer(state).materialize(goal)
+    result = VisualizationMaterializer(state).materialize(goal)
+    assert result.layers[0].encoding == {"x": "invented_time", "y": "value"}
 
 
-def test_table_is_a_first_class_mark():
-    rows = [{"category": "a", "value": 1.0}, {"category": "b", "value": 2.0}]
-    result = VisualizationMaterializer(_state(rows)).materialize(_goal(
-        VisualLayerPlan(role="details", source_ref="view:evidence:evi_series:default", mark="table", encoding={"columns": ["category", "value"]}),
-    ))
-    assert result.layers[0].mark == "table"
-    assert result.datasets[0].rows == rows
-    assert result.datasets[0].columns == ["category", "value"]
+@pytest.mark.parametrize("mark", ["text", "table"])
+def test_non_visual_marks_are_rejected_by_the_contract(mark):
+    with pytest.raises(ValueError, match="not a graphical visualization mark"):
+        VisualLayerPlan(role="details", source_ref="view:evidence:evi_series:default", mark=mark, encoding={})
 
 
 def test_structured_field_encodings_are_normalized_to_public_field_names():
@@ -148,7 +185,7 @@ def test_structured_field_encodings_are_normalized_to_public_field_names():
     assert result.layers[0].encoding == {"x": "timestamp", "y": "value"}
 
 
-def test_one_grounded_scalar_record_can_drive_multiple_semantic_point_layers_and_table():
+def test_one_grounded_record_can_drive_multiple_semantic_point_layers():
     state = _state([{"timestamp": "2026-01-01", "value": 1.0}])
     trade = KeyInsight(
         insight_id="insight_trade_record", name="Optimal trade", insight_type="analysis",
@@ -163,9 +200,210 @@ def test_one_grounded_scalar_record_can_drive_multiple_semantic_point_layers_and
     result = VisualizationMaterializer(state).materialize(_goal(
         VisualLayerPlan(role="buy", source_ref="insight:insight_trade_record", mark="point", encoding={"x": "buy_time", "y": "buy_price"}),
         VisualLayerPlan(role="sell", source_ref="insight:insight_trade_record", mark="point", encoding={"x": "sell_time", "y": "sell_price"}),
-        VisualLayerPlan(role="summary", source_ref="insight:insight_trade_record", mark="table", encoding={}),
     ))
 
     assert result.datasets[0].series[0].points[0].y == 10.0
     assert result.datasets[1].series[0].points[0].y == 15.0
-    assert result.datasets[2].rows[0]["profit"] == 5.0
+
+
+def test_materializer_allows_llm_to_reuse_a_projection_for_distinct_visual_roles():
+    state = _state([
+        {"timestamp": "2026-01-01", "value": 10.0, "role": "buy"},
+        {"timestamp": "2026-01-02", "value": 15.0, "role": "sell"},
+    ])
+    goal = _goal(
+        VisualLayerPlan(
+            role="buy", source_ref="view:evidence:evi_series:default", mark="point",
+            encoding={"x": "timestamp", "y": "value"},
+        ),
+        VisualLayerPlan(
+            role="sell", source_ref="view:evidence:evi_series:default", mark="point",
+            encoding={"x": "timestamp", "y": "value"},
+        ),
+    )
+
+    result = VisualizationMaterializer(state).materialize(goal)
+    assert [layer.role for layer in result.layers] == ["buy", "sell"]
+
+
+def test_read_only_filters_create_distinct_layers_without_mutating_upstream_rows():
+    rows = [
+        {"timestamp": "2026-01-01", "value": 10.0, "role": "buy"},
+        {"timestamp": "2026-01-02", "value": 15.0, "role": "sell"},
+    ]
+    state = _state(rows)
+    original = [dict(row) for row in state.latest_database_evidence.data["rows"]]
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan.model_validate({
+            "role": "buy", "source_ref": "view:evidence:evi_series:default", "mark": "point",
+            "encoding": {"x": "timestamp", "y": "value", "color": "role", "shape": "role"},
+            "transform": [{"type": "filter", "field": "role", "operator": "eq", "value": "buy"}],
+        }),
+        VisualLayerPlan.model_validate({
+            "role": "sell", "source_ref": "view:evidence:evi_series:default", "mark": "point",
+            "encoding": {"x": "timestamp", "y": "value", "color": "role", "shape": "role"},
+            "transform": [{"type": "filter", "field": "role", "operator": "eq", "value": "sell"}],
+        }),
+    ))
+
+    assert [dataset.series[0].points[0].y for dataset in result.datasets] == [10.0, 15.0]
+    assert [layer.transform[0]["value"] for layer in result.layers] == ["buy", "sell"]
+    assert state.latest_database_evidence.data["rows"] == original
+
+
+def test_visual_transform_contract_rejects_calculation_operations():
+    with pytest.raises(ValueError, match="Input should be 'filter'"):
+        VisualLayerPlan.model_validate({
+            "role": "profit", "source_ref": "view:evidence:evi_series:default", "mark": "line",
+            "encoding": {"x": "timestamp", "y": "value"},
+            "transform": [{"type": "calculate", "field": "profit", "value": "sell-buy"}],
+        })
+
+
+def test_category_encoding_splits_one_grounded_source_into_visual_series():
+    state = _state([
+        {"timestamp": "2026-01-01", "value": 10.0, "role": "buy"},
+        {"timestamp": "2026-01-02", "value": 15.0, "role": "sell"},
+    ])
+    result = VisualizationMaterializer(state).materialize(_goal(VisualLayerPlan(
+        role="trade", source_ref="view:evidence:evi_series:default", mark="point",
+        encoding={"x": "timestamp", "y": "value", "series": "role", "color": "role", "shape": "role"},
+    )))
+
+    assert [series.name for series in result.datasets[0].series] == ["trade: buy", "trade: sell"]
+    assert [series.points[0].metadata["role"] for series in result.datasets[0].series] == ["buy", "sell"]
+    assert state.latest_database_evidence.data["rows"][0]["role"] == "buy"
+
+
+def test_verified_return_rate_scalar_is_losslessly_projected_as_a_bar():
+    state = _state([{"timestamp": "2026-01-01", "value": 10.0}])
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_return_rate", insight_key="return_rate", name="Return rate",
+        insight_type="point_value", statement="Return rate is 44.3196 percent.", value=44.3196,
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_series")],
+        calculation_trace={"formula": "upstream_verified_return_rate", "unit": "percent"},
+    )]
+
+    result = VisualizationMaterializer(state).materialize(_goal(VisualLayerPlan(
+        role="return_rate", source_ref="insight:insight_return_rate", mark="bar",
+        encoding={"x": "label", "y": "value"}, label="Return rate (%)",
+    )))
+
+    point = result.datasets[0].series[0].points[0]
+    assert point.x == "Return rate"
+    assert point.y == 44.3196
+    assert state.insight_set.insights[0].value == 44.3196
+
+
+def test_line_segment_highlight_preserves_full_context_and_upstream_values():
+    rows = [
+        {"timestamp": f"2026-01-0{day}T00:00:00Z", "value": float(day)}
+        for day in range(1, 6)
+    ]
+    state = _state(rows)
+    original = [dict(row) for row in state.latest_database_evidence.data["rows"]]
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(
+            role="full_series", source_ref="view:evidence:evi_series:default", mark="line",
+            encoding={"x": "timestamp", "y": "value"},
+        ),
+        VisualLayerPlan.model_validate({
+            "role": "highlighted_interval", "source_ref": "view:evidence:evi_series:default", "mark": "line",
+            "encoding": {"x": "timestamp", "y": "value"},
+            "transform": [{
+                "type": "filter", "field": "timestamp", "operator": "between",
+                "value": ["2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"],
+            }],
+        }),
+    ))
+
+    assert len(result.datasets[0].series[0].points) == 5
+    assert [point.y for point in result.datasets[1].series[0].points] == [2.0, 3.0, 4.0]
+    assert state.latest_database_evidence.data["rows"] == original
+
+
+def test_renderer_native_mark_multi_field_encoding_and_presentation_are_open_ended():
+    rows = [{
+        "timestamp": "2026-01-01T00:00:00Z",
+        "open": 10.0, "close": 12.0, "low": 9.0, "high": 13.0,
+        "volume": 1200.0,
+    }]
+    state = _state(rows)
+    original = [dict(row) for row in state.latest_database_evidence.data["rows"]]
+    result = VisualizationMaterializer(state).materialize(_goal(VisualLayerPlan(
+        role="ohlc", source_ref="view:evidence:evi_series:default", mark="candlestick",
+        encoding={
+            "x": "timestamp", "y": ["open", "close", "low", "high"],
+            "tooltip": ["timestamp", "volume"],
+        },
+        presentation={
+            "itemStyle": {"color": "#087f5b", "color0": "#b42318"},
+            "emphasis": {"focus": "series"},
+        },
+    )))
+
+    assert result.layers[0].mark == "candlestick"
+    assert result.layers[0].encoding["y"] == ["open", "close", "low", "high"]
+    assert result.layers[0].encoding["tooltip"] == ["timestamp", "volume"]
+    assert result.layers[0].presentation["emphasis"] == {"focus": "series"}
+    assert result.datasets[0].series[0].points[0].metadata == rows[0]
+    assert state.latest_database_evidence.data["rows"] == original
+
+
+@pytest.mark.parametrize("data_key", ["data", "source", "dataset", "series", "encode", "dimensions"])
+def test_renderer_presentation_cannot_override_grounded_data_binding(data_key):
+    state = _state([{"timestamp": "2026-01-01T00:00:00Z", "value": 10.0}])
+    layer = VisualLayerPlan(
+        role="series", source_ref="view:evidence:evi_series:default", mark="effectScatter",
+        encoding={"x": "timestamp", "y": "value"},
+        presentation={"emphasis": {data_key: [{"value": 999.0}]}},
+    )
+
+    with pytest.raises(ValueError, match="may carry data"):
+        VisualizationMaterializer(state).materialize(_goal(layer))
+
+
+def test_renderer_native_highlight_type_is_not_rejected_by_semantic_role_shape_rules():
+    state = _state([{"timestamp": "2026-01-01T00:00:00Z", "value": 10.0}])
+    result = VisualizationMaterializer(
+        state, visual_constraints={"required_highlights": ["decision"]},
+    ).materialize(_goal(VisualLayerPlan(
+        role="decision", source_ref="view:evidence:evi_series:default", mark="effectScatter",
+        encoding={"x": "timestamp", "y": "value"},
+        presentation={"rippleEffect": {"scale": 3}},
+    )))
+
+    assert result.layers[0].mark == "effectScatter"
+
+
+def test_chart_level_presentation_is_kept_separate_from_series_and_data():
+    state = _state([{"timestamp": "2026-01-01T00:00:00Z", "value": 10.0}])
+    goal = VisualGoal(
+        purpose="show intensity", title="Heatmap", required_roles=["intensity"],
+        presentation={
+            "visualMap": {"type": "continuous", "calculable": True},
+            "dataZoom": [{"type": "inside"}],
+            "tooltip": {"trigger": "item"},
+        },
+        layers=[VisualLayerPlan(
+            role="intensity", source_ref="view:evidence:evi_series:default", mark="heatmap",
+            encoding={"x": "timestamp", "value": "value"},
+            presentation={"emphasis": {"focus": "series"}},
+        )],
+    )
+
+    result = VisualizationMaterializer(state).materialize(goal)
+
+    assert result.presentation["visualMap"]["type"] == "continuous"
+    assert result.presentation["dataZoom"] == [{"type": "inside"}]
+    assert "visualMap" not in result.layers[0].presentation
+
+
+def test_between_filter_requires_exactly_two_boundaries():
+    with pytest.raises(ValueError, match="exactly two boundary values"):
+        VisualLayerPlan.model_validate({
+            "role": "interval", "source_ref": "view:evidence:evi_series:default", "mark": "line",
+            "encoding": {"x": "timestamp", "y": "value"},
+            "transform": [{"type": "filter", "field": "timestamp", "operator": "between", "value": ["t0"]}],
+        })

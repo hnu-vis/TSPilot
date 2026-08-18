@@ -156,9 +156,11 @@ def test_format_answer_supports_visualizations_grounded_by_insight_items(tmp_pat
     assert result["claims"][0]["item_ids"] == ["buy"]
 
 
-def test_planner_inventory_contains_marks_views_and_no_renderer_templates():
+def test_planning_inventories_separate_raw_semantics_from_renderer_contract():
     inventory = PresentationCatalog(_state()).planner_inventory()
-    assert "line" in inventory["marks"] and "table" in inventory["marks"]
+    assert inventory["schema_version"] == "semantic-source-v1"
+    assert "renderer" not in inventory
+    assert "marks" not in inventory
     assert any(item["source_ref"] == "view:evidence:evi_prices:default" for item in inventory["sources"])
     assert "templates" not in inventory
 

@@ -96,6 +96,25 @@ def test_sql_query_drops_non_scalar_insight_hints_without_blocking_evidence_quer
     assert validated.constraints["unsupported_insight_requests"][0]["insight_key"] == "rate_series"
 
 
+def test_sql_query_drops_decision_time_disguised_as_dataset_boundary():
+    validated = SqlQueryInput(
+        message="return the complete price series for later optimization",
+        database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
+        insight_requests=[{
+            "name": "best buy time",
+            "insight_type": "time_boundary",
+            "insight_key": "best_single_trade_buy_time",
+            "requirements": {"time_position": "start", "measure": "buy_time"},
+            "semantic_class": "single_trade_timing",
+        }],
+    )
+
+    assert validated.insight_requests == []
+    rejected = validated.constraints["unsupported_insight_requests"][0]
+    assert rejected["insight_key"] == "best_single_trade_buy_time"
+    assert "code_interpreter" in rejected["contract_error"]
+
+
 def test_llm_generated_query_normalizes_object_required_outputs():
     generated = LLMGeneratedQuery.model_validate(
         {

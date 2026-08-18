@@ -5,6 +5,7 @@ from runtime.conversation_state import sync_from_request
 from runtime.tool_executor import ToolExecutor
 from schemas.database import DatabaseEvidence
 from schemas.state import ConversationStateModel, RequestStateModel
+from schemas.timeseries import AnomalyResult
 from schemas.tool import ToolCall
 
 
@@ -570,3 +571,108 @@ def test_bound_code_insight_preserves_planned_dependencies():
     assert coverage.partial == ["change"]
     assert insight.derived_from == ["price.start", "price.end"]
     assert insight.status == "partial"
+
+
+def test_traced_anomaly_artifact_semantic_alias_becomes_evidence_lineage():
+    request_state = _request_state()
+    anomaly_id = "anomaly_evi_prices"
+    request_state.anomaly_artifacts[anomaly_id] = AnomalyResult(
+        anomaly_id=anomaly_id,
+        detector_name="zscore",
+        anomaly_points=[{"timestamp": "2023-01-01T00:00:00Z", "value": 999.0}],
+    )
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="code_interpreter",
+            iteration=1,
+            tool_input={
+                "insight_requests": [{
+                    "insight_key": "optimal_trade",
+                    "name": "optimal trade",
+                    "insight_type": "optimization",
+                    "derived_from": ["anomaly_detection"],
+                }]
+            },
+        )
+    )
+
+    coverage = register_key_insights_from_payload(
+        request_state,
+        "code_interpreter",
+        {
+            "analysis_id": "ana_trade",
+            "input_evidence_id": "evi_prices",
+            "produced_insights": [{
+                "insight_key": "optimal_trade",
+                "name": "optimal trade",
+                "insight_type": "optimization",
+                "statement": "Buy at 10 and sell at 15.",
+                "value": {"profit": 5.0},
+                "items": [
+                    {"item_id": "buy", "value": 10.0, "timestamp": "2023-01-02T00:00:00Z", "label": "buy"},
+                    {"item_id": "sell", "value": 15.0, "timestamp": "2023-01-03T00:00:00Z", "label": "sell"},
+                ],
+                "calculation_trace": {
+                    "source_ref": f"anomaly:{anomaly_id}",
+                    "method": "remove the authoritative anomaly points, then maximize sell - buy",
+                },
+                "evidence_refs": [
+                    {"source_type": "analysis", "source_id": "ana_trade"},
+                    {"source_type": "query", "source_id": "evi_prices"},
+                ],
+            }],
+        },
+    )
+
+    insight = request_state.insight_set.insights[0]
+    assert coverage.verified == ["optimal trade"]
+    assert insight.status == "verified"
+    assert insight.derived_from == []
+    assert ("anomaly", anomaly_id) in {
+        (ref.source_type, ref.source_id) for ref in insight.evidence_refs
+    }
+    assert all(item.evidence_refs for item in insight.items)
+
+
+def test_untraced_artifact_dependency_remains_partial():
+    request_state = _request_state()
+    anomaly_id = "anomaly_evi_prices"
+    request_state.anomaly_artifacts[anomaly_id] = AnomalyResult(
+        anomaly_id=anomaly_id,
+        detector_name="zscore",
+    )
+    request_state.tool_history.append(
+        ToolCall(
+            tool_name="code_interpreter",
+            iteration=1,
+            tool_input={
+                "insight_requests": [{
+                    "insight_key": "optimal_trade",
+                    "name": "optimal trade",
+                    "insight_type": "optimization",
+                    "derived_from": [anomaly_id],
+                }]
+            },
+        )
+    )
+
+    coverage = register_key_insights_from_payload(
+        request_state,
+        "code_interpreter",
+        {
+            "produced_insights": [{
+                "insight_key": "optimal_trade",
+                "name": "optimal trade",
+                "insight_type": "optimization",
+                "statement": "Profit is 5.",
+                "value": 5.0,
+                "calculation_trace": {"method": "sell - buy"},
+                "evidence_refs": [{"source_type": "query", "source_id": "evi_prices"}],
+            }],
+        },
+    )
+
+    insight = request_state.insight_set.insights[0]
+    assert coverage.partial == ["optimal trade"]
+    assert insight.status == "partial"
+    assert "unverified_dependencies" in insight.quality_flags
