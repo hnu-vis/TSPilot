@@ -44,6 +44,7 @@ class ObservationFrame:
     latest_failure_payload: dict = field(default_factory=dict)
     latest_database_evidence_empty: bool = False
     downstream_analysis_request: dict | None = None
+    pending_source_request: dict | None = None
     shape_recovery_request: dict | None = None
     completion_missing_outputs: tuple[str, ...] = ()
     completion_reason: str | None = None
@@ -61,6 +62,7 @@ class ObservationFrame:
             "latest_failure_payload": self.latest_failure_payload,
             "latest_database_evidence_empty": self.latest_database_evidence_empty,
             "downstream_analysis_request": self.downstream_analysis_request,
+            "pending_source_request": self.pending_source_request,
             "shape_recovery_request": self.shape_recovery_request,
             "completion_missing_outputs": list(self.completion_missing_outputs),
             "completion_reason": self.completion_reason,
@@ -74,6 +76,7 @@ def build_observation_frame(
     requires_initial_todo_plan: bool = False,
     latest_database_evidence_empty: bool = False,
     downstream_analysis_request: dict | None = None,
+    pending_source_request: dict | None = None,
     shape_recovery_request: dict | None = None,
     completion_missing_outputs: list[str] | None = None,
     completion_reason: str | None = None,
@@ -103,6 +106,7 @@ def build_observation_frame(
         latest_failure_payload=latest_failure.payload if latest_failure and isinstance(latest_failure.payload, dict) else {},
         latest_database_evidence_empty=latest_database_evidence_empty,
         downstream_analysis_request=downstream_analysis_request,
+        pending_source_request=pending_source_request,
         shape_recovery_request=shape_recovery_request,
         completion_missing_outputs=tuple(completion_missing_outputs or []),
         completion_reason=completion_reason,
@@ -145,13 +149,15 @@ def state_capabilities(request_state: RequestStateModel) -> list[str]:
         if not getattr(output, "required", False):
             continue
         evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
-        if any(token in evidence_kind for token in ("anomaly", "outlier", "spike")):
+        output_type = str(getattr(output, "output_type", "") or "").strip().lower()
+        semantic_kind = f"{evidence_kind} {output_type}"
+        if any(token in semantic_kind for token in ("anomaly", "outlier", "spike")):
             values.append("anomaly")
-        elif any(token in evidence_kind for token in ("forecast", "predict")):
+        elif any(token in semantic_kind for token in ("forecast", "predict")):
             values.append("forecast")
-        elif any(token in evidence_kind for token in ("analysis", "derived", "statistical", "computed", "calculated", "custom")):
+        elif any(token in semantic_kind for token in ("analysis", "derived", "statistical", "computed", "calculated", "custom")):
             values.append("analysis")
-        elif any(token in evidence_kind for token in ("query", "database", "sql", "raw", "time_series", "timeseries")):
+        elif any(token in semantic_kind for token in ("query", "database", "sql", "raw", "time_series", "timeseries")):
             values.append("query")
         elif evidence_kind in {"rag", "skill"}:
             values.append(evidence_kind)

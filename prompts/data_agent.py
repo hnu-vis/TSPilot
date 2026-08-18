@@ -28,17 +28,27 @@ class DataAgentPromptBuilder:
             "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate.\n"
             "Language policy: task.response_language controls all natural-language fields; keep JSON keys, action names, identifiers, and database values unchanged.\n"
             "Core ReAct rule: Thought_n selects Action_n; runtime provides Observation_n; Thought_n+1 must use Observation_n and progress_summary before choosing the next action.\n"
+            "A successful tool observation proves artifact production only. Complete the active todo only when previous_observation_assessment confirms its acceptance criteria from the returned artifact.\n"
+            "In previous_observation_assessment, set completed_active_todo=true whenever the immediately previous observation satisfies the current in_progress Todo. If completed_todos includes the current Todo number/content, completed_active_todo must also be true; next_active_todo must identify the following unfinished Todo. Do not claim a future Todo complete from a prerequisite or from code that substitutes for its owning specialized tool.\n"
             "Do not repeat actions listed as completed in progress_summary unless last_observation says the existing artifact is insufficient.\n"
             "The context field state.next_action_constraints is authoritative. If it lists required_actions, choose one of them; if it lists prohibited_actions, do not choose those actions.\n"
             "Use the smallest next action that fills the current missing capability. When all requested capabilities are covered, call terminate.\n"
+            "Task-contract coverage is semantic, not a list of available tools. Give every independently requested user-facing "
+            "answer its own required output. A forecast artifact covers the future series, but it does not by itself cover requested "
+            "derived conclusions such as direction, endpoint change, percentage change, threshold crossing, ranking, or comparison. "
+            "Represent each such conclusion as output_type=analysis and evidence_kind=calculated, with success_criteria naming the "
+            "required values; satisfy it through code_interpreter grounded in the owning forecast/anomaly/evidence source. Do not let "
+            "a chart or a terminate narrative substitute for that calculation.\n"
             "Visual verification is a core completion requirement. When authoring or refining task_contract, add a required output with output_type=visualization for analytical conclusions that have a natural visual form, including time-series extrema, anomalies, trends, forecasts, intervals, and timestamped decision points. Pure metadata or explanatory answers need no forced chart. "
             "The visual verification output succeeds only when the conclusion is a grounded layer over contextual data covering the complete user analysis interval at the granularity needed to inspect it.\n"
             "Exact numeric claims in terminate must be grounded by artifact refs and verified insight state in context. Never do mental arithmetic in terminate. "
             "Use visualization after evidence/analysis is ready whenever task_contract requires visual verification, even if the user did not explicitly ask for a chart. Its action_input contains message, optional source_refs, and optional constraints; never author marks, layers, renderer options, or data arrays in the outer action. "
-            "The visualization tool owns semantic planning and verifies complete contextual coverage. If it reports missing evidence, follow the returned sql_query, anomaly, or code_interpreter repair contract before retrying visualization. A SQL query made only to add visual context does not invalidate or require rerunning unrelated existing analysis artifacts. "
+            "The visualization tool owns semantic planning and verifies complete contextual coverage. If it reports missing evidence, follow the returned sql_query, anomaly, forecast, or code_interpreter repair contract before retrying visualization. A SQL query made only to add visual context does not invalidate or require rerunning unrelated existing analysis artifacts. "
+            "When visualization returns status=needs_sources, it has not created a visualization. Keep the visualization todo active, call required_data_request.required_action with its exact input_source_refs and insight_requests, then retry visualization. "
             "Treat max_points as a prompt/presentation budget. Do not use it to reduce persisted raw evidence needed for anomaly detection, forecasting, exact extrema, optimization, or other calculations; those tools require the complete analysis interval at the necessary granularity. "
             "For terminate, action_input must contain response_plan with title, summary, sections, and visualization_ids. Each section has section_type, heading, content, and source_refs. "
             "Use only visualization_ids returned by successful visualization observations. In section source_refs, cite evidence/insight/view refs; a visualization section may also cite a selected visualization as visualization:<id> or its returned bare id. The final formatter only assembles existing artifacts and never creates charts or queries data. "
+            "When a visualization section cites a successful visualization:<id>, do not manually repeat its internal view or layer source refs; the visualization artifact already preserves that lineage, and copying internal refs creates avoidable citation errors. "
             "Terminate schema: {\"response_plan\":{\"title\":str|null,\"summary\":str,\"sections\":[{\"section_type\":str,\"heading\":str|null,\"content\":str,\"source_refs\":[str]}],\"visualization_ids\":[str]},\"unavailable_outputs\":[str],\"unavailable_reason\":str|null}. "
             "SQL boundary: the outer ReAct agent must not write SQL, Flux, PromQL, database query code, schema-linking logic, dialect logic, or repair code. "
             "For sql_query, provide only natural-language message and optional purpose describing the evidence needed.\n"
@@ -49,11 +59,15 @@ class DataAgentPromptBuilder:
             "SQL should produce evidence-backed atomic key insights; code_interpreter should produce derived or analytical key insights.\n"
             "SQL Key Insight contracts support point_value or time_boundary with requirements.time_position=start|end, extreme with "
             "requirements.operator=min|max, and count. Use time_boundary for timestamps and point_value only for scalar measure values. "
+            "SQL time_boundary means only the first or last timestamp of the queried dataset. Never use it for optimal buy/sell time, intervention time, anomaly time, forecast event time, or any other calculated/selected decision point; those belong to code_interpreter or their owning analysis artifact. "
             "Use count only when the requested insight is a row/record count. Tables, detail lists, and complete time series are query Evidence "
             "Artifacts, not scalar Key Insights, so leave insight_requests empty for those outputs. Do not request change, ratio, trend, or other derived Key Insight types from sql_query.\n"
             "Code interpreter boundary: use code_interpreter only to calculate derived or analytical Key Insights from grounded Evidence or verified parent Insights. "
+            "Use source_refs when the calculation depends on forecast, anomaly, derived_evidence, insight, or multiple artifacts; preserve the exact refs returned by a visualization source request. "
+            "Code interpreter must not replace forecast or anomaly: call the owning specialized tool first, then use code_interpreter only to derive requested conclusions from that artifact. "
             "Every call must include the exact non-empty insight_requests it should calculate; every request object must contain insight_key, name, and insight_type, plus optional requirements or derived_from. "
             "Do not use type as an alias for insight_type, and do not request unrelated supporting metrics. Python code is optional because the tool can generate it internally.\n"
+            "When a calculated event or decision must be located on a visualization, request a collection/series Insight whose items each contain the semantic role label, timestamp, and numeric value, or separate point Insights that each contain both timestamp and numeric value. Do not split one located point into unrelated scalar time and scalar value Insights, do not model a calculated decision time as time_boundary, and do not request raw visualization context as an evidence Insight from code_interpreter.\n"
             "Code interpreter sandbox contract: generated Python code receives canonical variables df, time, value, "
             "time_col, value_col, series, analysis_context, plus compatibility variables data, rows, points, columns, "
             "metadata, and diagnostics. Prefer value/time/df/series; do not guess business field names or index raw "
@@ -119,7 +133,7 @@ class DataAgentPromptBuilder:
         if action == "todowrite":
             return ["message", "todos", "task_contract?"]
         if action == "code_interpreter":
-            return ["database_evidence", "analysis_goal", "insight_requests", "code?", "constraints?"]
+            return ["source_refs?", "database_evidence?", "analysis_goal", "insight_requests", "code?", "constraints?"]
         if action == "forecast":
             return ["database_evidence", "horizon", "constraints?"]
         if action == "anomaly":
@@ -207,7 +221,7 @@ class DataAgentPromptBuilder:
             iteration = output.meta.get("iteration") if isinstance(output.meta, dict) else None
             progress.append(
                 {
-                    "status": "completed",
+                    "status": "artifact_available",
                     "step": iteration,
                     "action": output.tool_name,
                     "resource_ref": output.resource_ref,
@@ -231,6 +245,7 @@ class DataAgentPromptBuilder:
             "anomaly": "anomaly",
             "rag": "external_knowledge",
             "skill": "skill",
+            "visualization": "visualization",
         }.get(str(tool_name or "").strip())
 
     def _todo_progress_context(

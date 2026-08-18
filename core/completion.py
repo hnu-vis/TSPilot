@@ -692,7 +692,11 @@ def apply_previous_observation_assessment(
     if reconciled is not None:
         return reconciled
 
-    if not assessment.completed_active_todo:
+    assessment_completed_current = (
+        assessment.completed_active_todo
+        or _assessment_lists_current_todo(assessment, current, current_index)
+    )
+    if not assessment_completed_current:
         evaluation = CompletionEvaluation(
             False,
             assessment.reason or "LLM assessment did not mark the active todo complete.",
@@ -727,7 +731,12 @@ def apply_previous_observation_assessment(
 
     completed_todo = normalize_todo_for_completion(dict(current))
     completed_todo["status"] = "completed"
-    completed_todo["result_ref"] = evaluation.evidence_refs[0] if evaluation.evidence_refs else completed_todo.get("result_ref")
+    task_type = str(completed_todo.get("task_type") or "").strip().lower()
+    completed_todo["result_ref"] = (
+        _artifact_ref_for_todo(request_state, task_type)
+        or (evaluation.evidence_refs[0] if evaluation.evidence_refs else None)
+        or completed_todo.get("result_ref")
+    )
     completed_todo["completion_reason"] = evaluation.reason
     request_state.todo_list[current_index] = completed_todo
     next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
@@ -742,6 +751,31 @@ def apply_previous_observation_assessment(
         request_state.planning_complete = True
     request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
     return evaluation
+
+
+def _assessment_lists_current_todo(
+    assessment: PreviousObservationAssessment,
+    current: dict,
+    current_index: int,
+) -> bool:
+    """Honor the LLM's explicit completed_todos set for the active step.
+
+    The normal hard gate still verifies that the immediately previous tool and
+    cited artifact actually satisfy this Todo, so this does not auto-complete
+    from artifact existence alone.
+    """
+
+    markers = {
+        str(item).strip().lower()
+        for item in assessment.completed_todos
+        if str(item).strip()
+    }
+    candidates = {
+        str(current_index + 1),
+        str(current.get("id") or "").strip().lower(),
+        str(current.get("content") or "").strip().lower(),
+    }
+    return bool((markers & candidates) - {""})
 
 
 def gap_assessment_payload(assessment: PreviousObservationAssessment) -> dict:
@@ -909,6 +943,15 @@ def _hard_gate_previous_assessment(
                 next_action_hint="Run a grounded sql_query.",
             )
     elif tool_name in {"code_interpreter", "anomaly", "forecast", "visualization", "rag", "skill"}:
+        if tool_name == "visualization" and str(payload.get("status") or "").strip() == "needs_sources":
+            request = payload.get("required_data_request") if isinstance(payload.get("required_data_request"), dict) else {}
+            return CompletionEvaluation(
+                False,
+                "Visualization identified additional semantic sources and has not created an artifact yet.",
+                missing_evidence=[str(request.get("purpose") or "visualization_sources")],
+                evidence_refs=refs,
+                next_action_hint=f"Call {request.get('required_action') or 'the requested source tool'} with the returned source contract.",
+            )
         if not refs and not _has_non_empty_payload(payload):
             return CompletionEvaluation(
                 False,

@@ -295,12 +295,15 @@ def _terminate_payload_view(payload: dict) -> dict:
 def _visualization_payload_view(payload: dict) -> dict:
     visualizations = payload.get("visualizations") if isinstance(payload.get("visualizations"), list) else []
     return _drop_empty({
+        "status": payload.get("status"),
+        "summary": _strip_query_code(payload.get("summary")),
         "visualization_ids": payload.get("visualization_ids") or [
             item.get("visualization_id") for item in visualizations if isinstance(item, dict)
         ],
         "grounded_by": payload.get("grounded_by", []),
         "verification": payload.get("verification", []),
         "coverage_delta": payload.get("coverage_delta"),
+        "required_data_request": _sanitize_value(payload.get("required_data_request"), max_string_chars=900),
     })
 
 

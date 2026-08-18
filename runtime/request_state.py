@@ -630,9 +630,12 @@ def enrich_observation_payload(
     elif tool_spec.result_target == "visualization":
         visualizations = full_payload.get("visualizations", [])
         payload = {
+            "status": full_payload.get("status", "created"),
+            "summary": full_payload.get("summary"),
             "visualization_ids": full_payload.get("visualization_ids", []),
             "grounded_by": _outer_grounding_refs(full_payload.get("source_refs", [])),
             "verification": _visualization_verification_receipts(visualizations),
+            "required_data_request": full_payload.get("required_data_request"),
         }
     elif tool_spec.result_target == "presentation":
         payload = {
@@ -881,11 +884,13 @@ def _advance_todo_after_artifact(
     full_payload: dict,
     result_target: str,
 ) -> None:
+    """Record artifact production without equating it to todo completion.
+
+    The next ReAct turn owns semantic completion through
+    previous_observation_assessment. This keeps a successful tool receipt from
+    advancing a todo whose user-visible acceptance criteria are still unmet.
+    """
     if not request_state.todo_list:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
-    synchronized = _sync_todos_from_artifact_state(request_state)
-    if synchronized:
         request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
@@ -894,35 +899,22 @@ def _advance_todo_after_artifact(
         return
     current = normalize_todo_for_completion(dict(request_state.todo_list[current_index]))
     task_type = str(current.get("task_type") or "").strip().lower()
-    if not _tool_covers_todo_type(tool_name, result_target, task_type):
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
     ref = _artifact_ref_for_tool(tool_name, full_payload)
-    if not ref:
-        request_state.completion_state["latest_step"] = {
-            "completed": False,
-            "reason": f"Tool '{tool_name}' succeeded but did not produce a usable artifact ref.",
-            "missing_evidence": [f"{tool_name}_artifact"],
-            "evidence_refs": [],
-            "next_action_hint": default_capability_registry().hint_for_task_type(task_type),
-            "tool_name": tool_name,
-            "todo_index": current_index,
-            "todo": current,
-        }
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
-        return
-    current = _complete_todo_at_index(
-        request_state,
-        current_index,
-        result_ref=ref,
-        reason=f"Tool '{tool_name}' produced artifact {ref}.",
-    )
+    dependency = full_payload.get("required_data_request") if full_payload.get("status") == "needs_sources" else None
     request_state.completion_state["latest_step"] = {
-        "completed": True,
-        "reason": current["completion_reason"],
-        "missing_evidence": [],
+        "completed": False,
+        "reason": (
+            f"Tool '{tool_name}' identified an upstream source dependency; semantic todo assessment is pending."
+            if dependency
+            else f"Tool '{tool_name}' produced an artifact; semantic todo assessment is pending."
+        ),
+        "missing_evidence": [str(dependency.get("purpose") or "visualization_sources")] if isinstance(dependency, dict) else [],
         "evidence_refs": [ref] if ref else [],
-        "next_action_hint": None,
+        "next_action_hint": (
+            f"Call {dependency.get('required_action')} with the returned source contract."
+            if isinstance(dependency, dict) and dependency.get("required_action")
+            else "Assess the latest observation against the active todo acceptance criteria."
+        ),
         "tool_name": tool_name,
         "todo_index": current_index,
         "todo": current,

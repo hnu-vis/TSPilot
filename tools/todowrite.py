@@ -1,8 +1,10 @@
 """Todo writer tool."""
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -79,7 +81,23 @@ class TodoWriteResult(BaseModel):
     pending_count: int = 0
 
 
+class _TodoCapabilityBinding(BaseModel):
+    index: int = Field(ge=0)
+    task_type: Literal[
+        "query", "anomaly", "forecast", "code_interpreter",
+        "visualization", "answer", "rag", "skill",
+    ]
+    reason: str = Field(min_length=1)
+
+
+class _TodoCapabilityBindings(BaseModel):
+    bindings: list[_TodoCapabilityBinding] = Field(min_length=1)
+
+
 class TodoWriteTool(BaseTool):
+    def __init__(self, llm=None):
+        self._llm = llm
+
     async def execute(self, validated_input: TodoWriteInput, **kwargs) -> dict:
         total_todos = len(validated_input.todos)
         todos = [
@@ -109,6 +127,8 @@ class TodoWriteTool(BaseTool):
                     notes=validated_input.evidence_summary,
                 )
             ]
+        if self._llm is not None:
+            todos = await self._bind_task_types(todos, validated_input)
         todos = self._enforce_single_in_progress(todos)
         in_progress = next((todo.model_dump(mode="json") for todo in todos if todo.status == "in_progress"), None)
         completed_count = sum(1 for todo in todos if todo.status == "completed")
@@ -125,6 +145,65 @@ class TodoWriteTool(BaseTool):
             completed_count=completed_count,
             pending_count=pending_count,
         ).model_dump(mode="json")
+
+    async def _bind_task_types(
+        self,
+        todos: list[TodoItem],
+        validated_input: TodoWriteInput,
+    ) -> list[TodoItem]:
+        """Let the LLM bind each user-visible step to its owning capability."""
+
+        payload = {
+            "user_request": validated_input.message,
+            "task_contract": validated_input.task_contract,
+            "todos": [
+                {"index": index, "content": todo.content}
+                for index, todo in enumerate(todos)
+            ],
+        }
+        system = (
+            "Map every Todo to the single tool capability that owns its acceptance result. "
+            "Interpret each Todo by meaning and dependencies; never align Todos to task-contract outputs by list position. "
+            "Use query for database retrieval, anomaly for detection results, forecast for prediction generation, "
+            "code_interpreter for calculations over existing artifacts, visualization for charts, answer for final synthesis, "
+            "rag for external retrieval, and skill for packaged workflows. A prerequisite mentioned in a Todo does not change "
+            "the owner of its requested result. Return exactly one binding for every supplied zero-based index."
+        )
+        messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if hasattr(self._llm, "with_structured_output"):
+                    runnable = self._llm.with_structured_output(
+                        _TodoCapabilityBindings, method="json_schema", include_raw=True,
+                    )
+                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    if isinstance(bundle, dict):
+                        parsed = bundle.get("parsed")
+                        if parsed is None:
+                            raise ValueError(bundle.get("parsing_error") or "Todo capability binding was not parsed")
+                    else:
+                        parsed = bundle
+                    result = (
+                        parsed if isinstance(parsed, _TodoCapabilityBindings)
+                        else _TodoCapabilityBindings.model_validate(parsed)
+                    )
+                else:
+                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    result = _TodoCapabilityBindings.model_validate_json(str(getattr(response, "content", response)))
+                by_index = {item.index: item for item in result.bindings}
+                expected = set(range(len(todos)))
+                if set(by_index) != expected:
+                    raise ValueError(f"Todo capability bindings must cover indexes {sorted(expected)} exactly")
+                return [
+                    todo.model_copy(update={"task_type": by_index[index].task_type})
+                    for index, todo in enumerate(todos)
+                ]
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.append(("human", f"Correct the capability binding contract error: {exc}"))
+        raise ValueError(f"Todo capability binding failed: {last_error}") from last_error
 
     def _looks_like_placeholder_plan(self, todos: list[TodoItem]) -> bool:
         if not todos:
@@ -279,12 +358,12 @@ class TodoWriteTool(BaseTool):
         total_todos: int,
         validated_input: TodoWriteInput | None,
     ) -> str:
-        contract_type = self._contract_task_type(index, validated_input)
-        if contract_type and contract_type != "generic":
-            return contract_type
         inferred = self._infer_task_type_from_content(content)
         if inferred != "generic":
             return inferred
+        contract_type = self._contract_task_type(index, validated_input)
+        if contract_type and contract_type != "generic":
+            return contract_type
         if total_todos > 1 and index == total_todos:
             return "answer"
         return "generic"
@@ -295,6 +374,8 @@ class TodoWriteTool(BaseTool):
             return "generic"
         if re.search(r"异常|异常检测|离群|突增|突降|anomal|outlier|spike", text, flags=re.IGNORECASE):
             return "anomaly"
+        if re.search(r"可视化|综合图|图表|绘图|visuali[sz]|chart|plot|graph", text, flags=re.IGNORECASE):
+            return "visualization"
         if re.search(r"预测|预估|未来|forecast|predict|projection", text, flags=re.IGNORECASE):
             return "forecast"
         if re.search(

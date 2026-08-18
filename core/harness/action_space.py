@@ -98,6 +98,26 @@ class ActionSpaceBuilder:
             )
             missing.append("query_evidence_recovery")
 
+        if not required and frame.pending_source_request:
+            request = frame.pending_source_request
+            action = str(request.get("required_action") or "").strip()
+            if action in VALID_ACTIONS:
+                guidance = {
+                    "mode": "visualization_source_completion",
+                    "source_refs": request.get("input_source_refs", []),
+                    "database_evidence": request.get("input_evidence"),
+                    "analysis_goal": request.get("purpose"),
+                    "constraints": {"visualization_source_request": request},
+                }
+                if action == "code_interpreter":
+                    guidance["insight_requests"] = request.get("insight_requests", [])
+                required.append(RequiredAction(
+                    action=action,
+                    reason="Visualization planning identified a semantic source dependency.",
+                    input_guidance={key: value for key, value in guidance.items() if value not in (None, "", [], {})},
+                ))
+                missing.append("visualization_sources")
+
         for capability_id, artifact_attr, missing_name in (
             ("anomaly", "has_anomaly", "anomaly"),
             ("forecast", "has_forecast", "forecast"),
@@ -137,6 +157,12 @@ class ActionSpaceBuilder:
                 )
             )
             missing.append("analysis")
+
+        if not required:
+            gap_action = self._action_for_completion_gap(frame, has_evidence=has_evidence)
+            if gap_action is not None and gap_action.action != "visualization":
+                required.append(gap_action)
+                missing.extend(frame.completion_missing_outputs)
 
         if not required and "visualization" in capabilities and frame.artifacts.visualization_count == 0:
             required.append(

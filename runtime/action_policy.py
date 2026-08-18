@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 
-from core.completion import _requires_code_analysis, latest_gap_assessment
+from core.completion import _requires_code_analysis, evaluate_goal_completion, latest_gap_assessment
 from core.harness import build_action_space, build_observation_frame
 from core.harness.action_space import VALID_ACTIONS
 from core.harness.observation import state_capabilities
@@ -506,16 +506,39 @@ def runtime_action_constraints(request_state: RequestStateModel) -> dict:
     """Return runtime-owned next-action constraints derived from structured state."""
 
     downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
+    completion = evaluate_goal_completion(request_state)
     frame = build_observation_frame(
         request_state,
         requires_initial_todo_plan=_requires_initial_todo_plan(request_state),
         latest_database_evidence_empty=_latest_database_evidence_is_empty(request_state),
         downstream_analysis_request=downstream_analysis,
+        pending_source_request=_latest_visualization_source_request(request_state),
         shape_recovery_request=_latest_query_shape_recovery(request_state),
-        completion_missing_outputs=[],
-        completion_reason=None,
+        completion_missing_outputs=([] if completion.can_answer else completion.missing_evidence),
+        completion_reason=completion.reason,
     )
     return build_action_space(frame).model_view()
+
+
+def _latest_visualization_source_request(request_state: RequestStateModel) -> dict | None:
+    observations = list(request_state.observations or [])
+    for index in range(len(observations) - 1, -1, -1):
+        observation = observations[index]
+        if observation.tool_name != "visualization" or not observation.success:
+            continue
+        payload = observation.payload if isinstance(observation.payload, dict) else {}
+        if str(payload.get("status") or "").strip() != "needs_sources":
+            return None
+        request = payload.get("required_data_request")
+        if not isinstance(request, dict):
+            return None
+        required_action = str(request.get("required_action") or "").strip()
+        fulfilled = any(
+            later.success and later.tool_name == required_action
+            for later in observations[index + 1:]
+        )
+        return None if fulfilled else request
+    return None
 
 
 def _effective_capabilities(request_state: RequestStateModel) -> set[str]:
