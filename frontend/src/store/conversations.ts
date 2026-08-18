@@ -1,4 +1,4 @@
-import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep } from '../types';
+import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceSpan, TraceStep } from '../types';
 import { normalizeConversation } from '../lib/normalize';
 
 const STORAGE_KEY = 'tspilot:v03:conversations';
@@ -158,15 +158,17 @@ export function appendAssistantAnswer(conversation: Conversation, answer: FinalA
 export function completeRunningTraceSteps(conversation: Conversation, completedAt = now()): Conversation {
   let changed = false;
   const traceSteps = conversation.traceSteps.map((step) => {
-    if (step.status !== 'running') return step;
+    const children = settleRunningTraceSpans(step.children, 'complete', completedAt);
+    if (step.status !== 'running' && children === step.children) return step;
     changed = true;
-    return {
+    return step.status === 'running' ? {
       ...step,
       status: 'complete' as const,
       completedAt,
       elapsedSeconds: step.elapsedSeconds ?? elapsedSecondsBetween(step.startedAt, completedAt),
+      children,
       updatedAt: completedAt,
-    };
+    } : { ...step, children, updatedAt: completedAt };
   });
   if (!changed) return conversation;
   return {
@@ -179,17 +181,19 @@ export function completeRunningTraceSteps(conversation: Conversation, completedA
 export function failRunningTraceSteps(conversation: Conversation, message: string, completedAt = now()): Conversation {
   let changed = false;
   const traceSteps = conversation.traceSteps.map((step) => {
-    if (step.status !== 'running') return step;
+    const children = settleRunningTraceSpans(step.children, 'error', completedAt, message);
+    if (step.status !== 'running' && children === step.children) return step;
     changed = true;
-    return {
+    return step.status === 'running' ? {
       ...step,
       status: 'error' as const,
       summary: message,
       error: message,
       completedAt,
       elapsedSeconds: step.elapsedSeconds ?? elapsedSecondsBetween(step.startedAt, completedAt),
+      children,
       updatedAt: completedAt,
-    };
+    } : { ...step, children, updatedAt: completedAt };
   });
   if (!changed) return conversation;
   return { ...conversation, traceSteps, updatedAt: completedAt };
@@ -248,8 +252,28 @@ export function upsertTraceStep(conversation: Conversation, step: TraceStep): Co
   };
 }
 
+export function upsertTraceSpan(conversation: Conversation, span: TraceSpan): Conversation {
+  const parentIndex = conversation.traceSteps.findIndex((step) => step.id === span.parentId);
+  if (parentIndex < 0) return conversation;
+
+  const traceSteps = [...conversation.traceSteps];
+  const parent = traceSteps[parentIndex];
+  const children = [...(parent.children || [])];
+  const existingIndex = children.findIndex((item) => item.id === span.id);
+  if (existingIndex >= 0) {
+    children[existingIndex] = mergeTraceSpan(children[existingIndex], span);
+  } else {
+    children.push(span);
+  }
+  traceSteps[parentIndex] = { ...parent, children, updatedAt: span.updatedAt };
+  return { ...conversation, traceSteps, updatedAt: now() };
+}
+
 function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
-  const startedAt = existing.startedAt ?? keepValue(incoming.startedAt, existing.startedAt);
+  const startsToolExecution = incoming.phase === 'tool_call' && Boolean(incoming.toolCall) && !existing.toolCall;
+  const startedAt = startsToolExecution
+    ? keepValue(incoming.startedAt, existing.startedAt)
+    : existing.startedAt ?? keepValue(incoming.startedAt, existing.startedAt);
   const completedAt = keepValue(incoming.completedAt, existing.completedAt);
   const elapsedSeconds = incoming.elapsedSeconds
     ?? elapsedSecondsBetween(startedAt, incoming.completedAt ? completedAt : undefined)
@@ -265,10 +289,51 @@ function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
     observation: keepValue(incoming.observation, existing.observation),
     toolCall: keepValue(incoming.toolCall, existing.toolCall),
     toolResult: keepValue(incoming.toolResult, existing.toolResult),
+    children: keepValue(incoming.children, existing.children),
     startedAt,
     completedAt,
     elapsedSeconds,
   };
+}
+
+function mergeTraceSpan(existing: TraceSpan, incoming: TraceSpan): TraceSpan {
+  const startedAt = existing.startedAt ?? keepValue(incoming.startedAt, existing.startedAt);
+  const completedAt = keepValue(incoming.completedAt, existing.completedAt);
+  return {
+    ...existing,
+    ...incoming,
+    status: existing.status !== 'running' && incoming.status === 'running' ? existing.status : incoming.status,
+    summary: keepValue(incoming.summary, existing.summary),
+    tokenUsage: keepValue(incoming.tokenUsage, existing.tokenUsage),
+    inputSummary: keepValue(incoming.inputSummary, existing.inputSummary),
+    outputSummary: keepValue(incoming.outputSummary, existing.outputSummary),
+    inputPreview: keepValue(incoming.inputPreview, existing.inputPreview),
+    outputPreview: keepValue(incoming.outputPreview, existing.outputPreview),
+    error: keepValue(incoming.error, existing.error),
+    startedAt,
+    completedAt,
+    elapsedSeconds: incoming.elapsedSeconds
+      ?? elapsedSecondsBetween(startedAt, incoming.completedAt ? completedAt : undefined)
+      ?? existing.elapsedSeconds
+      ?? elapsedSecondsBetween(startedAt, completedAt),
+  };
+}
+
+function settleRunningTraceSpans(
+  spans: TraceSpan[] | undefined,
+  status: 'complete' | 'error',
+  completedAt: string,
+  error?: string,
+): TraceSpan[] | undefined {
+  if (!spans?.some((span) => span.status === 'running')) return spans;
+  return spans.map((span) => span.status !== 'running' ? span : {
+    ...span,
+    status,
+    error: status === 'error' ? error : span.error,
+    completedAt,
+    elapsedSeconds: span.elapsedSeconds ?? elapsedSecondsBetween(span.startedAt, completedAt),
+    updatedAt: completedAt,
+  });
 }
 
 function keepValue<T>(incoming: T | null | undefined, existing: T | undefined): T | undefined {
@@ -316,6 +381,22 @@ function compactTraceStepForStorage(step: TraceStep): TraceStep {
     observation: compactUnknown(step.observation) as TraceStep['observation'],
     toolCall,
     toolResult,
+    children: step.children?.slice(-24).map(compactTraceSpanForStorage),
+  };
+}
+
+function compactTraceSpanForStorage(span: TraceSpan): TraceSpan {
+  return {
+    ...span,
+    title: truncateString(span.title),
+    summary: truncateOptionalString(span.summary),
+    inputPreview: span.inputPreview?.map((message) => ({
+      ...message,
+      role: truncateString(message.role),
+      content: truncateString(message.content),
+    })),
+    outputPreview: truncateOptionalString(span.outputPreview),
+    error: truncateOptionalString(span.error),
   };
 }
 

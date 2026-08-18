@@ -1,27 +1,32 @@
-import { Activity, AlertCircle, ArrowRight, CheckCircle2, ChevronDown, Clipboard, Code2, FileText, LineChart, ListChecks, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { Activity, AlertCircle, ArrowRight, Check, CheckCircle2, ChevronDown, Clipboard, Code2, FileText, LineChart, ListChecks, Loader2, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
-import type { FinalAnswer, TraceStep } from '../types';
+import { elapsedSecondsForTrace } from '../lib/traceTiming';
+import type { FinalAnswer, TraceSpan, TraceStep } from '../types';
 import { useI18n } from '../i18n';
 
 type Props = {
   steps: TraceStep[];
-  selectedStepId: string | null;
+  selectedNodeId: string | null;
   answer?: FinalAnswer | null;
   collapsed: boolean;
   onToggleCollapsed: () => void;
 };
 
-export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onToggleCollapsed }: Props) {
+type InspectorSelection =
+  | { kind: 'step'; step: TraceStep; stepIndex: number }
+  | { kind: 'llm'; call: TraceSpan; parent: TraceStep; stepIndex: number; callIndex: number };
+
+export function InspectorPanel({ steps, selectedNodeId, answer, collapsed, onToggleCollapsed }: Props) {
   const { t } = useI18n();
   if (steps.length === 0 && !answer) return null;
 
-  const selectedStep = selectedStepId
-    ? steps.find((step) => step.id === selectedStepId) || null
-    : null;
-  const activeStep = selectedStep || steps[steps.length - 1] || null;
-  const displayStep = activeStep ? toDisplayStep(activeStep) : null;
-  const activeStepIndex = activeStep ? steps.findIndex((step) => step.id === activeStep.id) : -1;
+  const selection = resolveInspectorSelection(steps, selectedNodeId);
+  const displayStep = selection?.kind === 'step' ? toDisplayStep(selection.step) : null;
+  const nodeTitle = selection?.kind === 'llm' ? selection.call.title : displayStep?.title || 'Answer';
+  const nodeCategory = selection?.kind === 'llm' ? 'LLM call' : displayStep?.category || 'Run detail';
+  const nodeStatus = selection?.kind === 'llm' ? selection.call.status : displayStep?.status;
 
   if (collapsed) {
     return (
@@ -40,21 +45,25 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
         <div className="inspector-heading">
           <div className="inspector-kicker">
             <span>{t('Inspector')}</span>
-            {displayStep && <i aria-hidden="true" />}
-            {displayStep && <span>{t('Step')} {activeStepIndex + 1} / {steps.length}</span>}
+            {selection && <i aria-hidden="true" />}
+            {selection?.kind === 'llm' ? (
+              <span>{t('Call')} {selection.callIndex + 1} / {(selection.parent.children || []).length}</span>
+            ) : selection ? (
+              <span>{t('Step')} {selection.stepIndex + 1} / {steps.length}</span>
+            ) : null}
           </div>
           <div className="inspector-title-row">
-            <span className="inspector-title-icon" aria-hidden="true">
-              <Activity size={16} />
-            </span>
+            {selection?.kind !== 'llm' && (
+              <span className="inspector-title-icon" aria-hidden="true"><Activity size={16} /></span>
+            )}
             <div>
-              <h2>{t(displayStep?.title || 'Answer')}</h2>
-              <p>{t(displayStep?.category || 'Run detail')}</p>
+              <h2>{t(nodeTitle)}</h2>
+              <p>{t(nodeCategory)}</p>
             </div>
           </div>
         </div>
         <div className="inspector-header-actions">
-          {displayStep && <span className={`status-line compact ${displayStep.status}`}>{t(statusLabel(displayStep.status))}</span>}
+          {nodeStatus && <span className={`status-line compact ${nodeStatus}`}>{t(statusLabel(nodeStatus))}</span>}
           <button type="button" onClick={onToggleCollapsed} aria-label={t('Collapse run details')}>
             <PanelRightClose size={18} />
           </button>
@@ -62,8 +71,9 @@ export function InspectorPanel({ steps, selectedStepId, answer, collapsed, onTog
       </header>
 
       <div className="inspector-body">
-        {displayStep && <StepDetail step={displayStep} />}
-        {!displayStep && answer?.references && answer.references.length > 0 && (
+        {selection?.kind === 'step' && displayStep && <StepDetail step={displayStep} />}
+        {selection?.kind === 'llm' && <LLMCallDetail selection={selection} />}
+        {!selection && answer?.references && answer.references.length > 0 && (
           <ReferenceList answer={answer} />
         )}
       </div>
@@ -117,6 +127,7 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   const detail = step.reactDetail;
   const actionInput = compactReactInput(detail.actionInput);
   const observation = detail.observation;
+  const isDecisionPending = step.status === 'running' && !detail.action;
   return (
     <section className="inspector-card react-step-card">
       <div className="inspector-card-title">
@@ -129,17 +140,27 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
           <p>{detail.thought}</p>
         </div>
       )}
-      <div className="react-transition" aria-label={t('ReAct action and observation')}>
-        <div>
-          <span>{t('Action')}</span>
-          <strong>{detail.action || step.category}</strong>
+      {isDecisionPending ? (
+        <div className="react-decision-pending" role="status" aria-live="polite">
+          <Loader2 className="spin" size={15} aria-hidden="true" />
+          <div>
+            <strong>{t('ReAct is deciding the next action')}</strong>
+            <span>{t('The result will update this step in place.')}</span>
+          </div>
         </div>
-        <ArrowRight size={15} />
-        <div>
-          <span>{t('Observation')}</span>
-          <strong>{step.summary}</strong>
+      ) : (
+        <div className="react-transition" aria-label={t('ReAct action and observation')}>
+          <div>
+            <span>{t('Action')}</span>
+            <strong>{detail.action || step.category}</strong>
+          </div>
+          <ArrowRight size={15} />
+          <div>
+            <span>{t('Observation')}</span>
+            <strong>{step.summary}</strong>
+          </div>
         </div>
-      </div>
+      )}
       {actionInput && (
         <details className="react-input-details">
           <summary><ChevronDown size={14} className="collapsible-chevron" /> {t('Action input')}</summary>
@@ -154,6 +175,223 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
       )}
     </section>
   );
+}
+
+function LLMCallDetail({ selection }: { selection: Extract<InspectorSelection, { kind: 'llm' }> }) {
+  const { t } = useI18n();
+  const { call, parent, stepIndex } = selection;
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (call.status !== 'running') return;
+    const interval = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(interval);
+  }, [call.status]);
+  const duration = elapsedSecondsForTrace(call, nowMs);
+  const input = call.inputSummary;
+  const output = call.outputSummary;
+  const parentDisplay = toDisplayStep(parent);
+  const parentTitle = parent.phase === 'reasoning' && !parent.tool
+    ? t('ReAct decision')
+    : parent.tool || t(parentDisplay.title);
+  return (
+    <div className="llm-call-detail" aria-live="polite">
+      <section className={`inspector-card llm-call-overview ${call.status}`}>
+        <div className="inspector-card-title">
+          <span className="llm-call-status-icon" aria-hidden="true">
+            {call.status === 'running'
+              ? <Loader2 className="spin" size={14} />
+              : call.status === 'error'
+                ? <AlertCircle size={14} />
+                : <Check size={14} />}
+          </span>
+          <h3>{t('Model invocation')}</h3>
+          <span className={`status-line compact ${call.status}`}>{t(statusLabel(call.status))}</span>
+        </div>
+        {call.summary && <p className="llm-call-summary">{t(call.summary)}</p>}
+        <div className="llm-call-metrics">
+          <LLMMetric label={t('Duration')} value={duration === null ? '—' : `${duration.toFixed(1)}s`} />
+          <LLMMetric label={t('Input tokens')} value={formatCount(call.tokenUsage?.inputTokens)} />
+          <LLMMetric label={t('Output tokens')} value={formatCount(call.tokenUsage?.outputTokens)} />
+          <LLMMetric label={t('Total tokens')} value={formatCount(call.tokenUsage?.totalTokens)} />
+        </div>
+        {call.error && <p className="llm-call-failure"><AlertCircle size={13} /> {call.error}</p>}
+      </section>
+
+      <section className="inspector-card llm-content-card">
+        <div className="inspector-card-title">
+          <FileText size={16} />
+          <h3>{t('Call content')}</h3>
+        </div>
+        <p className="llm-content-note">{t('Text is bounded for display; binary and data URL payloads are omitted.')}</p>
+        {call.inputPreview?.length ? (
+          <details className="llm-content-section" open>
+            <summary>
+              <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Input messages')}</span>
+              <small>{call.inputPreview.length}</small>
+            </summary>
+            <div className="llm-message-list">
+              {call.inputPreview.map((message, index) => (
+                <LLMContentBlock
+                  key={`${message.role}-${index}`}
+                  label={message.role}
+                  content={message.content}
+                  copyLabel={t('Copy input message')}
+                />
+              ))}
+            </div>
+          </details>
+        ) : (
+          <p className="llm-content-empty">{t('No input content was captured.')}</p>
+        )}
+        {call.outputPreview ? (
+          <details className="llm-content-section" open>
+            <summary>
+              <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Output content')}</span>
+              <small>{call.outputSummary?.format ? formatLabel(call.outputSummary.format) : t('Text')}</small>
+            </summary>
+            <LLMContentBlock
+              label={call.outputSummary?.format ? formatLabel(call.outputSummary.format) : t('Output')}
+              content={call.outputPreview}
+              copyLabel={t('Copy output content')}
+            />
+          </details>
+        ) : call.status === 'running' ? (
+          <div className="llm-output-pending" role="status">
+            <Loader2 className="spin" size={13} />
+            <span>{t('Waiting for output')}</span>
+          </div>
+        ) : (
+          <p className="llm-content-empty">{t('No output content was captured.')}</p>
+        )}
+      </section>
+
+      <section className="inspector-card llm-io-card">
+        <div className="inspector-card-title">
+          <Activity size={16} />
+          <h3>{t('Invocation I/O')}</h3>
+        </div>
+        <div className="llm-io-grid">
+          <div className="llm-io-panel">
+            <span>{t('Input summary')}</span>
+            <strong>{input?.messageCount === undefined ? '—' : t('{count} messages', { count: input.messageCount })}</strong>
+            <dl>
+              <LLMSummaryRow label={t('Characters')} value={formatCount(input?.characterCount)} />
+              <LLMSummaryRow label={t('Roles')} value={input?.roles?.length ? input.roles.join(' · ') : '—'} />
+              <LLMSummaryRow label={t('Multimodal parts')} value={formatCount(input?.multimodalPartCount)} />
+            </dl>
+          </div>
+          <div className="llm-io-panel">
+            <span>{t('Output summary')}</span>
+            <strong>{output?.format ? t(formatLabel(output.format)) : call.status === 'running' ? t('Waiting for output') : '—'}</strong>
+            <dl>
+              <LLMSummaryRow label={t('Characters')} value={formatCount(output?.characterCount)} />
+              <LLMSummaryRow label={t('Multimodal parts')} value={formatCount(output?.multimodalPartCount)} />
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <section className="inspector-card llm-parent-card">
+        <div>
+          <span>{t('Parent step')}</span>
+          <strong>{parentTitle}</strong>
+        </div>
+        <span>{t('Step')} {stepIndex + 1}</span>
+      </section>
+    </div>
+  );
+}
+
+function LLMContentBlock({ label, content, copyLabel }: { label: string; content: string; copyLabel: string }) {
+  const displayContent = formattedLLMContent(content);
+  return (
+    <article className="llm-content-block">
+      <header>
+        <span>{label}</span>
+        <button
+          type="button"
+          className="inspector-icon-button"
+          onClick={() => void navigator.clipboard?.writeText(content)}
+          aria-label={copyLabel}
+          title={copyLabel}
+        >
+          <Clipboard size={13} />
+        </button>
+      </header>
+      <pre><code>{displayContent}</code></pre>
+    </article>
+  );
+}
+
+function formattedLLMContent(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return content;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return content;
+  }
+}
+
+function LLMMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function LLMSummaryRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function formatCount(value: number | undefined): string {
+  return value === undefined ? '—' : value.toLocaleString();
+}
+
+function resolveInspectorSelection(steps: TraceStep[], selectedNodeId: string | null): InspectorSelection | null {
+  if (selectedNodeId) {
+    for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+      const step = steps[stepIndex];
+      if (step.id === selectedNodeId) return { kind: 'step', step, stepIndex };
+      const callIndex = (step.children || []).findIndex((call) => call.id === selectedNodeId);
+      if (callIndex >= 0) {
+        return { kind: 'llm', call: step.children![callIndex], parent: step, stepIndex, callIndex };
+      }
+    }
+  }
+
+  const stepIndex = steps.length - 1;
+  if (stepIndex < 0) return null;
+  const step = steps[stepIndex];
+  const children = step.children || [];
+  for (let callIndex = children.length - 1; callIndex >= 0; callIndex -= 1) {
+    if (children[callIndex].status === 'running') {
+      return { kind: 'llm', call: children[callIndex], parent: step, stepIndex, callIndex };
+    }
+  }
+
+  let latest: InspectorSelection = { kind: 'step', step, stepIndex };
+  let latestTimestamp = timestampOf(step.updatedAt);
+  children.forEach((call, callIndex) => {
+    const timestamp = timestampOf(call.updatedAt);
+    if (timestamp >= latestTimestamp) {
+      latest = { kind: 'llm', call, parent: step, stepIndex, callIndex };
+      latestTimestamp = timestamp;
+    }
+  });
+  return latest;
+}
+
+function timestampOf(value: string): number {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function QueryPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['sqlDetail']> }) {
@@ -645,6 +883,7 @@ function statusLabel(status: string) {
 }
 
 function formatLabel(value: string) {
+  if (value.toLowerCase() === 'json') return 'JSON';
   if (value === 'query') return 'Database evidence';
   if (value === 'sql_query') return 'Database evidence';
   return value

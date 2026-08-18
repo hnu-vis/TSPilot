@@ -232,6 +232,49 @@ export type InsightMemoryLearningSettingsResponse = {
 
 export type TraceStatus = 'running' | 'complete' | 'error';
 
+export type TraceSpanTokenUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+};
+
+export type TraceSpanInputSummary = {
+  messageCount?: number;
+  roles?: string[];
+  characterCount?: number;
+  multimodalPartCount?: number;
+};
+
+export type TraceSpanOutputSummary = {
+  characterCount?: number;
+  format?: string;
+  multimodalPartCount?: number;
+};
+
+export type TraceSpanMessagePreview = {
+  role: string;
+  content: string;
+};
+
+export type TraceSpan = {
+  id: string;
+  parentId: string;
+  kind: 'llm';
+  title: string;
+  status: TraceStatus;
+  summary?: string;
+  tokenUsage?: TraceSpanTokenUsage;
+  inputSummary?: TraceSpanInputSummary;
+  outputSummary?: TraceSpanOutputSummary;
+  inputPreview?: TraceSpanMessagePreview[];
+  outputPreview?: string;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  elapsedSeconds?: number;
+  updatedAt: string;
+};
+
 export type TraceStep = {
   id: string;
   iteration: number;
@@ -249,6 +292,7 @@ export type TraceStep = {
   startedAt?: string;
   completedAt?: string;
   elapsedSeconds?: number;
+  children?: TraceSpan[];
   updatedAt: string;
 };
 

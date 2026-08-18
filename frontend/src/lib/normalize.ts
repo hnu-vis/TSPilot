@@ -1,4 +1,4 @@
-import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep, Visualization } from '../types';
+import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceSpan, TraceStep, Visualization } from '../types';
 
 const INTERRUPTED_MESSAGE = 'The previous response was interrupted before completion.';
 
@@ -47,9 +47,13 @@ export function normalizeConversation(value: unknown): Conversation | null {
         summary: hadInterruptedMessage ? INTERRUPTED_MESSAGE : step.summary,
         error: hadInterruptedMessage ? INTERRUPTED_MESSAGE : step.error,
         completedAt: updatedAt,
+        children: interruptRunningTraceSpans(step.children, updatedAt, hadInterruptedMessage),
         updatedAt,
       }
-    : step);
+    : {
+        ...step,
+        children: interruptRunningTraceSpans(step.children, updatedAt, hadInterruptedMessage),
+      });
 
   return {
     id,
@@ -108,8 +112,77 @@ function normalizeTraceStep(value: unknown): TraceStep | null {
     startedAt: validTimestamp(step.startedAt) || undefined,
     completedAt: validTimestamp(step.completedAt) || undefined,
     elapsedSeconds: finiteNumber(step.elapsedSeconds),
+    children: Array.isArray(step.children)
+      ? step.children.map(normalizeTraceSpan).filter((item): item is TraceSpan => Boolean(item))
+      : [],
     updatedAt,
   };
+}
+
+function normalizeTraceSpan(value: unknown): TraceSpan | null {
+  const span = asRecord(value);
+  const id = stringValue(span?.id);
+  const parentId = stringValue(span?.parentId);
+  const title = stringValue(span?.title);
+  if (!span || !id || !parentId || !title || span.kind !== 'llm') return null;
+  const status = span.status === 'complete' || span.status === 'error' || span.status === 'running'
+    ? span.status
+    : 'error';
+  const usage = asRecord(span.tokenUsage);
+  const input = asRecord(span.inputSummary);
+  const output = asRecord(span.outputSummary);
+  return {
+    id,
+    parentId,
+    kind: 'llm',
+    title,
+    status,
+    summary: optionalString(span.summary),
+    tokenUsage: usage ? {
+      inputTokens: finiteNumber(usage.inputTokens),
+      outputTokens: finiteNumber(usage.outputTokens),
+      totalTokens: finiteNumber(usage.totalTokens),
+    } : undefined,
+    inputSummary: input ? {
+      messageCount: finiteNumber(input.messageCount),
+      roles: stringArray(input.roles),
+      characterCount: finiteNumber(input.characterCount),
+      multimodalPartCount: finiteNumber(input.multimodalPartCount),
+    } : undefined,
+    outputSummary: output ? {
+      characterCount: finiteNumber(output.characterCount),
+      format: optionalString(output.format),
+      multimodalPartCount: finiteNumber(output.multimodalPartCount),
+    } : undefined,
+    inputPreview: Array.isArray(span.inputPreview)
+      ? span.inputPreview.flatMap((item) => {
+        const message = asRecord(item);
+        const role = stringValue(message?.role);
+        const content = stringValue(message?.content);
+        return role !== null && content !== null ? [{ role, content }] : [];
+      })
+      : undefined,
+    outputPreview: optionalString(span.outputPreview),
+    error: optionalString(span.error),
+    startedAt: validTimestamp(span.startedAt) || undefined,
+    completedAt: validTimestamp(span.completedAt) || undefined,
+    elapsedSeconds: finiteNumber(span.elapsedSeconds),
+    updatedAt: validTimestamp(span.updatedAt) || new Date().toISOString(),
+  };
+}
+
+function interruptRunningTraceSpans(
+  spans: TraceSpan[] | undefined,
+  completedAt: string,
+  interrupted: boolean,
+): TraceSpan[] {
+  return (spans || []).map((span) => span.status !== 'running' ? span : {
+    ...span,
+    status: 'error' as const,
+    error: interrupted ? INTERRUPTED_MESSAGE : span.error,
+    completedAt,
+    updatedAt: completedAt,
+  });
 }
 
 function normalizeSections(value: unknown): FinalAnswer['sections'] {

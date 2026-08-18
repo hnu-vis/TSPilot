@@ -1,4 +1,4 @@
-import type { KeyInsight, KeyInsightRequest, InsightCoverage, FinalAnswer, TraceStep } from '../types';
+import type { KeyInsight, KeyInsightRequest, InsightCoverage, FinalAnswer, TraceSpan, TraceStep } from '../types';
 
 export type DisplayMetric = {
   label: string;
@@ -132,6 +132,7 @@ export type DisplayStep = {
   insightDetail: InsightDetail | null;
   schemaLinkingDetail: SchemaLinkingDetail | null;
   completionDetail: CompletionDetail | null;
+  llmCalls: TraceSpan[];
   reactDetail: ReactDetail;
   hasPrimaryDetail: boolean;
   debugPayload: Record<string, unknown> | null;
@@ -192,6 +193,7 @@ export function toDisplayStep(step: TraceStep): DisplayStep {
     insightDetail,
     schemaLinkingDetail,
     completionDetail,
+    llmCalls: step.children || [],
     reactDetail,
     hasPrimaryDetail,
     debugPayload: result || call ? { toolCall: call, toolResult: result } : null,
@@ -291,6 +293,7 @@ export function titleForTool(tool?: string, phase?: string) {
   if (tool === 'rag') return 'Retrieve knowledge';
   if (tool === 'skill') return 'Run workflow';
   if (phase === 'answer_assembly') return 'Assemble answer';
+  if (phase === 'reasoning') return 'Choose next action';
   if (phase === 'analysis') return 'Analyze evidence';
   if (phase === 'tool_selection') return 'Data retrieval';
   if (phase === 'intent') return 'Plan the work';
@@ -298,6 +301,7 @@ export function titleForTool(tool?: string, phase?: string) {
 }
 
 function categoryForTool(tool?: string, phase?: string) {
+  if (phase === 'reasoning') return 'ReAct';
   if (tool === 'todowrite' || phase === 'intent') return 'Plan';
   if (tool === 'sql_query' || phase === 'tool_selection') return 'Data';
   if (tool === 'code_interpreter') return 'Analysis';

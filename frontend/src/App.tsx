@@ -26,8 +26,14 @@ import {
   saveConversations,
   settleIncompleteStream,
   sortConversations,
+  upsertTraceSpan,
   upsertTraceStep,
 } from './store/conversations';
+import {
+  isTraceSpanEvent,
+  traceSpanFromStreamEvent,
+  traceStepFromPolicyDecision,
+} from './lib/traceEvents';
 import type { Conversation, ResourceState, StreamEvent, TraceStep } from './types';
 import { useI18n } from './i18n';
 
@@ -51,9 +57,6 @@ export default function App() {
   const conversationsRef = useRef(conversations);
 
   const activeConversation = conversations.find((item) => item.id === activeId) || conversations[0];
-  const selectedTraceStep = activeConversation?.selectedTraceStepId
-    ? activeConversation.traceSteps.find((step) => step.id === activeConversation.selectedTraceStepId) || null
-    : null;
   const latestAnswer = activeConversation?.messages
     .slice()
     .reverse()
@@ -175,7 +178,7 @@ export default function App() {
     });
   };
 
-  const handleSelectTraceStep = (id: string) => {
+  const handleSelectTraceNode = (id: string) => {
     if (!activeConversation) return;
     setIsInspectorCollapsed(false);
     updateConversation(activeConversation.id, (conversation) => ({
@@ -251,6 +254,14 @@ export default function App() {
   };
 
   const handleStreamEvent = (conversationId: string, event: StreamEvent) => {
+    if (isTraceSpanEvent(event)) {
+      const span = traceSpanFromStreamEvent(event);
+      if (span) {
+        updateConversation(conversationId, (conversation) => upsertTraceSpan(conversation, span));
+      }
+      return;
+    }
+
     if (event.event === 'step.start') {
       const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
@@ -260,10 +271,9 @@ export default function App() {
         id,
         iteration,
         agent: 'data_agent',
-        phase: 'tool_call',
+        phase: 'reasoning',
         status: 'running',
         summary: stringFrom(event.data.detail, title),
-        tool: title,
         startedAt: stringFrom(event.data.started_at) || timestamp,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
         updatedAt: timestamp,
@@ -299,6 +309,7 @@ export default function App() {
       const iteration = numberFrom(event.data.step ?? event.data.iteration, 0);
       const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}`);
       const action = stringFrom(event.data.action, '');
+      const thought = stringFrom(event.data.thought, '');
       const timestamp = now();
       const step: TraceStep = {
         id,
@@ -306,12 +317,11 @@ export default function App() {
         agent: 'data_agent',
         phase: 'tool_call',
         status: 'running',
-        summary: action || t('Processing step.'),
+        summary: thought || action || t('Processing step.'),
         tool: action || undefined,
-        thought: stringFrom(event.data.thought, ''),
+        thought,
         actionInput: asRecord(event.data.action_input) || undefined,
-        toolCall: event.data,
-        startedAt: stringFrom(event.data.started_at) || undefined,
+        startedAt: stringFrom(event.data.started_at) || timestamp,
         elapsedSeconds: optionalNumberFrom(event.data.elapsed_seconds),
         updatedAt: timestamp,
       };
@@ -345,7 +355,7 @@ export default function App() {
 
     if (event.event === 'thought') {
       const iteration = numberFrom(event.data.iteration, 0);
-      const id = `iteration-${iteration || Date.now()}`;
+      const id = stringFrom(event.data.id, `iteration-${iteration || Date.now()}:decision`);
       const timestamp = now();
       const step: TraceStep = {
         id,
@@ -365,13 +375,19 @@ export default function App() {
 
     if (event.event === 'agent_step') {
       const iteration = numberFrom(event.data.iteration, 0);
-      const id = `iteration-${iteration || Date.now()}`;
+      const phase = stringFrom(event.data.phase, 'intent');
+      const id = stringFrom(
+        event.data.id,
+        phase === 'reasoning'
+          ? `iteration-${iteration || Date.now()}:decision`
+          : `iteration-${iteration || Date.now()}`,
+      );
       const timestamp = now();
       const step: TraceStep = {
         id,
         iteration,
         agent: stringFrom(event.data.agent, 'data_agent'),
-        phase: stringFrom(event.data.phase, 'intent'),
+        phase,
         status: statusFrom(event.data.status, 'running'),
         summary: stringFrom(event.data.message, t('Processing request.')),
         tool: stringFrom(event.data.tool, '') || undefined,
@@ -459,6 +475,10 @@ export default function App() {
     }
 
     if (event.event === 'policy_decision') {
+      const step = traceStepFromPolicyDecision(event);
+      if (step) {
+        updateConversation(conversationId, (conversation) => upsertTraceStep(conversation, step));
+      }
       return;
     }
 
@@ -597,8 +617,8 @@ export default function App() {
             <ChatThread
               messages={activeConversation.messages}
               traceSteps={activeConversation.traceSteps}
-              selectedTraceStepId={activeConversation.selectedTraceStepId}
-              onSelectTraceStep={handleSelectTraceStep}
+              selectedTraceNodeId={activeConversation.selectedTraceStepId}
+              onSelectTraceNode={handleSelectTraceNode}
             />
             {!hasConversationContent && (
               <div className="empty-composer-slot">
@@ -646,7 +666,7 @@ export default function App() {
       {isInspectorVisible && (
         <InspectorPanel
           steps={activeConversation.traceSteps}
-          selectedStepId={selectedTraceStep?.id || null}
+          selectedNodeId={activeConversation.selectedTraceStepId}
           answer={latestAnswer}
           collapsed={isInspectorCollapsed}
           onToggleCollapsed={() => setIsInspectorCollapsed((collapsed) => !collapsed)}

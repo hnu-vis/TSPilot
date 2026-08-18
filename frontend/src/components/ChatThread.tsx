@@ -4,19 +4,22 @@ import type { ChatMessage, TraceStep } from '../types';
 import { FinalAnswer } from './FinalAnswer';
 import { TraceTimeline } from './TraceTimeline';
 import { useI18n } from '../i18n';
+import { elapsedSecondsForTrace, runElapsedSeconds } from '../lib/traceTiming';
 
 type Props = {
   messages: ChatMessage[];
   traceSteps: TraceStep[];
-  selectedTraceStepId: string | null;
-  onSelectTraceStep: (id: string) => void;
+  selectedTraceNodeId: string | null;
+  onSelectTraceNode: (id: string) => void;
 };
 
-export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelectTraceStep }: Props) {
+export function ChatThread({ messages, traceSteps, selectedTraceNodeId, onSelectTraceNode }: Props) {
   const { t } = useI18n();
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const hasStreamingMessage = useMemo(() => messages.some((message) => message.isStreaming), [messages]);
-  const hasRunningStep = useMemo(() => traceSteps.some((step) => step.status === 'running'), [traceSteps]);
+  const hasRunningStep = useMemo(() => traceSteps.some((step) => (
+    step.status === 'running' || step.children?.some((child) => child.status === 'running')
+  )), [traceSteps]);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!hasStreamingMessage && !hasRunningStep) return;
@@ -34,6 +37,9 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
       traceSteps[traceSteps.length - 1]?.id,
       traceSteps[traceSteps.length - 1]?.summary,
       traceSteps[traceSteps.length - 1]?.status,
+      traceSteps[traceSteps.length - 1]?.children?.length,
+      traceSteps[traceSteps.length - 1]?.children?.at(-1)?.status,
+      traceSteps[traceSteps.length - 1]?.children?.at(-1)?.summary,
     ].join('|')
   ), [messages, traceSteps]);
 
@@ -66,11 +72,11 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
             <TodoList todos={latestTodos} />
           )}
           {index === lastAssistantIndex && traceSteps.length > 0 && message.answer && (
-            <TraceTimeline steps={traceSteps} selectedId={selectedTraceStepId} onSelect={onSelectTraceStep} />
+            <TraceTimeline steps={traceSteps} selectedId={selectedTraceNodeId} onSelect={onSelectTraceNode} nowMs={nowMs} />
           )}
           <div className="bubble">
             {message.answer ? (
-              <FinalAnswer answer={message.answer} tokenUsage={message.tokenUsage} elapsedSeconds={runElapsedSeconds(traceSteps)} />
+              <FinalAnswer answer={message.answer} tokenUsage={message.tokenUsage} elapsedSeconds={runElapsedSeconds(traceSteps, nowMs)} />
             ) : message.isStreaming ? (
               <div className="live-answer">
                 <div className="live-status">
@@ -86,7 +92,7 @@ export function ChatThread({ messages, traceSteps, selectedTraceStepId, onSelect
             <TodoList todos={latestTodos} />
           )}
           {index === lastAssistantIndex && traceSteps.length > 0 && !message.answer && (
-            <TraceTimeline steps={traceSteps} selectedId={selectedTraceStepId} onSelect={onSelectTraceStep} />
+            <TraceTimeline steps={traceSteps} selectedId={selectedTraceNodeId} onSelect={onSelectTraceNode} nowMs={nowMs} />
           )}
         </article>
       ))}
@@ -103,52 +109,22 @@ function findLastAssistantIndex(messages: ChatMessage[]) {
 }
 
 function latestTraceSummary(steps: TraceStep[], nowMs: number) {
+  for (let stepIndex = steps.length - 1; stepIndex >= 0; stepIndex -= 1) {
+    const runningCall = [...(steps[stepIndex].children || [])]
+      .reverse()
+      .find((call) => call.status === 'running');
+    if (runningCall) {
+      const elapsed = elapsedSecondsForTrace(runningCall, nowMs);
+      const summary = runningCall.summary || runningCall.title;
+      return elapsed === null ? summary : `${summary} · ${elapsed.toFixed(1)}s`;
+    }
+  }
   const latestRunning = [...steps].reverse().find((step) => step.status === 'running');
   const latest = latestRunning || steps[steps.length - 1];
   if (!latest?.summary) return '';
-  const elapsed = elapsedSecondsForStep(latest, nowMs);
+  const elapsed = elapsedSecondsForTrace(latest, nowMs);
   if (elapsed === null) return latest.summary;
   return `${latest.summary} · ${elapsed.toFixed(1)}s`;
-}
-
-function runElapsedSeconds(steps: TraceStep[]): number | null {
-  const timestamps = steps
-    .flatMap((step) => [step.startedAt, step.completedAt])
-    .filter((value): value is string => Boolean(value))
-    .map((value) => Date.parse(value))
-    .filter((value) => Number.isFinite(value));
-  if (timestamps.length >= 2) {
-    const started = Math.min(...timestamps);
-    const completed = Math.max(...timestamps);
-    if (completed >= started) {
-      return Math.round((completed - started) / 100) / 10;
-    }
-  }
-  const elapsedValues = steps
-    .map((step) => step.elapsedSeconds)
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-  if (elapsedValues.length === 0) return null;
-  return Math.round(elapsedValues.reduce((total, value) => total + value, 0) * 10) / 10;
-}
-
-function elapsedSecondsForStep(step: TraceStep, nowMs: number): number | null {
-  if (step.status === 'running' && step.startedAt) {
-    const started = Date.parse(step.startedAt);
-    if (Number.isFinite(started)) {
-      return Math.max(0, Math.round((nowMs - started) / 100) / 10);
-    }
-  }
-  if (typeof step.elapsedSeconds === 'number' && Number.isFinite(step.elapsedSeconds)) {
-    return step.elapsedSeconds;
-  }
-  if (step.startedAt && step.completedAt) {
-    const started = Date.parse(step.startedAt);
-    const completed = Date.parse(step.completedAt);
-    if (Number.isFinite(started) && Number.isFinite(completed) && completed >= started) {
-      return Math.round((completed - started) / 100) / 10;
-    }
-  }
-  return null;
 }
 
 type TodoItem = {
