@@ -53,6 +53,7 @@ class LLMInsightBinder:
         analysis_id: str,
         analysis_goal: str,
         input_evidence_id: str,
+        input_source_refs: list[str] | None = None,
         response_language: str,
     ) -> list[KeyInsight]:
         if self._llm is None:
@@ -82,7 +83,10 @@ class LLMInsightBinder:
             items = _bind_items(candidate.items, [item.model_dump(mode="json") for item in binding.item_annotations])
             evidence_refs = [
                 InsightEvidenceRef(source_type="analysis", source_id=analysis_id, label=analysis_goal),
-                InsightEvidenceRef(source_type="query", source_id=input_evidence_id),
+                *[
+                    _source_evidence_ref(ref)
+                    for ref in (input_source_refs or [f"evidence:{input_evidence_id}"])
+                ],
                 *[
                     InsightEvidenceRef(source_type="derived_evidence", source_id=evidence_id)
                     for evidence_id in candidate.derived_evidence_ids
@@ -113,7 +117,6 @@ class LLMInsightBinder:
                 )
             )
         return result
-
     async def _invoke(self, payload: dict, *, response_language: str) -> list[_Binding]:
         system = prompt_locale_instruction(response_language) + (
             "You bind immutable Python computation outputs to Key Insight semantics. "
@@ -153,6 +156,15 @@ class LLMInsightBinder:
                         ("human", f"Your binding output violated the required schema: {exc}. Return one corrected schema-valid object only."),
                     ])
         raise InsightBindingError(f"Insight Binder violated its output contract: {last_error}") from last_error
+
+
+def _source_evidence_ref(ref: str) -> InsightEvidenceRef:
+    source_type, separator, source_id = str(ref or "").partition(":")
+    if not separator:
+        source_type, source_id = "query", source_type
+    elif source_type == "evidence":
+        source_type = "query"
+    return InsightEvidenceRef(source_type=source_type, source_id=source_id)
 
 
 def _bind_items(raw_items: list[dict[str, Any]], annotations: Any) -> list[InsightItem]:

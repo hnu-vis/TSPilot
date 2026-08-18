@@ -124,6 +124,10 @@ class ToolExecutor:
             }
         if normalized.get("constraints") in (None, "", False):
             normalized["constraints"] = {}
+        if action_name in {"anomaly", "forecast", "code_interpreter"}:
+            evidence_input = normalized.get("database_evidence")
+            if isinstance(evidence_input, list) and len(evidence_input) == 1:
+                normalized["database_evidence"] = evidence_input[0]
         if "time_range" in normalized:
             normalized["time_range"] = self._normalize_time_range_hint(normalized.get("time_range"), normalized)
         normalized["insight_requests"] = self._normalize_insight_requests(normalized.get("insight_requests"), normalized)
@@ -134,11 +138,12 @@ class ToolExecutor:
             self._drop_unselected_optional_choice(normalized, "model_name")
         if action_name == "code_interpreter":
             normalized.setdefault("analysis_goal", request_state.message)
-            normalized.setdefault("database_evidence", "latest")
+            if not normalized.get("source_refs"):
+                normalized.setdefault("database_evidence", "latest")
             return {
                 key: value
                 for key, value in normalized.items()
-                if key in {"database_evidence", "analysis_goal", "insight_requests", "code", "constraints"}
+                if key in {"database_evidence", "source_refs", "analysis_goal", "insight_requests", "code", "constraints"}
             }
         if action_name == "todowrite":
             normalized.setdefault("message", request_state.message)

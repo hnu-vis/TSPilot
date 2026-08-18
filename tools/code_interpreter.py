@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.analysis.code_policy import AnalysisPolicyError, prepare_analysis_code
 from core.analysis.python_runner import AnalysisCodeError
+from core.artifact_sources import (
+    database_evidence_for_sources,
+    primary_analysis_input,
+    resolve_artifact_sources,
+    source_prompt_manifest,
+)
 from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
 from core.timeseries.evidence_resolution import resolve_database_evidence
@@ -26,6 +32,7 @@ from tools.base import BaseTool
 
 class CodeInterpreterInput(BaseModel):
     database_evidence: DatabaseEvidence | dict | str | None = None
+    source_refs: list[str] = Field(default_factory=list)
     analysis_goal: str
     code: str | None = None
     constraints: dict = Field(default_factory=dict)
@@ -39,6 +46,9 @@ class CodeInterpreterInput(BaseModel):
             evidence = data.get("database_evidence")
             if isinstance(evidence, list) and len(evidence) == 1:
                 data["database_evidence"] = evidence[0]
+            refs = data.get("source_refs")
+            if isinstance(refs, str):
+                data["source_refs"] = [refs]
             if not data.get("code") and data.get("analysis_code"):
                 data["code"] = data["analysis_code"]
             if not isinstance(data.get("constraints"), dict):
@@ -66,6 +76,13 @@ class _GeneratedCode(BaseModel):
     code: str = Field(min_length=1)
 
 
+class _PrimarySourceSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_ref: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class CodeInterpreterTool(BaseTool):
     """Calculate requested Insight values; semantic binding is a separate LLM stage."""
 
@@ -75,10 +92,40 @@ class CodeInterpreterTool(BaseTool):
 
     async def execute(self, validated_input: CodeInterpreterInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
-        evidence = _resolve_database_evidence(validated_input.database_evidence, request_state)
+        source_refs = list(validated_input.source_refs)
+        if isinstance(validated_input.database_evidence, str):
+            database_ref = validated_input.database_evidence.strip()
+            if database_ref not in {"", "latest", "latest_database_evidence", "current"}:
+                source_refs.insert(0, database_ref if database_ref.startswith("evidence:") else f"evidence:{database_ref}")
+        try:
+            sources = resolve_artifact_sources(request_state, source_refs) if request_state is not None and source_refs else []
+        except ValueError as exc:
+            raise ValueError(f"code_interpreter requires grounded database_evidence or source_refs: {exc}") from exc
+        evidence = (
+            database_evidence_for_sources(request_state, sources)
+            if request_state is not None and sources
+            else _resolve_database_evidence(validated_input.database_evidence, request_state)
+        )
         if evidence is None:
-            raise ValueError("code_interpreter requires grounded database_evidence")
+            raise ValueError("code_interpreter requires grounded source_refs or database_evidence")
+        if not sources and request_state is not None:
+            evidence_ref = f"evidence:{evidence.evidence_id}"
+            sources = resolve_artifact_sources(request_state, [evidence_ref])
+        code = str(validated_input.code or "").strip()
+        generated_code = not code
+        if generated_code and len(sources) > 1:
+            sources = await self._select_primary_source(
+                sources=sources,
+                goal=validated_input.analysis_goal,
+                requests=validated_input.insight_requests,
+            )
+        input_source_refs = [source["source_ref"] for source in sources] or [f"evidence:{evidence.evidence_id}"]
         rows, points, columns = _analysis_inputs(evidence)
+        primary_input = primary_analysis_input(sources)
+        if primary_input is not None:
+            rows = primary_input["rows"]
+            points = primary_input["points"]
+            columns = primary_input["columns"]
         input_insights = _input_insights(request_state, validated_input.insight_requests)
         context = build_canonical_analysis_context(
             rows=rows,
@@ -87,14 +134,23 @@ class CodeInterpreterTool(BaseTool):
             metadata=evidence.metadata,
             diagnostics=evidence.diagnostics,
         )
+        context["sources"] = sources
+        context["source_by_ref"] = {source["source_ref"]: source for source in sources}
+        context["primary_source"] = (
+            {
+                "source_ref": primary_input["source_ref"],
+                "dataset_name": primary_input["dataset_name"],
+                "shape": primary_input["shape"],
+            }
+            if primary_input is not None
+            else None
+        )
         context["input_insights"] = input_insights
         anomaly_context = _authoritative_anomaly_context(request_state, evidence.evidence_id)
         if anomaly_context:
             context["anomaly_context"] = anomaly_context
 
         response_language = getattr(request_state, "response_language", "en")
-        code = str(validated_input.code or "").strip()
-        generated_code = not code
         if generated_code:
             code = await self._generate_code(
                 goal=validated_input.analysis_goal,
@@ -129,6 +185,7 @@ class CodeInterpreterTool(BaseTool):
                     sandbox_output.result.get("derived_evidence", []),
                     analysis_id=analysis_id,
                     input_evidence_id=evidence.evidence_id,
+                    input_source_refs=input_source_refs,
                     input_insights=input_insights,
                 )
                 computed = _validate_computed_insights(
@@ -154,6 +211,7 @@ class CodeInterpreterTool(BaseTool):
             analysis_id=analysis_id,
             analysis_goal=validated_input.analysis_goal,
             input_evidence_id=evidence.evidence_id,
+            input_source_refs=input_source_refs,
             response_language=response_language,
         )
         result = AnalysisResult(
@@ -161,6 +219,7 @@ class CodeInterpreterTool(BaseTool):
             analysis_goal=validated_input.analysis_goal,
             code_hash=code_hash,
             input_evidence_id=evidence.evidence_id,
+            input_source_refs=input_source_refs,
             input_row_count=len(rows),
             status="succeeded",
             summary=f"Computed {len(computed)} requested insight value(s).",
@@ -174,9 +233,63 @@ class CodeInterpreterTool(BaseTool):
                 "input_columns": columns,
                 "canonical_inputs": context.get("schema"),
                 "binder": "llm_insight_binder_v1",
+                "input_source_refs": input_source_refs,
+                "primary_source": context.get("primary_source"),
             },
         )
         return result.model_dump(mode="json")
+
+    async def _select_primary_source(
+        self,
+        *,
+        sources: list[dict],
+        goal: str,
+        requests: list[KeyInsightRequest],
+    ) -> list[dict]:
+        """Use semantic ownership to choose the canonical df for multi-source analysis."""
+
+        payload = {
+            "analysis_goal": goal,
+            "insight_requests": [item.model_dump(mode="json", exclude_none=True) for item in requests],
+            "artifact_sources": source_prompt_manifest(sources),
+        }
+        system = (
+            "Choose the one grounded artifact source that should back the canonical df for this calculation. "
+            "Select by semantic ownership, not list order: calculations about an existing forecast should use the forecast artifact; "
+            "calculations about detected anomalies should use the anomaly artifact; raw evidence is primary only for calculations "
+            "whose requested values are owned by the observations themselves. Other sources remain available for composition. "
+            "Return exactly one source_ref copied verbatim from artifact_sources and a concise reason."
+        )
+        messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if hasattr(self._llm, "with_structured_output"):
+                    runnable = self._llm.with_structured_output(
+                        _PrimarySourceSelection, method="json_schema", include_raw=True,
+                    )
+                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    if isinstance(bundle, dict):
+                        parsed = bundle.get("parsed")
+                        if parsed is None:
+                            raise ValueError(bundle.get("parsing_error") or "primary source selection was not parsed")
+                    else:
+                        parsed = bundle
+                    selection = parsed if isinstance(parsed, _PrimarySourceSelection) else _PrimarySourceSelection.model_validate(parsed)
+                else:
+                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    selection = _PrimarySourceSelection.model_validate_json(_llm_content(response))
+                by_ref = {source["source_ref"]: source for source in sources}
+                if selection.source_ref not in by_ref:
+                    raise ValueError("selected source_ref is not one of the supplied artifact sources")
+                return [by_ref[selection.source_ref], *[
+                    source for source in sources if source["source_ref"] != selection.source_ref
+                ]]
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.append(("human", f"Correct the primary source selection error: {exc}"))
+        raise AnalysisCodeError(f"code_interpreter primary source selection failed: {last_error}") from last_error
 
     async def _generate_code(
         self,
@@ -192,11 +305,27 @@ class CodeInterpreterTool(BaseTool):
         system = prompt_locale_instruction(response_language) + (
             "You generate Python for a computation-only Code Interpreter. Return exactly one JSON object with key code. "
             "The sandbox provides df, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
-            "metadata, diagnostics, input_insights, insight_by_key, pd, np, math, and statistics. Do not import or access files, "
-            "network, processes, environment variables, or clocks. All computed values must be produced by the Python program from the "
+            "sources, source_by_ref, "
+            "metadata, diagnostics, input_insights, insight_by_key, pd, np, math, and statistics. Do not import or access files. "
+            "Do not call globals, locals, vars, eval, exec, compile, __import__, getattr, setattr, or any introspection helper. "
+            "Do not use try/except/raise; inspect the documented inputs directly with ordinary conditionals. "
+            "Do not access network, processes, environment variables, or clocks. All computed values must be produced by the Python program from the "
             "provided sandbox inputs. Generated code must read at least one grounded "
-            "data input (for example df, rows, points, input_insights, or analysis_context); never hardcode computed answers or merely copy "
+            "data input (for example df, rows, points, sources, source_by_ref, input_insights, or analysis_context); never hardcode computed answers or merely copy "
             "answer values from this prompt. Preserve temporal and other ordering constraints expressed by the requested calculation. "
+            "df, rows, points, columns, time_col, and value_col are bound to the first explicit artifact source in source_refs, "
+            "not to that artifact's database ancestor. Treat analysis_context.primary_source as authoritative for what df represents. "
+            "Always read df/rows/points directly for the primary source; do not look the primary source up again through source_by_ref. "
+            "Use source_by_ref only when the calculation intentionally composes additional referenced sources. Each source exposes "
+            "datasets as a list of {name, rows, scalar, ...} and also exposes every dataset directly by its name, for example "
+            "source_by_ref[ref]['forecast_points'] or source_by_ref[ref]['anomaly_points']. "
+            "Forecast and anomaly artifacts are immutable specialized outputs. When a forecast source is supplied, never fit, "
+            "extrapolate, smooth, clean, or generate another forecast in Python; derive requested values from its forecast_points. "
+            "When an anomaly source is supplied, never redetect or replace its anomaly set. For a comparison between the latest "
+            "observation and forecast endpoint, read each value from its owning source through source_by_ref. "
+            "Never manufacture uncertainty bands from an arbitrary fixed percentage or unsupported constant. If grounded forecast "
+            "intervals are absent and an interval was explicitly requested, return that Insight as unavailable; if no interval was "
+            "requested, do not create one. "
             "Assign one dict to result with exactly two keys: "
             "computed_insights and derived_evidence. computed_insights must contain exactly one object per requested insight_key. "
             "Each object contains insight_key, value or items, a non-empty calculation_trace describing formula/inputs as concise text or JSON, and optional "
@@ -215,8 +344,10 @@ class CodeInterpreterTool(BaseTool):
             "goal": goal,
             "insight_requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
             "canonical_inputs": context.get("schema", {}),
+            "primary_source": context.get("primary_source"),
             "input_insights": context.get("input_insights", []),
             "anomaly_context": context.get("anomaly_context"),
+            "artifact_sources": source_prompt_manifest(context.get("sources", [])),
             "repair_context": repair_context,
         }
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
@@ -286,12 +417,13 @@ def _materialize_derived_evidence(
     *,
     analysis_id: str,
     input_evidence_id: str,
+    input_source_refs: list[str] | None = None,
     input_insights: list[dict],
 ) -> tuple[list[DerivedEvidence], dict[str, str]]:
     if not isinstance(raw, list):
         raise AnalysisCodeError("derived_evidence must be a list")
     lineage = [
-        f"evidence:{input_evidence_id}",
+        *(input_source_refs or [f"evidence:{input_evidence_id}"]),
         *[
             f"insight:{item['insight_id']}"
             for item in input_insights
@@ -404,6 +536,8 @@ def _preflight_analysis_code(
             "insight_by_key",
             "analysis_context",
             "anomaly_context",
+            "sources",
+            "source_by_ref",
         }
         if not prepared.loaded_names.intersection(grounded_inputs):
             return (

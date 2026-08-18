@@ -72,6 +72,8 @@ def _execute(payload: dict) -> dict:
     if isinstance(supplied_context, dict):
         canonical_values["analysis_context"] = supplied_context
         canonical_values["anomaly_context"] = supplied_context.get("anomaly_context")
+        canonical_values["sources"] = supplied_context.get("sources", [])
+        canonical_values["source_by_ref"] = supplied_context.get("source_by_ref", {})
     database_evidence = {
         "rows": rows,
         "points": points,

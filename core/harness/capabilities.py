@@ -206,7 +206,7 @@ def default_capability_registry() -> CapabilityRegistry:
                 card=ActionParameterCard(
                     action="code_interpreter",
                     use_when="Existing evidence needs derived metrics, statistics, ratios, windows, or user-requested custom computation.",
-                    parameters=("database_evidence", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "insight_requests?"),
+                    parameters=("source_refs?", "database_evidence?", "analysis_goal", "analysis_request?", "required_outputs?", "code?", "expected_result_schema?", "constraints?", "insight_requests?"),
                     input_defaults={"database_evidence": "latest", "analysis_request": {"mode": "canonical_timeseries_metrics"}},
                 ),
                 aliases=("derived_metric", "statistics", "statistical_summary", "calculation"),

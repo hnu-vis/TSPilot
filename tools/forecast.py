@@ -1,13 +1,15 @@
 """Forecast tool placeholder."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
+import json
 from math import ceil
 import re
 from statistics import median
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import field_validator
 
 from core.database.dialects import dialect_for_database
@@ -93,7 +95,18 @@ class ForecastInput(BaseModel):
         return value
 
 
+class _ForecastInputAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    safe_to_forecast: bool
+    reason: str = Field(min_length=1)
+    quality_issues: list[str] = Field(default_factory=list)
+
+
 class ForecastTool(BaseTool):
+    def __init__(self, llm=None):
+        self._llm = llm
+
     async def execute(self, validated_input: ForecastInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
         database_evidence = validated_input.database_evidence
@@ -121,6 +134,23 @@ class ForecastTool(BaseTool):
             request_state=request_state,
             constraints=constraints,
         )
+        # The semantic gate owns dependency routing for raw forecast inputs. Once a
+        # matching anomaly artifact has been applied, the specialized anomaly tool
+        # owns point selection and the forecaster consumes that filtered contract;
+        # asking the same gate to veto it again creates an unrepairable
+        # anomaly/forecast loop rather than a new source dependency.
+        if self._llm is not None and not input_policy_diagnostics.get("source_anomaly_id"):
+            assessment = await self._assess_input_quality(
+                series=series,
+                evidence=database_evidence,
+                policy_diagnostics=input_policy_diagnostics,
+            )
+            if not assessment.safe_to_forecast:
+                raise _semantic_input_quality_error(
+                    assessment=assessment,
+                    evidence=database_evidence,
+                    anomaly_already_applied=bool(input_policy_diagnostics.get("source_anomaly_id")),
+                )
         quality = _validate_forecast_evidence_quality(database_evidence, series, request_state, constraints)
         forecast_plan = _resolve_forecast_plan(validated_input, constraints, series)
         horizon = forecast_plan.requested_steps
@@ -165,6 +195,107 @@ class ForecastTool(BaseTool):
                 **input_policy_diagnostics,
             },
         ).model_dump(mode="json")
+
+    async def _assess_input_quality(
+        self,
+        *,
+        series: TimeSeriesSeries,
+        evidence: DatabaseEvidence,
+        policy_diagnostics: dict,
+    ) -> _ForecastInputAssessment:
+        points = [point.model_dump(mode="json") for point in series.points]
+        if len(points) > 16:
+            preview = {
+                "start_window": points[:8],
+                "end_window": points[-8:],
+            }
+            sample_layout = (
+                "Two separate chronological edge windows. Adjacency exists only within each window; "
+                "the last start_window point and first end_window point are not adjacent."
+            )
+        else:
+            preview = {"complete_series": points}
+            sample_layout = "The complete chronological series; consecutive records are adjacent."
+        payload = {
+            "evidence_id": evidence.evidence_id,
+            "series_name": series.series_name,
+            "point_count": len(points),
+            "ordered_samples": preview,
+            "sample_layout": sample_layout,
+            "input_policy": policy_diagnostics,
+        }
+        system = (
+            "Assess whether a time-series input is semantically credible enough for a specialized forecast model. "
+            "Return one schema-valid object. Judge discontinuities, impossible scale changes, corruption-like values, and whether "
+            "a few points visibly dominate the series. Do not forecast, clean, clip, replace, or calculate user conclusions. "
+            "The payload can contain two distant edge windows: never treat the gap between those windows or the difference between "
+            "their endpoint levels as an adjacent discontinuity. A gradual level change over a long time span is not corruption. "
+            "Judge local transitions only where the sample_layout says points are adjacent. If a matching anomaly artifact has "
+            "already been applied, assess the filtered series and do not demand the same anomaly step again. Reject that filtered "
+            "series only when the visible adjacent points still contain a concrete residual corruption pattern, and identify those "
+            "points in the reason. safe_to_forecast must be false when visible evidence is clearly contaminated enough to make the "
+            "model output misleading; explain the semantic quality issue concisely."
+        )
+        messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if hasattr(self._llm, "with_structured_output"):
+                    runnable = self._llm.with_structured_output(
+                        _ForecastInputAssessment, method="json_schema", include_raw=True,
+                    )
+                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    if isinstance(bundle, dict):
+                        parsed = bundle.get("parsed")
+                        if parsed is None:
+                            raise ValueError(bundle.get("parsing_error") or "forecast input assessment was not parsed")
+                    else:
+                        parsed = bundle
+                    return parsed if isinstance(parsed, _ForecastInputAssessment) else _ForecastInputAssessment.model_validate(parsed)
+                response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                return _ForecastInputAssessment.model_validate_json(str(getattr(response, "content", response)))
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.append(("human", f"Correct the forecast input assessment schema error: {exc}"))
+        raise ValueError(f"Forecast input semantic assessment failed: {last_error}") from last_error
+
+
+def _semantic_input_quality_error(
+    *,
+    assessment: _ForecastInputAssessment,
+    evidence: DatabaseEvidence,
+    anomaly_already_applied: bool,
+) -> StructuredToolError:
+    required_action = "sql_query" if anomaly_already_applied else "anomaly"
+    repair_contract = {
+        "mode": "forecast_input_quality_repair",
+        "failed_tool": "forecast",
+        "input_evidence": evidence.evidence_id,
+        "quality_issues": assessment.quality_issues,
+        "reason": assessment.reason,
+    }
+    return StructuredToolError(
+        f"Forecast input failed semantic quality assessment: {assessment.reason}",
+        error_type="forecast_input_semantic_quality",
+        retryable=True,
+        diagnostics=repair_contract,
+        recommended_next_action=required_action,
+        validation_failure={
+            "tool": required_action,
+            "scope": "forecast_input_quality",
+            "capability": "forecast",
+            "error_code": "forecast_input_semantic_quality",
+            "message": assessment.reason,
+            "repair_contract": repair_contract,
+            "retry_policy": {
+                "required_action": required_action,
+                "max_equivalent_retries": 2,
+                "allow_same_action": False,
+                "terminal_after_exhausted": True,
+            },
+        },
+    )
 
 
 def _insufficient_timeseries_evidence_error(

@@ -57,6 +57,7 @@ class AnalysisResult(BaseModel):
     code_type: Literal["code_interpreter_v2"] = "code_interpreter_v2"
     code_hash: str
     input_evidence_id: str
+    input_source_refs: list[str] = Field(default_factory=list)
     input_row_count: int
     status: Literal["succeeded", "failed"]
     summary: str
