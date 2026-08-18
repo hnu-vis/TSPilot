@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from core.analysis.python_runner import AnalysisCodeError
 from schemas.analysis import ComputedInsight
 from schemas.key_insight import InsightEvidenceRef, InsightItem, KeyInsight, KeyInsightRequest
+from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
 from runtime.timeout_policy import load_timeout_policy
 
@@ -170,28 +171,56 @@ class LLMInsightBinder:
         for attempt in range(2):
             raw_content = ""
             try:
-                if hasattr(self._llm, "with_structured_output"):
-                    runnable = self._llm.with_structured_output(
-                        _BindingResponse, method="json_schema", include_raw=True,
-                    )
-                    bundle = await asyncio.wait_for(
-                        runnable.ainvoke(messages), timeout=self._timeout_seconds
-                    )
-                    if isinstance(bundle, dict):
-                        raw_content = _llm_content(bundle.get("raw"))
-                        parsed = bundle.get("parsed")
-                        if parsed is None:
-                            raise ValueError(bundle.get("parsing_error") or "structured output was not parsed")
-                        parsed = parsed if isinstance(parsed, _BindingResponse) else _BindingResponse.model_validate(parsed)
+                async with llm_trace_span(
+                    "Interpretation Repair" if attempt else "Result Interpretation",
+                    summary=(
+                        "将计算结果修正为可靠的数据发现"
+                        if response_language == "zh" and attempt
+                        else "将计算结果归纳为数据发现"
+                        if response_language == "zh"
+                        else "Repair the semantic interpretation of computed results"
+                        if attempt
+                        else "Interpret computed results as grounded findings"
+                    ),
+                    messages=messages,
+                ) as trace_span:
+                    if hasattr(self._llm, "with_structured_output"):
+                        runnable = self._llm.with_structured_output(
+                            _BindingResponse, method="json_schema", include_raw=True,
+                        )
+                        bundle = await asyncio.wait_for(
+                            runnable.ainvoke(messages), timeout=self._timeout_seconds
+                        )
+                        if isinstance(bundle, dict):
+                            trace_response = bundle.get("raw")
+                            raw_content = _llm_content(trace_response)
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    trace_response,
+                                    messages=messages,
+                                    output_text=raw_content,
+                                )
+                            parsed = bundle.get("parsed")
+                            if parsed is None:
+                                raise ValueError(bundle.get("parsing_error") or "structured output was not parsed")
+                            parsed = parsed if isinstance(parsed, _BindingResponse) else _BindingResponse.model_validate(parsed)
+                        else:
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    bundle,
+                                    messages=messages,
+                                    output_text=_llm_content(bundle),
+                                )
+                            parsed = bundle if isinstance(bundle, _BindingResponse) else _BindingResponse.model_validate(bundle)
                     else:
-                        parsed = bundle if isinstance(bundle, _BindingResponse) else _BindingResponse.model_validate(bundle)
-                else:
-                    response = await asyncio.wait_for(
-                        self._llm.ainvoke(messages), timeout=self._timeout_seconds
-                    )
-                    raw_content = _llm_content(response)
-                    parsed = _BindingResponse.model_validate_json(raw_content)
-                return parsed.bindings
+                        response = await asyncio.wait_for(
+                            self._llm.ainvoke(messages), timeout=self._timeout_seconds
+                        )
+                        raw_content = _llm_content(response)
+                        if trace_span is not None:
+                            trace_span.attach_response(response, messages=messages, output_text=raw_content)
+                        parsed = _BindingResponse.model_validate_json(raw_content)
+                    return parsed.bindings
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:

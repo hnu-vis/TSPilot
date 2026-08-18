@@ -65,6 +65,17 @@ class StructuredTerminateThenNaturalLLM:
         return _FakeResponse(json.dumps(payload, ensure_ascii=False))
 
 
+class PolicyRejectedActionLLM:
+    async def ainvoke(self, messages, config=None, stop=None, **kwargs):
+        return _FakeResponse(json.dumps({
+            "thought": "I will use unrelated knowledge retrieval for this database-only forecast.",
+            "task_contract": None,
+            "previous_observation_assessment": None,
+            "action": "rag",
+            "action_input": {"query": "BTC forecast"},
+        }))
+
+
 class _FakeResponse:
     def __init__(self, content: str):
         self.content = content
@@ -111,6 +122,8 @@ def test_chat_json_path_returns_final_answer():
     assert payload["token_usage"]["totals"]["total_tokens"] > 0
     assert payload["token_usage"]["totals"]["call_count"] >= 1
     assert payload["token_usage"]["totals"]["counting_method"] == "tiktoken_estimate"
+    assert any(event["event_type"] == "tool_call" for event in payload["trace"])
+    assert not any(event["event_type"] == "tool_boundary" for event in payload["trace"])
 
 
 def test_chat_json_path_returns_agent_decision_timeout():
@@ -296,7 +309,8 @@ def test_first_visible_action_does_not_wait_for_separate_intent_llm_call():
 
 
 def test_chat_sse_path_returns_event_stream():
-    client = _build_client(FakeLLM())
+    llm = FakeLLM()
+    client = _build_client(llm)
     with client.stream(
         "POST",
         "/api/v1/chat",
@@ -319,14 +333,72 @@ def test_chat_sse_path_returns_event_stream():
     assert "event: step.start" in body
     assert "event: step.meta" in body
     assert "event: step.done" in body
+    assert "event: trace_span_start" in body
+    assert "event: trace_span_end" in body
     assert "event: final_answer" in body
     assert "event: terminate" in body
     assert "event: thought" in body
     assert '"action_input"' in body
     assert '"observation"' in body
     assert body.index('"placeholder": true') < body.index("event: tool_call")
+    assert body.index("event: step.start") < body.index("event: trace_span_start")
+    assert body.index('"title": "ReAct Decision"') < body.index("event: tool_call")
     assert "event: action" not in body
     assert "event: observation" not in body
+    llm_frames = [frame for frame in body.split("\n\n") if "event: trace_span_" in frame]
+    step_start_frame = next(frame for frame in body.split("\n\n") if "event: step.start" in frame)
+    step_meta_frame = next(frame for frame in body.split("\n\n") if "event: step.meta" in frame)
+    assert '"id": "iteration-1:decision"' in step_start_frame
+    assert '"id": "iteration-1"' in step_meta_frame
+    llm_starts = [frame for frame in llm_frames if "event: trace_span_start" in frame]
+    llm_ends = [frame for frame in llm_frames if "event: trace_span_end" in frame]
+    assert len(llm_starts) == len(llm_ends)
+    assert len(llm_starts) >= 3
+    assert '"title": "ReAct Decision"' in llm_starts[0]
+    assert '"parent_id": "iteration-1:decision"' in llm_starts[0]
+    assert all('"input_summary"' in frame for frame in llm_starts)
+    assert all('"output_summary"' in frame for frame in llm_ends)
+    assert all('"input_preview"' in frame for frame in llm_starts)
+    assert all('"output_preview"' in frame for frame in llm_ends)
+    llm_payloads = [json.loads(frame.split("data: ", 1)[1]) for frame in llm_frames]
+    assert all("model" not in payload and "provider" not in payload for payload in llm_payloads)
+    sql_generation = next(payload for payload in llm_payloads if payload.get("title") == "SQL Generation")
+    assert sql_generation["parent_id"] == "iteration-1"
+
+
+def test_chat_sse_policy_rejection_is_closed_without_a_phantom_tool_call():
+    client = _build_client(PolicyRejectedActionLLM(), max_iterations=1)
+    with client.stream(
+        "POST",
+        "/api/v1/chat",
+        json={
+            "message": "预测未来一周的 BTC/USD 走势。",
+            "database_context": {
+                "database_id": "influxdb2-bitcoin-sample",
+                "database_type": "influxdb",
+            },
+            "stream": True,
+        },
+    ) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+
+    frames = [frame for frame in body.split("\n\n") if frame.strip()]
+    rejected_policy = [
+        frame for frame in frames
+        if frame.startswith("event: policy_decision\n") and '"accepted": false' in frame
+    ]
+    failed_steps = [
+        frame for frame in frames
+        if frame.startswith("event: step.done\n") and '"status": "failed"' in frame
+    ]
+
+    assert response.status_code == 200
+    assert len(rejected_policy) == 1
+    assert len(failed_steps) == 1
+    assert '"tool": "rag"' in rejected_policy[0]
+    assert "event: tool_call" not in body
+    assert "event: tool_result" not in body
+    assert "event: step.meta" not in body
 
 
 def test_chat_json_path_persists_complete_trace_log(tmp_path):

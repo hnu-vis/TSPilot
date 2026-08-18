@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.completion import normalize_todo_for_completion
 from core.harness import default_capability_registry
+from runtime.llm_trace import llm_trace_span
 from runtime.timeout_policy import load_timeout_policy
 from tools.base import BaseTool
 
@@ -179,28 +180,58 @@ class TodoWriteTool(BaseTool):
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                if hasattr(self._llm, "with_structured_output"):
-                    runnable = self._llm.with_structured_output(
-                        _TodoCapabilityBindings, method="json_schema", include_raw=True,
-                    )
-                    bundle = await asyncio.wait_for(
-                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    if isinstance(bundle, dict):
-                        parsed = bundle.get("parsed")
-                        if parsed is None:
-                            raise ValueError(bundle.get("parsing_error") or "Todo capability binding was not parsed")
+                async with llm_trace_span(
+                    "Task Classification Repair" if attempt else "Task Classification",
+                    summary="Bind each task to its owning capability",
+                    messages=messages,
+                ) as trace_span:
+                    if hasattr(self._llm, "with_structured_output"):
+                        runnable = self._llm.with_structured_output(
+                            _TodoCapabilityBindings, method="json_schema", include_raw=True,
+                        )
+                        bundle = await asyncio.wait_for(
+                            runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        if isinstance(bundle, dict):
+                            trace_response = bundle.get("raw")
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    trace_response,
+                                    messages=messages,
+                                    output_text=str(getattr(trace_response, "content", trace_response) or ""),
+                                )
+                            parsed = bundle.get("parsed")
+                            if parsed is None:
+                                raise ValueError(
+                                    bundle.get("parsing_error")
+                                    or "Todo capability binding was not parsed"
+                                )
+                        else:
+                            parsed = bundle
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    bundle,
+                                    messages=messages,
+                                    output_text=str(getattr(bundle, "content", bundle) or ""),
+                                )
+                        result = (
+                            parsed
+                            if isinstance(parsed, _TodoCapabilityBindings)
+                            else _TodoCapabilityBindings.model_validate(parsed)
+                        )
                     else:
-                        parsed = bundle
-                    result = (
-                        parsed if isinstance(parsed, _TodoCapabilityBindings)
-                        else _TodoCapabilityBindings.model_validate(parsed)
-                    )
-                else:
-                    response = await asyncio.wait_for(
-                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    result = _TodoCapabilityBindings.model_validate_json(str(getattr(response, "content", response)))
+                        response = await asyncio.wait_for(
+                            self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        if trace_span is not None:
+                            trace_span.attach_response(
+                                response,
+                                messages=messages,
+                                output_text=str(getattr(response, "content", response) or ""),
+                            )
+                        result = _TodoCapabilityBindings.model_validate_json(
+                            str(getattr(response, "content", response))
+                        )
                 by_index = {item.index: item for item in result.bindings}
                 expected = set(range(len(todos)))
                 if set(by_index) != expected:

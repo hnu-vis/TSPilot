@@ -7,6 +7,7 @@ import time
 
 from agents.base import BaseAgent
 from prompts.data_agent import DataAgentPromptBuilder
+from runtime.llm_trace import llm_trace_span
 from runtime.token_usage import record_llm_token_usage
 from schemas.agent_turn import ReActTurn
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -34,6 +35,8 @@ class DataAgent(BaseAgent):
             ],
             request_state=request_state,
             source="data_agent.next_turn",
+            trace_title="ReAct Decision",
+            trace_summary="Choose the next action from the current task state",
         )
         if structured_turn is not None:
             return structured_turn
@@ -60,6 +63,8 @@ class DataAgent(BaseAgent):
                     ],
                     request_state=request_state,
                     source="data_agent.contract_repair",
+                    trace_title="ReAct Decision Repair",
+                    trace_summary="Repair an invalid ReAct decision contract",
                 )
                 if structured_turn is not None:
                     return structured_turn
@@ -113,40 +118,69 @@ class DataAgent(BaseAgent):
             f"Parser error: {parser_error}"
         )
 
-    async def _invoke_model(self, messages, *, request_state=None, source: str = "data_agent") -> str:
-        started_at = time.perf_counter()
-        response = await self._llm.ainvoke(messages)
-        duration_ms = int((time.perf_counter() - started_at) * 1000)
-        content = getattr(response, "content", response)
-        if isinstance(content, list):
-            content = "".join(
-                item.get("text", "") if isinstance(item, dict) else str(item)
-                for item in content
+    async def _invoke_model(
+        self,
+        messages,
+        *,
+        request_state=None,
+        source: str = "data_agent",
+        trace_title: str,
+        trace_summary: str | None = None,
+    ) -> str:
+        async with llm_trace_span(trace_title, summary=trace_summary, messages=messages) as trace_span:
+            started_at = time.perf_counter()
+            response = await self._llm.ainvoke(messages)
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            content = getattr(response, "content", response)
+            if isinstance(content, list):
+                content = "".join(
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            content = str(content)
+            usage = record_llm_token_usage(
+                request_state,
+                source=source,
+                response=response,
+                messages=messages,
+                output_text=content,
+                duration_ms=duration_ms,
             )
-        content = str(content)
-        record_llm_token_usage(
-            request_state,
-            source=source,
-            response=response,
-            messages=messages,
-            output_text=content,
-            duration_ms=duration_ms,
-        )
-        return content
+            if trace_span is not None:
+                trace_span.attach_output(response, output_text=content)
+                trace_span.attach_token_usage(usage)
+            return content
 
-    async def _invoke_turn(self, messages, *, request_state=None, source: str = "data_agent") -> tuple[str, ReActTurn | None]:
+    async def _invoke_turn(
+        self,
+        messages,
+        *,
+        request_state=None,
+        source: str = "data_agent",
+        trace_title: str,
+        trace_summary: str | None = None,
+    ) -> tuple[str, ReActTurn | None]:
         if self._structured_llm is None:
-            return await self._invoke_model(messages, request_state=request_state, source=source), None
+            return await self._invoke_model(
+                messages,
+                request_state=request_state,
+                source=source,
+                trace_title=trace_title,
+                trace_summary=trace_summary,
+            ), None
 
-        started_at = time.perf_counter()
-        result = await self._structured_llm.ainvoke(messages)
-        duration_ms = int((time.perf_counter() - started_at) * 1000)
-        raw_response = result.get("raw") if isinstance(result, dict) else result
-        parsed = result.get("parsed") if isinstance(result, dict) else None
-        parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
-        if isinstance(parsed, ReActTurn):
-            content = json.dumps(parsed.model_dump(mode="json"), ensure_ascii=False)
-            record_llm_token_usage(
+        async with llm_trace_span(trace_title, summary=trace_summary, messages=messages) as trace_span:
+            started_at = time.perf_counter()
+            result = await self._structured_llm.ainvoke(messages)
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            raw_response = result.get("raw") if isinstance(result, dict) else result
+            parsed = result.get("parsed") if isinstance(result, dict) else None
+            parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
+            if isinstance(parsed, ReActTurn):
+                content = json.dumps(parsed.model_dump(mode="json"), ensure_ascii=False)
+            else:
+                content = self._structured_failure_text(result, parsing_error)
+            usage = record_llm_token_usage(
                 request_state,
                 source=source,
                 response=raw_response,
@@ -154,18 +188,10 @@ class DataAgent(BaseAgent):
                 output_text=content,
                 duration_ms=duration_ms,
             )
-            return content, parsed
-
-        content = self._structured_failure_text(result, parsing_error)
-        record_llm_token_usage(
-            request_state,
-            source=source,
-            response=raw_response,
-            messages=messages,
-            output_text=content,
-            duration_ms=duration_ms,
-        )
-        return content, None
+            if trace_span is not None:
+                trace_span.attach_output(raw_response, output_text=content)
+                trace_span.attach_token_usage(usage)
+            return content, parsed if isinstance(parsed, ReActTurn) else None
 
     def _build_structured_llm(self, llm):
         builder = getattr(llm, "with_structured_output", None)

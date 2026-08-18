@@ -21,6 +21,7 @@ from core.artifact_sources import (
 from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
 from core.timeseries.evidence_resolution import resolve_database_evidence
+from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
 from runtime.timeout_policy import load_timeout_policy
 from sandbox import execute_python_sandbox_v1
@@ -135,11 +136,13 @@ class CodeInterpreterTool(BaseTool):
             sources = resolve_artifact_sources(request_state, [evidence_ref])
         code = str(validated_input.code or "").strip()
         generated_code = not code
+        response_language = getattr(request_state, "response_language", "en")
         if generated_code and len(sources) > 1:
             sources = await self._select_primary_source(
                 sources=sources,
                 goal=validated_input.analysis_goal,
                 requests=validated_input.insight_requests,
+                response_language=response_language,
             )
         input_source_refs = [source["source_ref"] for source in sources] or [f"evidence:{evidence.evidence_id}"]
         rows, points, columns = _analysis_inputs(evidence)
@@ -172,7 +175,6 @@ class CodeInterpreterTool(BaseTool):
         if anomaly_context:
             context["anomaly_context"] = anomaly_context
 
-        response_language = getattr(request_state, "response_language", "en")
         if generated_code:
             code = await self._generate_code(
                 goal=validated_input.analysis_goal,
@@ -280,6 +282,7 @@ class CodeInterpreterTool(BaseTool):
         sources: list[dict],
         goal: str,
         requests: list[KeyInsightRequest],
+        response_language: str,
     ) -> list[dict]:
         """Use semantic ownership to choose the canonical df for multi-source analysis."""
 
@@ -299,25 +302,61 @@ class CodeInterpreterTool(BaseTool):
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                if hasattr(self._llm, "with_structured_output"):
-                    runnable = self._llm.with_structured_output(
-                        _PrimarySourceSelection, method="json_schema", include_raw=True,
-                    )
-                    bundle = await asyncio.wait_for(
-                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    if isinstance(bundle, dict):
-                        parsed = bundle.get("parsed")
-                        if parsed is None:
-                            raise ValueError(bundle.get("parsing_error") or "primary source selection was not parsed")
+                async with llm_trace_span(
+                    "Source Selection Repair" if attempt else "Source Selection",
+                    summary=(
+                        "选择计算所使用的主数据源"
+                        if response_language == "zh"
+                        else "Select the primary source for the calculation"
+                    ),
+                    messages=messages,
+                ) as trace_span:
+                    if hasattr(self._llm, "with_structured_output"):
+                        runnable = self._llm.with_structured_output(
+                            _PrimarySourceSelection, method="json_schema", include_raw=True,
+                        )
+                        bundle = await asyncio.wait_for(
+                            runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        if isinstance(bundle, dict):
+                            trace_response = bundle.get("raw")
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    trace_response,
+                                    messages=messages,
+                                    output_text=_llm_content(trace_response),
+                                )
+                            parsed = bundle.get("parsed")
+                            if parsed is None:
+                                raise ValueError(
+                                    bundle.get("parsing_error")
+                                    or "primary source selection was not parsed"
+                                )
+                        else:
+                            parsed = bundle
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    bundle,
+                                    messages=messages,
+                                    output_text=_llm_content(bundle),
+                                )
+                        selection = (
+                            parsed
+                            if isinstance(parsed, _PrimarySourceSelection)
+                            else _PrimarySourceSelection.model_validate(parsed)
+                        )
                     else:
-                        parsed = bundle
-                    selection = parsed if isinstance(parsed, _PrimarySourceSelection) else _PrimarySourceSelection.model_validate(parsed)
-                else:
-                    response = await asyncio.wait_for(
-                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    selection = _PrimarySourceSelection.model_validate_json(_llm_content(response))
+                        response = await asyncio.wait_for(
+                            self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        raw_content = _llm_content(response)
+                        if trace_span is not None:
+                            trace_span.attach_response(
+                                response,
+                                messages=messages,
+                                output_text=raw_content,
+                            )
+                        selection = _PrimarySourceSelection.model_validate_json(raw_content)
                 by_ref = {source["source_ref"]: source for source in sources}
                 if selection.source_ref not in by_ref:
                     raise ValueError("selected source_ref is not one of the supplied artifact sources")
@@ -403,40 +442,94 @@ class CodeInterpreterTool(BaseTool):
             "repair_context": repair_context,
         }
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+        is_repair = repair_context is not None
         last_error: Exception | None = None
         for attempt in range(2):
             raw_content = ""
             try:
-                if hasattr(self._llm, "with_structured_output"):
-                    runnable = self._llm.with_structured_output(
-                        _GeneratedCode, method="json_schema", include_raw=True,
-                    )
-                    bundle = await asyncio.wait_for(
-                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    if isinstance(bundle, dict):
-                        raw_content = _llm_content(bundle.get("raw"))
-                        parsed = bundle.get("parsed")
-                        if parsed is None:
-                            raise ValueError(bundle.get("parsing_error") or "structured output was not parsed")
-                        generated = parsed if isinstance(parsed, _GeneratedCode) else _GeneratedCode.model_validate(parsed)
+                async with llm_trace_span(
+                    "Analysis Contract Repair" if attempt else "Analysis Repair" if is_repair else "Analysis Planning",
+                    summary=(
+                        "修正模型返回的分析方案格式"
+                        if response_language == "zh" and attempt
+                        else "修正未通过验证的分析方案"
+                        if response_language == "zh" and is_repair
+                        else "选择分析方法并生成执行方案"
+                        if response_language == "zh"
+                        else "Repair the analysis-plan output contract"
+                        if attempt
+                        else "Repair an analysis plan that failed validation"
+                        if is_repair
+                        else "Choose the analysis method and execution plan"
+                    ),
+                    messages=messages,
+                ) as trace_span:
+                    if hasattr(self._llm, "with_structured_output"):
+                        runnable = self._llm.with_structured_output(
+                            _GeneratedCode, method="json_schema", include_raw=True,
+                        )
+                        bundle = await asyncio.wait_for(
+                            runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        if isinstance(bundle, dict):
+                            trace_response = bundle.get("raw")
+                            raw_content = _llm_content(trace_response)
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    trace_response,
+                                    messages=messages,
+                                    output_text=raw_content,
+                                )
+                            parsed = bundle.get("parsed")
+                            if parsed is None:
+                                raise ValueError(
+                                    bundle.get("parsing_error")
+                                    or "structured output was not parsed"
+                                )
+                            generated = (
+                                parsed
+                                if isinstance(parsed, _GeneratedCode)
+                                else _GeneratedCode.model_validate(parsed)
+                            )
+                        else:
+                            generated = (
+                                bundle
+                                if isinstance(bundle, _GeneratedCode)
+                                else _GeneratedCode.model_validate(bundle)
+                            )
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    bundle,
+                                    messages=messages,
+                                    output_text=_llm_content(bundle),
+                                )
                     else:
-                        generated = bundle if isinstance(bundle, _GeneratedCode) else _GeneratedCode.model_validate(bundle)
-                else:
-                    response = await asyncio.wait_for(
-                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
-                    )
-                    raw_content = _llm_content(response)
-                    generated = _GeneratedCode.model_validate_json(raw_content)
-                return generated.code.strip()
+                        response = await asyncio.wait_for(
+                            self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        raw_content = _llm_content(response)
+                        if trace_span is not None:
+                            trace_span.attach_response(
+                                response,
+                                messages=messages,
+                                output_text=raw_content,
+                            )
+                        generated = _GeneratedCode.model_validate_json(raw_content)
+                    return generated.code.strip()
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:
                     messages.extend([
                         ("assistant", raw_content),
-                        ("human", f"Your output violated the required schema: {exc}. Return one corrected schema-valid object only."),
+                        (
+                            "human",
+                            f"Your output violated the required schema: {exc}. "
+                            "Return one corrected schema-valid object only.",
+                        ),
                     ])
-        raise AnalysisCodeError(f"code generation LLM violated its output contract: {last_error}") from last_error
+        raise AnalysisCodeError(
+            f"code generation LLM violated its output contract: {last_error}"
+        ) from last_error
 
 
 def _validate_computed_insights(raw: Any, *, requests: list[KeyInsightRequest], derived_name_map: dict[str, str]) -> list[ComputedInsight]:

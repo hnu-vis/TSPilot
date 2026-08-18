@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from core.database.dialects import dialect_for_database
 from runtime.language import detect_response_language
+from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
@@ -238,6 +239,12 @@ class LLMQueryGenerator:
             messages,
             request_state=request_state,
             source="sql_query.schema_linking",
+            title="Schema Linking",
+            summary=(
+                "识别时间列、指标列与过滤条件"
+                if response_language == "zh"
+                else "Identify time, measure, and filter fields"
+            ),
         )
         contract = LLMSchemaLinkingContract.model_validate(self._decode_json(raw_response))
         return {
@@ -282,6 +289,16 @@ class LLMQueryGenerator:
             [("system", system_prompt), ("user", user_prompt)],
             request_state=request_state,
             source="sql_query.generation_repair" if previous_query or error else "sql_query.generation",
+            title="SQL Repair" if previous_query or error else "SQL Generation",
+            summary=(
+                "修正未通过验证的查询"
+                if response_language == "zh" and (previous_query or error)
+                else "根据数据库方言生成查询"
+                if response_language == "zh"
+                else "Repair a query that failed validation"
+                if previous_query or error
+                else "Generate a query for the database dialect"
+            ),
         )
         generated_query = self._parse_response(raw_response)
         return LLMQueryGenerationResult(
@@ -291,27 +308,39 @@ class LLMQueryGenerator:
             diagnostics={"repair": bool(previous_query or error)},
         )
 
-    async def _invoke_model(self, messages, *, request_state=None, source: str = "sql_query.generation") -> str:
-        response = await asyncio.wait_for(
-            self._llm.ainvoke(messages),
-            timeout=self._timeout_seconds,
-        )
-        content = getattr(response, "content", response)
-        if isinstance(content, list):
-            content = "".join(
-                item.get("text", "") if isinstance(item, dict) else str(item)
-                for item in content
+    async def _invoke_model(
+        self,
+        messages,
+        *,
+        request_state=None,
+        source: str = "sql_query.generation",
+        title: str,
+        summary: str | None = None,
+    ) -> str:
+        async with llm_trace_span(title, summary=summary, messages=messages) as trace_span:
+            response = await asyncio.wait_for(
+                self._llm.ainvoke(messages),
+                timeout=self._timeout_seconds,
             )
-        content = str(content)
-        record_llm_token_usage(
-            request_state,
-            source=source,
-            response=response,
-            messages=messages,
-            output_text=content,
-            tool_name="sql_query",
-        )
-        return content
+            content = getattr(response, "content", response)
+            if isinstance(content, list):
+                content = "".join(
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            content = str(content)
+            usage = record_llm_token_usage(
+                request_state,
+                source=source,
+                response=response,
+                messages=messages,
+                output_text=content,
+                tool_name="sql_query",
+            )
+            if trace_span is not None:
+                trace_span.attach_output(response, output_text=content)
+                trace_span.attach_token_usage(usage)
+            return content
 
     def _parse_response(self, content: str) -> LLMGeneratedQuery:
         payload = self._decode_json(content)

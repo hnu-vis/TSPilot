@@ -15,8 +15,9 @@ from core.visualization import (
     VisualizationMaterializer,
     VisualizationSemanticValidator,
 )
-from runtime.token_usage import record_llm_token_usage
+from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
+from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
 from schemas.output import VisualGoal
 from schemas.key_insight import KeyInsightRequest
@@ -425,6 +426,8 @@ class VisualizationTool(BaseTool):
             VisualVerificationDecision,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
+            trace_title="Visual Verification Planning",
+            trace_summary="选择需要通过图表验证的数据发现",
         )
         record_llm_token_usage(
             request_state,
@@ -502,6 +505,8 @@ class VisualizationTool(BaseTool):
             VisualizationCandidateAudit,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
+            trace_title="Visualization Audit",
+            trace_summary="检查图表候选是否忠实表达证据",
         )
         record_llm_token_usage(
             request_state,
@@ -638,6 +643,8 @@ class VisualizationTool(BaseTool):
             SemanticProjectionPlan,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
+            trace_title="Semantic Projection",
+            trace_summary="将证据映射为可视化语义字段",
         )
         duration_ms = int((time.perf_counter() - started_at) * 1000)
         record_llm_token_usage(
@@ -756,6 +763,8 @@ class VisualizationTool(BaseTool):
             VisualizationPlan,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
+            trace_title="Chart Planning",
+            trace_summary="选择图表结构与视觉编码",
         )
         duration_ms = int((time.perf_counter() - started_at) * 1000)
         record_llm_token_usage(
@@ -787,34 +796,68 @@ class VisualizationTool(BaseTool):
             raise _semantic_error(ValueError(f"invalid chart plan: {exc}"), inventory) from exc
 
 
-async def _invoke_structured(llm, schema, messages, *, timeout_seconds: float):
+async def _invoke_structured(
+    llm,
+    schema,
+    messages,
+    *,
+    timeout_seconds: float,
+    trace_title: str,
+    trace_summary: str | None = None,
+):
     response = None
     content = ""
     try:
-        if hasattr(llm, "with_structured_output"):
-            runnable = llm.with_structured_output(schema, method="json_mode", include_raw=True)
-            bundle = await asyncio.wait_for(
-                runnable.ainvoke(messages),
+        async with llm_trace_span(
+            trace_title,
+            summary=trace_summary,
+            messages=messages,
+        ) as trace_span:
+            if hasattr(llm, "with_structured_output"):
+                runnable = llm.with_structured_output(schema, method="json_mode", include_raw=True)
+                bundle = await asyncio.wait_for(
+                    runnable.ainvoke(messages),
+                    timeout=timeout_seconds,
+                )
+                if isinstance(bundle, dict):
+                    response = bundle.get("raw")
+                    content = _llm_content(response)
+                    if trace_span is not None:
+                        trace_span.attach_response(
+                            response,
+                            messages=messages,
+                            output_text=content,
+                        )
+                    parsed = bundle.get("parsed")
+                    if parsed is None:
+                        error = bundle.get("parsing_error") or ValueError(
+                            "structured output was not parsed"
+                        )
+                        raise ValueError(str(error))
+                    parsed = parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
+                    return response, content, parsed, None
+                parsed = bundle if isinstance(bundle, schema) else schema.model_validate(bundle)
+                content = _llm_content(bundle)
+                if trace_span is not None:
+                    trace_span.attach_response(
+                        bundle,
+                        messages=messages,
+                        output_text=content,
+                    )
+                return bundle, content, parsed, None
+            response = await asyncio.wait_for(
+                llm.ainvoke(messages),
                 timeout=timeout_seconds,
             )
-            if isinstance(bundle, dict):
-                response = bundle.get("raw")
-                content = _llm_content(response)
-                parsed = bundle.get("parsed")
-                if parsed is None:
-                    error = bundle.get("parsing_error") or ValueError("structured output was not parsed")
-                    return response, content, None, ValueError(str(error))
-                parsed = parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
-                return response, content, parsed, None
-            parsed = bundle if isinstance(bundle, schema) else schema.model_validate(bundle)
-            return bundle, _llm_content(bundle), parsed, None
-        response = await asyncio.wait_for(
-            llm.ainvoke(messages),
-            timeout=timeout_seconds,
-        )
-        content = _llm_content(response)
-        parsed = schema.model_validate(json.loads(_json_object(content)))
-        return response, content, parsed, None
+            content = _llm_content(response)
+            if trace_span is not None:
+                trace_span.attach_response(
+                    response,
+                    messages=messages,
+                    output_text=content,
+                )
+            parsed = schema.model_validate(json.loads(_json_object(content)))
+            return response, content, parsed, None
     except (json.JSONDecodeError, ValueError, OutputParserException) as exc:
         return response, content, None, exc
 

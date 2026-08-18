@@ -1463,16 +1463,19 @@ class _TerminateAgent:
 
 
 class _PreparedExecutorAdapter:
+    def execution_timeout_seconds(self, action_name):
+        return 30.0
+
     def react_proposed_action_input(self, action_name, action_input):
         return dict(action_input)
 
-    async def prepare(self, action_name, action_input, request_state):
+    async def prepare(self, action_name, action_input, request_state, *, timeout_seconds=None):
         return SimpleNamespace(action_name=action_name, action_input=dict(action_input))
 
     def react_action_input(self, prepared):
         return dict(prepared.action_input)
 
-    async def execute_prepared(self, prepared, request_state, conversation_state):
+    async def execute_prepared(self, prepared, request_state, conversation_state, *, timeout_seconds=None):
         result = await self.execute(
             prepared.action_name,
             prepared.action_input,

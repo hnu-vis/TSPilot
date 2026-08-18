@@ -26,6 +26,46 @@ def record_llm_token_usage(
 
     if request_state is None:
         return None
+    response_text = output_text if output_text is not None else _response_text(response)
+    measured = measure_llm_token_usage(
+        response=response,
+        messages=messages,
+        output_text=response_text,
+        model=model,
+    )
+    if measured is None:
+        return None
+    token_state = request_state.completion_state.setdefault("token_usage", _empty_usage())
+    entry = {
+        "source": source,
+        "tool_name": _tool_name_for_usage(source=source, output_text=response_text, tool_name=tool_name),
+        **measured,
+    }
+    if duration_ms is not None:
+        entry["duration_ms"] = int(duration_ms)
+    token_state["calls"].append(entry)
+    totals = token_state["totals"]
+    counted = measured["estimated"] or measured["provider"] or {}
+    _add_usage(totals, counted)
+    totals["call_count"] = len(token_state["calls"])
+    totals["counting_method"] = "tiktoken_estimate" if measured["estimated"] else "provider_usage"
+    by_tool = token_state.setdefault("by_tool", {})
+    tool_bucket = by_tool.setdefault(entry["tool_name"] or "unknown", _empty_totals())
+    _add_usage(tool_bucket, counted)
+    tool_bucket["call_count"] += 1
+    tool_bucket["counting_method"] = totals["counting_method"]
+    return entry
+
+
+def measure_llm_token_usage(
+    *,
+    response: Any,
+    messages: list | None = None,
+    output_text: str | None = None,
+    model: str | None = None,
+) -> dict | None:
+    """Measure one response without mutating request accounting state."""
+
     provider_usage = extract_provider_token_usage(response)
     response_text = output_text if output_text is not None else _response_text(response)
     estimated_usage = None
@@ -41,28 +81,11 @@ def record_llm_token_usage(
         )
     if estimated_usage is None and provider_usage is None:
         return None
-    token_state = request_state.completion_state.setdefault("token_usage", _empty_usage())
-    entry = {
-        "source": source,
-        "tool_name": _tool_name_for_usage(source=source, output_text=response_text, tool_name=tool_name),
+    return {
         "estimated": estimated_usage,
         "provider": provider_usage,
         "accounting": accounting_status,
     }
-    if duration_ms is not None:
-        entry["duration_ms"] = int(duration_ms)
-    token_state["calls"].append(entry)
-    totals = token_state["totals"]
-    counted = estimated_usage or provider_usage or {}
-    _add_usage(totals, counted)
-    totals["call_count"] = len(token_state["calls"])
-    totals["counting_method"] = "tiktoken_estimate" if estimated_usage else "provider_usage"
-    by_tool = token_state.setdefault("by_tool", {})
-    tool_bucket = by_tool.setdefault(entry["tool_name"] or "unknown", _empty_totals())
-    _add_usage(tool_bucket, counted)
-    tool_bucket["call_count"] += 1
-    tool_bucket["counting_method"] = totals["counting_method"]
-    return entry
 
 
 def token_usage_summary(request_state) -> dict | None:

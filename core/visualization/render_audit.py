@@ -10,6 +10,7 @@ from typing import Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from runtime.llm_trace import llm_trace_span
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
 
@@ -120,27 +121,41 @@ class PlaywrightEChartsRenderAuditor:
         ]
         started_at = time.perf_counter()
         try:
-            response = await asyncio.wait_for(
-                self._llm.ainvoke(messages),
-                timeout=self._llm_timeout_seconds,
-            )
-            text = _message_text(response)
-            decision = RenderAuditDecision.model_validate(json.loads(_json_object(text)))
+            async with llm_trace_span(
+                "Render Audit",
+                summary="检查实际渲染结果的可读性与准确性",
+                messages=messages,
+            ) as trace_span:
+                try:
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages),
+                        timeout=self._llm_timeout_seconds,
+                    )
+                    text = _message_text(response)
+                    decision = RenderAuditDecision.model_validate(
+                        json.loads(_json_object(text))
+                    )
+                finally:
+                    if "response" in locals():
+                        usage = record_llm_token_usage(
+                            request_state,
+                            source="visualization.render_audit",
+                            response=response,
+                            messages=messages,
+                            output_text=_message_text(response),
+                            duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        )
+                        if trace_span is not None:
+                            trace_span.attach_output(
+                                response,
+                                output_text=_message_text(response),
+                            )
+                            trace_span.attach_token_usage(usage)
         except Exception as exc:
             return {
                 "decision": "unavailable",
                 "issues": [f"Multimodal render audit was unavailable: {exc}"],
             }
-        finally:
-            if "response" in locals():
-                record_llm_token_usage(
-                    request_state,
-                    source="visualization.render_audit",
-                    response=response,
-                    messages=messages,
-                    output_text=_message_text(response),
-                    duration_ms=int((time.perf_counter() - started_at) * 1000),
-                )
         return decision.model_dump(mode="json")
 
     async def _render(self, visualizations) -> list[bytes]:

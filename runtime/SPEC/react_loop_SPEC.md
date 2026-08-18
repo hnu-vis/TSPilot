@@ -64,7 +64,10 @@ Each model turn must be parsed as one JSON `ReActTurn` with:
 
 1. load request and conversation state
 2. build the prompt context
-3. ask the model for one ReAct turn
+3. emit the round placeholder, then ask the model for one ReAct turn while
+   streaming a distinct child span for every concrete model invocation; the
+   decision phase uses `iteration-N:decision`, while any selected tool uses
+   `iteration-N`, so the placeholder/decision can never become the tool node
 4. parse the turn into `schemas.agent_turn.ReActTurn`
 5. validate the selected action against runtime policy; visualization Thoughts
    that omit verified targets, an inspectable relation, or complete context,
@@ -88,7 +91,8 @@ Each model turn must be parsed as one JSON `ReActTurn` with:
 - one loop iteration may emit at most one `ToolCall` and one `ToolObservation`
 - a failed parse or validation must not create a partial `ToolCall`
 - a rejected or input-invalid attempted action may still be shown in the trace,
-  but it is never recorded as an executed `ToolCall`
+  but it is closed as a failed policy decision and never recorded as an
+  executed `ToolCall`
 
 ## Insight and visualization routing
 

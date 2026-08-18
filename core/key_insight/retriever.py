@@ -18,6 +18,7 @@ from core.key_insight.memory import memory_cards_view, memory_detail, memory_det
 from core.key_insight.contracts import insight_request_contract_error
 from schemas.key_insight import KeyInsightRequest, MemoryCard, MemoryDetail, normalize_insight_key
 from schemas.state import RequestStateModel
+from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
 
 
@@ -478,8 +479,24 @@ class HybridInsightMemoryRetriever:
                 ),
             ),
         ]
-        response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
-        payload = _parse_json_response(getattr(response, "content", response))
+        trace_messages = _localized_prompt_messages(messages, request_state)
+        async with llm_trace_span(
+            "Memory Reranking",
+            summary=_trace_summary(
+                request_state,
+                zh="根据当前任务重排记忆候选",
+                en="Rerank memory candidates for the current task",
+            ),
+            messages=trace_messages,
+        ) as trace_span:
+            response = await self.llm.ainvoke(trace_messages)
+            if trace_span is not None:
+                trace_span.attach_response(
+                    response,
+                    messages=trace_messages,
+                    output_text=str(getattr(response, "content", response) or ""),
+                )
+            payload = _parse_json_response(getattr(response, "content", response))
         selected = payload.get("selected") if isinstance(payload, dict) else []
         valid_ids = {detail.id for detail in recalled_details}
         result: list[MemoryHit] = []
@@ -639,8 +656,24 @@ class LlmInsightMemoryRetriever:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
-            payload = _parse_json_response(getattr(response, "content", response))
+            trace_messages = _localized_prompt_messages(messages, request_state)
+            async with llm_trace_span(
+                "Memory Reconciliation",
+                summary=_trace_summary(
+                    request_state,
+                    zh="合并显式需求与可复用记忆",
+                    en="Reconcile explicit requests with reusable memory",
+                ),
+                messages=trace_messages,
+            ) as trace_span:
+                response = await self.llm.ainvoke(trace_messages)
+                if trace_span is not None:
+                    trace_span.attach_response(
+                        response,
+                        messages=trace_messages,
+                        output_text=str(getattr(response, "content", response) or ""),
+                    )
+                payload = _parse_json_response(getattr(response, "content", response))
         except Exception:
             return []
         selected = payload.get("selected_memory_insight_keys") if isinstance(payload, dict) else []
@@ -708,8 +741,24 @@ class LlmInsightMemoryRetriever:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
-            payload = _parse_json_response(getattr(response, "content", response))
+            trace_messages = _localized_prompt_messages(messages, request_state)
+            async with llm_trace_span(
+                "Insight Planning",
+                summary=_trace_summary(
+                    request_state,
+                    zh="为当前工具规划数据发现契约",
+                    en="Plan insight contracts for the current tool",
+                ),
+                messages=trace_messages,
+            ) as trace_span:
+                response = await self.llm.ainvoke(trace_messages)
+                if trace_span is not None:
+                    trace_span.attach_response(
+                        response,
+                        messages=trace_messages,
+                        output_text=str(getattr(response, "content", response) or ""),
+                    )
+                payload = _parse_json_response(getattr(response, "content", response))
         except Exception:
             return []
         requests = _validated_insight_requests(payload.get("insight_requests") if isinstance(payload, dict) else None)
@@ -779,8 +828,24 @@ class LlmInsightMemoryRetriever:
                 ),
             ),
         ]
-        response = await self.llm.ainvoke(_localized_prompt_messages(messages, request_state))
-        payload = _parse_json_response(getattr(response, "content", response))
+        trace_messages = _localized_prompt_messages(messages, request_state)
+        async with llm_trace_span(
+            "Memory Selection",
+            summary=_trace_summary(
+                request_state,
+                zh="选择与当前工具相关的记忆卡片",
+                en="Select memory cards relevant to the current tool",
+            ),
+            messages=trace_messages,
+        ) as trace_span:
+            response = await self.llm.ainvoke(trace_messages)
+            if trace_span is not None:
+                trace_span.attach_response(
+                    response,
+                    messages=trace_messages,
+                    output_text=str(getattr(response, "content", response) or ""),
+                )
+            payload = _parse_json_response(getattr(response, "content", response))
         selected = payload.get("selected") if isinstance(payload, dict) else []
         valid_ids = {card.id for card in cards}
         result: list[MemoryHit] = []
@@ -1055,6 +1120,10 @@ def _parse_json_response(content: Any) -> dict:
         if start >= 0 and end > start:
             return json.loads(text[start : end + 1])
         raise
+
+
+def _trace_summary(request_state: RequestStateModel, *, zh: str, en: str) -> str:
+    return zh if request_state.response_language == "zh" else en
 
 
 def _localized_prompt_messages(messages: list[tuple[str, str]], request_state: RequestStateModel) -> list[tuple[str, str]]:

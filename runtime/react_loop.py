@@ -14,6 +14,7 @@ from core.harness.observation_view import public_observation_view
 from runtime.action_policy import build_policy_observation, validate_action
 from runtime.conversation_state import sync_from_request
 from runtime.conversation_log import ConversationTraceLogger
+from runtime.llm_trace import llm_trace_scope
 from runtime.request_state import (
     append_react_transcript_step,
     apply_task_contract,
@@ -100,22 +101,6 @@ class ReActLoop:
             )
             public_trace.append(conversation_event)
             yield conversation_event
-            placeholder_event = append_trace(
-                request_state,
-                "agent_step",
-                {
-                    "agent": "data_agent",
-                    "status": "running",
-                    "phase": "reasoning",
-                    "message": "正在理解问题并选择下一步工具。",
-                    "iteration": 1,
-                    "placeholder": True,
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_seconds": 0.0,
-                },
-            )
-            public_trace.append(placeholder_event)
-            yield placeholder_event
             async for event in self._iterate(request_state, conversation_state, emit_heartbeats=True):
                 internal_trace.append(event)
                 async for mapped in self._map_trace_to_sse(request_state, event):
@@ -170,21 +155,41 @@ class ReActLoop:
                 )
                 return
             request_state.iteration += 1
+            decision_started_at = datetime.now(timezone.utc).isoformat()
+            yield append_trace(
+                request_state,
+                "agent_decision_start",
+                {
+                    "iteration": request_state.iteration,
+                    "status": "running",
+                    "phase": "reasoning",
+                    "message": "正在理解当前状态并选择下一步工具。",
+                    "placeholder": True,
+                    "started_at": decision_started_at,
+                    "elapsed_seconds": 0.0,
+                },
+            )
             try:
-                turn_task = asyncio.create_task(self._data_agent.next_turn(request_state, conversation_state))
-                turn_wait_task = asyncio.create_task(
-                    asyncio.wait_for(turn_task, timeout=self._remaining_agent_timeout(deadline))
-                )
-                async for heartbeat in self._heartbeat_until_done(
-                    request_state,
-                    turn_wait_task,
-                    emit_heartbeats=emit_heartbeats,
-                    phase="reasoning",
-                    message="正在选择下一步工具。",
-                    iteration=request_state.iteration,
+                decision_trace_events: asyncio.Queue[TraceEventModel] = asyncio.Queue()
+                with llm_trace_scope(
+                    parent_id=self._decision_step_event_id(request_state.iteration),
+                    events=decision_trace_events,
                 ):
-                    yield heartbeat
-                turn = await turn_wait_task
+                    turn_task = asyncio.create_task(self._data_agent.next_turn(request_state, conversation_state))
+                    turn_wait_task = asyncio.create_task(
+                        asyncio.wait_for(turn_task, timeout=self._remaining_agent_timeout(deadline))
+                    )
+                    async for heartbeat in self._heartbeat_until_done(
+                        request_state,
+                        turn_wait_task,
+                        emit_heartbeats=emit_heartbeats,
+                        phase="reasoning",
+                        message="正在选择下一步工具。",
+                        iteration=request_state.iteration,
+                        trace_events=decision_trace_events,
+                    ):
+                        yield heartbeat
+                    turn = await turn_wait_task
             except asyncio.CancelledError:
                 if "turn_wait_task" in locals() and not turn_wait_task.done():
                     turn_wait_task.cancel()
@@ -240,7 +245,7 @@ class ReActLoop:
             except Exception as exc:
                 yield append_trace(
                     request_state,
-                    "action",
+                    "action_proposed",
                     {
                         "iteration": request_state.iteration,
                         "action": turn.action,
@@ -298,7 +303,7 @@ class ReActLoop:
                 if had_active_todo and turn.previous_observation_assessment.completed_active_todo and not assessment.completed:
                     yield append_trace(
                         request_state,
-                        "action",
+                        "action_proposed",
                         {
                             "iteration": request_state.iteration,
                             "action": turn.action,
@@ -351,7 +356,7 @@ class ReActLoop:
             if not allowed:
                 yield append_trace(
                     request_state,
-                    "action",
+                    "action_proposed",
                     {
                         "iteration": request_state.iteration,
                         "action": turn.action,
@@ -383,50 +388,83 @@ class ReActLoop:
                 sync_from_request(request_state, conversation_state)
                 continue
 
+            action_emitted = False
             try:
                 tool_started_at = datetime.now(timezone.utc).isoformat()
                 tool_started_monotonic = time.monotonic()
                 tool_timeout_seconds = self._remaining_tool_timeout(turn.action, deadline)
-                action_emitted = False
-                prepared = await self._tool_executor.prepare(
-                    turn.action,
-                    turn.action_input,
-                    request_state,
-                    timeout_seconds=tool_timeout_seconds,
-                )
-                executed_action_input = self._tool_executor.react_action_input(prepared)
                 yield append_trace(
                     request_state,
-                    "action",
+                    "tool_boundary",
                     {
                         "iteration": request_state.iteration,
                         "action": turn.action,
                         "action_input": executed_action_input,
                     },
                 )
-                action_emitted = True
-                tool_task = asyncio.create_task(self._tool_executor.execute_prepared(
-                    prepared,
-                    request_state,
-                    conversation_state,
-                    timeout_seconds=max(
-                        0.001,
-                        tool_timeout_seconds - (time.monotonic() - tool_started_monotonic),
-                    ),
-                ))
-                async for heartbeat in self._heartbeat_until_done(
-                    request_state,
-                    tool_task,
-                    emit_heartbeats=emit_heartbeats,
-                    phase=self._phase_for_action(turn.action),
-                    message=f"正在执行 {turn.action}",
-                    iteration=request_state.iteration,
-                    tool=turn.action,
+                nested_trace_events: asyncio.Queue[TraceEventModel] = asyncio.Queue()
+                with llm_trace_scope(
+                    parent_id=self._step_event_id(request_state.iteration),
+                    events=nested_trace_events,
                 ):
-                    yield heartbeat
-                execution_result = await tool_task
+                    prepare_task = asyncio.create_task(self._tool_executor.prepare(
+                        turn.action,
+                        turn.action_input,
+                        request_state,
+                        timeout_seconds=tool_timeout_seconds,
+                    ))
+                    async for progress_event in self._heartbeat_until_done(
+                        request_state,
+                        prepare_task,
+                        emit_heartbeats=emit_heartbeats,
+                        phase=self._phase_for_action(turn.action),
+                        message=f"正在准备 {turn.action}",
+                        iteration=request_state.iteration,
+                        tool=turn.action,
+                        trace_events=nested_trace_events,
+                    ):
+                        yield progress_event
+                    prepared = await prepare_task
+                    executed_action_input = self._tool_executor.react_action_input(prepared)
+                    yield append_trace(
+                        request_state,
+                        "action",
+                        {
+                            "iteration": request_state.iteration,
+                            "action": turn.action,
+                            "action_input": executed_action_input,
+                        },
+                    )
+                    action_emitted = True
+                    tool_task = asyncio.create_task(self._tool_executor.execute_prepared(
+                        prepared,
+                        request_state,
+                        conversation_state,
+                        timeout_seconds=max(
+                            0.001,
+                            tool_timeout_seconds - (time.monotonic() - tool_started_monotonic),
+                        ),
+                    ))
+                    async for progress_event in self._heartbeat_until_done(
+                        request_state,
+                        tool_task,
+                        emit_heartbeats=emit_heartbeats,
+                        phase=self._phase_for_action(turn.action),
+                        message=f"正在执行 {turn.action}",
+                        iteration=request_state.iteration,
+                        tool=turn.action,
+                        trace_events=nested_trace_events,
+                    ):
+                        yield progress_event
+                    execution_result = await tool_task
                 tool_timing = self._tool_timing(tool_started_monotonic, tool_started_at)
             except asyncio.CancelledError:
+                if "prepare_task" in locals() and not prepare_task.done():
+                    prepare_task.cancel()
+                    try:
+                        await prepare_task
+                    except asyncio.CancelledError:
+                        pass
                 if "tool_task" in locals() and not tool_task.done():
                     tool_task.cancel()
                     try:
@@ -817,15 +855,41 @@ class ReActLoop:
         message: str,
         iteration: int,
         tool: str | None = None,
+        trace_events: asyncio.Queue[TraceEventModel] | None = None,
     ) -> AsyncIterator[TraceEventModel]:
-        if not emit_heartbeats:
+        if not emit_heartbeats and trace_events is None:
             return
         started_at = time.monotonic()
         started_at_iso = datetime.now(timezone.utc).isoformat()
         while not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL_SECONDS)
-            except TimeoutError:
+            if trace_events is None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL_SECONDS)
+                except TimeoutError:
+                    pass
+                else:
+                    return
+                timed_out = True
+            else:
+                trace_task = asyncio.create_task(trace_events.get())
+                done, _ = await asyncio.wait(
+                    {task, trace_task},
+                    timeout=HEARTBEAT_INTERVAL_SECONDS if emit_heartbeats else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if trace_task in done:
+                    yield trace_task.result()
+                else:
+                    trace_task.cancel()
+                    try:
+                        await trace_task
+                    except asyncio.CancelledError:
+                        pass
+                if task in done:
+                    break
+                timed_out = not done
+
+            if emit_heartbeats and timed_out:
                 elapsed = round(time.monotonic() - started_at, 1)
                 payload = {
                     "agent": "data_agent",
@@ -840,8 +904,9 @@ class ReActLoop:
                 if tool:
                     payload["tool"] = tool
                 yield append_trace(request_state, "agent_step", payload)
-            else:
-                return
+        if trace_events is not None:
+            while not trace_events.empty():
+                yield trace_events.get_nowait()
 
     async def _map_trace_to_sse(
         self,
@@ -851,8 +916,27 @@ class ReActLoop:
         event_type = event.event_type
         payload = event.payload
 
-        if event_type == "agent_step":
+        if event_type in {"agent_step", "trace_span_start", "trace_span_end"}:
             yield event
+            return
+
+        if event_type == "agent_decision_start":
+            iteration = payload.get("iteration")
+            yield append_trace(
+                request_state,
+                "step.start",
+                {
+                    "type": "step.start",
+                    "step": iteration,
+                    "id": self._decision_step_event_id(iteration),
+                    "title": f"react round {iteration}",
+                    "detail": payload.get("message") or "正在判断下一步。",
+                    "phase": "reasoning",
+                    "placeholder": True,
+                    "started_at": payload.get("started_at"),
+                    "elapsed_seconds": payload.get("elapsed_seconds", 0.0),
+                },
+            )
             return
 
         if event_type == "action_output":
@@ -861,15 +945,30 @@ class ReActLoop:
             timing = self._timing_from_action_output_payload(payload)
             result_target = payload.get("meta", {}).get("result_target") if isinstance(payload.get("meta"), dict) else None
             if result_target == "policy":
+                accepted = bool(payload.get("success", False))
+                observation = payload.get("observations")
                 yield append_trace(
                     request_state,
                     "policy_decision",
                     {
                         "tool": payload.get("tool_name"),
-                        "accepted": bool(payload.get("success", False)),
+                        "accepted": accepted,
                         "summary": payload.get("content"),
                         "iteration": iteration,
                         "payload_preview": view.get("payload") if isinstance(view.get("payload"), dict) else view,
+                        **timing,
+                    },
+                )
+                yield append_trace(
+                    request_state,
+                    "step.done",
+                    {
+                        "type": "step.done",
+                        "step": iteration,
+                        "id": self._step_event_id(iteration),
+                        "status": "done" if accepted else "failed",
+                        "observation": observation,
+                        "result_kind": "policy_decision",
                         **timing,
                     },
                 )
@@ -915,24 +1014,14 @@ class ReActLoop:
 
         if event_type == "thought":
             iteration = payload.get("iteration")
-            step_id = self._step_event_id(iteration)
-            yield append_trace(
-                request_state,
-                "step.start",
-                {
-                    "type": "step.start",
-                    "step": iteration,
-                    "id": step_id,
-                    "title": f"react round {iteration}",
-                    "detail": "正在判断下一步。",
-                },
-            )
+            step_id = self._decision_step_event_id(iteration)
             yield append_trace(
                 request_state,
                 "thought",
                 {
+                    "id": step_id,
                     "agent": "data_agent",
-                    "status": "running",
+                    "status": "complete",
                     "phase": "reasoning",
                     "message": payload.get("thought") or "正在判断下一步。",
                     "iteration": payload.get("iteration"),
@@ -952,7 +1041,14 @@ class ReActLoop:
             )
             return
 
-        if event_type == "action":
+        # Rejected model proposals are recorded internally as
+        # `action_proposed` and closed by a policy decision; they never become
+        # public tool metadata. `tool_boundary` proves execution started, while
+        # the later `action` carries the canonical prepared input.
+        if event_type == "action_proposed":
+            return
+
+        if event_type in {"action", "tool_boundary"}:
             action_name = str(payload.get("action", ""))
             iteration = payload.get("iteration")
             step_id = self._step_event_id(iteration)
@@ -967,6 +1063,8 @@ class ReActLoop:
                     "action_input": payload.get("action_input", {}),
                 },
             )
+            if event_type == "action":
+                return
             yield append_trace(
                 request_state,
                 "agent_step",
@@ -1053,6 +1151,9 @@ class ReActLoop:
         except (TypeError, ValueError):
             numeric = 0
         return f"iteration-{numeric}"
+
+    def _decision_step_event_id(self, iteration) -> str:
+        return f"{self._step_event_id(iteration)}:decision"
 
     def _timing_from_action_output_payload(self, payload: dict) -> dict:
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}

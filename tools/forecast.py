@@ -16,6 +16,7 @@ from core.database.dialects import dialect_for_database
 from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.forecast_registry import default_forecast_model_name, get_forecast_model
 from core.timeseries.normalization import normalize_timeseries_evidence
+from runtime.llm_trace import llm_trace_span
 from runtime.timeout_policy import load_timeout_policy
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsightRequest
@@ -162,6 +163,7 @@ class ForecastTool(BaseTool):
                 series=series,
                 evidence=database_evidence,
                 policy_diagnostics=input_policy_diagnostics,
+                response_language=getattr(request_state, "response_language", "en"),
             )
             if not assessment.safe_to_forecast:
                 raise _semantic_input_quality_error(
@@ -227,6 +229,7 @@ class ForecastTool(BaseTool):
         series: TimeSeriesSeries,
         evidence: DatabaseEvidence,
         policy_diagnostics: dict,
+        response_language: str,
     ) -> _ForecastInputAssessment:
         points = [point.model_dump(mode="json") for point in series.points]
         if len(points) > 16:
@@ -265,24 +268,65 @@ class ForecastTool(BaseTool):
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                if hasattr(self._llm, "with_structured_output"):
-                    runnable = self._llm.with_structured_output(
-                        _ForecastInputAssessment, method="json_schema", include_raw=True,
+                async with llm_trace_span(
+                    "Forecast Assessment Repair" if attempt else "Forecast Input Assessment",
+                    summary=(
+                        "修正预测输入质量评估"
+                        if response_language == "zh" and attempt
+                        else "评估时序输入是否适合预测"
+                        if response_language == "zh"
+                        else "Repair the forecast input assessment"
+                        if attempt
+                        else "Assess whether the time series is suitable for forecasting"
+                    ),
+                    messages=messages,
+                ) as trace_span:
+                    if hasattr(self._llm, "with_structured_output"):
+                        runnable = self._llm.with_structured_output(
+                            _ForecastInputAssessment, method="json_schema", include_raw=True,
+                        )
+                        bundle = await asyncio.wait_for(
+                            runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                        )
+                        if isinstance(bundle, dict):
+                            trace_response = bundle.get("raw")
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    trace_response,
+                                    messages=messages,
+                                    output_text=str(getattr(trace_response, "content", trace_response) or ""),
+                                )
+                            parsed = bundle.get("parsed")
+                            if parsed is None:
+                                raise ValueError(
+                                    bundle.get("parsing_error")
+                                    or "forecast input assessment was not parsed"
+                                )
+                        else:
+                            parsed = bundle
+                            if trace_span is not None:
+                                trace_span.attach_response(
+                                    bundle,
+                                    messages=messages,
+                                    output_text=str(getattr(bundle, "content", bundle) or ""),
+                                )
+                        return (
+                            parsed
+                            if isinstance(parsed, _ForecastInputAssessment)
+                            else _ForecastInputAssessment.model_validate(parsed)
+                        )
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
                     )
-                    bundle = await asyncio.wait_for(
-                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    if trace_span is not None:
+                        trace_span.attach_response(
+                            response,
+                            messages=messages,
+                            output_text=str(getattr(response, "content", response) or ""),
+                        )
+                    return _ForecastInputAssessment.model_validate_json(
+                        str(getattr(response, "content", response))
                     )
-                    if isinstance(bundle, dict):
-                        parsed = bundle.get("parsed")
-                        if parsed is None:
-                            raise ValueError(bundle.get("parsing_error") or "forecast input assessment was not parsed")
-                    else:
-                        parsed = bundle
-                    return parsed if isinstance(parsed, _ForecastInputAssessment) else _ForecastInputAssessment.model_validate(parsed)
-                response = await asyncio.wait_for(
-                    self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
-                )
-                return _ForecastInputAssessment.model_validate_json(str(getattr(response, "content", response)))
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:

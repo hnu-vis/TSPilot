@@ -413,6 +413,19 @@ def _public_response_trace(trace_events: list[TraceEventModel]) -> list[TraceEve
     public_events: list[TraceEventModel] = []
     for event in trace_events:
         payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.event_type == "tool_boundary":
+            public_events.append(
+                TraceEventModel(
+                    event_type="tool_call",
+                    payload={
+                        "tool": payload.get("action"),
+                        "iteration": payload.get("iteration"),
+                        "action_input": payload.get("action_input") or {},
+                    },
+                    timestamp=event.timestamp,
+                )
+            )
+            continue
         if event.event_type == "action_output":
             view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
             timing = _timing_from_action_output_payload(payload)
