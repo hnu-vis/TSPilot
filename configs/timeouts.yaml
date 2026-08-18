@@ -1,0 +1,60 @@
+schema_version: "1"
+
+# One request may contain several ReAct turns and Tool calls. This budget must
+# therefore be larger than the longest individual Tool budget.
+runtime:
+  request_deadline_seconds: 600
+  agent_turn_seconds: 45
+
+services:
+  llm_transport_seconds: 60
+  embedding_request_seconds: 30
+
+tools:
+  todowrite:
+    execution_seconds: 90
+    stages:
+      llm_call_seconds: 30
+
+  sql_query:
+    execution_seconds: 180
+    stages:
+      llm_call_seconds: 60
+      connection_seconds: 30
+      query_seconds: 60
+
+  code_interpreter:
+    execution_seconds: 180
+    stages:
+      llm_call_seconds: 30
+      sandbox_seconds: 120
+
+  forecast:
+    execution_seconds: 120
+    stages:
+      llm_call_seconds: 30
+      external_request_seconds: 30
+
+  anomaly:
+    execution_seconds: 60
+    stages:
+      external_request_seconds: 30
+
+  visualization:
+    execution_seconds: 300
+    stages:
+      llm_call_seconds: 60
+      browser_navigation_seconds: 20
+      browser_render_seconds: 10
+
+  rag:
+    execution_seconds: 30
+    stages: {}
+
+  skill:
+    execution_seconds: 60
+    stages: {}
+
+  terminate:
+    execution_seconds: 30
+    stages: {}

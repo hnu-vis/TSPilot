@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.analysis.python_runner import AnalysisCodeError, ExecutionOutput, validate_analysis_result_payload
+from runtime.timeout_policy import load_timeout_policy
 
 from .analysis_context import build_canonical_analysis_context
-from .policy import MAX_RESULT_BYTES, MAX_STDIO_CHARS, clamp_timeout
+from .policy import MAX_RESULT_BYTES, MAX_STDIO_CHARS, validate_timeout
 
 
 @dataclass
@@ -32,14 +33,19 @@ def execute_python_sandbox_v1(
     diagnostics: dict,
     input_insights: list[dict] | None = None,
     analysis_context: dict | None = None,
-    timeout_seconds: int = 5,
+    timeout_seconds: int | float | None = None,
     work_dir: str | Path | None = None,
 ) -> ExecutionOutput:
     """Execute generated analysis code in a short-lived Python subprocess."""
 
     if not code or not code.strip():
         raise AnalysisCodeError("analysis_code cannot be empty.")
-    timeout = clamp_timeout(timeout_seconds)
+    configured_timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else load_timeout_policy().tool("code_interpreter").stage_seconds("sandbox_seconds")
+    )
+    timeout = validate_timeout(configured_timeout)
     started = time.perf_counter()
     paths, temp_dir = _prepare_paths(work_dir)
     payload = {

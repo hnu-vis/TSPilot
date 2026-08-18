@@ -97,7 +97,7 @@ class TimescaleDBConnector(DBConnector):
             cursor = self._client.cursor()
 
             if timeout:
-                cursor.execute(f"SET statement_timeout = '{timeout}ms'")
+                cursor.execute(f"SET statement_timeout = '{timeout}s'")
 
             cursor.execute(query, params or None)
 

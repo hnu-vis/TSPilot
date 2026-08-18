@@ -192,7 +192,7 @@ class QuestDBConnector(DBConnector):
 
         try:
             if timeout:
-                cursor.execute(f"SET statement_timeout = '{timeout}ms'")
+                cursor.execute(f"SET statement_timeout = '{timeout}s'")
 
             cursor.execute(query)
 

@@ -58,9 +58,14 @@ class Settings(BaseSettings):
     knowledge_base_dir: str | None = Field(default=None, alias="TSPILOT_KNOWLEDGE_BASE_DIR")
     model_config_path: str | None = Field(default=None, alias="TSPILOT_MODEL_CONFIG_PATH")
     model_config_dir: str | None = Field(default=None, alias="TSPILOT_MODEL_CONFIG_DIR")
+    timeout_config_path: str | None = Field(default=None, alias="TSPILOT_TIMEOUT_CONFIG_PATH")
     conversation_log_enabled: bool = Field(default=True, alias="TSPILOT_CONVERSATION_LOG_ENABLED")
     conversation_log_dir: str | None = Field(default=None, alias="TSPILOT_CONVERSATION_LOG_DIR")
     visualization_artifact_dir: str | None = Field(default=None, alias="TSPILOT_VISUALIZATION_ARTIINSIGHT_DIR")
+    visualization_audit_url: str = Field(
+        default="http://127.0.0.1:5173/visualization-audit",
+        alias="TSPILOT_VISUALIZATION_AUDIT_URL",
+    )
 
     max_iterations: int = 30
     max_prompt_tokens: int = 12000
@@ -69,9 +74,6 @@ class Settings(BaseSettings):
     max_observation_chars: int = 1600
     max_visible_rows: int = 60
     max_visible_points: int = 240
-    agent_turn_timeout_seconds: float = Field(default=45.0, alias="TSPILOT_AGENT_TURN_TIMEOUT_SECONDS")
-    request_deadline_seconds: float = Field(default=180.0, alias="TSPILOT_REQUEST_DEADLINE_SECONDS")
-
     @property
     def resolved_database_config_dir(self) -> Path:
         if self.database_config_dir:
@@ -97,6 +99,12 @@ class Settings(BaseSettings):
         if self.model_config_path:
             return self.resolved_model_config_path.with_suffix("")
         return (Path(self.tspilot_root) / "configs" / "models").resolve()
+
+    @property
+    def resolved_timeout_config_path(self) -> Path:
+        if self.timeout_config_path:
+            return Path(self.timeout_config_path).resolve()
+        return (Path(self.tspilot_root) / "configs" / "timeouts.yaml").resolve()
 
     @property
     def resolved_conversation_log_dir(self) -> Path:

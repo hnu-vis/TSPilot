@@ -10,8 +10,6 @@ token: tspilot-dev-token
 username: tspilot
 password: tspilot_password
 ssl_enabled: false
-timeout: 30
-query_timeout: 60
 max_connections: 10
 schema_measurement_names:
   - home_energy_environment
