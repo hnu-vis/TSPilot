@@ -11,6 +11,7 @@ from schemas.key_insight import (
     InsightCoverage,
     InsightEvent,
     InsightEvidenceRef,
+    InsightItem,
     normalize_insight_key,
 )
 
@@ -83,20 +84,63 @@ def key_insight_prompt_view(request_state) -> dict:
             for request in requests[-12:]
         ],
         "recent_insights": [
-            {
+            _drop_empty({
                 "insight_id": insight.insight_id,
                 "insight_key": insight.insight_key,
                 "name": insight.name,
                 "insight_type": insight.insight_type,
                 "status": insight.status,
                 "statement": insight.statement,
-                "evidence_refs": [ref.source_id for ref in insight.evidence_refs[:4]],
+                "value": _prompt_fact_value(insight.value),
+                "items": [
+                    _prompt_fact_value(item.model_dump(mode="json", exclude_none=True))
+                    for item in insight.items[:12]
+                ],
+                "unit": insight.unit,
+                "dimensions": _prompt_fact_value(insight.dimensions),
+                "evidence_refs": [_canonical_prompt_ref(ref) for ref in insight.evidence_refs[:4]],
                 "derived_from": insight.derived_from,
                 "unavailable_reason": insight.unavailable_reason,
-            }
+            })
             for insight in recent
         ],
     }
+
+
+def _canonical_prompt_ref(ref: InsightEvidenceRef) -> str:
+    source_id = str(ref.source_id or "").strip()
+    if ":" in source_id:
+        return source_id
+    prefix = {
+        "query": "evidence",
+        "evidence": "evidence",
+        "analysis": "analysis",
+        "derived_evidence": "derived_evidence",
+        "forecast": "forecast",
+        "anomaly": "anomaly",
+        "insight": "insight",
+    }.get(str(ref.source_type or "").strip(), str(ref.source_type or "evidence").strip())
+    return f"{prefix}:{source_id}"
+
+
+def _prompt_fact_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 5:
+        return "[depth limit]"
+    if isinstance(value, str):
+        return value if len(value) <= 500 else value[:500] + f"... [truncated {len(value) - 500} chars]"
+    if isinstance(value, list):
+        selected = value if len(value) <= 12 else [*value[:6], *value[-6:]]
+        return [_prompt_fact_value(item, depth=depth + 1) for item in selected]
+    if isinstance(value, dict):
+        return {
+            str(key): _prompt_fact_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:20]
+        }
+    return value
+
+
+def _drop_empty(payload: dict) -> dict:
+    return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
 def _latest_action_input(request_state, tool_name: str) -> dict:
@@ -302,6 +346,17 @@ def _database_insight_for_request(
         value = row.get(value_key)
         timestamp = row.get(time_key) if time_key else None
         insight_value = timestamp if insight_type == "extreme_time" or name in {"max_time", "min_time"} else value
+        located_item = InsightItem(
+            item_id=_located_item_id(evidence_ref.source_id, request.insight_key, row),
+            value=value,
+            timestamp=str(timestamp) if timestamp is not None else None,
+            dimensions={
+                **(request.dimensions if isinstance(request.dimensions, dict) else {}),
+                "operator": operator,
+            },
+            evidence_refs=[evidence_ref],
+            locator={"row": row},
+        )
         return KeyInsight(
             insight_id=_insight_id(evidence_ref.source_id, name, insight_value),
             name=name,
@@ -313,6 +368,8 @@ def _database_insight_for_request(
                 else f"{name} is {value}" + (f" at {timestamp}." if timestamp else ".")
             ),
             value=insight_value,
+            value_shape="collection",
+            items=[located_item],
             subject=request.subject,
             time_range=request.time_range,
             method="sql_query",
@@ -327,6 +384,18 @@ def _database_insight_for_request(
             derived_from=request.derived_from,
         )
     return None
+
+
+def _located_item_id(evidence_id: str, insight_key: str | None, row: dict) -> str:
+    digest = sha1(
+        json.dumps(
+            {"evidence_id": evidence_id, "insight_key": insight_key, "row": row},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode()
+    ).hexdigest()[:12]
+    return f"item_{digest}"
 
 
 def _rows_for_insight_request(request: KeyInsightRequest, rows: list[dict]) -> tuple[list[dict], dict[str, Any]]:
@@ -473,7 +542,24 @@ def _merge_insight_state(
     existing = {insight.insight_key: insight for insight in insight_set.insights}
     for insight in [*produced, *rejected]:
         current = existing.get(insight.insight_key)
-        if current is None or _insight_status_rank(insight.status) >= _insight_status_rank(current.status):
+        current_rank = _insight_status_rank(current.status) if current is not None else -1
+        next_rank = _insight_status_rank(insight.status)
+        preserves_located_detail = (
+            current is not None
+            and current_rank == next_rank
+            and current.status == "verified"
+            and insight.status == "verified"
+            and (
+                current.value == insight.value
+                or (
+                    isinstance(insight.value, dict)
+                    and insight.value.get("value") == current.value
+                )
+            )
+            and bool(current.items)
+            and not insight.items
+        )
+        if not preserves_located_detail and (current is None or next_rank >= current_rank):
             existing[insight.insight_key] = insight
     insight_set.insights = list(existing.values())
     coverage = _coverage_for(insight_set.requests, insight_set.insights, [insight for insight in insight_set.insights if insight.status == "rejected"])

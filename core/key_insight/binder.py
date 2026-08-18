@@ -12,6 +12,7 @@ from core.analysis.python_runner import AnalysisCodeError
 from schemas.analysis import ComputedInsight
 from schemas.key_insight import InsightEvidenceRef, InsightItem, KeyInsight, KeyInsightRequest
 from runtime.prompt_locale import prompt_locale_instruction
+from runtime.timeout_policy import load_timeout_policy
 
 
 class InsightBindingError(AnalysisCodeError):
@@ -29,7 +30,10 @@ class _Binding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     insight_key: str = Field(min_length=1)
+    supported: bool
+    unsupported_reason: str | None
     statement: str = Field(min_length=1)
+    derived_from: list[str]
     item_annotations: list[_ItemAnnotation] = Field(default_factory=list)
 
 
@@ -42,8 +46,13 @@ class _BindingResponse(BaseModel):
 class LLMInsightBinder:
     """Bind immutable computed values to requested Insight semantics."""
 
-    def __init__(self, llm):
+    def __init__(self, llm, *, timeout_seconds: float | None = None):
         self._llm = llm
+        self._timeout_seconds = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else load_timeout_policy().tool("code_interpreter").stage_seconds("llm_call_seconds")
+        )
 
     async def bind(
         self,
@@ -54,6 +63,7 @@ class LLMInsightBinder:
         analysis_goal: str,
         input_evidence_id: str,
         input_source_refs: list[str] | None = None,
+        computation_code: str | None = None,
         response_language: str,
     ) -> list[KeyInsight]:
         if self._llm is None:
@@ -69,17 +79,34 @@ class LLMInsightBinder:
             "analysis_goal": analysis_goal,
             "requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
             "computed_insights": [item.model_dump(mode="json") for item in computed],
+            "executed_computation_code": computation_code,
         }
         bindings = await self._invoke(payload, response_language=response_language)
         bindings_by_key = {item.insight_key.strip(): item for item in bindings}
         if set(bindings_by_key) != set(requests_by_key):
             raise InsightBindingError("Insight Binder must return exactly one binding for every requested insight")
+        unsupported = {
+            key: binding.unsupported_reason or "the computation does not support the requested semantic scope"
+            for key, binding in bindings_by_key.items()
+            if not binding.supported
+        }
+        if unsupported:
+            raise InsightBindingError(
+                "Insight Binder rejected computed semantics: "
+                + json.dumps(unsupported, ensure_ascii=False, sort_keys=True)
+            )
 
         result: list[KeyInsight] = []
         for key, request in requests_by_key.items():
             candidate = computed_by_key[key]
             binding = bindings_by_key[key]
             statement = binding.statement.strip()
+            unknown_dependencies = set(binding.derived_from) - set(request.derived_from)
+            if unknown_dependencies:
+                raise InsightBindingError(
+                    f"Insight Binder introduced unknown dependencies for {key}: {sorted(unknown_dependencies)}"
+                )
+            derived_from = list(dict.fromkeys(binding.derived_from))
             items = _bind_items(candidate.items, [item.model_dump(mode="json") for item in binding.item_annotations])
             evidence_refs = [
                 InsightEvidenceRef(source_type="analysis", source_id=analysis_id, label=analysis_goal),
@@ -111,7 +138,7 @@ class LLMInsightBinder:
                     method="code_interpreter",
                     evidence_refs=evidence_refs,
                     calculation_trace=candidate.calculation_trace,
-                    derived_from=request.derived_from,
+                    derived_from=derived_from,
                     status="unavailable" if candidate.unavailable_reason else "verified",
                     unavailable_reason=candidate.unavailable_reason,
                 )
@@ -121,8 +148,21 @@ class LLMInsightBinder:
         system = prompt_locale_instruction(response_language) + (
             "You bind immutable Python computation outputs to Key Insight semantics. "
             "Return exactly one JSON object with a bindings list. Each binding must contain only "
-            "insight_key, a concise evidence-grounded statement, and optional item_annotations. "
+            "insight_key, supported, unsupported_reason, a concise evidence-grounded statement, derived_from, and optional item_annotations. "
             "Do not calculate, alter, round, replace, or infer any value. Do not add insights. "
+            "derived_from must be a subset of the request's parent keys and must retain only parents whose values actually "
+            "participate in computing the child value. Treat executed_computation_code as authoritative: retain a parent only "
+            "when the code reads that parent's value from input_insights and uses it in the child computation. Recomputing the "
+            "same fact from df, rows, points, or another Evidence source does not make the earlier Insight a dependency. Omit "
+            "parents used only for consistency checks. If the child is computed directly from Evidence rows, return an empty "
+            "derived_from list. Audit whether the executed computation and calculation_trace support the requested meaning, scope, "
+            "and result shape. Set supported=false with a concrete unsupported_reason whenever they do not; narrowing the statement "
+            "does not make a semantically broader requested Insight valid. Set supported=true and unsupported_reason=null only when "
+            "they match. The statement must match calculation_trace exactly: "
+            "an endpoint comparison is an endpoint-change claim, not an unqualified overall/global trend; an overall/global trend "
+            "statement requires a trace whose estimator consumes observations across the interval. Sorting or filtering all rows and "
+            "then using only the first and last values remains an endpoint comparison, even if the trace reports the full row count. If the requested label is broader "
+            "than the calculation, mark it unsupported rather than extending the claim. "
             "item_annotations may identify an item by zero-based index and add label only; preserve item order."
         )
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
@@ -134,7 +174,9 @@ class LLMInsightBinder:
                     runnable = self._llm.with_structured_output(
                         _BindingResponse, method="json_schema", include_raw=True,
                     )
-                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    bundle = await asyncio.wait_for(
+                        runnable.ainvoke(messages), timeout=self._timeout_seconds
+                    )
                     if isinstance(bundle, dict):
                         raw_content = _llm_content(bundle.get("raw"))
                         parsed = bundle.get("parsed")
@@ -144,7 +186,9 @@ class LLMInsightBinder:
                     else:
                         parsed = bundle if isinstance(bundle, _BindingResponse) else _BindingResponse.model_validate(bundle)
                 else:
-                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages), timeout=self._timeout_seconds
+                    )
                     raw_content = _llm_content(response)
                     parsed = _BindingResponse.model_validate_json(raw_content)
                 return parsed.bindings

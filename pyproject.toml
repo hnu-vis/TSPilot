@@ -23,6 +23,7 @@ dependencies = [
   "influxdb-client>=1.43.0",
   "langchain-core>=0.1.0",
   "langchain-openai>=0.0.5",
+  "playwright>=1.48.0",
   "tiktoken>=0.7.0",
 ]
 

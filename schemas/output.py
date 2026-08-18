@@ -99,6 +99,19 @@ class VisualGoal(BaseModel):
     presentation: dict[str, Any] = Field(default_factory=dict)
     layers: list[VisualLayerPlan] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def require_role_layer_bijection(self):
+        layer_roles = {layer.role.strip().casefold() for layer in self.layers}
+        missing = [
+            role for role in self.required_roles
+            if role.strip().casefold() not in layer_roles
+        ]
+        if missing:
+            raise ValueError(
+                f"every required visual role must have a same-role layer; missing={missing}"
+            )
+        return self
+
 
 class FinalResponsePlan(BaseModel):
     model_config = ConfigDict(extra="forbid")

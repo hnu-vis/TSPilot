@@ -1,36 +1,43 @@
-# core/visualization/composer.py SPEC
+# core/visualization materialization SPEC
 
 ## Purpose
 
-Plan visualization semantics from selected verified Insights and materialize chart data exclusively from request-scoped artifacts.
+Project request-scoped artifacts into semantic views, then materialize an
+LLM-authored visual-verification plan into renderer-independent V3 payloads.
 
 ## Contract
 
-- The LLM sees only bounded Insight, Evidence, and existing-visualization inventories, never the full data arrays.
-- Plans may reference only listed Insight IDs, Evidence IDs, visualization IDs, fields, renderers, and marks.
-- Materialization reads full `database_evidence_artifacts`, applies bounded visual sampling, and creates explicit bindings.
-- Existing forecast/anomaly views are composed in place when compatible Insights need highlights; duplicate contextual charts are rejected.
-- Forecast presentation plans select a bounded historical context window and may request explicit independent scales when supplied series ranges cannot share a readable scale.
-- Insight marks remain separate from sampled context data and retain stable Insight/item bindings.
-- Context lines do not require point-level bindings; prediction, anomaly, and Insight interaction bindings are retained only for visible interactive marks.
-- Invalid plans are repaired through the LLM planning contract; the composer does not use a heuristic chart fallback.
-- The composer must not query a database or invent data absent from an artifact.
+- Verified Key Insights define the conclusions to inspect; complete Evidence,
+  Derived Evidence, Forecast, and Anomaly artifacts supply context.
+- The caller supplies target Insight refs. The catalog parses each Insight's
+  evidence lineage and resolves its related complete data views automatically;
+  callers do not repeat contextual artifact refs.
+- The planning LLM sees target-Insight semantic contracts and directly held
+  scalar/located values plus reference-backed source contracts (shape, schema,
+  count, coverage, lineage, and record paths). Large item collections stay
+  reference-backed.
+  Referenced data records are not copied into planning prompts.
+- Semantic projection selects and renames existing values only. It never
+  calculates a business result.
+- Materialization reads authoritative request-scoped artifacts, applies only
+  selection transforms, and preserves source lineage and stable bindings.
+- Insight marks stay distinct from contextual series and retain Insight/item
+  locators.
+- The semantic validator independently checks required roles, verified target
+  IDs, grounded encodings, and graphical data sufficiency.
+- After those executable invariants pass, the candidate is published. The
+  Candidate Semantic Audit and screenshot Render Audit are currently disabled
+  in the publication path and cannot return `unavailable` or request a rewrite.
+- Every line or area layer contains at least two grounded points per plotted
+  series. A one-row scalar, method receipt, or boundary receipt is not a line.
+- Invalid candidates are returned to the LLM planning repair loop. There is no
+  heuristic or deterministic chart fallback.
+- Materialization never queries a database, recomputes an Insight, or invents
+  absent values.
 
-## Supported renderers
+## Output
 
-- `metric`
-- `table`
-- `linechart`
-- `barchart`
-
-## Supported marks
-
-- `line`
-- `point`
-- `bar`
-- `rule`
-- `band`
-- `label`
-
-Rules may be vertical (`x_field`) or horizontal (`y_field`). Bands use
-`x_field`/`x2_field` for temporal intervals or `y_field`/`y2_field` for value ranges.
+`VisualizationPayload` schema version 3 contains explicit datasets, layers,
+bindings, verification metadata, accessibility data, presentation options, and
+source refs. The frontend maps this renderer-independent payload to production
+ECharts options.

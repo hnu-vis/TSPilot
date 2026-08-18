@@ -7,6 +7,7 @@ from core.visualization.materializer import (
     VisualizationSemanticValidator,
 )
 from core.visualization.artifact_store import VisualizationArtifactStore
+from core.visualization.render_audit import PlaywrightEChartsRenderAuditor
 
 __all__ = [
     "InvalidPresentationLineageError",
@@ -14,4 +15,5 @@ __all__ = [
     "VisualizationMaterializer",
     "VisualizationSemanticValidator",
     "VisualizationArtifactStore",
+    "PlaywrightEChartsRenderAuditor",
 ]

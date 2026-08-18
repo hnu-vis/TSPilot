@@ -51,7 +51,18 @@ class FormatAnswerTool(BaseTool):
         except ValueError as exc:
             raise _response_plan_reference_error(exc, catalog) from exc
         visualization_ids_by_ref: dict[str, list[str]] = {}
+        visualization_ids_by_insight_id: dict[str, list[str]] = {}
         for visualization in visualizations:
+            verification = visualization.verification
+            if verification is not None:
+                for insight_id in verification.target_insight_ids:
+                    visualization_ids_by_insight_id.setdefault(insight_id, []).append(
+                        visualization.visualization_id
+                    )
+                    for lineage_ref in self._target_insight_lineage_refs(insight_id, catalog):
+                        visualization_ids_by_ref.setdefault(lineage_ref, []).append(
+                            visualization.visualization_id
+                        )
             for ref in visualization.source_refs:
                 source = catalog.resolve(ref)
                 related_refs = [source.ref]
@@ -80,8 +91,10 @@ class FormatAnswerTool(BaseTool):
             plan,
             catalog,
             visualization_ids_by_ref,
+            visualization_ids_by_insight_id,
             selected_visualization_ids,
         )
+        self._ensure_visual_claims(claims, visualizations)
         answer = FinalAnswer(
             title=plan.title,
             summary=plan.summary,
@@ -159,7 +172,14 @@ class FormatAnswerTool(BaseTool):
             evidence=presentation.evidence,
         )
 
-    def _claims(self, plan, catalog, visualization_ids_by_ref, selected_visualization_ids):
+    def _claims(
+        self,
+        plan,
+        catalog,
+        visualization_ids_by_ref,
+        visualization_ids_by_insight_id,
+        selected_visualization_ids,
+    ):
         claims: list[AnswerClaim] = []
         for index, section in enumerate(plan.sections):
             explicit_visualization_ids = [
@@ -213,9 +233,58 @@ class FormatAnswerTool(BaseTool):
                         for ref in canonical
                         for visualization_id in visualization_ids_by_ref.get(ref, [])
                     ]
+                    + [
+                        visualization_id
+                        for _source, presentation in presentations
+                        if presentation.source_type == "insight"
+                        for visualization_id in visualization_ids_by_insight_id.get(
+                            presentation.source_id, []
+                        )
+                    ]
                 )),
             ))
         return claims
+
+    def _target_insight_lineage_refs(self, insight_id: str, catalog: PresentationCatalog) -> list[str]:
+        """Resolve formal Insight provenance into canonical answer-source refs."""
+        try:
+            source = catalog.resolve(f"insight:{insight_id}")
+        except ValueError:
+            return []
+        insight = source.value
+        evidence_refs = [
+            *(getattr(insight, "evidence_refs", None) or []),
+            *[
+                evidence_ref
+                for item in (getattr(insight, "items", None) or [])
+                for evidence_ref in (getattr(item, "evidence_refs", None) or [])
+            ],
+        ]
+        canonical: list[str] = []
+        for evidence_ref in evidence_refs:
+            try:
+                canonical.append(catalog.resolve(evidence_ref.source_id).ref)
+            except ValueError:
+                continue
+        return list(dict.fromkeys(canonical))
+
+    def _ensure_visual_claims(self, claims, visualizations) -> None:
+        """Keep every approved visual-verification artifact attached to a visible claim."""
+        linked = {
+            visualization_id
+            for claim in claims
+            for visualization_id in claim.visualization_ids
+        }
+        for visualization in visualizations:
+            verification = visualization.verification
+            if verification is None or visualization.visualization_id in linked:
+                continue
+            claims.append(AnswerClaim(
+                claim_id=f"claim_visualization_{visualization.visualization_id}",
+                text=verification.interpretation,
+                insight_ids=verification.target_insight_ids,
+                visualization_ids=[visualization.visualization_id],
+            ))
 
 
 def _selected_visualization_id(ref: str, selected_ids: set[str]) -> str | None:

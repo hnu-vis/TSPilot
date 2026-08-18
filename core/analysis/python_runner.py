@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from runtime.timeout_policy import load_timeout_policy
+
 from .code_policy import (
     AnalysisPolicyError,
     prepare_analysis_code,
@@ -49,9 +51,15 @@ def execute_python_rows_v1(
     columns: list[str],
     metadata: dict,
     diagnostics: dict,
-    timeout_seconds: int = 2,
+    timeout_seconds: int | float | None = None,
 ) -> ExecutionOutput:
     """Execute generated analysis code over normalized evidence rows."""
+
+    timeout_seconds = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else load_timeout_policy().tool("code_interpreter").stage_seconds("sandbox_seconds")
+    )
 
     try:
         prepared = prepare_analysis_code(

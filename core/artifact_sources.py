@@ -116,8 +116,8 @@ def database_evidence_for_sources(request_state, sources: list[dict]) -> Databas
     return request_state.latest_database_evidence
 
 
-def source_prompt_manifest(sources: list[dict], *, preview_rows: int = 5) -> list[dict]:
-    """Bounded source description for LLM code generation."""
+def source_prompt_manifest(sources: list[dict]) -> list[dict]:
+    """Describe runtime-resolvable sources without copying their data into an LLM prompt."""
 
     return [
         {
@@ -131,8 +131,6 @@ def source_prompt_manifest(sources: list[dict], *, preview_rows: int = 5) -> lis
                     "shape": dataset["shape"],
                     "row_count": dataset["row_count"],
                     "schema_fields": dataset["schema_fields"],
-                    "preview": dataset.get("rows", [])[:preview_rows]
-                    or ([dataset["scalar"]] if dataset.get("scalar") is not None else []),
                 }
                 for dataset in source.get("datasets", [])
             ],
@@ -266,13 +264,18 @@ def _insight_item_row(item) -> dict:
 
 
 def _schema_fields(rows: list[dict]) -> list[dict]:
-    fields: list[dict] = []
-    for row in rows[:40]:
+    field_types: dict[str, list[str]] = {}
+    for row in rows:
         for key, value in row.items():
-            if any(item["name"] == str(key) for item in fields):
-                continue
-            fields.append({"name": str(key), "type": type(value).__name__})
-    return fields
+            name = str(key)
+            kinds = field_types.setdefault(name, [])
+            kind = type(value).__name__ if value is not None else "null"
+            if kind not in kinds:
+                kinds.append(kind)
+    return [
+        {"name": name, "type": "|".join(kinds)}
+        for name, kinds in field_types.items()
+    ]
 
 
 def _row_shape(rows: list[dict]) -> str:

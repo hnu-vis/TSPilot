@@ -7,6 +7,7 @@ Calculate exactly the requested analytical Key Insight values over grounded Evid
 ## Inputs
 
 - `database_evidence`: an existing database Evidence object or reference.
+- `source_refs`: stable references to the complete runtime artifacts used by the calculation.
 - `analysis_goal`: natural-language computation goal.
 - `insight_requests`: non-empty semantic contracts; output keys must match them exactly.
 - `code`: optional Python. When absent, the internal LLM generates computation-only code.
@@ -25,6 +26,10 @@ Calculate exactly the requested analytical Key Insight values over grounded Evid
 
 - Python must not write statements, Key Insight semantics, presentation objects,
   Data Views, chart roles, final-answer prose, or repair policy.
+- Code-generation prompts contain the analysis goal, Insight contracts, and
+  reference-backed source contracts (dataset names, shapes, counts, and schema),
+  never the complete source records. The sandbox resolves those references and
+  injects the complete data only when the generated code executes.
 - The LLM Binder may add statements and item labels but must never calculate or
   modify Python-produced values.
 - Output keys must preserve request order and exactly match `insight_requests`.

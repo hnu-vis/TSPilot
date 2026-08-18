@@ -7,7 +7,8 @@ represents a user-visible goal as grounded datasets and semantic layers; it has
 no template registry.
 
 Visualization planning has two LLM-owned stages. Semantic projection first
-interprets the request together with raw Evidence and verified Insights, then
+interprets the request together with verified Insights and reference-backed
+Evidence contracts, then
 publishes request-scoped semantic views by selecting, renaming, and reorganizing
 existing nested values. Chart planning consumes only those semantic views and
 chooses the layers, encodings, composition, and renderer-native presentation.
@@ -46,7 +47,8 @@ excluded because they are answer content rather than graphical visualization.
   `encode`. The materializer and frontend inject those properties from grounded
   sources after presentation options are applied.
 - Every layer resolves to a request-scoped source and dataset.
-- Every required semantic role has a non-empty materialized layer.
+- Every required semantic role has a same-role non-empty materialized layer.
+- Line and area layers contain at least two grounded points per plotted series.
 - Semantic-view encodings name real projected fields and their recursive lineage
   resolves to canonical artifacts.
 - Encoding channel names and multi-field bindings are renderer-native and open;
@@ -55,9 +57,13 @@ excluded because they are answer content rather than graphical visualization.
 - Passive context series do not carry one binding per row; semantic decision
   marks retain Insight-item identity.
 - Full time-series datasets are retained in the artifact so global patterns are
-  visible. Only prompt previews and accessibility tables are bounded.
+  visible. Data records are resolved after planning and are absent from planning
+  prompts; only the persisted accessibility table is bounded.
 - Semantic extrema retain their locator row (including timestamp) and are
   materialized as explicit marks alongside the full base series.
+- Explicit target Insights are parsed first; only the target and data views
+  reached through its lineage enter semantic projection. Sibling analysis
+  Insights are not implicit visualization inputs.
 - Analysis filtering and business calculations happen before visualization.
   Semantic projection may compose existing meanings, but cannot calculate,
   aggregate, predict, rescale, or manufacture values.

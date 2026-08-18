@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from schemas.visual_verification import VisualizationVerification
+
 
 # The renderer owns the available series vocabulary.  Keeping this as a string
 # prevents the API contract from becoming the bottleneck every time the
@@ -97,6 +99,7 @@ class VisualizationPayload(BaseModel):
     priority: Literal["primary", "supporting"] = "primary"
     title: str
     summary: str | None = None
+    verification: VisualizationVerification | None = None
     source_refs: list[str] = Field(default_factory=list)
     required_roles: list[str] = Field(default_factory=list)
     datasets: list[VisualizationDataset] = Field(default_factory=list)

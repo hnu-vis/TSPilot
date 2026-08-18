@@ -22,6 +22,7 @@ from core.key_insight.binder import LLMInsightBinder
 from core.key_insight.contracts import insight_request_contract_error
 from core.timeseries.evidence_resolution import resolve_database_evidence
 from runtime.prompt_locale import prompt_locale_instruction
+from runtime.timeout_policy import load_timeout_policy
 from sandbox import execute_python_sandbox_v1
 from sandbox.analysis_context import build_canonical_analysis_context
 from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
@@ -86,9 +87,30 @@ class _PrimarySourceSelection(BaseModel):
 class CodeInterpreterTool(BaseTool):
     """Calculate requested Insight values; semantic binding is a separate LLM stage."""
 
-    def __init__(self, llm=None, binder: LLMInsightBinder | None = None):
+    def __init__(
+        self,
+        llm=None,
+        binder: LLMInsightBinder | None = None,
+        *,
+        llm_timeout_seconds: float | None = None,
+        sandbox_timeout_seconds: float | None = None,
+    ):
+        policy = load_timeout_policy().tool("code_interpreter")
         self._llm = llm
-        self._binder = binder or LLMInsightBinder(llm)
+        self._llm_timeout_seconds = float(
+            llm_timeout_seconds
+            if llm_timeout_seconds is not None
+            else policy.stage_seconds("llm_call_seconds")
+        )
+        self._sandbox_timeout_seconds = float(
+            sandbox_timeout_seconds
+            if sandbox_timeout_seconds is not None
+            else policy.stage_seconds("sandbox_seconds")
+        )
+        self._binder = binder or LLMInsightBinder(
+            llm,
+            timeout_seconds=self._llm_timeout_seconds,
+        )
 
     async def execute(self, validated_input: CodeInterpreterInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
@@ -177,7 +199,7 @@ class CodeInterpreterTool(BaseTool):
                     diagnostics=evidence.diagnostics,
                     input_insights=input_insights,
                     analysis_context=context,
-                    timeout_seconds=int(validated_input.constraints.get("timeout_seconds", 5)),
+                    timeout_seconds=self._sandbox_timeout_seconds,
                     work_dir=_work_dir(request_state, code_hash),
                 )
                 analysis_id = _analysis_id(evidence.evidence_id, validated_input.analysis_goal, code_hash)
@@ -193,6 +215,28 @@ class CodeInterpreterTool(BaseTool):
                     requests=validated_input.insight_requests,
                     derived_name_map=derived_name_map,
                 )
+                referenced_derived_ids = {
+                    evidence_id
+                    for insight in computed
+                    for evidence_id in insight.derived_evidence_ids
+                }
+                unreferenced_derived_ids = set(derived_name_map.values()) - referenced_derived_ids
+                if unreferenced_derived_ids:
+                    raise AnalysisCodeError(
+                        "every derived evidence artifact must be referenced by at least one computed insight through "
+                        "derived_evidence_names; "
+                        f"unreferenced={sorted(unreferenced_derived_ids)}"
+                    )
+                produced = await self._binder.bind(
+                    requests=validated_input.insight_requests,
+                    computed=computed,
+                    analysis_id=analysis_id,
+                    analysis_goal=validated_input.analysis_goal,
+                    input_evidence_id=evidence.evidence_id,
+                    input_source_refs=input_source_refs,
+                    computation_code=code,
+                    response_language=response_language,
+                )
                 break
             except AnalysisCodeError as exc:
                 if not generated_code or repair_attempts >= 2:
@@ -205,15 +249,6 @@ class CodeInterpreterTool(BaseTool):
                     response_language=response_language,
                     repair_context={"validation_error": str(exc), "rejected_code": code},
                 )
-        produced = await self._binder.bind(
-            requests=validated_input.insight_requests,
-            computed=computed,
-            analysis_id=analysis_id,
-            analysis_goal=validated_input.analysis_goal,
-            input_evidence_id=evidence.evidence_id,
-            input_source_refs=input_source_refs,
-            response_language=response_language,
-        )
         result = AnalysisResult(
             analysis_id=analysis_id,
             analysis_goal=validated_input.analysis_goal,
@@ -268,7 +303,9 @@ class CodeInterpreterTool(BaseTool):
                     runnable = self._llm.with_structured_output(
                         _PrimarySourceSelection, method="json_schema", include_raw=True,
                     )
-                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    bundle = await asyncio.wait_for(
+                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     if isinstance(bundle, dict):
                         parsed = bundle.get("parsed")
                         if parsed is None:
@@ -277,7 +314,9 @@ class CodeInterpreterTool(BaseTool):
                         parsed = bundle
                     selection = parsed if isinstance(parsed, _PrimarySourceSelection) else _PrimarySourceSelection.model_validate(parsed)
                 else:
-                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     selection = _PrimarySourceSelection.model_validate_json(_llm_content(response))
                 by_ref = {source["source_ref"]: source for source in sources}
                 if selection.source_ref not in by_ref:
@@ -307,6 +346,8 @@ class CodeInterpreterTool(BaseTool):
             "The sandbox provides df, time, value, time_col, value_col, series, analysis_context, rows, points, columns, "
             "sources, source_by_ref, "
             "metadata, diagnostics, input_insights, insight_by_key, pd, np, math, and statistics. Do not import or access files. "
+            "The prompt contains source contracts rather than source records. Treat source_ref, dataset names, shapes, row counts, "
+            "and schema fields as the planning interface; the complete referenced records exist only in the runtime variables above. "
             "Do not call globals, locals, vars, eval, exec, compile, __import__, getattr, setattr, or any introspection helper. "
             "Do not use try/except/raise; inspect the documented inputs directly with ordinary conditionals. "
             "Do not access network, processes, environment variables, or clocks. All computed values must be produced by the Python program from the "
@@ -326,16 +367,27 @@ class CodeInterpreterTool(BaseTool):
             "Never manufacture uncertainty bands from an arbitrary fixed percentage or unsupported constant. If grounded forecast "
             "intervals are absent and an interval was explicitly requested, return that Insight as unavailable; if no interval was "
             "requested, do not create one. "
+            "Match the computation's scope to the requested claim. An overall/global trend must use the observations across the "
+            "analysis interval through a defensible trend estimator and report that method and the number of valid observations in "
+            "calculation_trace. Comparing only the first and last values supports an endpoint-change Insight, never an unqualified "
+            "overall/global trend. Filtering or sorting all observations before selecting only the endpoints still does not make the "
+            "estimator consume the interval observations. If the available observations cannot support the requested scope, return that Insight unavailable. "
+            "When filtering timestamps, convert both the data column and every comparison boundary to compatible timezone-aware or "
+            "timezone-naive datetime values before comparison; never compare pandas Timestamp values with raw strings. "
             "Assign one dict to result with exactly two keys: "
             "computed_insights and derived_evidence. computed_insights must contain exactly one object per requested insight_key. "
             "Each object contains insight_key, value or items, a non-empty calculation_trace describing formula/inputs as concise text or JSON, and optional "
             "unavailable_reason only when the grounded inputs make the requested calculation impossible. Never invent a placeholder value. "
+            "Produce only the requested calculation. Do not copy unrelated extrema, timestamps, boundaries, or other existing facts into a computed Insight or derived Evidence for display context; consumers must cite those facts from their existing Insight or artifact refs. "
             "When an Insight contains concrete timestamped observations or decisions that can be visually verified, preserve the summary in value and also emit one item per locator. "
             "Each item must carry its JSON-native value, timestamp, and semantic dimensions such as role; buy/sell points, extrema, boundaries, and similar multi-point results must not exist only as timestamps nested inside one value object. "
-            "derived_evidence_names. Do not produce statements, names, semantic classes, display roles, Key Insight objects, Data Views, "
+            "When a derived Evidence artifact contains the complete records used to verify an Insight, list that artifact's exact name in "
+            "the Insight object's derived_evidence_names. Do not emit an unreferenced derived artifact or nest a second items collection "
+            "inside an Insight item when those records belong in derived Evidence. Do not produce statements, names, semantic classes, display roles, Key Insight objects, Data Views, "
             "charts, summaries, repair policies, or final-answer prose. derived_evidence is normally empty; include a named artifact only "
             "when a complete calculated table or series is needed to verify or reuse an Insight. Each artifact contains name, either rows as a list of JSON objects "
             "or scalar as a JSON object, and transform_summary. Do not emit a shape field; the tool derives artifact shape from its data. "
+            "Never duplicate, filter, or rename the selected raw Evidence as derived Evidence when its values are unchanged; consumers already have the complete source artifact. "
             "Never use DataFrame.shape or values.tolist() as artifact rows; use df.to_dict(orient='records'). Use exact authoritative anomaly_context points when present; do not run another detector. "
             "When anomaly_context is used, include its exact source_ref in every affected calculation_trace. "
             "Convert numpy/pandas values and timestamps to JSON-native scalars and ISO strings. Never return NaN or Infinity."
@@ -343,10 +395,10 @@ class CodeInterpreterTool(BaseTool):
         payload = {
             "goal": goal,
             "insight_requests": [request.model_dump(mode="json", exclude_none=True) for request in requests],
-            "canonical_inputs": context.get("schema", {}),
+            "canonical_inputs": _analysis_schema_contract(context),
             "primary_source": context.get("primary_source"),
             "input_insights": context.get("input_insights", []),
-            "anomaly_context": context.get("anomaly_context"),
+            "anomaly_context": _anomaly_prompt_contract(context.get("anomaly_context")),
             "artifact_sources": source_prompt_manifest(context.get("sources", [])),
             "repair_context": repair_context,
         }
@@ -359,7 +411,9 @@ class CodeInterpreterTool(BaseTool):
                     runnable = self._llm.with_structured_output(
                         _GeneratedCode, method="json_schema", include_raw=True,
                     )
-                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    bundle = await asyncio.wait_for(
+                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     if isinstance(bundle, dict):
                         raw_content = _llm_content(bundle.get("raw"))
                         parsed = bundle.get("parsed")
@@ -369,7 +423,9 @@ class CodeInterpreterTool(BaseTool):
                     else:
                         generated = bundle if isinstance(bundle, _GeneratedCode) else _GeneratedCode.model_validate(bundle)
                 else:
-                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     raw_content = _llm_content(response)
                     generated = _GeneratedCode.model_validate_json(raw_content)
                 return generated.code.strip()
@@ -514,6 +570,40 @@ def _authoritative_anomaly_context(request_state, evidence_id: str) -> dict | No
                 "anomaly_points": [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)],
             }
     return None
+
+
+def _analysis_schema_contract(context: dict) -> dict:
+    """Expose the executable namespace contract while keeping records in the sandbox data plane."""
+
+    schema = context.get("schema") if isinstance(context, dict) else None
+    if not isinstance(schema, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in schema.items()
+        if not str(key).startswith("sample_")
+    }
+
+
+def _anomaly_prompt_contract(context: Any) -> dict | None:
+    """Describe authoritative anomaly data without embedding its points in the generation prompt."""
+
+    if not isinstance(context, dict):
+        return None
+    points = [item for item in context.get("anomaly_points", []) if isinstance(item, dict)]
+    fields: list[dict[str, str]] = []
+    for point in points:
+        for key, value in point.items():
+            name = str(key)
+            if any(field["name"] == name for field in fields):
+                continue
+            fields.append({"name": name, "type": type(value).__name__})
+    return {
+        "source_ref": context.get("source_ref"),
+        "point_count": len(points),
+        "schema_fields": fields,
+        "runtime_variable": "anomaly_context",
+    }
 
 
 def _preflight_analysis_code(
