@@ -16,14 +16,15 @@ import {
 } from './services/api';
 import {
   appendAssistantAnswer,
-  appendAssistantError,
   appendAssistantPending,
   appendUserMessage,
   buildBackendHistory,
   completeRunningTraceSteps,
   createConversation,
+  failRunningTraceSteps,
   loadConversations,
   saveConversations,
+  settleIncompleteStream,
   sortConversations,
   upsertTraceStep,
 } from './store/conversations';
@@ -40,13 +41,14 @@ export default function App() {
   const [activeId, setActiveId] = useState(() => conversations[0]?.id || createConversation().id);
   const [historyQuery, setHistoryQuery] = useState('');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [isHistoryCollapsed, setIsHistoryCollapsed] = useState(() => localStorage.getItem('tspilot.history-collapsed') === 'true');
+  const [isHistoryCollapsed, setIsHistoryCollapsed] = useState(loadHistoryCollapsed);
   const [activeView, setActiveView] = useState<WorkspaceView>('chat');
   const [isInspectorCollapsed, setIsInspectorCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [resources, setResources] = useState<ResourceState>({ databases: [], knowledge: [], model: 'backend model', models: [] });
   const [, setResourceError] = useState<string | null>(null);
   const activeAbortRef = useRef<AbortController | null>(null);
+  const conversationsRef = useRef(conversations);
 
   const activeConversation = conversations.find((item) => item.id === activeId) || conversations[0];
   const selectedTraceStep = activeConversation?.selectedTraceStepId
@@ -77,11 +79,23 @@ export default function App() {
   );
 
   useEffect(() => {
-    saveConversations(conversations);
+    conversationsRef.current = conversations;
+    const saveTimer = window.setTimeout(() => saveConversations(conversations), 350);
+    return () => window.clearTimeout(saveTimer);
   }, [conversations]);
 
   useEffect(() => {
-    localStorage.setItem('tspilot.history-collapsed', String(isHistoryCollapsed));
+    const flushConversations = () => saveConversations(conversationsRef.current);
+    window.addEventListener('pagehide', flushConversations);
+    return () => window.removeEventListener('pagehide', flushConversations);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('tspilot.history-collapsed', String(isHistoryCollapsed));
+    } catch (error) {
+      console.warn('Unable to save history sidebar state.', error);
+    }
   }, [isHistoryCollapsed]);
 
   const loadResources = () => Promise.all([fetchDatabases(), fetchKnowledge(), fetchModelsConfig()]);
@@ -205,16 +219,23 @@ export default function App() {
         (event) => handleStreamEvent(conversationId, event),
         abortController.signal,
       );
+      updateConversation(conversationId, (conversation) => settleIncompleteStream(
+        conversation,
+        t('The response stream ended before a final answer.'),
+      ));
     } catch (error) {
       if (isAbortError(error)) {
-        updateConversation(conversationId, (conversation) => appendAssistantError(
-          markLatestRunningStepErrored(conversation, t('Stopped by user.')),
+        updateConversation(conversationId, (conversation) => settleIncompleteStream(
+          failRunningTraceSteps(conversation, t('Stopped by user.')),
           t('Stopped by user.'),
         ));
         return;
       }
-      updateConversation(conversationId, (conversation) => appendAssistantError(
-        conversation,
+      updateConversation(conversationId, (conversation) => settleIncompleteStream(
+        failRunningTraceSteps(
+          conversation,
+          error instanceof Error ? error.message : t('The chat request failed.'),
+        ),
         error instanceof Error ? error.message : t('The chat request failed.'),
       ));
     } finally {
@@ -481,10 +502,15 @@ export default function App() {
       return;
     }
 
+    if (event.event === 'terminate') {
+      updateConversation(conversationId, (conversation) => completeRunningTraceSteps(conversation));
+      return;
+    }
+
     if (event.event === 'error') {
       const message = stringFrom(event.data.message, t('The backend returned an error.'));
-      updateConversation(conversationId, (conversation) => appendAssistantError(
-        markLatestRunningStepErrored(conversation, message),
+      updateConversation(conversationId, (conversation) => settleIncompleteStream(
+        failRunningTraceSteps(conversation, message),
         message,
       ));
     }
@@ -663,29 +689,16 @@ function dedupeEmptyNewConversations(conversations: Conversation[]) {
   });
 }
 
-function markLatestRunningStepErrored(conversation: Conversation, message: string): Conversation {
-  for (let index = conversation.traceSteps.length - 1; index >= 0; index -= 1) {
-    const step = conversation.traceSteps[index];
-    if (step.status !== 'running') continue;
-    const traceSteps = [...conversation.traceSteps];
-    traceSteps[index] = {
-      ...step,
-      status: 'error',
-      summary: message,
-      error: message,
-      updatedAt: now(),
-    };
-    return {
-      ...conversation,
-      traceSteps,
-      selectedTraceStepId: conversation.selectedTraceStepId || step.id,
-    };
-  }
-  return conversation;
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function loadHistoryCollapsed() {
+  try {
+    return localStorage.getItem('tspilot.history-collapsed') === 'true';
+  } catch {
+    return false;
+  }
 }
 
 function isAbortError(error: unknown) {

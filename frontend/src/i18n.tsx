@@ -291,6 +291,7 @@ const zhCN: Record<string, string> = {
   'Unable to test external model.': '无法测试外部模型。',
   'Unable to remove external model.': '无法移除外部模型。',
   'Unable to load chart data.': '无法加载图表数据。',
+  'Unable to render this visualization.': '该可视化暂时无法显示。',
   '{count} saved visualizations cannot be displayed because the data schema is no longer supported.': '有 {count} 个已保存的可视化无法显示，因为其数据模式已不再受支持。',
   'Loading complete visualization data…': '正在加载完整可视化数据…',
   'Linked evidence': '关联证据',
@@ -357,6 +358,7 @@ const zhCN: Record<string, string> = {
   'Assemble answer': '组织答案',
   'Analyze evidence': '分析证据',
   'Process step': '处理步骤',
+  'The response stream ended before a final answer.': '响应流在生成最终答案前已结束。',
   Plan: '计划',
   Data: '数据',
   Analysis: '分析',
@@ -372,7 +374,12 @@ const zhCN: Record<string, string> = {
 
 function initialLocale(): UiLocale {
   if (typeof window === 'undefined') return 'en';
-  const stored = localStorage.getItem(STORAGE_KEY);
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(STORAGE_KEY);
+  } catch {
+    // Storage can be unavailable in privacy-restricted browsing contexts.
+  }
   if (stored === 'zh-CN' || stored === 'en') return stored;
   return navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
 }
@@ -407,7 +414,11 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (typeof document === 'undefined') return;
-    localStorage.setItem(STORAGE_KEY, locale);
+    try {
+      localStorage.setItem(STORAGE_KEY, locale);
+    } catch (error) {
+      console.warn('Unable to save interface language.', error);
+    }
     document.documentElement.lang = locale;
   }, [locale]);
 

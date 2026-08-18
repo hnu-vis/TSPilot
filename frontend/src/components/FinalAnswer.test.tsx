@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { FinalAnswer as FinalAnswerType } from '../types';
+import type { FinalAnswer as FinalAnswerType, Visualization } from '../types';
 import { FinalAnswer } from './FinalAnswer';
 
 function answer(overrides: Partial<FinalAnswerType> = {}): FinalAnswerType {
@@ -54,5 +54,65 @@ describe('FinalAnswer', () => {
 
     expect(markup.match(/最大 7 天窗口标准差/g)).toHaveLength(1);
     expect(markup).toContain('1 项依据');
+  });
+
+  it('renders an approved visualization as claim, evidence, interpretation, and source', () => {
+    const visualization: Visualization = {
+      schema_version: '3',
+      visualization_id: 'viz_trend',
+      purpose: 'verify the observed trend',
+      priority: 'primary',
+      title: 'Observed value over time',
+      verification: {
+        target_insight_ids: ['insight_trend'],
+        verification_question: '完整序列是否在区间内上升？',
+        interpretation: '从首个观测点到末个观测点读取完整序列。',
+      },
+      datasets: [{
+        dataset_id: 'dataset_0',
+        source_ref: 'semantic:trend',
+        dimensions: [
+          { name: 'timestamp', data_type: 'time', role: 'x' },
+          { name: 'value', data_type: 'number', role: 'y' },
+        ],
+        series: [{
+          series_id: 'series_0',
+          name: 'Observed value',
+          role: 'complete_series',
+          points: [
+            { x: '2026-01-01', y: 10 },
+            { x: '2026-01-02', y: 12 },
+          ],
+        }],
+      }],
+      layers: [{
+        layer_id: 'layer_0',
+        mark: 'line',
+        role: 'complete_series',
+        source_ref: 'semantic:trend',
+        encoding: { x: 'timestamp', y: 'value' },
+        dataset_id: 'dataset_0',
+      }],
+      bindings: [],
+      accessibility: { description: '完整观测序列。' },
+    };
+    const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
+      claims: [{
+        claim_id: 'claim_trend',
+        text: '价格在观察区间内上升。',
+        insight_ids: ['insight_trend'],
+        analysis_ids: ['ana_trend'],
+        visualization_ids: ['viz_trend'],
+      }],
+      visualizations: [visualization],
+    })} />);
+
+    expect(markup).toContain('结论与视觉证据');
+    expect(markup).toContain('价格在观察区间内上升。');
+    expect(markup).toContain('完整序列是否在区间内上升？');
+    expect(markup).toContain('从首个观测点到末个观测点读取完整序列。');
+    expect(markup).toContain('Insight · insight_trend');
+    expect(markup).toContain('Analysis · ana_trend');
+    expect(markup).not.toContain('<h3>可视化</h3>');
   });
 });

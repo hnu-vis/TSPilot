@@ -71,6 +71,54 @@ describe('buildVisualizationOption', () => {
     expect(option.xAxis[0].axisLabel.formatter(Date.UTC(2026, 0, 3, 0, 15))).toBe('1/3 00:15');
   });
 
+  it('localizes visible chart times while preserving the ISO series coordinates', () => {
+    const input = visualization({
+      datasets: [{
+        dataset_id: 'history', source_ref: 'history', dimensions,
+        series: [{
+          series_id: 'history', name: '价格', role: 'history',
+          points: [{ x: '2023-01-04T23:48:00+00:00', y: 16842.3425 }],
+        }],
+      }],
+      layers: [{
+        layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history',
+        dataset_id: 'history', series_id: 'history',
+      }],
+    });
+    const option = buildVisualizationOption(input, null, false, 'zh-CN') as Record<string, any>;
+    const tooltip = option.tooltip.formatter([{
+      axisValue: '2023-01-04T23:48:00+00:00',
+      marker: '',
+      seriesName: '价格',
+      value: ['2023-01-04T23:48:00+00:00', 16842.3425],
+    }]);
+
+    expect(option.xAxis[0].axisLabel.formatter(Date.UTC(2023, 0, 4, 23, 48))).toBe('1月4日 23:48');
+    expect(tooltip).toContain('2023年1月4日 23:48（UTC）');
+    expect(tooltip).not.toContain('2023-01-04T23:48:00+00:00');
+    expect(option.series[0].data[0].value[0]).toBe('2023-01-04T23:48:00+00:00');
+  });
+
+  it('uses a renderer-owned compact layout without changing grounded series', () => {
+    const input = visualization({
+      presentation: {
+        title: { text: 'Planner title' },
+        toolbox: { show: true },
+        legend: { textStyle: { fontSize: 18 } },
+      },
+    });
+    const option = buildVisualizationOption(input, null, true) as Record<string, any>;
+
+    expect(option.title.show).toBe(false);
+    expect(option.toolbox.show).toBe(false);
+    expect(option.grid[0]).toMatchObject({ left: 48, right: 12, top: 52, bottom: 48 });
+    expect(option.legend.textStyle.fontSize).toBe(9);
+    expect(option.xAxis[0].axisLabel.fontSize).toBe(9);
+    expect(option.series[0].data.map((point: Record<string, unknown>) => point.value)).toEqual([
+      ['2026-01-01T00:00:00Z', 10], ['2026-01-02T00:00:00Z', 12],
+    ]);
+  });
+
   it('renders a bar layer from its own dataset', () => {
     const option = buildVisualizationOption(visualization({
       datasets: [{
@@ -110,12 +158,125 @@ describe('buildVisualizationOption', () => {
     ]);
   });
 
+  it('keeps the full time series while opening a scrollable viewport around a planned interval', () => {
+    const points = Array.from({ length: 100 }, (_, index) => ({
+      x: `2026-01-${String(Math.floor(index / 4) + 1).padStart(2, '0')}T${String((index % 4) * 6).padStart(2, '0')}:00:00Z`,
+      y: 10 + index,
+    }));
+    const input = visualization({
+      presentation: {
+        dataZoom: [{
+          type: 'slider',
+          startValue: '2026-01-08T00:00:00Z',
+          endValue: '2026-01-12T00:00:00Z',
+        }],
+      },
+      datasets: [{
+        dataset_id: 'history', source_ref: 'history', dimensions,
+        series: [{ series_id: 'history', name: 'History', role: 'history', points }],
+      }],
+      layers: [{
+        layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history',
+        dataset_id: 'history', series_id: 'history',
+      }],
+    });
+
+    const desktop = buildVisualizationOption(input) as Record<string, any>;
+    const compact = buildVisualizationOption(input, null, true) as Record<string, any>;
+
+    for (const option of [desktop, compact]) {
+      expect(option.dataZoom.map((zoom: Record<string, unknown>) => zoom.type)).toEqual(['inside', 'slider']);
+      expect(option.dataZoom.every((zoom: Record<string, unknown>) => zoom.filterMode === 'filter')).toBe(true);
+      expect(option.dataZoom.every((zoom: Record<string, unknown>) => (
+        zoom.startValue === '2026-01-08T00:00:00Z'
+        && zoom.endValue === '2026-01-12T00:00:00Z'
+      ))).toBe(true);
+      expect(option.series[0].data).toHaveLength(100);
+    }
+  });
+
   it('creates separate grids and axes for layered facets', () => {
     const base = visualization();
     const option = buildVisualizationOption({ ...base, layout: 'facets' }) as Record<string, any>;
     expect(option.grid).toHaveLength(4);
     expect(option.xAxis).toHaveLength(4);
     expect(option.series.some((item: Record<string, any>) => item.xAxisIndex === 1)).toBe(true);
+  });
+
+  it('preserves facet axis cardinality when presentation supplies fewer axes and grids', () => {
+    const base = visualization();
+    const option = buildVisualizationOption({
+      ...base,
+      layout: 'facets',
+      presentation: {
+        xAxis: { name: 'Shared time' },
+        yAxis: [{ name: 'Only one presented axis' }],
+        grid: [{ top: '10%', height: '80%' }],
+      },
+    }) as Record<string, any>;
+
+    expect(option.grid).toHaveLength(4);
+    expect(option.xAxis).toHaveLength(4);
+    expect(option.yAxis).toHaveLength(4);
+    expect(option.xAxis.every((axis: Record<string, unknown>, index: number) => axis.gridIndex === index)).toBe(true);
+    expect(option.yAxis.every((axis: Record<string, unknown>, index: number) => axis.gridIndex === index)).toBe(true);
+    expect(option.series.every((series: Record<string, number>) => series.xAxisIndex < option.xAxis.length)).toBe(true);
+    expect(option.series.every((series: Record<string, number>) => series.yAxisIndex < option.yAxis.length)).toBe(true);
+  });
+
+  it('renders an LLM-authored shared-axis plan in one canvas even for a legacy facets payload', () => {
+    const base = visualization();
+    const layers = base.layers?.map((layer, index) => ({
+      ...layer,
+      presentation: { ...layer.presentation, xAxisIndex: 0, yAxisIndex: index === 2 ? 1 : 0 },
+    }));
+    const option = buildVisualizationOption({
+      ...base,
+      layout: 'facets',
+      layers,
+      presentation: {
+        grid: [{ top: '8%', height: '48%' }, { top: '64%', height: '28%' }],
+        xAxis: { type: 'time' },
+        yAxis: [{ name: 'Value' }, { name: 'Secondary value' }],
+      },
+    }) as Record<string, any>;
+
+    expect(option.grid).toHaveLength(1);
+    expect(option.xAxis).toHaveLength(1);
+    expect(option.yAxis).toHaveLength(2);
+    expect(option.series.every((series: Record<string, number>) => series.xAxisIndex === 0)).toBe(true);
+    expect(option.series.some((series: Record<string, number>) => series.yAxisIndex === 1)).toBe(true);
+  });
+
+  it('keeps incompatible single-value summaries inside the chart as annotations', () => {
+    const option = buildVisualizationOption(visualization({
+      layout: 'facets',
+      presentation: {
+        xAxis: { type: 'time' },
+        yAxis: [{ name: 'Value' }, { name: 'Percent' }],
+      },
+      datasets: [
+        {
+          dataset_id: 'history', source_ref: 'history', dimensions,
+          series: [{ series_id: 'history', name: 'History', role: 'history', points: [{ x: '2026-01-01', y: 10 }] }],
+        },
+        {
+          dataset_id: 'summary', source_ref: 'summary',
+          dimensions: [{ name: 'metric', data_type: 'category', role: 'x' }, { name: 'percent', data_type: 'number', role: 'y' }],
+          series: [{ series_id: 'summary', name: 'Change', role: 'summary', unit: '%', points: [{ x: 'change', y: 12.5 }] }],
+        },
+      ],
+      layers: [
+        { layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history', dataset_id: 'history', presentation: { xAxisIndex: 0, yAxisIndex: 0 } },
+        { layer_id: 'summary', mark: 'bar', role: 'summary', source_ref: 'summary', dataset_id: 'summary', presentation: { xAxisIndex: 0, yAxisIndex: 1 } },
+      ],
+    })) as Record<string, any>;
+
+    expect(option.grid).toHaveLength(1);
+    expect(option.series).toHaveLength(1);
+    expect(option.series[0].name).toBe('History');
+    expect(option.yAxis).toHaveLength(1);
+    expect(option.graphic[0].style.text).toContain('Change: 12.5 %');
   });
 
   it('passes renderer-native marks, multi-field encodings, and presentation through grounded datasets', () => {

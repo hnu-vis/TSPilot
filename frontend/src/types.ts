@@ -96,6 +96,11 @@ export type Visualization = {
   priority: 'primary' | 'supporting';
   title: string;
   summary?: string | null;
+  verification?: {
+    target_insight_ids?: string[];
+    verification_question: string;
+    interpretation: string;
+  } | null;
   source_refs?: string[];
   required_roles?: string[];
   datasets: Array<{

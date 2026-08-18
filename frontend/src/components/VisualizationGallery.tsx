@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
-import type { EChartsOption } from 'echarts';
-import type { EChartsType } from 'echarts/core';
+import type { ECharts, EChartsOption } from 'echarts';
 import type { Visualization, VisualizationPoint, VisualizationSeries } from '../types';
 import { fetchVisualizationData } from '../services/api';
-import { useI18n } from '../i18n';
+import { useI18n, type UiLocale } from '../i18n';
+import { formatHumanTime, isIsoTimestamp } from '../lib/humanTime';
 
 type GalleryProps = {
   visualizations: Visualization[];
@@ -128,7 +128,7 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const marks = (visualization.layers || []).map((layer) => layer.mark);
   return (
     <article className={`answer-visualization-card is-${visualization.priority}`}>
@@ -143,6 +143,7 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
         visualization={visualization}
         activeBindingId={activeBindingId}
         onSelectBinding={onSelectBinding}
+        locale={locale}
       />
       {(visualization.accessibility.table_rows?.length || 0) > 0 && (
         <details className="visualization-data-details">
@@ -152,6 +153,7 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
             rows={visualization.accessibility.table_rows || []}
             columns={visualization.accessibility.table_columns || []}
             onSelectBinding={onSelectBinding}
+            locale={locale}
           />
         </details>
       )}
@@ -163,19 +165,33 @@ function formatFieldLabel(value: string) {
   return value.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function EChartView({ visualization, activeBindingId, onSelectBinding }: {
+function EChartView({ visualization, activeBindingId, onSelectBinding, locale }: {
   visualization: Visualization;
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
+  locale: UiLocale;
 }) {
+  const { t } = useI18n();
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<EChartsType | null>(null);
-  const option = useMemo(() => buildVisualizationOption(visualization, activeBindingId), [visualization, activeBindingId]);
+  const chartRef = useRef<ECharts | null>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [compact, setCompact] = useState(false);
+  const option = useMemo(
+    () => buildVisualizationOption(visualization, activeBindingId, compact, locale),
+    [visualization, activeBindingId, compact, locale],
+  );
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return undefined;
-    const chart = echarts.init(host, undefined, { renderer: 'canvas' });
+    let chart: ECharts;
+    try {
+      chart = echarts.init(host, undefined, { renderer: 'canvas' });
+    } catch (error) {
+      console.error('Unable to initialize visualization.', error);
+      setRenderError(error instanceof Error ? error.message : t('Unable to render this visualization.'));
+      return undefined;
+    }
     chartRef.current = chart;
     const handleClick = (params: { data?: unknown }) => {
       const data = isRecord(params.data) ? params.data : null;
@@ -185,7 +201,13 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
       if (bindingId) onSelectBinding(bindingId);
     };
     chart.on('click', handleClick);
-    const observer = new ResizeObserver(() => chart.resize());
+    const resize = () => {
+      const nextCompact = host.clientWidth < 520;
+      setCompact((current) => current === nextCompact ? current : nextCompact);
+      chart.resize();
+    };
+    resize();
+    const observer = new ResizeObserver(resize);
     observer.observe(host);
     return () => {
       observer.disconnect();
@@ -193,34 +215,76 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
       chart.dispose();
       chartRef.current = null;
     };
-  }, [onSelectBinding]);
+  }, [onSelectBinding, t]);
 
   useEffect(() => {
-    chartRef.current?.setOption(option, { notMerge: true, lazyUpdate: true });
-  }, [option]);
+    try {
+      chartRef.current?.setOption(option, { notMerge: true, lazyUpdate: true });
+      setRenderError(null);
+    } catch (error) {
+      console.error('Unable to render visualization.', error);
+      setRenderError(error instanceof Error ? error.message : t('Unable to render this visualization.'));
+    }
+  }, [option, t]);
+
+  if (renderError) {
+    return (
+      <div className="answer-visualization-unavailable" role="status">
+        {t('Unable to render this visualization.')}
+        <small>{renderError}</small>
+      </div>
+    );
+  }
+
+  const faceted = usesIndependentGrids(visualization);
 
   return (
     <div
       ref={hostRef}
-      className={`answer-echart${visualization.layout === 'facets' ? ' is-faceted' : ''}`}
-      style={{ height: visualization.layout === 'facets' ? Math.max(360, Math.max(1, (visualization.layers || []).filter((layer) => layer.mark !== 'table').length) * 190 + 28) : 340 }}
+      className={`answer-echart${faceted ? ' is-faceted' : ''}`}
+      style={{ height: faceted ? Math.max(360, Math.max(1, (visualization.layers || []).filter((layer) => layer.mark !== 'table').length) * 190 + 28) : 380 }}
       role="img"
       aria-label={visualization.accessibility.description || visualization.title}
     />
   );
 }
 
-export function buildVisualizationOption(visualization: Visualization, activeBindingId: string | null = null): EChartsOption {
+export function buildVisualizationOption(
+  visualization: Visualization,
+  activeBindingId: string | null = null,
+  compact = false,
+  locale: UiLocale = 'en',
+): EChartsOption {
   const layers = visualization.layers || [];
   const datasets = new Map(visualization.datasets.map((dataset) => [dataset.dataset_id, dataset]));
-  const faceted = visualization.layout === 'facets' && layers.length > 1;
+  const faceted = usesIndependentGrids(visualization) && layers.length > 1;
+  const overlayYAxisCount = faceted ? 1 : Math.max(1, axisPresentationCount(visualization.presentation?.yAxis));
+  const primaryXAxisType = preferredSharedXAxisType(layers, datasets);
   const grids = faceted
-    ? layers.map((_, index) => ({ left: 66, right: 24, top: 34 + index * 190, height: 130 }))
-    : [{ left: 62, right: 24, top: 36, bottom: 52, containLabel: false }];
+    ? layers.map((_, index) => ({
+        left: compact ? 48 : 66,
+        right: compact ? 12 : 24,
+        top: (compact ? 54 : 34) + index * 190,
+        height: compact ? 122 : 130,
+      }))
+    : [{
+        left: compact ? 48 : 62,
+        right: compact ? 12 : 24,
+        top: compact ? 52 : 36,
+        bottom: compact ? 48 : 52,
+        containLabel: false,
+      }];
   const xAxis = layers.map((layer, index) => ({
     type: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type),
     gridIndex: faceted ? index : 0,
-    axisLabel: { hideOverlap: true, color: '#667085', formatter: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type) === 'time' ? formatAxisTime : undefined },
+    axisLabel: {
+      hideOverlap: true,
+      color: '#667085',
+      fontSize: compact ? 9 : 11,
+      formatter: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type) === 'time'
+        ? (value: unknown) => formatAxisTime(value, locale, compact)
+        : undefined,
+    },
     axisLine: { lineStyle: { color: '#d0d5dd' } },
     splitLine: { show: false },
   }));
@@ -228,22 +292,33 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     type: 'value',
     gridIndex: faceted ? index : 0,
     name: faceted ? layer.label || formatRoleLabel(layer.role) : undefined,
-    nameTextStyle: { color: '#667085', align: 'left' },
+    nameTextStyle: { color: '#667085', align: 'left', fontSize: compact ? 9 : 11 },
     scale: true,
-    axisLabel: { color: '#667085', formatter: formatAxisNumber },
+    axisLabel: { color: '#667085', fontSize: compact ? 9 : 11, formatter: formatAxisNumber },
     splitLine: { lineStyle: { color: '#eef1f4' } },
   }));
   const seriesOptions: any[] = [];
+  const scalarAnnotations: Array<{ label: string; value: number | null; unit?: string | null }> = [];
   const rendererDatasets: Array<{ id: string; source: Array<Record<string, unknown>> }> = [];
   layers.forEach((layer, index) => {
     const dataset = datasets.get(layer.dataset_id);
     if (layer.mark === 'rule') return;
+    const xAxisIndex = faceted ? index : 0;
+    const yAxisIndex = faceted ? index : requestedAxisIndex(layer.presentation?.yAxisIndex, overlayYAxisCount);
     const sourceSeries = dataset?.series?.length
       ? dataset.series
       : [{ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points: layer.points || [] }];
     sourceSeries.forEach((series) => {
+      if (!faceted && isScalarAnnotationLayer(dataset, series, primaryXAxisType)) {
+        scalarAnnotations.push({
+          label: series.name || layer.label || formatRoleLabel(layer.role),
+          value: series.points?.[0]?.y ?? null,
+          unit: series.unit,
+        });
+        return;
+      }
       if (layer.mark === 'band') {
-        seriesOptions.push(...confidenceBandSeries(series, index, faceted));
+        seriesOptions.push(...confidenceBandSeries(series, index, xAxisIndex, yAxisIndex));
         return;
       }
       if (!['line', 'area', 'bar', 'point', 'boxplot', 'rule', 'rect'].includes(layer.mark)) {
@@ -253,12 +328,12 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
           source: (series.points || []).map((point) => groundedPointRecord(point, layer.encoding)),
         });
         seriesOptions.push(buildRendererNativeSeriesOption(
-          { ...layer, label: series.name }, rendererDatasetId, index, faceted,
+          { ...layer, label: series.name }, rendererDatasetId, xAxisIndex, yAxisIndex,
         ));
         return;
       }
       seriesOptions.push(buildLayerSeriesOption(
-        { ...layer, label: series.name }, series.points || [], index, faceted, activeBindingId,
+        { ...layer, label: series.name }, series.points || [], index, xAxisIndex, yAxisIndex, activeBindingId,
       ));
     });
   });
@@ -282,27 +357,241 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     };
   }
 
+  const generatedXAxis = faceted ? xAxis : xAxis.slice(0, 1);
+  const renderedOverlayYAxisCount = faceted
+    ? 1
+    : Math.max(1, ...seriesOptions.map((series) => Number(series.yAxisIndex) + 1).filter(Number.isFinite));
+  const generatedYAxis = faceted
+    ? yAxis
+    : Array.from({ length: renderedOverlayYAxisCount }, (_, index) => ({
+        ...yAxis[0],
+        gridIndex: 0,
+        position: index === 0 ? 'left' : 'right',
+        offset: index > 1 ? (index - 1) * 48 : 0,
+      }));
+  const hasDenseSeries = layers.some(
+    (layer) => (datasets.get(layer.dataset_id)?.series?.[0]?.points?.length || 0) > 80,
+  );
   const option: Record<string, unknown> = {
     animationDuration: 260,
     aria: { enabled: true, decal: { show: true }, description: visualization.accessibility.description },
     color: ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'],
     grid: grids,
-    tooltip: { trigger: layers.some((layer) => layer.mark === 'point') ? 'item' : 'axis', confine: true, valueFormatter: formatAxisNumber },
-    legend: { type: 'scroll', top: 2, textStyle: { color: '#475467' } },
-    xAxis: faceted ? xAxis : xAxis.slice(0, 1),
-    yAxis: faceted ? yAxis : yAxis.slice(0, 1),
-    dataZoom: layers.some((layer) => (datasets.get(layer.dataset_id)?.series?.[0]?.points?.length || 0) > 80)
-      ? [{ type: 'inside', filterMode: 'none' }, { type: 'slider', height: 18, bottom: 4 }]
-      : [],
+    tooltip: {
+      trigger: layers.some((layer) => layer.mark === 'point') ? 'item' : 'axis',
+      confine: true,
+      valueFormatter: formatAxisNumber,
+      formatter: primaryXAxisType === 'time'
+        ? (params: unknown) => formatTimeSeriesTooltip(params, locale)
+        : undefined,
+      textStyle: { fontSize: compact ? 10 : 12 },
+    },
+    legend: {
+      type: 'scroll',
+      top: 2,
+      left: compact ? 8 : 'center',
+      right: compact ? 8 : undefined,
+      itemWidth: compact ? 12 : 25,
+      itemHeight: compact ? 8 : 14,
+      itemGap: compact ? 8 : 10,
+      textStyle: { color: '#475467', fontSize: compact ? 9 : 12 },
+      formatter: compact ? compactLegendLabel : undefined,
+    },
+    xAxis: generatedXAxis,
+    yAxis: generatedYAxis,
+    dataZoom: resolveDataZoom(hasDenseSeries, undefined, compact),
     dataset: rendererDatasets,
     series: seriesOptions,
+    graphic: scalarAnnotationGraphic(scalarAnnotations, compact),
   };
   const presented = deepMerge(option, visualization.presentation || {});
-  // These are the immutable binding boundary. Even malformed or legacy
-  // presentation payloads cannot replace verified renderer data.
+  // These are the immutable structural binding boundary. Presentation may
+  // style generated axes but cannot change their cardinality or grid binding.
+  presented.grid = grids;
+  presented.xAxis = responsiveAxes(
+    mergeAxisPresentation(generatedXAxis, visualization.presentation?.xAxis, faceted),
+    compact,
+    'x',
+    locale,
+  );
+  presented.yAxis = responsiveAxes(
+    mergeAxisPresentation(generatedYAxis, visualization.presentation?.yAxis, faceted),
+    compact,
+    'y',
+  );
   presented.dataset = rendererDatasets;
-  presented.series = seriesOptions;
+  presented.series = compact ? seriesOptions.map(compactSeriesOption) : seriesOptions;
+  presented.graphic = scalarAnnotationGraphic(scalarAnnotations, compact);
+  presented.dataZoom = resolveDataZoom(
+    hasDenseSeries,
+    visualization.presentation?.dataZoom,
+    compact,
+  );
+  if (compact) {
+    // Card headings already carry title and summary. Renderer-owned compact
+    // layout keeps the plot's semantic encodings legible at audit/mobile width.
+    presented.title = { show: false };
+    presented.toolbox = { show: false };
+    presented.legend = option.legend;
+  }
   return presented as EChartsOption;
+}
+
+function resolveDataZoom(
+  hasDenseSeries: boolean,
+  plannedDataZoom: unknown,
+  compact: boolean,
+): Array<Record<string, unknown>> {
+  const planned = (Array.isArray(plannedDataZoom)
+    ? plannedDataZoom.filter(isRecord)
+    : isRecord(plannedDataZoom) ? [plannedDataZoom] : [])
+    .map((item) => ({ ...item }));
+  if (!hasDenseSeries) return planned;
+
+  const hasViewport = (item: Record<string, unknown>) => (
+    ['start', 'end', 'startValue', 'endValue'].some((key) => Object.prototype.hasOwnProperty.call(item, key))
+  );
+  const viewportSource = planned.find(hasViewport) || {};
+  const viewport = Object.fromEntries(
+    [
+      'start', 'end', 'startValue', 'endValue', 'minSpan', 'maxSpan',
+      'minValueSpan', 'maxValueSpan', 'rangeMode', 'zoomLock',
+    ]
+      .filter((key) => Object.prototype.hasOwnProperty.call(viewportSource, key))
+      .map((key) => [key, viewportSource[key]]),
+  );
+  const inside = planned.find((item) => item.type === 'inside') || {};
+  const slider = planned.find((item) => item.type === 'slider') || {};
+  return [
+    { ...inside, ...viewport, type: 'inside', filterMode: 'filter' },
+    {
+      height: compact ? 16 : 18,
+      bottom: compact ? 2 : 4,
+      ...slider,
+      ...viewport,
+      type: 'slider',
+      filterMode: 'filter',
+    },
+  ];
+}
+
+function responsiveAxes(
+  axes: Array<Record<string, unknown>>,
+  compact: boolean,
+  dimension: 'x' | 'y',
+  locale: UiLocale,
+): Array<Record<string, unknown>> {
+  if (!compact) return axes;
+  return axes.map((axis) => {
+    const axisLabel = isRecord(axis.axisLabel) ? axis.axisLabel : {};
+    return {
+      ...axis,
+      nameGap: 8,
+      nameTextStyle: { ...(isRecord(axis.nameTextStyle) ? axis.nameTextStyle : {}), fontSize: 9 },
+      axisLabel: {
+        ...axisLabel,
+        fontSize: 9,
+        hideOverlap: true,
+        formatter: dimension === 'x' && axis.type === 'time'
+          ? (value: unknown) => formatAxisTime(value, locale, true)
+          : axisLabel.formatter,
+      },
+    };
+  });
+}
+
+function compactSeriesOption(series: Record<string, unknown>): Record<string, unknown> {
+  const label = isRecord(series.label) ? series.label : null;
+  if (!label) return series;
+  return {
+    ...series,
+    label: {
+      ...label,
+      fontSize: 9,
+      width: 96,
+      overflow: 'truncate',
+    },
+    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' },
+  };
+}
+
+function mergeAxisPresentation(
+  generated: Array<Record<string, unknown>>,
+  presentation: unknown,
+  faceted: boolean,
+): Array<Record<string, unknown>> {
+  const shared = isRecord(presentation) ? presentation : null;
+  const perAxis = Array.isArray(presentation) ? presentation : [];
+  return generated.map((axis, index) => {
+    const overlay = shared || (isRecord(perAxis[index]) ? perAxis[index] : null);
+    const merged = overlay ? deepMerge(axis, overlay) : axis;
+    return { ...merged, gridIndex: faceted ? index : 0 };
+  });
+}
+
+function usesIndependentGrids(visualization: Visualization): boolean {
+  if (visualization.layout !== 'facets') return false;
+  const requestedXAxisIndices = (visualization.layers || [])
+    .map((layer) => layer.presentation?.xAxisIndex)
+    .filter((value): value is number => typeof value === 'number' && Number.isInteger(value));
+  return requestedXAxisIndices.length === 0 || requestedXAxisIndices.some((index) => index !== 0);
+}
+
+function axisPresentationCount(value: unknown): number {
+  if (Array.isArray(value)) return value.filter(isRecord).length;
+  return isRecord(value) ? 1 : 0;
+}
+
+function requestedAxisIndex(value: unknown, axisCount: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < axisCount ? value : 0;
+}
+
+function preferredSharedXAxisType(
+  layers: NonNullable<Visualization['layers']>,
+  datasets: Map<string, Visualization['datasets'][number]>,
+) {
+  const types = layers.map((layer) => axisType(
+    datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type,
+  ));
+  return types.includes('time') ? 'time' : types[0] || 'category';
+}
+
+function isScalarAnnotationLayer(
+  dataset: Visualization['datasets'][number] | undefined,
+  series: VisualizationSeries,
+  primaryXAxisType: 'time' | 'value' | 'category',
+) {
+  const layerXAxisType = axisType(dataset?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type);
+  return layerXAxisType !== primaryXAxisType && (series.points?.length || 0) <= 1;
+}
+
+function scalarAnnotationGraphic(
+  annotations: Array<{ label: string; value: number | null; unit?: string | null }>,
+  compact = false,
+) {
+  if (annotations.length === 0) return [];
+  const text = annotations.map((annotation) => {
+    const value = annotation.value == null ? '—' : formatAxisNumber(annotation.value);
+    return `${annotation.label}: ${value}${annotation.unit ? ` ${annotation.unit}` : ''}`;
+  }).join('\n');
+  return [{
+    type: 'text',
+    left: compact ? 48 : 76,
+    top: compact ? 48 : 58,
+    z: 100,
+    silent: true,
+    style: {
+      text,
+      fill: '#475467',
+      font: compact ? '9px sans-serif' : '11px sans-serif',
+      lineHeight: compact ? 14 : 18,
+      backgroundColor: 'rgba(255, 255, 255, 0.9)',
+      borderColor: '#e4e7ec',
+      borderWidth: 1,
+      borderRadius: 6,
+      padding: [6, 8],
+    },
+  }];
 }
 
 function deepMerge(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
@@ -320,7 +609,8 @@ function buildLayerSeriesOption(
   layer: NonNullable<Visualization['layers']>[number],
   points: VisualizationPoint[],
   index: number,
-  faceted: boolean,
+  xAxisIndex: number,
+  yAxisIndex: number,
   activeBindingId: string | null,
 ): any {
   const name = layer.label || formatRoleLabel(layer.role);
@@ -329,8 +619,8 @@ function buildLayerSeriesOption(
       ...(layer.presentation || {}),
       name,
       type: 'boxplot',
-      xAxisIndex: faceted ? index : 0,
-      yAxisIndex: faceted ? index : 0,
+      xAxisIndex,
+      yAxisIndex,
       data: points.map((point) => [
         point.lower,
         numberFrom(point.metadata?.q1),
@@ -345,8 +635,8 @@ function buildLayerSeriesOption(
       ...(layer.presentation || {}),
       name,
       type: 'bar',
-      xAxisIndex: faceted ? index : 0,
-      yAxisIndex: faceted ? index : 0,
+      xAxisIndex,
+      yAxisIndex,
       barMaxWidth: 34,
       itemStyle: { borderRadius: [5, 5, 0, 0] },
       emphasis: { focus: 'series' },
@@ -362,8 +652,8 @@ function buildLayerSeriesOption(
       ...(layer.presentation || {}),
       name,
       type: 'scatter',
-      xAxisIndex: faceted ? index : 0,
-      yAxisIndex: faceted ? index : 0,
+      xAxisIndex,
+      yAxisIndex,
       symbol: (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index),
       symbolSize: (_value: unknown, params: { data?: unknown }) => isRecord(params.data) && params.data.bindingId === activeBindingId
         ? 15
@@ -383,6 +673,7 @@ function buildLayerSeriesOption(
   const presentedLineStyle = isRecord(linePresentation.lineStyle) ? linePresentation.lineStyle : {};
   const presentedAreaStyle = isRecord(linePresentation.areaStyle) ? linePresentation.areaStyle : {};
   const presentedEmphasis = isRecord(linePresentation.emphasis) ? linePresentation.emphasis : {};
+  const presentedLabel = isRecord(linePresentation.label) ? linePresentation.label : null;
   const colorField = encodingField(layer.encoding?.color);
   const shapeField = encodingField(layer.encoding?.shape);
   const sizeField = encodingField(layer.encoding?.size);
@@ -391,8 +682,8 @@ function buildLayerSeriesOption(
     ...linePresentation,
     name,
     type: 'line',
-    xAxisIndex: faceted ? index : 0,
-    yAxisIndex: faceted ? index : 0,
+    xAxisIndex,
+    yAxisIndex,
     showSymbol: linePresentation.showSymbol ?? (points.length <= 40 || points.some((point) => point.binding_id)),
     symbol: shapeField
       ? (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index)
@@ -415,6 +706,13 @@ function buildLayerSeriesOption(
         : presentedLineStyle.opacity ?? 1,
     },
     areaStyle: layer.mark === 'area' ? { opacity: 0.16, ...presentedAreaStyle } : undefined,
+    label: presentedLabel
+      ? {
+          ...presentedLabel,
+          formatter: presentedLabel.formatter ?? (() => points[0]?.label || name),
+        }
+      : undefined,
+    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' },
     data: points.map((point) => toEChartsPoint(point, layer, index, opacityField)),
     emphasis: { focus: 'series', ...presentedEmphasis },
     z: linePresentation.z ?? 3 + index,
@@ -424,8 +722,8 @@ function buildLayerSeriesOption(
 function buildRendererNativeSeriesOption(
   layer: NonNullable<Visualization['layers']>[number],
   datasetId: string,
-  index: number,
-  faceted: boolean,
+  xAxisIndex: number,
+  yAxisIndex: number,
 ): Record<string, unknown> {
   // Presentation is merged first. Grounded binding properties below always win,
   // so renderer freedom cannot replace the dataset or its field encodings.
@@ -435,8 +733,8 @@ function buildRendererNativeSeriesOption(
     type: layer.mark,
     datasetId,
     encode: layer.encoding || {},
-    xAxisIndex: faceted ? index : 0,
-    yAxisIndex: faceted ? index : 0,
+    xAxisIndex,
+    yAxisIndex,
   };
 }
 
@@ -462,16 +760,20 @@ function encodingField(value: string | string[] | undefined): string | undefined
   return encodingFields(value)[0];
 }
 
-function confidenceBandSeries(series: VisualizationSeries, index: number, faceted: boolean): any[] {
+function confidenceBandSeries(
+  series: VisualizationSeries,
+  index: number,
+  xAxisIndex: number,
+  yAxisIndex: number,
+): any[] {
   const bounded = (series.points || []).filter((point) => point.lower != null && point.upper != null);
   if (bounded.length === 0) return [];
-  const axisIndex = faceted ? index : 0;
   return [
     {
       name: `${series.name} lower`,
       type: 'line',
-      xAxisIndex: axisIndex,
-      yAxisIndex: axisIndex,
+      xAxisIndex,
+      yAxisIndex,
       stack: `confidence_${index}`,
       symbol: 'none',
       lineStyle: { opacity: 0 },
@@ -483,8 +785,8 @@ function confidenceBandSeries(series: VisualizationSeries, index: number, facete
     {
       name: `${series.name} interval`,
       type: 'line',
-      xAxisIndex: axisIndex,
-      yAxisIndex: axisIndex,
+      xAxisIndex,
+      yAxisIndex,
       stack: `confidence_${index}`,
       symbol: 'none',
       lineStyle: { opacity: 0 },
@@ -496,13 +798,19 @@ function confidenceBandSeries(series: VisualizationSeries, index: number, facete
   ];
 }
 
-function AccessibleTable({ visualization, rows, columns, onSelectBinding }: {
+function AccessibleTable({ visualization, rows, columns, onSelectBinding, locale }: {
   visualization: Visualization;
   rows: Array<Record<string, unknown>>;
   columns: string[];
   onSelectBinding: (bindingId: string) => void;
+  locale: UiLocale;
 }) {
   const bindingById = new Map((visualization.bindings || []).map((binding) => [binding.binding_id, binding]));
+  const temporalColumns = new Set(visualization.datasets.flatMap((dataset) => (
+    (dataset.dimensions || [])
+      .filter((dimension) => dimension.data_type === 'time')
+      .map((dimension) => dimension.name)
+  )));
   return (
     <div className="answer-visualization-table-wrap">
       <table className="answer-data-table answer-visualization-table">
@@ -520,7 +828,9 @@ function AccessibleTable({ visualization, rows, columns, onSelectBinding }: {
                 }}
                 tabIndex={binding ? 0 : undefined}
               >
-                {columns.map((column) => <td key={column}>{formatCell(row[column])}</td>)}
+                {columns.map((column) => (
+                  <td key={column}>{formatCell(row[column], locale, temporalColumns.has(column))}</td>
+                ))}
               </tr>
             );
           })}
@@ -557,13 +867,12 @@ function chartValue(value: unknown): string | number | null {
   return value == null ? null : String(value);
 }
 
-function formatAxisTime(value: unknown): string {
-  const parsed = typeof value === 'number' && Number.isFinite(value)
-    ? value
-    : Date.parse(String(value ?? ''));
-  if (!Number.isFinite(parsed)) return String(value ?? '');
-  const date = new Date(parsed);
-  return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`;
+function formatAxisTime(value: unknown, locale: UiLocale = 'en', compact = false): string {
+  return formatHumanTime(value, locale, compact ? 'axis-compact' : 'axis');
+}
+
+function compactLegendLabel(value: string): string {
+  return value.length > 18 ? `${value.slice(0, 17)}…` : value;
 }
 
 function formatAxisNumber(value: unknown): string {
@@ -627,11 +936,52 @@ function opacityForEncoding(data: unknown, field?: string): number {
   return Number.isFinite(value) ? Math.max(0.15, Math.min(1, value)) : 1;
 }
 
-function formatCell(value: unknown): string {
+function formatCell(value: unknown, locale: UiLocale, temporal = false): string {
   if (value === null || value === undefined || value === '') return '—';
+  if (temporal || isIsoTimestamp(value)) return formatHumanTime(value, locale, 'long');
   if (typeof value === 'number') return formatAxisNumber(value);
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
+}
+
+function formatTimeSeriesTooltip(value: unknown, locale: UiLocale): string {
+  const params = (Array.isArray(value) ? value : [value]).filter(isRecord);
+  if (params.length === 0) return '';
+  const first = params[0];
+  const timestamp = first.axisValue ?? firstAxisValue(first.value) ?? firstAxisValue(first.data);
+  const heading = escapeTooltipText(formatHumanTime(timestamp, locale, 'long'));
+  const rows = params.map((param) => {
+    const marker = typeof param.marker === 'string' ? param.marker : '';
+    const name = escapeTooltipText(String(param.seriesName || param.name || ''));
+    const renderedValue = escapeTooltipText(formatTooltipValue(param.value));
+    return `${marker}${name}${name ? ': ' : ''}${renderedValue}`;
+  });
+  return [heading, ...rows].filter(Boolean).join('<br/>');
+}
+
+function firstAxisValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value[0];
+  if (isRecord(value)) return firstAxisValue(value.value);
+  return undefined;
+}
+
+function formatTooltipValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    const measures = value.slice(1).filter((item) => item !== null && item !== undefined);
+    return measures.map((item) => typeof item === 'number' ? formatAxisNumber(item) : String(item)).join(' · ');
+  }
+  if (typeof value === 'number') return formatAxisNumber(value);
+  if (isRecord(value)) return formatTooltipValue(value.value);
+  return value === null || value === undefined ? '—' : String(value);
+}
+
+function escapeTooltipText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function numberFrom(value: unknown): number | null {

@@ -1,4 +1,5 @@
 import type { ChatMessage, Conversation, FinalAnswer, TokenUsage, TraceStep } from '../types';
+import { normalizeConversation } from '../lib/normalize';
 
 const STORAGE_KEY = 'tspilot:v03:conversations';
 const MAX_STORED_CONVERSATIONS = 12;
@@ -41,8 +42,8 @@ export function loadConversations(): Conversation[] {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [createConversation()];
     const conversations = parsed
-      .filter((item): item is Conversation => Boolean(item?.id))
-      .map((item) => ({ ...item, selectedModelId: item.selectedModelId ?? null }));
+      .map(normalizeConversation)
+      .filter((item): item is Conversation => Boolean(item));
     return conversations.length ? conversations : [createConversation()];
   } catch {
     return [createConversation()];
@@ -175,6 +176,32 @@ export function completeRunningTraceSteps(conversation: Conversation, completedA
   };
 }
 
+export function failRunningTraceSteps(conversation: Conversation, message: string, completedAt = now()): Conversation {
+  let changed = false;
+  const traceSteps = conversation.traceSteps.map((step) => {
+    if (step.status !== 'running') return step;
+    changed = true;
+    return {
+      ...step,
+      status: 'error' as const,
+      summary: message,
+      error: message,
+      completedAt,
+      elapsedSeconds: step.elapsedSeconds ?? elapsedSecondsBetween(step.startedAt, completedAt),
+      updatedAt: completedAt,
+    };
+  });
+  if (!changed) return conversation;
+  return { ...conversation, traceSteps, updatedAt: completedAt };
+}
+
+export function settleIncompleteStream(conversation: Conversation, message: string): Conversation {
+  if (!conversation.messages.some((item) => item.role === 'assistant' && item.isStreaming)) {
+    return completeRunningTraceSteps(conversation);
+  }
+  return appendAssistantError(failRunningTraceSteps(conversation, message), message);
+}
+
 export function appendAssistantError(conversation: Conversation, content: string): Conversation {
   const timestamp = now();
   const streamingIndex = findStreamingAssistantIndex(conversation);
@@ -231,6 +258,7 @@ function mergeTraceStep(existing: TraceStep, incoming: TraceStep): TraceStep {
   return {
     ...existing,
     ...incoming,
+    status: existing.status !== 'running' && incoming.status === 'running' ? existing.status : incoming.status,
     tool: keepValue(incoming.tool, existing.tool),
     thought: keepValue(incoming.thought, existing.thought),
     actionInput: keepValue(incoming.actionInput, existing.actionInput),

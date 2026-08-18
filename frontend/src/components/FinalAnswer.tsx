@@ -5,12 +5,13 @@ import {
   ChevronDown,
   Code2,
   Database,
+  Eye,
   FileSearch,
   Lightbulb,
 } from 'lucide-react';
 import { useState } from 'react';
 import type { ReactNode } from 'react';
-import type { FinalAnswer as FinalAnswerType, TokenUsage } from '../types';
+import type { AnswerClaim, FinalAnswer as FinalAnswerType, TokenUsage, Visualization } from '../types';
 import { VisualizationGallery } from './VisualizationGallery';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
@@ -102,6 +103,11 @@ export function FinalAnswer({
   const references = deduplicateReferences(answer.references || []);
   const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
   const [activeBindingId, setActiveBindingId] = useState<string | null>(null);
+  const claimEvidence = visualClaimEvidence(answer);
+  const legacyVisualizations = (answer.visualizations || []).filter((visualization) => (
+    !visualization.verification
+    && !claimEvidence.some((item) => item.visualization.visualization_id === visualization.visualization_id)
+  ));
 
   return (
     <div className="final-answer">
@@ -150,11 +156,29 @@ export function FinalAnswer({
         </div>
       )}
 
-      {answer.visualizations && answer.visualizations.length > 0 && (
+      {claimEvidence.length > 0 && (
+        <section className="answer-section answer-visualizations-section" aria-label="Visual evidence">
+          <ContentHeading icon={<Eye size={16} />} title={locale === 'zh' ? '结论与视觉证据' : 'Claims and visual evidence'} />
+          <div className="answer-claim-evidence-list">
+            {claimEvidence.map(({ visualization, claims }) => (
+              <ClaimEvidenceCard
+                key={visualization.visualization_id}
+                visualization={visualization}
+                claims={claims}
+                locale={locale}
+                activeBindingId={activeBindingId}
+                onSelectBinding={setActiveBindingId}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {legacyVisualizations.length > 0 && (
         <section className="answer-section answer-visualizations-section" aria-label="Visualizations">
           <ContentHeading icon={<BarChart3 size={16} />} title={locale === 'zh' ? '可视化' : 'Visualizations'} />
           <VisualizationGallery
-            visualizations={answer.visualizations}
+            visualizations={legacyVisualizations}
             activeBindingId={activeBindingId}
             onSelectBinding={setActiveBindingId}
           />
@@ -176,6 +200,70 @@ export function FinalAnswer({
       )}
     </div>
   );
+}
+
+function ClaimEvidenceCard({
+  visualization,
+  claims,
+  locale,
+  activeBindingId,
+  onSelectBinding,
+}: {
+  visualization: Visualization;
+  claims: AnswerClaim[];
+  locale: AnswerLocale;
+  activeBindingId: string | null;
+  onSelectBinding: (bindingId: string) => void;
+}) {
+  const verification = visualization.verification;
+  const sourceLabels = Array.from(new Set(claims.flatMap((claim) => [
+    ...(claim.insight_ids || []).map((id) => `Insight · ${id}`),
+    ...(verification?.target_insight_ids || []).map((id) => `Insight · ${id}`),
+    ...(claim.analysis_ids || []).map((id) => `Analysis · ${id}`),
+    ...(claim.evidence_ids || []).map((id) => `Evidence · ${id}`),
+    ...(claim.artifact_ids || []).map((id) => `Artifact · ${id}`),
+  ])));
+  return (
+    <article className="answer-claim-evidence-card">
+      <header className="answer-claim-evidence-header">
+        <span>{locale === 'zh' ? '关键结论' : 'Key claim'}</span>
+        <div className="answer-claim-evidence-claims">
+          {claims.map((claim) => <MarkdownContent key={claim.claim_id} content={claim.text} />)}
+        </div>
+      </header>
+      <VisualizationGallery
+        visualizations={[visualization]}
+        activeBindingId={activeBindingId}
+        onSelectBinding={onSelectBinding}
+      />
+      {verification && (
+        <div className="answer-claim-evidence-reading">
+          <div>
+            <strong>{locale === 'zh' ? '验证问题' : 'Verification question'}</strong>
+            <p>{verification.verification_question}</p>
+          </div>
+          <div>
+            <strong>{locale === 'zh' ? '如何阅读' : 'How to read it'}</strong>
+            <p>{verification.interpretation}</p>
+          </div>
+        </div>
+      )}
+      {sourceLabels.length > 0 && (
+        <footer className="answer-claim-evidence-sources" aria-label={locale === 'zh' ? '证据来源' : 'Evidence sources'}>
+          {sourceLabels.map((label) => <code key={label}>{label}</code>)}
+        </footer>
+      )}
+    </article>
+  );
+}
+
+function visualClaimEvidence(answer: FinalAnswerType): Array<{ visualization: Visualization; claims: AnswerClaim[] }> {
+  const claims = answer.claims || [];
+  return (answer.visualizations || []).flatMap((visualization) => {
+    if (!visualization.verification) return [];
+    const related = claims.filter((claim) => (claim.visualization_ids || []).includes(visualization.visualization_id));
+    return related.length > 0 ? [{ visualization, claims: related }] : [];
+  });
 }
 
 function ContentHeading({ icon, title }: { icon: ReactNode; title: string }) {

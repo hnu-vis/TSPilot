@@ -15,6 +15,7 @@ import type {
   StreamEvent,
   Visualization,
 } from '../types';
+import { normalizeFinalAnswer } from '../lib/normalize';
 
 const API_BASE = '/api/v1';
 
@@ -299,9 +300,5 @@ async function responseError(response: Response, fallback: string) {
 }
 
 export function extractFinalAnswer(data: Record<string, unknown>): FinalAnswer | null {
-  const answer = data.answer;
-  if (answer && typeof answer === 'object') {
-    return answer as FinalAnswer;
-  }
-  return null;
+  return normalizeFinalAnswer(data.answer);
 }
