@@ -65,7 +65,7 @@ describe('buildVisualizationOption', () => {
     const series = option.series as Array<Record<string, any>>;
 
     expect(series.some((item) => item.name === 'Historical' && item.type === 'line')).toBe(true);
-    expect(series.some((item) => item.name === 'Forecast' && item.lineStyle?.type === 'dashed')).toBe(true);
+    expect(series.some((item) => item.name === 'Forecast' && item.type === 'line')).toBe(true);
     expect(series.some((item) => String(item.name).includes('interval'))).toBe(true);
     expect(series[0].markLine.data[0].xAxis).toBe('2026-01-03T00:00:00Z');
     expect(option.xAxis[0].axisLabel.formatter(Date.UTC(2026, 0, 3, 0, 15))).toBe('1/3 00:15');
@@ -86,6 +86,30 @@ describe('buildVisualizationOption', () => {
     expect(option.series[0].data[0].value).toEqual(['A', 30]);
   });
 
+  it('honors LLM-selected line presentation without changing grounded points', () => {
+    const base = visualization();
+    const layers = base.layers?.map((layer) => layer.role === 'historical' ? {
+      ...layer,
+      presentation: {
+        smooth: true,
+        step: 'middle',
+        showSymbol: false,
+        lineStyle: { color: '#b42318', width: 5, opacity: 0.6, type: 'dashed' },
+        emphasis: { focus: 'self' },
+      },
+    } : layer);
+    const option = buildVisualizationOption({ ...base, layers }) as Record<string, any>;
+    const historical = option.series.find((item: Record<string, unknown>) => item.name === 'Historical');
+
+    expect(historical.smooth).toBe(true);
+    expect(historical.step).toBe('middle');
+    expect(historical.lineStyle).toMatchObject({ color: '#b42318', width: 5, opacity: 0.6, type: 'dashed' });
+    expect(historical.emphasis.focus).toBe('self');
+    expect(historical.data.map((point: Record<string, unknown>) => point.value)).toEqual([
+      ['2026-01-01T00:00:00Z', 10], ['2026-01-02T00:00:00Z', 12],
+    ]);
+  });
+
   it('creates separate grids and axes for layered facets', () => {
     const base = visualization();
     const option = buildVisualizationOption({ ...base, layout: 'facets' }) as Record<string, any>;
@@ -94,23 +118,44 @@ describe('buildVisualizationOption', () => {
     expect(option.series.some((item: Record<string, any>) => item.xAxisIndex === 1)).toBe(true);
   });
 
-  it('renders a scalar text layer as a metric with context', () => {
-    const markup = renderToStaticMarkup(
-      <VisualizationGallery activeBindingId={null} onSelectBinding={() => undefined} visualizations={[visualization({
-        title: '最大 7 天窗口标准差',
-        datasets: [{
-          dataset_id: 'metric', source_ref: 'insight:window_std',
-          metric: { label: '7 天滚动样本标准差最大窗口', value: { start_date: '2023-01-14', end_date: '2023-01-20', std_dev: 0.0357 } },
-        }],
-        layers: [{ layer_id: 'metric', mark: 'text', role: 'metric', source_ref: 'insight:window_std', dataset_id: 'metric' }],
-        accessibility: { description: '标准差窗口' },
-      })]} />,
-    );
+  it('passes renderer-native marks, multi-field encodings, and presentation through grounded datasets', () => {
+    const option = buildVisualizationOption(visualization({
+      datasets: [{
+        dataset_id: 'ohlc', source_ref: 'view:evidence:ohlc:default', dimensions,
+        series: [{ series_id: 'ohlc', name: 'OHLC', role: 'ohlc', points: [{
+          x: '2026-01-01T00:00:00Z', y: 10,
+          metadata: { timestamp: '2026-01-01T00:00:00Z', open: 10, close: 12, low: 9, high: 13 },
+        }] }],
+      }],
+      layers: [{
+        layer_id: 'ohlc', mark: 'candlestick', role: 'ohlc',
+        source_ref: 'view:evidence:ohlc:default', dataset_id: 'ohlc', series_id: 'ohlc',
+        encoding: { x: 'timestamp', y: ['open', 'close', 'low', 'high'] },
+        presentation: { itemStyle: { color: '#087f5b' }, emphasis: { focus: 'series' } },
+      }],
+    })) as Record<string, any>;
 
-    expect(markup).toContain('0.036');
-    expect(markup).toContain('2023-01-14');
-    expect(markup).toContain('2023-01-20');
-    expect(markup).not.toContain('&quot;std_dev&quot;');
+    expect(option.series[0].type).toBe('candlestick');
+    expect(option.series[0].datasetId).toBe('ohlc_ohlc');
+    expect(option.series[0].encode.y).toEqual(['open', 'close', 'low', 'high']);
+    expect(option.series[0].emphasis.focus).toBe('series');
+    expect(option.dataset[0].source[0].high).toBe(13);
+  });
+
+  it('applies chart-level presentation while grounded datasets and series remain authoritative', () => {
+    const option = buildVisualizationOption(visualization({
+      presentation: {
+        visualMap: { type: 'continuous', calculable: true },
+        dataZoom: [{ type: 'inside', yAxisIndex: [0] }],
+        dataset: [{ id: 'forged', source: [{ value: 999 }] }],
+        series: [{ type: 'pie', data: [999] }],
+      },
+    })) as Record<string, any>;
+
+    expect(option.visualMap.type).toBe('continuous');
+    expect(option.dataZoom[0].yAxisIndex).toEqual([0]);
+    expect(option.dataset).toEqual([]);
+    expect(option.series.some((item: Record<string, unknown>) => item.name === 'Historical')).toBe(true);
   });
 
   it('isolates an obsolete persisted visualization instead of crashing the page', () => {

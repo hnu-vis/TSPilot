@@ -106,16 +106,15 @@ export type Visualization = {
     time_range?: { start?: unknown; end?: unknown } | null;
     dimensions?: Array<{ name: string; data_type: string; role: string; unit?: string | null }>;
     series?: VisualizationSeries[];
-    rows?: Array<Record<string, unknown>>;
-    columns?: string[];
-    metric?: Record<string, unknown> | null;
   }>;
   layers?: Array<{
     layer_id: string;
     mark: string;
     role: string;
     source_ref: string;
-    encoding?: Record<string, string>;
+    encoding?: Record<string, string | string[]>;
+    transform?: Array<{ type: 'filter'; field: string; operator: string; value?: unknown }>;
+    presentation?: Record<string, unknown>;
     dataset_id: string;
     series_id?: string | null;
     points?: VisualizationPoint[];
@@ -123,6 +122,7 @@ export type Visualization = {
   }>;
   bindings?: VisualizationBinding[];
   layout?: 'overlay' | 'facets';
+  presentation?: Record<string, unknown>;
   accessibility: {
     description: string;
     table_columns?: string[];

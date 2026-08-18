@@ -1,6 +1,7 @@
 """Runtime registration for KeyInsights produced by tools."""
 from __future__ import annotations
 
+import json
 from hashlib import sha1
 from typing import Any
 
@@ -51,6 +52,7 @@ def register_key_insights_from_payload(request_state, tool_name: str, full_paylo
     produced = _verify_insight_dependencies(
         _dedupe_insights([insight for insight in produced if _insight_has_evidence_or_unavailable(insight)]),
         request_state.insight_set.insights,
+        request_state=request_state,
     )
     rejected = _dedupe_insights(rejected)
     event_coverage = _coverage_for(requests, produced, rejected)
@@ -530,8 +532,21 @@ def _dedupe_insights(insights: list[KeyInsight]) -> list[KeyInsight]:
     return list(result.values())
 
 
-def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyInsight]) -> list[KeyInsight]:
-    """Verify a Key Insight DAG and inherit source evidence through verified parents."""
+def _verify_insight_dependencies(
+    produced: list[KeyInsight],
+    existing: list[KeyInsight],
+    *,
+    request_state=None,
+) -> list[KeyInsight]:
+    """Verify an Insight DAG while canonicalizing traced artifact inputs as evidence.
+
+    ``derived_from`` is the Insight-to-Insight DAG. Models occasionally place an
+    artifact identifier there even though the computation consumed that artifact
+    through its tool context. When the identifier resolves to a real request
+    artifact *and* the calculation trace records that exact artifact, preserve the
+    provenance as an evidence ref instead of treating it as a missing Insight.
+    Unresolved or merely declared dependencies remain partial.
+    """
 
     existing_index: dict[str, KeyInsight] = {}
     pending: dict[str, KeyInsight] = {}
@@ -543,6 +558,7 @@ def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyI
         pending[insight.insight_key] = insight
         aliases[normalize_insight_key(insight.insight_id)] = insight.insight_key
     resolved: dict[str, KeyInsight] = {}
+    artifact_refs = _artifact_dependency_index(request_state)
 
     def verify(insight_key: str, stack: set[str]) -> KeyInsight:
         if insight_key in resolved:
@@ -554,9 +570,17 @@ def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyI
                 quality_flags.append("missing_calculation_trace")
             insight = insight.model_copy(update={"status": "partial", "quality_flags": quality_flags})
         if not insight.derived_from:
-            resolved[insight_key] = insight
-            return insight
+            items = [
+                item if item.evidence_refs else item.model_copy(update={"evidence_refs": insight.evidence_refs})
+                for item in insight.items
+            ]
+            result = insight.model_copy(update={"items": items})
+            resolved[insight_key] = result
+            return result
         dependencies: list[KeyInsight | None] = []
+        insight_dependency_keys: list[str] = []
+        evidence_refs = list(insight.evidence_refs)
+        seen_refs = {(ref.source_type, ref.source_id) for ref in evidence_refs}
         for reference in insight.derived_from:
             reference_key = normalize_insight_key(reference)
             dependency_key = reference_key if reference_key in pending else aliases.get(reference_key)
@@ -564,8 +588,28 @@ def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyI
                 dependencies.append(None)
             elif dependency_key in pending:
                 dependencies.append(verify(dependency_key, {*stack, insight_key}))
+                insight_dependency_keys.append(reference_key)
+            elif reference_key in existing_index:
+                dependencies.append(existing_index[reference_key])
+                insight_dependency_keys.append(reference_key)
             else:
-                dependencies.append(existing_index.get(reference_key))
+                artifact_ref = artifact_refs.get(reference_key)
+                if artifact_ref is None:
+                    traced_candidates = {
+                        (candidate.source_type, candidate.source_id): candidate
+                        for candidate in artifact_refs.values()
+                        if (candidate.source_type, candidate.source_id) not in seen_refs
+                        and _calculation_trace_uses_artifact(insight, candidate)
+                    }
+                    if len(traced_candidates) == 1:
+                        artifact_ref = next(iter(traced_candidates.values()))
+                if artifact_ref is not None and _calculation_trace_uses_artifact(insight, artifact_ref):
+                    key = (artifact_ref.source_type, artifact_ref.source_id)
+                    if key not in seen_refs:
+                        evidence_refs.append(artifact_ref)
+                        seen_refs.add(key)
+                else:
+                    dependencies.append(None)
         quality_flags = list(insight.quality_flags)
         if any(dependency is None or dependency.status != "verified" for dependency in dependencies):
             if "unverified_dependencies" not in quality_flags:
@@ -573,8 +617,6 @@ def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyI
             result = insight.model_copy(update={"status": "partial", "quality_flags": quality_flags})
             resolved[insight_key] = result
             return result
-        evidence_refs = list(insight.evidence_refs)
-        seen_refs = {(ref.source_type, ref.source_id) for ref in evidence_refs}
         for dependency in dependencies:
             for ref in dependency.evidence_refs:
                 key = (ref.source_type, ref.source_id)
@@ -589,15 +631,53 @@ def _verify_insight_dependencies(produced: list[KeyInsight], existing: list[KeyI
                     "status": "partial",
                     "quality_flags": quality_flags,
                     "evidence_refs": evidence_refs,
+                    "derived_from": insight_dependency_keys,
                 }
             )
             resolved[insight_key] = result
             return result
-        result = insight.model_copy(update={"evidence_refs": evidence_refs, "quality_flags": quality_flags})
+        items = [
+            item if item.evidence_refs else item.model_copy(update={"evidence_refs": evidence_refs})
+            for item in insight.items
+        ]
+        result = insight.model_copy(update={
+            "evidence_refs": evidence_refs,
+            "quality_flags": quality_flags,
+            "derived_from": insight_dependency_keys,
+            "items": items,
+        })
         resolved[insight_key] = result
         return result
 
     return [verify(insight.insight_key, set()) for insight in produced]
+
+
+def _artifact_dependency_index(request_state) -> dict[str, InsightEvidenceRef]:
+    if request_state is None:
+        return {}
+    index: dict[str, InsightEvidenceRef] = {}
+    collections = (
+        ("query", "evidence", getattr(request_state, "database_evidence_artifacts", {})),
+        ("derived_evidence", "derived_evidence", getattr(request_state, "derived_evidence_artifacts", {})),
+        ("analysis", "analysis", getattr(request_state, "analysis_artifacts", {})),
+        ("anomaly", "anomaly", getattr(request_state, "anomaly_artifacts", {})),
+        ("forecast", "forecast", getattr(request_state, "forecast_artifacts", {})),
+    )
+    for source_type, ref_prefix, artifacts in collections:
+        for source_id in artifacts or {}:
+            evidence_ref = InsightEvidenceRef(source_type=source_type, source_id=str(source_id))
+            index[normalize_insight_key(str(source_id))] = evidence_ref
+            index[normalize_insight_key(f"{ref_prefix}:{source_id}")] = evidence_ref
+    return index
+
+
+def _calculation_trace_uses_artifact(insight: KeyInsight, artifact_ref: InsightEvidenceRef) -> bool:
+    try:
+        trace = json.dumps(insight.calculation_trace, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        trace = str(insight.calculation_trace or "")
+    source_id = artifact_ref.source_id
+    return source_id in trace or f"{artifact_ref.source_type}:{source_id}" in trace
 
 
 def _insight_has_evidence_or_unavailable(insight: KeyInsight) -> bool:

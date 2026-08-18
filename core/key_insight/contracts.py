@@ -41,6 +41,14 @@ def insight_request_contract_error(request: KeyInsightRequest, tool_name: str) -
         return f"SQL point_value Key Insight '{request.insight_key}' requires requirements.time_position start or end."
     if request.insight_type in {"time_boundary", "boundary_time"} and requirements.get("time_position") not in {"start", "end"}:
         return f"SQL time boundary Key Insight '{request.insight_key}' requires requirements.time_position start or end."
+    if request.insight_type in {"time_boundary", "boundary_time"}:
+        semantic_class = str(request.semantic_class or "").strip().lower()
+        boundary_classes = {"", "dataset_boundary", "observation_boundary", "time_boundary"}
+        if semantic_class not in boundary_classes or "measure" in requirements:
+            return (
+                f"SQL time boundary Key Insight '{request.insight_key}' can describe only a queried dataset/observation boundary. "
+                "Calculated event or decision times must be produced by code_interpreter."
+            )
     if request.insight_type in {"extreme", "extrema", "extreme_time"} and requirements.get("operator") not in {"min", "max"}:
         return f"SQL extreme Key Insight '{request.insight_key}' requires requirements.operator min or max."
     return None

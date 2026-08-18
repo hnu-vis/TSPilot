@@ -24,7 +24,7 @@ class VisualizationArtifactStore:
         data_ref = f"/api/v1/visualizations/{artifact_id}/data"
         complete_datasets = []
         for dataset in visualization.datasets:
-            row_count = len(dataset.rows) or sum(len(series.points) for series in dataset.series)
+            row_count = sum(len(series.points) for series in dataset.series)
             complete_datasets.append(dataset.model_copy(update={
                 "data_ref": data_ref,
                 "row_count": row_count,
@@ -54,14 +54,12 @@ class VisualizationArtifactStore:
     def descriptor(self, visualization: VisualizationPayload) -> VisualizationPayload:
         datasets = []
         for dataset in visualization.datasets:
-            row_count = len(dataset.rows) or sum(len(series.points) for series in dataset.series)
+            row_count = sum(len(series.points) for series in dataset.series)
             datasets.append(dataset.model_copy(update={
                 "data_ref": visualization.data_ref,
                 "row_count": row_count,
                 "time_range": _dataset_time_range(dataset),
                 "series": [],
-                "rows": [],
-                "metric": None,
             }, deep=True))
         layers = [layer.model_copy(update={"points": []}, deep=True) for layer in visualization.layers]
         return visualization.model_copy(update={
@@ -81,11 +79,6 @@ def _dataset_time_range(dataset) -> dict | None:
     values = []
     for series in dataset.series:
         values.extend(point.x for point in series.points if point.x not in (None, ""))
-    if not values and dataset.rows:
-        time_fields = [item.name for item in dataset.dimensions if item.data_type == "time"]
-        if time_fields:
-            field = time_fields[0]
-            values.extend(row.get(field) for row in dataset.rows if row.get(field) not in (None, ""))
     if not values:
         return None
     ordered = sorted(values, key=str)

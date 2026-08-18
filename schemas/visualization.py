@@ -6,7 +6,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-VisualizationMark = Literal["line", "point", "bar", "area", "band", "rule", "rect", "text", "boxplot", "table"]
+# The renderer owns the available series vocabulary.  Keeping this as a string
+# prevents the API contract from becoming the bottleneck every time the
+# renderer gains a new visual form (candlestick, heatmap, sankey, ...).
+VisualizationMark = str
 
 
 class VisualizationBinding(BaseModel):
@@ -55,9 +58,6 @@ class VisualizationDataset(BaseModel):
     time_range: dict | None = None
     dimensions: list[VisualizationDimension] = Field(default_factory=list)
     series: list[VisualizationSeries] = Field(default_factory=list)
-    rows: list[dict] = Field(default_factory=list)
-    columns: list[str] = Field(default_factory=list)
-    metric: dict | None = None
 
 
 class VisualizationLayer(BaseModel):
@@ -65,11 +65,20 @@ class VisualizationLayer(BaseModel):
     mark: VisualizationMark
     role: str
     source_ref: str
-    encoding: dict[str, str] = Field(default_factory=dict)
+    encoding: dict[str, str | list[str]] = Field(default_factory=dict)
+    transform: list[dict] = Field(default_factory=list)
+    presentation: dict[str, Any] = Field(default_factory=dict)
     dataset_id: str
     series_id: str | None = None
     points: list[VisualizationPoint] = Field(default_factory=list)
     label: str | None = None
+
+    @model_validator(mode="after")
+    def require_graphical_mark(self):
+        mark = self.mark.strip()
+        if not mark or mark.casefold() in {"text", "table"}:
+            raise ValueError("visualization layer requires a graphical renderer mark")
+        return self
 
 
 class VisualizationAccessibility(BaseModel):
@@ -94,12 +103,13 @@ class VisualizationPayload(BaseModel):
     layers: list[VisualizationLayer] = Field(default_factory=list)
     bindings: list[VisualizationBinding] = Field(default_factory=list)
     layout: Literal["overlay", "facets"] = "overlay"
+    presentation: dict[str, Any] = Field(default_factory=dict)
     accessibility: VisualizationAccessibility
 
     @model_validator(mode="after")
     def validate_renderable_content(self):
         has_content = bool(
-            any(dataset.series or dataset.rows or dataset.metric for dataset in self.datasets)
+            any(dataset.series for dataset in self.datasets)
             or any(layer.points for layer in self.layers)
         )
         if not has_content and not self.data_ref:

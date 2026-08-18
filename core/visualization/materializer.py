@@ -1,9 +1,10 @@
-"""Grounded Visualization V3 catalog, layer materializer, and semantic validation."""
+"""Grounded visualization catalog, semantic projection executor, and materializer."""
 from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -22,7 +23,9 @@ from schemas.visualization import (
 )
 
 
-SUPPORTED_MARKS = ["line", "point", "bar", "area", "band", "rule", "rect", "text", "boxplot", "table"]
+_DATA_BEARING_PRESENTATION_KEYS = {
+    "data", "source", "dataset", "datasetid", "encode", "dimensions", "series",
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,8 @@ class DataViewValue:
     schema_fields: list[dict]
     lineage: list[str]
     name: str
+    field_semantics: dict[str, str] = field(default_factory=dict)
+    bindings: dict[str, VisualizationBinding] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -106,7 +111,11 @@ class PresentationCatalog:
                 scalar=None, lineage=[f"forecast:{forecast_id}", *_forecast_input_refs(forecast)],
             )
             interval_rows = [
-                {"timestamp": item.timestamp, "lower": item.lower, "upper": item.upper}
+                {
+                    "timestamp": _object_value(item, "timestamp"),
+                    "lower": _object_value(item, "lower"),
+                    "upper": _object_value(item, "upper"),
+                }
                 for item in forecast.confidence_interval
             ]
             if interval_rows:
@@ -114,20 +123,41 @@ class PresentationCatalog:
                     f"view:forecast:{forecast_id}:interval", name="Confidence interval", shape="intervals",
                     rows=interval_rows, scalar=None, lineage=[f"forecast:{forecast_id}"],
                 )
+            diagnostics = forecast.diagnostics if isinstance(forecast.diagnostics, dict) else {}
+            quality = diagnostics.get("input_quality") if isinstance(diagnostics.get("input_quality"), dict) else None
+            if quality:
+                self._register_view(
+                    f"view:forecast:{forecast_id}:quality", name="Forecast input quality", shape="scalar",
+                    rows=[], scalar=dict(quality), lineage=[f"forecast:{forecast_id}"],
+                )
         for anomaly_id, anomaly in request_state.anomaly_artifacts.items():
             self._register_artifact(
                 "anomaly", anomaly_id, anomaly,
                 source_type="anomaly", label=anomaly.detector_name,
             )
             rows = [dict(item) for item in anomaly.anomaly_points if isinstance(item, dict)]
+            evidence_ref = _anomaly_evidence_ref(anomaly)
+            lineage = [f"anomaly:{anomaly_id}", *([evidence_ref] if evidence_ref else [])]
+            self._register_view(
+                f"view:anomaly:{anomaly_id}:status", name="Anomaly detection status", shape="scalar",
+                rows=[], scalar={"detected_count": len(rows)}, lineage=lineage,
+            )
             if rows:
-                lineage = [f"anomaly:{anomaly_id}"]
-                evidence_ref = _anomaly_evidence_ref(anomaly)
-                if evidence_ref:
-                    lineage.append(evidence_ref)
                 self._register_view(
                     f"view:anomaly:{anomaly_id}:points", name="Anomaly points", shape="records",
                     rows=rows, scalar=None, lineage=lineage,
+                )
+            spans = [dict(item) for item in anomaly.anomaly_spans if isinstance(item, dict)]
+            if spans:
+                self._register_view(
+                    f"view:anomaly:{anomaly_id}:spans", name="Anomaly spans", shape="intervals",
+                    rows=spans, scalar=None, lineage=lineage,
+                )
+            scores = [dict(item) for item in anomaly.scores if isinstance(item, dict)]
+            if scores:
+                self._register_view(
+                    f"view:anomaly:{anomaly_id}:scores", name="Anomaly scores", shape="timeseries",
+                    rows=scores, scalar=None, lineage=lineage,
                 )
         for insight in request_state.insight_set.insights:
             self._register_artifact(
@@ -187,10 +217,23 @@ class PresentationCatalog:
     def _register_view(
         self, ref: str, *, name: str, shape: str, rows: list[dict], scalar: dict | None,
         lineage: list[str], schema_fields: list[dict] | None = None,
+        field_semantics: dict[str, str] | None = None,
+        bindings: dict[str, VisualizationBinding] | None = None,
     ) -> None:
         fields = schema_fields or _schema_fields(rows or ([scalar] if scalar else []))
         self._sources[ref] = PresentationSource(
-            ref, "view", DataViewValue(rows, scalar, shape, fields, list(dict.fromkeys(lineage)), name)
+            ref,
+            "view",
+            DataViewValue(
+                rows,
+                scalar,
+                shape,
+                fields,
+                list(dict.fromkeys(lineage)),
+                name,
+                dict(field_semantics or {}),
+                dict(bindings or {}),
+            ),
         )
 
     def resolve(self, ref: str) -> PresentationSource:
@@ -206,6 +249,51 @@ class PresentationCatalog:
             raise ValueError(f"presentation source '{source.ref}' is not an answer reference")
         return source.reference
 
+    def analysis_input_evidence_id(self, ref: str | None) -> str | None:
+        """Resolve a presentation ref to the one database evidence id it derives from."""
+        if not ref:
+            return None
+        source = self.resolve(ref)
+        candidates: set[str] = set()
+        pending = [source]
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current.ref in visited:
+                continue
+            visited.add(current.ref)
+            if current.kind == "evidence":
+                evidence_id = str(getattr(current.value, "evidence_id", "") or "")
+                if evidence_id:
+                    candidates.add(evidence_id)
+                continue
+            if current.kind == "view":
+                pending.extend(self.resolve_lineage(current))
+        candidates.discard("")
+        if len(candidates) != 1:
+            raise ValueError(
+                f"presentation source '{source.ref}' does not resolve to exactly one database evidence input"
+            )
+        return next(iter(candidates))
+
+    def analysis_input_source_refs(self, refs: list[str]) -> list[str]:
+        """Resolve presentation refs to authoritative analysis artifact refs."""
+
+        result: list[str] = []
+        pending = [self.resolve(ref) for ref in refs if ref]
+        visited: set[str] = set()
+        while pending:
+            source = pending.pop()
+            if source.ref in visited:
+                continue
+            visited.add(source.ref)
+            if source.kind == "view":
+                pending.extend(reversed(self.resolve_lineage(source)))
+                continue
+            if source.kind in {"evidence", "forecast", "anomaly", "derived_evidence", "insight"}:
+                result.append(source.ref)
+        return list(dict.fromkeys(result))
+
     def canonical_refs(self) -> list[str]:
         return sorted(key for key, source in self._sources.items() if key == source.ref and ":" in key)
 
@@ -213,13 +301,41 @@ class PresentationCatalog:
         return sorted(
             ref
             for ref, source in self._sources.items()
-            if ref == source.ref and source.kind in {"view", "insight", "insight_item"}
+            if ref == source.ref and self._is_renderable_source(source)
         )
+
+    def projection_refs(self) -> list[str]:
+        """Return grounded sources that the semantic projection LLM may interpret."""
+        return sorted(
+            ref
+            for ref, source in self._sources.items()
+            if ref == source.ref and self._is_projection_source(source)
+        )
+
+    @staticmethod
+    def _is_projection_source(source: PresentationSource) -> bool:
+        if source.kind == "insight":
+            return source.value.status == "verified"
+        if source.kind == "insight_item":
+            return source.value[0].status == "verified"
+        return source.kind == "view"
+
+    @staticmethod
+    def _is_renderable_source(source: PresentationSource) -> bool:
+        if source.kind == "insight" and source.value.status != "verified":
+            return False
+        if source.kind == "insight_item" and source.value[0].status != "verified":
+            return False
+        if source.kind not in {"view", "insight", "insight_item"}:
+            return False
+        rows, scalar = _source_data(source)
+        fields = _schema_fields(rows or ([scalar] if scalar else []))
+        return bool(_render_capabilities(fields, scalar=not bool(rows))["renderable"])
 
     def expand_preferences(self, refs: list[str]) -> tuple[set[str], set[str]]:
         """Expand stable artifact refs into renderable sources without exposing storage refs."""
 
-        renderable = set(self.renderable_refs())
+        renderable = set(self.projection_refs())
         expanded: set[str] = set()
         unknown: set[str] = set()
         for raw_ref in refs:
@@ -274,26 +390,127 @@ class PresentationCatalog:
             resolved.append(lineage)
         return resolved
 
-    def planner_inventory(self) -> dict:
+    def planner_inventory(self, preferred_refs: set[str] | None = None) -> dict:
+        """Describe grounded sources for LLM-authored semantic projection."""
+        preferred = preferred_refs or set()
+        sources = []
+        for ref, source in sorted(
+            self._sources.items(), key=lambda item: (item[0] not in preferred, item[0]),
+        ):
+            if ref != source.ref or not self._is_projection_source(source):
+                continue
+            # The parent Insight already exposes the complete item collection
+            # through $.items. Publishing every item as another planner source
+            # scales the prompt with row count; retain item sources only when
+            # the caller explicitly requested that exact located item.
+            if source.kind == "insight_item" and ref not in preferred:
+                continue
+            description = self._source_inventory(source)
+            description["preferred_by_caller"] = ref in preferred
+            sources.append(description)
         return {
-            "schema_version": "3",
-            "marks": SUPPORTED_MARKS,
-            "sources": [
-                self._source_inventory(source)
-                for ref, source in sorted(self._sources.items())
-                if ref == source.ref and source.kind in {"view", "insight", "insight_item"}
-            ],
+            "schema_version": "semantic-source-v1",
+            "sources": sources,
             "rules": [
-                "Plan visual_goals around the user's purpose and declare every required semantic role.",
-                "Each layer owns exactly one grounded source_ref; never replace a base series with an annotation collection.",
-                "Use typed view:* sources for chart data and insight:*#item sources for semantic decision points.",
-                "Artifact refs are lineage only and are intentionally absent; outer artifact preferences have already been expanded into renderable sources.",
-                "Use only listed fields in encoding and never invent rows, field names, renderer options, or colors.",
-                "Business filtering and calculations must already exist in a Data View; presentation does not recompute them.",
-                "materialization_complete only describes whether the executed query result was stored without truncation; it does not prove coverage of the user's analysis interval.",
-                "Use time_range, query_context, lineage, and the user request together to judge whether a source is complete enough for visual verification.",
+                "Interpret source meaning from its evidence, insight statement, item semantics, structure, and lineage.",
+                "Semantic views may select, rename, and reorganize existing values but may not calculate new business values.",
+                "Artifact refs are lineage only; choose the grounded view or verified Insight that actually contains the values.",
             ],
         }
+
+    def semantic_inventory(self, refs: list[str]) -> dict:
+        """Describe materialized semantic views for the chart-planning LLM."""
+        return {
+            "schema_version": "semantic-view-v1",
+            "renderer": "echarts",
+            "series_type": "open renderer-native string",
+            "views": [self._source_inventory(self.resolve(ref)) for ref in refs],
+            "rules": [
+                "Compose chart layers from semantic views according to their purpose and field semantics.",
+                "Use semantic column names exactly as exposed by each view.",
+                "Choose renderer-native series types and presentation options that best express the analytical goal.",
+                "Do not calculate, aggregate, or invent values in chart planning.",
+            ],
+        }
+
+    def materialize_semantic_views(self, plans: Iterable[Any]) -> list[str]:
+        """Execute LLM-authored semantic projections without interpreting business meaning."""
+        refs: list[str] = []
+        try:
+            for plan in plans:
+                source_ref = str(getattr(plan, "source_ref", "") or "").strip()
+                source = self.resolve(source_ref)
+                record_path = getattr(plan, "record_path", None)
+                if record_path is not None:
+                    selected = _value_at_path(_projection_root(source), str(record_path))
+                    if isinstance(selected, dict):
+                        records = [selected]
+                    elif isinstance(selected, list) and all(isinstance(item, dict) for item in selected):
+                        records = selected
+                    else:
+                        raise ValueError(
+                            f"semantic record path '{record_path}' must resolve to an object or array of objects"
+                        )
+                else:
+                    rows, scalar = _source_data(source)
+                    records = rows or ([dict(scalar)] if scalar else [])
+                if not records:
+                    raise ValueError(f"semantic projection source '{source_ref}' contains no records")
+                projected: list[dict] = []
+                source_bindings = _projection_bindings(source)
+                bindings: dict[str, VisualizationBinding] = {}
+                field_semantics: dict[str, str] = {}
+                projected_columns: dict[str, list[Any]] = {}
+                for mapping in getattr(plan, "fields", []) or []:
+                    name = str(getattr(mapping, "name", "") or "").strip()
+                    path = str(getattr(mapping, "source_path", "") or "").strip()
+                    values: list[Any] = []
+                    resolved_count = 0
+                    for record in records:
+                        try:
+                            values.append(_value_at_path(record, path))
+                            resolved_count += 1
+                        except ValueError:
+                            values.append(None)
+                    if resolved_count == 0:
+                        structures = [_structure_outline([record]) for record in records[:4]]
+                        raise ValueError(
+                            f"semantic source path '{path}' is unavailable in every record within "
+                            f"record_path {record_path!r}; representative record structures: {structures}"
+                        )
+                    projected_columns[name] = values
+                    field_semantics[name] = str(getattr(mapping, "semantic_role", "") or name)
+                for row_index, record in enumerate(records):
+                    output = {
+                        name: values[row_index]
+                        for name, values in projected_columns.items()
+                    }
+                    binding = source_bindings.get(str(record.get("item_id") or "")) or source_bindings.get("")
+                    if binding is not None:
+                        binding_id = f"semantic:{getattr(plan, 'view_id', 'view')}:{row_index}"
+                        bindings[binding_id] = binding.model_copy(update={"binding_id": binding_id})
+                        output["__binding_id"] = binding_id
+                    projected.append(output)
+                view_id = str(getattr(plan, "view_id", "") or "").strip()
+                ref = f"semantic:{view_id}"
+                if ref in self._sources:
+                    raise ValueError(f"duplicate semantic view id '{view_id}'")
+                self._register_view(
+                    ref,
+                    name=str(getattr(plan, "name", "") or view_id),
+                    shape=str(getattr(plan, "grain", "") or "records"),
+                    rows=projected,
+                    scalar=None,
+                    lineage=[source.ref],
+                    field_semantics=field_semantics,
+                    bindings=bindings,
+                )
+                refs.append(ref)
+        except Exception:
+            for ref in refs:
+                self._sources.pop(ref, None)
+            raise
+        return refs
 
     def _source_inventory(self, source: PresentationSource) -> dict:
         if source.kind == "view":
@@ -306,7 +523,7 @@ class PresentationCatalog:
                     lineage_sources.append(resolved)
             materialization_complete = _full_fidelity_status(lineage_sources)
             capabilities = _render_capabilities(value.schema_fields, scalar=value.scalar is not None)
-            return {
+            result = {
                 "source_ref": source.ref, "kind": "data_view", "name": value.name, "shape": value.shape,
                 "row_count": len(value.rows) or int(value.scalar is not None), "schema_fields": value.schema_fields,
                 "render_capabilities": capabilities,
@@ -320,30 +537,65 @@ class PresentationCatalog:
                 ],
                 "preview": [_bounded_row(item) for item in preview if item],
             }
+            result["data_structure"] = _structure_outline(preview)
+            projection_root = _projection_root_preview(source)
+            result["projection_root"] = {
+                "data_structure": _structure_outline([projection_root]),
+                "preview": _bounded_value(projection_root),
+            }
+            if value.field_semantics:
+                result["field_semantics"] = value.field_semantics
+            return result
         if source.kind == "insight":
             insight: KeyInsight = source.value
             locator_row = _insight_locator_row(insight)
+            _rows, scalar = _source_data(source)
             fields = _schema_fields(
                 [_insight_item_row(item) for item in insight.items]
                 or ([locator_row] if locator_row else [])
+                or ([scalar] if scalar else [])
             )
-            return {
+            records = [_insight_item_row(item) for item in insight.items]
+            if not records:
+                records = [locator_row] if locator_row else ([scalar] if scalar else [])
+            result = {
                 "source_ref": source.ref, "kind": "insight", "status": insight.status, "insight_type": insight.insight_type,
+                "insight_key": insight.insight_key, "name": insight.name,
                 "semantic_class": insight.semantic_class, "statement": insight.statement, "value_shape": insight.value_shape,
+                "derived_from": insight.derived_from,
+                "evidence_refs": [f"{ref.source_type}:{ref.source_id}" for ref in insight.evidence_refs[:6]],
                 "item_refs": [f"{source.ref}#{item.item_id}" for item in insight.items[:12]],
+                "schema_fields": fields,
                 "locator_fields": list(locator_row) if locator_row else [],
                 "locator_preview": _bounded_row(locator_row) if locator_row else None,
-                "render_capabilities": _render_capabilities(fields, scalar=not bool(fields)),
+                "render_capabilities": _render_capabilities(fields, scalar=not bool(insight.items or locator_row)),
+                "data_structure": _structure_outline(records),
+                "preview": [_bounded_value(item) for item in records[:4]],
             }
+            projection_root = _projection_root_preview(source)
+            result["projection_root"] = {
+                "data_structure": _structure_outline([projection_root]),
+                "preview": _bounded_value(projection_root),
+            }
+            return result
         if source.kind == "insight_item":
             insight, item = source.value
             fields = _schema_fields([_insight_item_row(item)])
-            return {
+            result = {
                 "source_ref": source.ref, "kind": "insight_item", "status": insight.status,
+                "insight_key": insight.insight_key, "insight_name": insight.name,
                 "label": item.label or insight.name, "timestamp": item.timestamp, "value": item.value,
                 "schema_fields": fields,
                 "render_capabilities": _render_capabilities(fields, scalar=False),
+                "data_structure": _structure_outline([_insight_item_row(item)]),
+                "preview": [_bounded_value(_insight_item_row(item))],
             }
+            projection_root = _projection_root_preview(source)
+            result["projection_root"] = {
+                "data_structure": _structure_outline([projection_root]),
+                "preview": _bounded_value(projection_root),
+            }
+            return result
         value = source.value
         return {
             "source_ref": source.ref, "kind": source.kind,
@@ -352,11 +604,17 @@ class PresentationCatalog:
 
 
 class VisualizationMaterializer:
-    """Compile grounded V3 layer plans without guessing cross-source precedence."""
+    """Compile LLM-planned semantic views into grounded V3 renderer payloads."""
 
-    def __init__(self, request_state: RequestStateModel):
+    def __init__(
+        self,
+        request_state: RequestStateModel,
+        *,
+        catalog: PresentationCatalog | None = None,
+        visual_constraints: dict | None = None,
+    ):
         self.request_state = request_state
-        self.catalog = PresentationCatalog(request_state)
+        self.catalog = catalog or PresentationCatalog(request_state)
 
     def materialize_all(self, goals: list[VisualGoal]) -> list[VisualizationPayload]:
         output: list[VisualizationPayload] = []
@@ -387,7 +645,10 @@ class VisualizationMaterializer:
             dataset, layer, layer_bindings = self._materialize_layer(plan, source, layer_index)
             datasets.append(dataset)
             layers.append(layer)
-            source_refs.append(source.ref)
+            if source.ref.startswith("semantic:") and source.kind == "view":
+                source_refs.extend(source.value.lineage)
+            else:
+                source_refs.append(source.ref)
             for binding in layer_bindings:
                 bindings[binding.binding_id] = binding
         digest = hashlib.sha1(
@@ -398,9 +659,9 @@ class VisualizationMaterializer:
             title=goal.title, summary=goal.summary, source_refs=list(dict.fromkeys(source_refs)),
             required_roles=list(dict.fromkeys(goal.required_roles)), datasets=datasets, layers=layers,
             bindings=list(bindings.values()), layout=_legible_layout_from_datasets(datasets),
+            presentation=_presentation_options(goal.presentation),
             accessibility=_accessibility(goal, datasets),
         )
-        VisualizationSemanticValidator(self.catalog).validate(goal, payload)
         return payload
 
     def _materialize_layer(
@@ -408,84 +669,136 @@ class VisualizationMaterializer:
     ) -> tuple[VisualizationDataset, VisualizationLayer, list[VisualizationBinding]]:
         rows, scalar = _source_data(source)
         encoding = _encoding_fields(plan.encoding)
-        if plan.mark == "table":
-            if not rows and scalar:
-                rows = [dict(scalar)]
-            if not rows:
-                raise ValueError(f"layer role '{plan.role}' requires row-shaped data")
-            columns = _table_columns(plan.encoding, rows)
-            dataset_id = f"dataset_{index}"
-            dataset = VisualizationDataset(
-                dataset_id=dataset_id, source_ref=source.ref, rows=rows, columns=columns,
-            )
-            return dataset, VisualizationLayer(
-                layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
-                encoding=encoding, dataset_id=dataset_id, label=plan.label,
-            ), []
+        presentation = _presentation_options(plan.presentation)
+        rows = _apply_presentation_transforms(rows, plan.transform, source)
+        if plan.transform:
+            scalar = None
         points, bindings, x_field, y_field = _points_for_source(source, rows, scalar, encoding)
-        if plan.mark == "text" and scalar:
-            dataset_id = f"dataset_{index}"
-            metric = dict(scalar)
-            metric.setdefault("label", plan.label or plan.role)
-            dataset = VisualizationDataset(dataset_id=dataset_id, source_ref=source.ref, metric=metric)
-            return dataset, VisualizationLayer(
-                layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
-                encoding=encoding, dataset_id=dataset_id, points=points, label=plan.label,
-            ), bindings
         if not points:
             raise ValueError(f"layer role '{plan.role}' produced no renderable points from {source.ref}")
         dataset_id = f"dataset_{index}"
-        series_id = f"series_{index}"
-        series = VisualizationSeries(series_id=series_id, name=plan.label or plan.role, role=plan.role, points=points)
+        group_field = _first_encoding_field(encoding.get("series"))
+        grouped_points: dict[str, list[VisualizationPoint]] = {}
+        if group_field:
+            for point in points:
+                group = str(point.metadata.get(group_field, ""))
+                grouped_points.setdefault(group, []).append(point)
+        else:
+            grouped_points[""] = points
+        series = [
+            VisualizationSeries(
+                series_id=f"series_{index}_{group_index}",
+                name=(f"{plan.label or plan.role}: {group}" if group else plan.label or plan.role),
+                role=(f"{plan.role}:{group}" if group else plan.role),
+                points=group_points,
+            )
+            for group_index, (group, group_points) in enumerate(grouped_points.items())
+        ]
         dataset = VisualizationDataset(
             dataset_id=dataset_id, source_ref=source.ref,
-            dimensions=_dimensions(x_field, y_field, rows, scalar), series=[series],
+            dimensions=_dimensions(x_field, y_field, rows, scalar), series=series,
         )
         layer = VisualizationLayer(
             layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
-            encoding=encoding, dataset_id=dataset_id, series_id=series_id,
-            points=points if plan.mark in {"point", "rule", "text", "rect"} else [], label=plan.label,
+            encoding=encoding, transform=[item.model_dump(mode="json") for item in plan.transform],
+            presentation=presentation,
+            dataset_id=dataset_id, series_id=series[0].series_id if len(series) == 1 else None,
+            points=points if plan.mark in {"point", "rule", "rect"} else [], label=plan.label,
         )
         return dataset, layer, bindings
 
 
 class VisualizationSemanticValidator:
-    """Validate that materialized layers satisfy the roles authored by the LLM."""
+    """Compatibility shim; semantic decisions now belong to the chart-planning LLM."""
 
-    def __init__(self, catalog: PresentationCatalog):
+    def __init__(self, catalog: PresentationCatalog, *, required_located_roles: set[str] | None = None):
         self.catalog = catalog
+        self.required_located_roles = required_located_roles or set()
 
     def validate(self, goal: VisualGoal, payload: VisualizationPayload) -> None:
-        role_layers: dict[str, list[VisualizationLayer]] = {}
-        datasets = {dataset.dataset_id: dataset for dataset in payload.datasets}
-        for layer in payload.layers:
-            role_layers.setdefault(layer.role.strip().casefold(), []).append(layer)
-            source = self.catalog.resolve(layer.source_ref)
-            if source.kind == "insight" and source.value.status != "verified":
-                raise ValueError(f"visual layer '{layer.role}' uses non-verified Insight {source.ref}")
-            if source.kind == "insight_item" and source.value[0].status != "verified":
-                raise ValueError(f"visual layer '{layer.role}' uses non-verified Insight item {source.ref}")
-            if source.kind == "view":
-                for lineage_ref in source.value.lineage:
-                    self.catalog.resolve(lineage_ref)
-            dataset = datasets[layer.dataset_id]
-            if layer.mark == "table":
-                nonempty = bool(dataset.rows)
-            elif layer.mark == "text":
-                nonempty = bool(dataset.metric)
-            else:
-                nonempty = bool(dataset.series and dataset.series[0].points)
-            if not nonempty:
-                raise ValueError(f"visual layer '{layer.role}' is empty")
-            available = {field["name"] for field in _source_schema(source)}
-            invalid_fields = sorted({value for value in layer.encoding.values() if value not in available})
-            if invalid_fields:
-                raise ValueError(
-                    f"visual layer '{layer.role}' references unavailable fields {invalid_fields}; available fields: {sorted(available)}"
-                )
-        missing = [role for role in goal.required_roles if not role_layers.get(role.strip().casefold())]
-        if missing:
-            raise ValueError(f"visualization semantic validation failed; missing required roles: {missing}")
+        return None
+
+
+def _constraint_role_candidates(constraints: dict) -> set[str]:
+    """Collect role labels explicitly supplied as members of constraint arrays."""
+    roles: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, (list, tuple, set)):
+            for nested in value:
+                if isinstance(nested, str) and nested.strip():
+                    roles.add(_semantic_role_key(nested))
+                else:
+                    visit(nested)
+
+    visit(constraints)
+    return roles
+
+
+def _semantic_role_key(value: str) -> str:
+    return re.sub(r"[^\w]+", "", value, flags=re.UNICODE).casefold()
+
+
+def _apply_presentation_transforms(rows: list[dict], transforms, source: PresentationSource) -> list[dict]:
+    """Apply selection-only transforms to copies of grounded rows without changing values."""
+    selected = [dict(row) for row in rows]
+    available = {field["name"] for field in _source_schema(source)}
+    for transform in transforms:
+        field = transform.field.strip()
+        if field not in available:
+            raise ValueError(
+                f"visual filter references unavailable field '{field}'; available fields: {sorted(available)}"
+            )
+        operator = transform.operator
+        expected = transform.value
+        if operator == "between" and _ordered_filter_value(expected[0]) > _ordered_filter_value(expected[1]):
+            raise ValueError(f"visual filter field '{field}' has reversed between boundaries")
+
+        def keep(row: dict) -> bool:
+            actual = row.get(field)
+            if operator == "exists":
+                return actual is not None
+            if operator == "not_exists":
+                return actual is None
+            if operator == "eq":
+                return actual == expected
+            if operator == "neq":
+                return actual != expected
+            if operator == "in":
+                return actual in expected
+            if operator == "not_in":
+                return actual not in expected
+            if actual is None:
+                return False
+            if operator == "between":
+                return _ordered_filter_value(expected[0]) <= _ordered_filter_value(actual) <= _ordered_filter_value(expected[1])
+            left = _ordered_filter_value(actual)
+            right = _ordered_filter_value(expected)
+            if operator == "gt":
+                return left > right
+            if operator == "gte":
+                return left >= right
+            if operator == "lt":
+                return left < right
+            return left <= right
+
+        selected = [row for row in selected if keep(row)]
+    return selected
+
+
+def _ordered_filter_value(value: Any) -> tuple[int, Any]:
+    if isinstance(value, bool):
+        return 0, int(value)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return 1, float(value)
+    if isinstance(value, (str, datetime)):
+        parsed = _time_value(value)
+        if parsed is not None:
+            return 2, parsed.timestamp()
+    return 3, str(value)
 
 
 def _source_data(source: PresentationSource) -> tuple[list[dict], dict | None]:
@@ -532,26 +845,67 @@ def _insight_locator_row(insight: KeyInsight) -> dict:
     return {}
 
 
-def _encoding_fields(encoding: dict) -> dict[str, str]:
-    result: dict[str, str] = {}
+def _encoding_fields(encoding: dict) -> dict[str, str | list[str]]:
+    result: dict[str, str | list[str]] = {}
+    channel_aliases = {
+        "time": "x",
+        "timestamp": "x",
+        "date": "x",
+        "category": "x",
+        "value": "y",
+        "measure": "y",
+        "metric": "y",
+    }
     for channel, value in (encoding or {}).items():
+        normalized_channel = channel_aliases.get(str(channel).strip().lower(), channel)
         if isinstance(value, str):
             if channel != "columns":
-                result[channel] = value
+                result[normalized_channel] = value
+            continue
+        if isinstance(value, list):
+            fields = []
+            for item in value:
+                field = item if isinstance(item, str) else getattr(item, "field", None)
+                if isinstance(field, str) and field.strip():
+                    fields.append(field.strip())
+            if fields:
+                result[normalized_channel] = fields
             continue
         field = getattr(value, "field", None)
         if isinstance(field, str) and field.strip():
-            result[channel] = field.strip()
+            result[normalized_channel] = field.strip()
     return result
 
 
-def _table_columns(encoding: dict, rows: list[dict]) -> list[str]:
-    requested = (encoding or {}).get("columns")
-    if isinstance(requested, list):
-        columns = [str(item).strip() for item in requested if str(item).strip()]
-    else:
-        columns = list(_encoding_fields(encoding).values())
-    return list(dict.fromkeys(columns)) or _row_fields(rows)
+def _presentation_options(value: dict) -> dict:
+    """Accept renderer presentation JSON while preventing it from carrying data.
+
+    The renderer may evolve independently from this materializer.  Data-bearing
+    properties stay owned by the grounded dataset compiler and are injected by
+    the frontend after presentation options are applied.
+    """
+    def copy_presentation(item: Any, path: tuple[str, ...] = ()) -> Any:
+        if item is None or isinstance(item, (str, bool, int, float)):
+            if isinstance(item, float) and not math.isfinite(item):
+                raise ValueError("visual presentation contains a non-finite number")
+            return item
+        if isinstance(item, list):
+            return [copy_presentation(nested, path) for nested in item]
+        if isinstance(item, dict):
+            copied = {}
+            for raw_key, nested in item.items():
+                key = str(raw_key)
+                if key.casefold() in _DATA_BEARING_PRESENTATION_KEYS:
+                    location = ".".join((*path, key))
+                    raise ValueError(
+                        f"visual presentation property '{location}' may carry data; "
+                        "bind it through source_ref and encoding instead"
+                    )
+                copied[key] = copy_presentation(nested, (*path, key))
+            return copied
+        raise ValueError(f"visual presentation contains unsupported JSON value {type(item).__name__}")
+
+    return copy_presentation(value or {})
 
 
 def _points_for_source(source, rows, scalar, encoding):
@@ -569,11 +923,13 @@ def _points_for_source(source, rows, scalar, encoding):
             )
         else:
             bindings.append(_insight_binding(source.ref, insight))
-    x_field = encoding.get("x") or _first_field(rows, "time") or _first_field(rows, "category")
-    y_field = encoding.get("y") or encoding.get("value") or _first_field(rows, "number")
-    lower_field = encoding.get("lower") or "lower"
-    upper_field = encoding.get("upper") or "upper"
-    label_field = encoding.get("label")
+    elif source.kind == "view" and source.value.bindings:
+        bindings.extend(source.value.bindings.values())
+    x_field = _first_encoding_field(encoding.get("x")) or _first_field(rows, "time") or _first_field(rows, "category")
+    y_field = _first_encoding_field(encoding.get("y")) or _first_encoding_field(encoding.get("value")) or _first_field(rows, "number")
+    lower_field = _first_encoding_field(encoding.get("lower")) or "lower"
+    upper_field = _first_encoding_field(encoding.get("upper")) or "upper"
+    label_field = _first_encoding_field(encoding.get("label"))
     points: list[VisualizationPoint] = []
     binding_by_item = {binding.item_id: binding.binding_id for binding in bindings if binding.item_id}
     for row in rows:
@@ -585,12 +941,14 @@ def _points_for_source(source, rows, scalar, encoding):
             x=row.get(x_field) if x_field else row.get("label") or row.get("name"), y=y,
             lower=lower, upper=upper,
             label=str(row.get(label_field) or row.get("label") or row.get("type") or "") or None,
-            binding_id=binding_by_item.get(item_id),
-            metadata={key: value for key, value in row.items() if key not in {x_field, y_field, lower_field, upper_field}},
+            binding_id=str(row.get("__binding_id") or binding_by_item.get(item_id) or "") or None,
+            # Keep an immutable copy of every grounded field so renderer-native
+            # encodings can address shapes beyond the normalized x/y pair.
+            metadata=dict(row),
         )
         if point.x is not None or point.y is not None or point.lower is not None or point.upper is not None:
             points.append(point)
-    if scalar:
+    if scalar and not points:
         y_key = y_field or next((key for key, value in scalar.items() if _number(value) is not None), None)
         x_key = x_field or next((key for key, value in scalar.items() if _time_value(value) is not None), None)
         binding_id = bindings[0].binding_id if bindings else None
@@ -598,12 +956,21 @@ def _points_for_source(source, rows, scalar, encoding):
             x=scalar.get(x_key) if x_key else scalar.get("label"),
             y=_number(scalar.get(y_key)) if y_key else None,
             label=str(scalar.get("label") or "") or None, binding_id=binding_id,
+            metadata=dict(scalar),
         )
         if point.x is not None or point.y is not None:
             points.append(point)
         x_field = x_key or "label"
         y_field = y_key or "value"
     return points, bindings, x_field or "x", y_field or "value"
+
+
+def _first_encoding_field(value: str | list[str] | None) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return next((item for item in value if isinstance(item, str) and item), None)
+    return None
 
 
 def _insight_item_binding(ref: str, insight: KeyInsight, item: InsightItem) -> VisualizationBinding:
@@ -631,15 +998,15 @@ def _source_schema(source: PresentationSource) -> list[dict]:
 
 def _schema_fields(rows: list[dict]) -> list[dict]:
     result = []
-    for name in _row_fields(rows):
+    for name in (field for field in _row_fields(rows) if not field.startswith("__")):
         values = [row.get(name) for row in rows if row.get(name) is not None]
         kind = "string"
-        if any(_time_value(value) is not None for value in values[:12]):
-            kind = "time"
+        if any(isinstance(value, bool) for value in values[:12]):
+            kind = "boolean"
         elif any(_number(value) is not None for value in values[:12]):
             kind = "number"
-        elif any(isinstance(value, bool) for value in values[:12]):
-            kind = "boolean"
+        elif any(_time_value(value) is not None for value in values[:12]):
+            kind = "time"
         elif any(isinstance(value, (dict, list)) for value in values[:12]):
             kind = "object"
         elif len({str(value) for value in values[:40]}) <= 12:
@@ -662,8 +1029,6 @@ def _dimensions(x_field, y_field, rows, scalar):
 def _accessibility(goal, datasets):
     rows: list[dict] = []
     for dataset in datasets:
-        if dataset.rows:
-            rows.extend(dataset.rows[:12])
         for series in dataset.series:
             rows.extend(
                 {"role": series.role, "x": point.x, "y": point.y, "lower": point.lower, "upper": point.upper}
@@ -722,16 +1087,12 @@ def _full_fidelity_status(sources: list[PresentationSource]) -> bool | None:
 def _render_capabilities(schema_fields: list[dict], *, scalar: bool) -> dict:
     data_types = {str(item.get("data_type") or "") for item in schema_fields if isinstance(item, dict)}
     timestamped_numeric = "time" in data_types and "number" in data_types
-    if scalar:
-        marks = ["text", "table"]
-    elif timestamped_numeric:
-        marks = ["line", "point", "area", "band", "bar", "rule", "rect", "text", "table"]
-    else:
-        marks = ["bar", "point", "text", "table"]
+    renderable = bool(data_types - {"object"}) and (not scalar or "number" in data_types)
     return {
         "timestamped_numeric": timestamped_numeric,
         "scalar_only": scalar,
-        "supported_marks": marks,
+        "renderer_series_type": "open",
+        "renderable": renderable,
     }
 
 
@@ -851,8 +1212,145 @@ def _row_fields(rows: Iterable[dict]) -> list[str]:
     return result
 
 
+def _projection_bindings(source: PresentationSource) -> dict[str, VisualizationBinding]:
+    if source.kind == "insight_item":
+        insight, item = source.value
+        return {item.item_id: _insight_item_binding(source.ref, insight, item)}
+    if source.kind == "insight":
+        insight = source.value
+        bindings = {"": _insight_binding(source.ref, insight)}
+        if insight.items:
+            bindings.update({
+                item.item_id: _insight_item_binding(
+                    f"insight:{insight.insight_id}#{item.item_id}", insight, item,
+                )
+                for item in insight.items
+            })
+        return bindings
+    if source.kind == "view":
+        return dict(source.value.bindings)
+    return {}
+
+
+def _projection_root(source: PresentationSource) -> dict:
+    """Expose a source document whose nested grains can be selected by the LLM."""
+    if source.kind == "view":
+        value: DataViewValue = source.value
+        return {"records": value.rows, "scalar": value.scalar}
+    if source.kind == "insight":
+        insight: KeyInsight = source.value
+        return {
+            **insight.model_dump(mode="json", exclude={"items"}),
+            "items": [_insight_item_row(item) for item in insight.items],
+        }
+    if source.kind == "insight_item":
+        insight, item = source.value
+        return {
+            "insight": insight.model_dump(mode="json", exclude={"items"}),
+            "item": _insight_item_row(item),
+        }
+    raise ValueError(f"presentation source '{source.ref}' cannot be semantically projected")
+
+
+def _object_value(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _projection_root_preview(source: PresentationSource) -> dict:
+    root = _projection_root(source)
+    if source.kind == "view":
+        return {**root, "records": root["records"][:4]}
+    if source.kind == "insight":
+        return {**root, "items": root.get("items", [])[:4]}
+    return root
+
+
+def _value_at_path(record: dict, path: str) -> Any:
+    """Read one value selected by the LLM from an existing grounded record."""
+    current: Any = record
+    for token in _path_tokens(path):
+        if isinstance(token, int):
+            if not isinstance(current, (list, tuple)) or token >= len(current):
+                raise ValueError(f"semantic source path '{path}' is unavailable")
+            current = current[token]
+            continue
+        if not isinstance(current, dict) or token not in current:
+            raise ValueError(f"semantic source path '{path}' is unavailable")
+        current = current[token]
+    return current
+
+
+def _path_tokens(path: str) -> list[str | int]:
+    normalized = path.strip()
+    if normalized in {"", "$"}:
+        return []
+    if normalized.startswith("$."):
+        normalized = normalized[2:]
+    elif normalized.startswith("$"):
+        normalized = normalized[1:]
+    tokens: list[str | int] = []
+    for name, index, quoted in re.findall(
+        r"(?:^|\.)([^.\[\]]+)|\[(\d+)\]|\[['\"]([^'\"]+)['\"]\]",
+        normalized,
+    ):
+        if name:
+            tokens.append(name)
+        elif index:
+            tokens.append(int(index))
+        elif quoted:
+            tokens.append(quoted)
+    if not tokens:
+        raise ValueError(f"semantic source path '{path}' is invalid")
+    return tokens
+
+
+def _structure_outline(records: list[dict]) -> dict:
+    """Expose nested structure and representative types without assigning semantics."""
+    samples = [item for item in records[:8] if isinstance(item, dict)]
+
+    def describe(values: list[Any], depth: int = 0) -> Any:
+        present = [value for value in values if value is not None]
+        if not present:
+            return {"type": "null"}
+        if depth >= 6:
+            return {"type": "nested"}
+        if any(isinstance(value, dict) for value in present):
+            keys = []
+            for value in present:
+                if isinstance(value, dict):
+                    for key in value:
+                        if key not in keys:
+                            keys.append(key)
+            return {
+                "type": "object",
+                "fields": {
+                    str(key): describe(
+                        [value.get(key) for value in present if isinstance(value, dict)], depth + 1,
+                    )
+                    for key in keys[:40]
+                },
+            }
+        if any(isinstance(value, list) for value in present):
+            items = [item for value in present if isinstance(value, list) for item in value[:8]]
+            return {"type": "array", "items": describe(items, depth + 1)}
+        if any(isinstance(value, bool) for value in present):
+            kind = "boolean"
+        elif any(_number(value) is not None for value in present):
+            kind = "number"
+        elif any(_time_value(value) is not None for value in present):
+            kind = "time"
+        else:
+            kind = "string"
+        return {"type": kind, "examples": [_bounded_value(value) for value in present[:3]]}
+
+    return describe(samples)
+
+
 def _bounded_row(row: dict) -> dict:
-    return {str(key): _bounded_value(value) for key, value in list(row.items())[:12]}
+    visible = [(key, value) for key, value in row.items() if not str(key).startswith("__")]
+    return {str(key): _bounded_value(value) for key, value in visible[:12]}
 
 
 def _bounded_value(value):

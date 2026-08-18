@@ -1,38 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import * as echarts from 'echarts';
 import type { EChartsOption } from 'echarts';
-import { BarChart, BoxplotChart, LineChart, ScatterChart } from 'echarts/charts';
-import {
-  AriaComponent,
-  DataZoomComponent,
-  GridComponent,
-  LegendComponent,
-  MarkAreaComponent,
-  MarkLineComponent,
-  MarkPointComponent,
-  TooltipComponent,
-} from 'echarts/components';
-import * as echarts from 'echarts/core';
 import type { EChartsType } from 'echarts/core';
-import { CanvasRenderer } from 'echarts/renderers';
 import type { Visualization, VisualizationPoint, VisualizationSeries } from '../types';
 import { fetchVisualizationData } from '../services/api';
 import { useI18n } from '../i18n';
-
-echarts.use([
-  LineChart,
-  BarChart,
-  ScatterChart,
-  BoxplotChart,
-  GridComponent,
-  TooltipComponent,
-  LegendComponent,
-  DataZoomComponent,
-  MarkPointComponent,
-  MarkLineComponent,
-  MarkAreaComponent,
-  AriaComponent,
-  CanvasRenderer,
-]);
 
 type GalleryProps = {
   visualizations: Visualization[];
@@ -136,8 +108,6 @@ export function isRenderableVisualization(value: unknown): value is Visualizatio
     && typeof dataset.dataset_id === 'string'
     && typeof dataset.source_ref === 'string'
     && (dataset.series === undefined || Array.isArray(dataset.series))
-    && (dataset.rows === undefined || Array.isArray(dataset.rows))
-    && (dataset.columns === undefined || Array.isArray(dataset.columns))
   ));
   if (!datasetsAreValid) return false;
 
@@ -160,15 +130,6 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
 }) {
   const { t } = useI18n();
   const marks = (visualization.layers || []).map((layer) => layer.mark);
-  const isMetric = marks.length === 1 && marks[0] === 'text';
-  const isTable = marks.length > 0 && marks.every((mark) => mark === 'table');
-  const metric = visualization.datasets.find((dataset) => dataset.metric)?.metric;
-  const metricDisplay = metric ? normalizeMetricDisplay(metric) : null;
-  const rows = visualization.datasets.flatMap((dataset) => dataset.rows || []);
-  const configuredColumns = visualization.datasets.flatMap((dataset) => dataset.columns || []);
-  const columns = configuredColumns.length
-    ? Array.from(new Set(configuredColumns))
-    : Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
   return (
     <article className={`answer-visualization-card is-${visualization.priority}`}>
       <div className="answer-visualization-card-header">
@@ -178,36 +139,12 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
         </div>
         <span>{Array.from(new Set(marks)).map(formatMarkLabel).join(' · ')}</span>
       </div>
-      {isMetric && metricDisplay ? (
-        <div className="answer-insight-metric" role="group" aria-label={visualization.title}>
-          {metricDisplay.value !== undefined && (
-            <div className="answer-insight-metric-value">
-              <strong>{formatCell(metricDisplay.value)}</strong>
-              {metricDisplay.unit ? <span>{formatCell(metricDisplay.unit)}</span> : null}
-            </div>
-          )}
-          {metricDisplay.label ? <small>{formatCell(metricDisplay.label)}</small> : null}
-          {metricDisplay.context.length > 0 && (
-            <dl className="answer-insight-metric-context">
-              {metricDisplay.context.map(([key, value]) => (
-                <div key={key}>
-                  <dt>{formatFieldLabel(key)}</dt>
-                  <dd>{formatCell(value)}</dd>
-                </div>
-              ))}
-            </dl>
-          )}
-        </div>
-      ) : isTable ? (
-        <AccessibleTable visualization={visualization} rows={rows} columns={columns} onSelectBinding={onSelectBinding} />
-      ) : (
-        <EChartView
-          visualization={visualization}
-          activeBindingId={activeBindingId}
-          onSelectBinding={onSelectBinding}
-        />
-      )}
-      {!isTable && (visualization.accessibility.table_rows?.length || 0) > 0 && (
+      <EChartView
+        visualization={visualization}
+        activeBindingId={activeBindingId}
+        onSelectBinding={onSelectBinding}
+      />
+      {(visualization.accessibility.table_rows?.length || 0) > 0 && (
         <details className="visualization-data-details">
           <summary>{t('View chart data')}</summary>
           <AccessibleTable
@@ -220,32 +157,6 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
       )}
     </article>
   );
-}
-
-function normalizeMetricDisplay(metric: Record<string, unknown>) {
-  const nested = isRecord(metric.value) ? metric.value : null;
-  if (!nested) {
-    return {
-      value: metric.value,
-      unit: metric.unit,
-      label: metric.label,
-      context: [] as Array<[string, unknown]>,
-    };
-  }
-
-  const entries = Object.entries(nested).filter(([, value]) => isDisplayScalar(value));
-  const numericEntries = entries.filter(([, value]) => typeof value === 'number' && Number.isFinite(value));
-  const primary = numericEntries.length === 1 ? numericEntries[0] : null;
-  return {
-    value: primary?.[1],
-    unit: metric.unit,
-    label: metric.label || (primary ? formatFieldLabel(primary[0]) : undefined),
-    context: entries.filter(([key]) => key !== primary?.[0]),
-  };
-}
-
-function isDisplayScalar(value: unknown): value is string | number | boolean | null {
-  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
 }
 
 function formatFieldLabel(value: string) {
@@ -268,7 +179,9 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
     chartRef.current = chart;
     const handleClick = (params: { data?: unknown }) => {
       const data = isRecord(params.data) ? params.data : null;
-      const bindingId = data && typeof data.bindingId === 'string' ? data.bindingId : null;
+      const bindingId = data && typeof data.bindingId === 'string'
+        ? data.bindingId
+        : data && typeof data.__binding_id === 'string' ? data.__binding_id : null;
       if (bindingId) onSelectBinding(bindingId);
     };
     chart.on('click', handleClick);
@@ -298,7 +211,7 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
 }
 
 export function buildVisualizationOption(visualization: Visualization, activeBindingId: string | null = null): EChartsOption {
-  const layers = (visualization.layers || []).filter((layer) => layer.mark !== 'table');
+  const layers = visualization.layers || [];
   const datasets = new Map(visualization.datasets.map((dataset) => [dataset.dataset_id, dataset]));
   const faceted = visualization.layout === 'facets' && layers.length > 1;
   const grids = faceted
@@ -321,15 +234,33 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     splitLine: { lineStyle: { color: '#eef1f4' } },
   }));
   const seriesOptions: any[] = [];
+  const rendererDatasets: Array<{ id: string; source: Array<Record<string, unknown>> }> = [];
   layers.forEach((layer, index) => {
     const dataset = datasets.get(layer.dataset_id);
-    const points = dataset?.series?.[0]?.points || layer.points || [];
     if (layer.mark === 'rule') return;
-    if (layer.mark === 'band') {
-      seriesOptions.push(...confidenceBandSeries({ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points }, index, faceted));
-      return;
-    }
-    seriesOptions.push(buildLayerSeriesOption(layer, points, index, faceted, activeBindingId));
+    const sourceSeries = dataset?.series?.length
+      ? dataset.series
+      : [{ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points: layer.points || [] }];
+    sourceSeries.forEach((series) => {
+      if (layer.mark === 'band') {
+        seriesOptions.push(...confidenceBandSeries(series, index, faceted));
+        return;
+      }
+      if (!['line', 'area', 'bar', 'point', 'boxplot', 'rule', 'rect'].includes(layer.mark)) {
+        const rendererDatasetId = `${layer.layer_id}_${series.series_id}`;
+        rendererDatasets.push({
+          id: rendererDatasetId,
+          source: (series.points || []).map((point) => groundedPointRecord(point, layer.encoding)),
+        });
+        seriesOptions.push(buildRendererNativeSeriesOption(
+          { ...layer, label: series.name }, rendererDatasetId, index, faceted,
+        ));
+        return;
+      }
+      seriesOptions.push(buildLayerSeriesOption(
+        { ...layer, label: series.name }, series.points || [], index, faceted, activeBindingId,
+      ));
+    });
   });
   const rulePoints = layers.flatMap((layer) => layer.mark === 'rule' ? layer.points || [] : []);
   if (rulePoints.length > 0 && seriesOptions.length > 0) {
@@ -351,7 +282,7 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     };
   }
 
-  const option = {
+  const option: Record<string, unknown> = {
     animationDuration: 260,
     aria: { enabled: true, decal: { show: true }, description: visualization.accessibility.description },
     color: ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'],
@@ -363,9 +294,26 @@ export function buildVisualizationOption(visualization: Visualization, activeBin
     dataZoom: layers.some((layer) => (datasets.get(layer.dataset_id)?.series?.[0]?.points?.length || 0) > 80)
       ? [{ type: 'inside', filterMode: 'none' }, { type: 'slider', height: 18, bottom: 4 }]
       : [],
+    dataset: rendererDatasets,
     series: seriesOptions,
   };
-  return option as EChartsOption;
+  const presented = deepMerge(option, visualization.presentation || {});
+  // These are the immutable binding boundary. Even malformed or legacy
+  // presentation payloads cannot replace verified renderer data.
+  presented.dataset = rendererDatasets;
+  presented.series = seriesOptions;
+  return presented as EChartsOption;
+}
+
+function deepMerge(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  Object.entries(overlay).forEach(([key, value]) => {
+    const current = merged[key];
+    merged[key] = isRecord(current) && isRecord(value)
+      ? deepMerge(current, value)
+      : value;
+  });
+  return merged;
 }
 
 function buildLayerSeriesOption(
@@ -378,6 +326,7 @@ function buildLayerSeriesOption(
   const name = layer.label || formatRoleLabel(layer.role);
   if (layer.mark === 'boxplot') {
     return {
+      ...(layer.presentation || {}),
       name,
       type: 'boxplot',
       xAxisIndex: faceted ? index : 0,
@@ -393,6 +342,7 @@ function buildLayerSeriesOption(
   }
   if (layer.mark === 'bar') {
     return {
+      ...(layer.presentation || {}),
       name,
       type: 'bar',
       xAxisIndex: faceted ? index : 0,
@@ -400,42 +350,116 @@ function buildLayerSeriesOption(
       barMaxWidth: 34,
       itemStyle: { borderRadius: [5, 5, 0, 0] },
       emphasis: { focus: 'series' },
-      data: points.map(toEChartsPoint),
+      data: points.map((point) => toEChartsPoint(point)),
     };
   }
-  if (['point', 'text'].includes(layer.mark)) {
-    const style = semanticLayerStyle(layer.role);
+  if (layer.mark === 'point') {
+    const colorField = encodingField(layer.encoding?.color);
+    const shapeField = encodingField(layer.encoding?.shape);
+    const sizeField = encodingField(layer.encoding?.size);
+    const opacityField = encodingField(layer.encoding?.opacity);
     return {
+      ...(layer.presentation || {}),
       name,
       type: 'scatter',
       xAxisIndex: faceted ? index : 0,
       yAxisIndex: faceted ? index : 0,
-      symbol: style.symbol,
-      symbolSize: (value: unknown, params: { data?: unknown }) => isRecord(params.data) && params.data.bindingId === activeBindingId ? 15 : style.size,
-      itemStyle: { color: style.color, borderColor: '#fff', borderWidth: 2 },
-      label: { show: true, position: 'top', color: style.labelColor, formatter: (params: { data?: unknown }) => isRecord(params.data) ? String(params.data.semanticLabel || '') : '' },
+      symbol: (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index),
+      symbolSize: (_value: unknown, params: { data?: unknown }) => isRecord(params.data) && params.data.bindingId === activeBindingId
+        ? 15
+        : sizeForEncoding(params.data, sizeField),
+      itemStyle: {
+        color: (params: { data?: unknown }) => colorForEncoding(params.data, colorField, index),
+        borderColor: '#fff',
+        borderWidth: 2,
+      },
+      label: { show: true, position: 'top', color: '#475467', formatter: (params: { data?: unknown }) => isRecord(params.data) ? String(params.data.semanticLabel || '') : '' },
       large: points.length > 1200,
-      data: points.map(toEChartsPoint),
+      data: points.map((point) => toEChartsPoint(point, layer, index, opacityField)),
       z: 10,
     };
   }
+  const linePresentation = layer.presentation || {};
+  const presentedLineStyle = isRecord(linePresentation.lineStyle) ? linePresentation.lineStyle : {};
+  const presentedAreaStyle = isRecord(linePresentation.areaStyle) ? linePresentation.areaStyle : {};
+  const presentedEmphasis = isRecord(linePresentation.emphasis) ? linePresentation.emphasis : {};
+  const colorField = encodingField(layer.encoding?.color);
+  const shapeField = encodingField(layer.encoding?.shape);
+  const sizeField = encodingField(layer.encoding?.size);
+  const opacityField = encodingField(layer.encoding?.opacity);
   return {
+    ...linePresentation,
     name,
     type: 'line',
     xAxisIndex: faceted ? index : 0,
     yAxisIndex: faceted ? index : 0,
-    showSymbol: points.length <= 40 || points.some((point) => point.binding_id),
+    showSymbol: linePresentation.showSymbol ?? (points.length <= 40 || points.some((point) => point.binding_id)),
+    symbol: shapeField
+      ? (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index)
+      : linePresentation.symbol,
     symbolSize: (value: unknown, params: { data?: unknown }) => (
       isRecord(params.data) && params.data.bindingId === activeBindingId ? 10 : 5
     ),
-    smooth: false,
-    connectNulls: false,
-    lineStyle: layer.role.includes('forecast') ? { type: 'dashed', width: 2.5 } : { width: 2 },
-    areaStyle: layer.mark === 'area' ? { opacity: 0.16 } : undefined,
-    data: points.map(toEChartsPoint),
-    emphasis: { focus: 'series' },
-    z: layer.role.includes('forecast') ? 5 : 3,
+    smooth: linePresentation.smooth ?? false,
+    connectNulls: linePresentation.connectNulls ?? false,
+    lineStyle: {
+      ...presentedLineStyle,
+      color: colorField
+        ? colorForEncoding({ metadata: points[0]?.metadata || {} }, colorField, index)
+        : presentedLineStyle.color,
+      width: sizeField
+        ? lineWidthForEncoding({ metadata: points[0]?.metadata || {} }, sizeField)
+        : presentedLineStyle.width ?? 2,
+      opacity: opacityField
+        ? opacityForEncoding({ metadata: points[0]?.metadata || {} }, opacityField)
+        : presentedLineStyle.opacity ?? 1,
+    },
+    areaStyle: layer.mark === 'area' ? { opacity: 0.16, ...presentedAreaStyle } : undefined,
+    data: points.map((point) => toEChartsPoint(point, layer, index, opacityField)),
+    emphasis: { focus: 'series', ...presentedEmphasis },
+    z: linePresentation.z ?? 3 + index,
   };
+}
+
+function buildRendererNativeSeriesOption(
+  layer: NonNullable<Visualization['layers']>[number],
+  datasetId: string,
+  index: number,
+  faceted: boolean,
+): Record<string, unknown> {
+  // Presentation is merged first. Grounded binding properties below always win,
+  // so renderer freedom cannot replace the dataset or its field encodings.
+  return {
+    ...(layer.presentation || {}),
+    name: layer.label || formatRoleLabel(layer.role),
+    type: layer.mark,
+    datasetId,
+    encode: layer.encoding || {},
+    xAxisIndex: faceted ? index : 0,
+    yAxisIndex: faceted ? index : 0,
+  };
+}
+
+function groundedPointRecord(
+  point: VisualizationPoint,
+  encoding: Record<string, string | string[]> | undefined,
+): Record<string, unknown> {
+  const record: Record<string, unknown> = { ...(point.metadata || {}) };
+  const xField = encodingField(encoding?.x);
+  const yFields = encodingFields(encoding?.y || encoding?.value);
+  if (xField && record[xField] === undefined) record[xField] = point.x;
+  if (yFields.length === 1 && record[yFields[0]] === undefined) record[yFields[0]] = point.y;
+  record.__binding_id = point.binding_id;
+  record.__semantic_label = point.label;
+  return record;
+}
+
+function encodingFields(value: string | string[] | undefined): string[] {
+  return Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+}
+
+function encodingField(value: string | string[] | undefined): string | undefined {
+  return encodingFields(value)[0];
 }
 
 function confidenceBandSeries(series: VisualizationSeries, index: number, faceted: boolean): any[] {
@@ -506,12 +530,25 @@ function AccessibleTable({ visualization, rows, columns, onSelectBinding }: {
   );
 }
 
-function toEChartsPoint(point: VisualizationPoint) {
+function toEChartsPoint(
+  point: VisualizationPoint,
+  layer?: NonNullable<Visualization['layers']>[number],
+  layerIndex = 0,
+  opacityField?: string,
+) {
+  const metadata = point.metadata || {};
+  const colorField = encodingField(layer?.encoding?.color);
   return {
     value: [chartValue(point.x), point.y],
     bindingId: point.binding_id,
     semanticLabel: point.label,
-    itemStyle: point.binding_id ? { borderWidth: 2, borderColor: '#fff' } : undefined,
+    metadata,
+    itemStyle: {
+      color: colorForEncoding({ metadata }, colorField, layerIndex),
+      opacity: opacityForEncoding({ metadata }, opacityField),
+      borderWidth: point.binding_id ? 2 : undefined,
+      borderColor: point.binding_id ? '#fff' : undefined,
+    },
   };
 }
 
@@ -552,18 +589,42 @@ function axisType(dataType?: string): 'time' | 'value' | 'category' {
   return 'category';
 }
 
-function semanticLayerStyle(role: string) {
-  const normalized = role.toLowerCase();
-  if (normalized.includes('buy') || normalized.includes('start')) {
-    return { color: '#087f5b', labelColor: '#05603f', symbol: 'triangle', size: 13 };
-  }
-  if (normalized.includes('sell') || normalized.includes('end')) {
-    return { color: '#b42318', labelColor: '#7a271a', symbol: 'diamond', size: 13 };
-  }
-  if (normalized.includes('anomaly') || normalized.includes('excluded') || normalized.includes('outlier')) {
-    return { color: '#dc6803', labelColor: '#7a2e0e', symbol: 'circle', size: 9 };
-  }
-  return { color: '#6941c6', labelColor: '#4a1fb8', symbol: 'circle', size: 10 };
+const VISUAL_COLORS = ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'];
+const VISUAL_SYMBOLS = ['circle', 'triangle', 'diamond', 'rect', 'roundRect'];
+
+function encodedValue(data: unknown, field?: string): unknown {
+  return field && isRecord(data) && isRecord(data.metadata) ? data.metadata[field] : undefined;
+}
+
+function stableIndex(value: unknown, modulo: number, fallback: number): number {
+  if (value === undefined || value === null) return fallback % modulo;
+  const text = String(value);
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) hash = ((hash * 31) + text.charCodeAt(index)) >>> 0;
+  return hash % modulo;
+}
+
+function colorForEncoding(data: unknown, field: string | undefined, fallback: number): string {
+  return VISUAL_COLORS[stableIndex(encodedValue(data, field), VISUAL_COLORS.length, fallback)];
+}
+
+function symbolForEncoding(data: unknown, field: string | undefined, fallback: number): string {
+  return VISUAL_SYMBOLS[stableIndex(encodedValue(data, field), VISUAL_SYMBOLS.length, fallback)];
+}
+
+function sizeForEncoding(data: unknown, field?: string): number {
+  const value = Number(encodedValue(data, field));
+  return Number.isFinite(value) ? Math.max(6, Math.min(24, Math.abs(value))) : 10;
+}
+
+function lineWidthForEncoding(data: unknown, field?: string): number {
+  const value = Number(encodedValue(data, field));
+  return Number.isFinite(value) ? Math.max(1, Math.min(8, Math.abs(value))) : 2;
+}
+
+function opacityForEncoding(data: unknown, field?: string): number {
+  const value = Number(encodedValue(data, field));
+  return Number.isFinite(value) ? Math.max(0.15, Math.min(1, value)) : 1;
 }
 
 function formatCell(value: unknown): string {

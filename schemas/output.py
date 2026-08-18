@@ -1,7 +1,7 @@
 """Final answer models."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -41,6 +41,28 @@ class VisualFieldEncoding(BaseModel):
         return normalized
 
 
+class VisualFilterTransform(BaseModel):
+    """A read-only row selection applied only to a visualization layer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["filter"] = "filter"
+    field: str
+    operator: Literal[
+        "eq", "neq", "in", "not_in", "exists", "not_exists",
+        "gt", "gte", "lt", "lte", "between",
+    ] = "eq"
+    value: Any = None
+
+    @model_validator(mode="after")
+    def validate_value_shape(self):
+        if self.operator in {"in", "not_in"} and not isinstance(self.value, list):
+            raise ValueError(f"filter operator '{self.operator}' requires a list value")
+        if self.operator == "between" and (not isinstance(self.value, list) or len(self.value) != 2):
+            raise ValueError("filter operator 'between' requires exactly two boundary values")
+        return self
+
+
 class VisualLayerPlan(BaseModel):
     """One grounded semantic layer selected by the response-planning LLM."""
 
@@ -50,7 +72,18 @@ class VisualLayerPlan(BaseModel):
     source_ref: str
     mark: VisualizationMark
     encoding: dict[str, str | VisualFieldEncoding | list[str | VisualFieldEncoding]] = Field(default_factory=dict)
+    transform: list[VisualFilterTransform] = Field(default_factory=list)
+    presentation: dict[str, Any] = Field(default_factory=dict)
     label: str | None = None
+
+    @model_validator(mode="after")
+    def require_renderer_mark(self):
+        mark = self.mark.strip()
+        if not mark:
+            raise ValueError("visual layer mark must be a non-empty renderer series type")
+        if mark.casefold() in {"text", "table"}:
+            raise ValueError(f"'{mark}' is content, not a graphical visualization mark")
+        return self
 
 
 class VisualGoal(BaseModel):
@@ -63,6 +96,7 @@ class VisualGoal(BaseModel):
     priority: Literal["primary", "supporting"] = "primary"
     summary: str | None = None
     required_roles: list[str] = Field(default_factory=list)
+    presentation: dict[str, Any] = Field(default_factory=dict)
     layers: list[VisualLayerPlan] = Field(default_factory=list)
 
 

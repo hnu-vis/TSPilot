@@ -686,6 +686,10 @@ class LlmInsightMemoryRetriever:
                     "selection must encode the requested grain and distinct key (for example granularity=day, "
                     "distinct_by=date), together with order_by and direction. "
                     "Use code_interpreter for change, ratio, trend, distribution, association, and multi-Key Insight composition. "
+                    "For calculated events or decisions that must be located in a visualization, request a collection/series Insight "
+                    "whose items carry semantic role label, timestamp, and numeric value, or separate point Insights that each carry "
+                    "both timestamp and numeric value. Never split one located point into scalar time and scalar value requests, never "
+                    "use time_boundary for an optimized/selected decision time, and never request raw visual context as an evidence Insight. "
                     "Do not invent parent keys and do not return already verified insights unless this call must replace them."
                 ),
             ),
