@@ -8,7 +8,6 @@ class ToolCall(BaseModel):
     tool_name: str
     tool_input: dict = Field(default_factory=dict)
     iteration: int
-    reason: str | None = None
 
 
 class ToolObservation(BaseModel):
@@ -25,11 +24,7 @@ class ReActTranscriptStep(BaseModel):
     """One structured Thought/Action/Observation memory fragment."""
 
     iteration: int
-    question: str | None = None
     thought: str | None = None
-    phase: str | None = None
-    action_intention: str | None = None
-    action_reason: str | None = None
     action: str
     action_input: dict = Field(default_factory=dict)
     observation: ToolObservation | None = None

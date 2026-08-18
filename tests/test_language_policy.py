@@ -8,6 +8,7 @@ from core.database.llm_query import LLMQueryGenerator
 from prompts.data_agent import DataAgentPromptBuilder
 from runtime.request_state import build_conversation_state, build_request_state
 from runtime.plain_chat import PlainChatService
+from runtime.prompt_locale import prompt_locale_instruction
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
@@ -61,6 +62,18 @@ def test_data_agent_prompt_exposes_language_policy():
     assert "task.response_language controls all natural-language fields" in system_prompt
     assert "当前查询语言：简体中文" in system_prompt
     assert context["task"]["response_language"] == "zh"
+
+
+def test_prompt_locale_keeps_machine_timestamps_but_humanizes_user_facing_time():
+    zh_instruction = prompt_locale_instruction("zh")
+    en_instruction = prompt_locale_instruction("en")
+
+    assert "2023年1月4日 23:48（UTC）" in zh_instruction
+    assert "即使这些自然语言位于 JSON 字符串字段内" in zh_instruction
+    assert "结构化数据、JSON、引用、定位器与代码中的时间值保持原样" in zh_instruction
+    assert "Jan 4, 2023 at 11:48 PM UTC" in en_instruction
+    assert "prose is carried in a JSON string field" in en_instruction
+    assert "keep timestamp values unchanged in structured data" in en_instruction
 
 
 def test_llm_query_prompt_carries_response_language():

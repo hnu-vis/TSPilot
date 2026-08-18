@@ -1,6 +1,7 @@
 """Anomaly tool placeholder."""
 from __future__ import annotations
 
+import asyncio
 import re
 
 from pydantic import BaseModel, Field, model_validator
@@ -12,6 +13,7 @@ from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsightRequest
 from schemas.timeseries import AnomalyResult
 from tools.base import BaseTool, StructuredToolError
+from runtime.timeout_policy import load_timeout_policy
 
 
 class AnomalyInput(BaseModel):
@@ -29,6 +31,13 @@ class AnomalyInput(BaseModel):
 
 
 class AnomalyTool(BaseTool):
+    def __init__(self, *, external_request_timeout_seconds: float | None = None):
+        self._external_request_timeout_seconds = float(
+            external_request_timeout_seconds
+            if external_request_timeout_seconds is not None
+            else load_timeout_policy().tool("anomaly").stage_seconds("external_request_seconds")
+        )
+
     async def execute(self, validated_input: AnomalyInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
         database_evidence = validated_input.database_evidence
@@ -57,7 +66,10 @@ class AnomalyTool(BaseTool):
             ) from exc
         detector_name = validated_input.detector_name or constraints.get("detector_name") or default_anomaly_detector_name()
         detector = get_anomaly_detector(detector_name)
-        detector_output = detector.detect(series, params=constraints)
+        detector_output = await asyncio.wait_for(
+            asyncio.to_thread(detector.detect, series, params=constraints),
+            timeout=self._external_request_timeout_seconds,
+        )
         anomaly_points = detector_output.anomaly_points
         return AnomalyResult(
             anomaly_id=f"anomaly_{database_evidence.evidence_id}",

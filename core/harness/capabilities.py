@@ -85,6 +85,24 @@ class CapabilityRegistry:
                 return dict(spec.card.input_defaults)
         return {}
 
+    def semantic_input_fields_for_action(self, action_name: str) -> set[str]:
+        """Return the model-visible tool contract fields for an action.
+
+        Capability cards are already the single source of truth for what the
+        outer ReAct agent may provide. Reusing that contract keeps runtime-only
+        context out of Action traces without maintaining a second per-tool
+        allowlist.
+        """
+
+        for spec in self._specs.values():
+            if spec.card and spec.card.action == action_name:
+                return {
+                    parameter.removesuffix("?")
+                    for parameter in spec.card.parameters
+                    if parameter.removesuffix("?")
+                }
+        return set()
+
     def task_type_for_capability(self, capability_id: str) -> str:
         normalized = self.normalize_id(capability_id)
         spec = self._specs.get(normalized)
@@ -192,7 +210,15 @@ def default_capability_registry() -> CapabilityRegistry:
                         "Need grounded database evidence. Describe the evidence needed in natural language; "
                         "schema linking, query generation, dialect handling, and validation happen inside the tool."
                     ),
-                    parameters=("message", "purpose?", "time_range?", "constraints?", "insight_requests?"),
+                    parameters=(
+                        "message",
+                        "purpose?",
+                        "time_range?",
+                        "constraints?",
+                        "insight_requests?",
+                        "mode?",
+                        "repair_contract?",
+                    ),
                 ),
                 aliases=("database_query", "database", "sql"),
                 task_types=("query", "database", "database_evidence", "sql"),

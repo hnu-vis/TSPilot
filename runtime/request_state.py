@@ -9,10 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.settings import Settings
-from core.completion import (
-    evaluate_goal_completion,
-    normalize_todo_for_completion,
-)
+from core.completion import normalize_todo_for_completion
 from core.intent import build_intent_profile_fallback
 from core.database.dialects import query_language_for_database_type
 from core.harness.observation_view import public_observation_view
@@ -315,19 +312,12 @@ def append_react_transcript_step(
     action: str,
     action_input: dict | None,
     observation: ToolObservation | None,
-    action_intention: str | None = None,
-    action_reason: str | None = None,
-    phase: str | None = None,
 ) -> ReActTranscriptStep:
     """Append a DB-GPT-style structured ReAct memory fragment."""
 
     step = ReActTranscriptStep(
         iteration=iteration,
-        question=request_state.message,
         thought=thought,
-        phase=phase,
-        action_intention=action_intention,
-        action_reason=action_reason,
         action=action,
         action_input=action_input or {},
         observation=observation,
@@ -564,9 +554,6 @@ def apply_observation(
     observation: ToolObservation,
     full_payload: dict,
     tool_spec: "ToolSpec",
-    *,
-    thought: str | None = None,
-    action_reason: str | None = None,
 ) -> ToolObservation:
     from core.harness import StateTransitionEngine
 
@@ -583,9 +570,6 @@ async def apply_observation_async(
     observation: ToolObservation,
     full_payload: dict,
     tool_spec: "ToolSpec",
-    *,
-    thought: str | None = None,
-    action_reason: str | None = None,
 ) -> ToolObservation:
     from core.harness import StateTransitionEngine
 
@@ -632,6 +616,7 @@ def enrich_observation_payload(
         payload = {
             "status": full_payload.get("status", "created"),
             "summary": full_payload.get("summary"),
+            "unavailable_reason": full_payload.get("unavailable_reason"),
             "visualization_ids": full_payload.get("visualization_ids", []),
             "grounded_by": _outer_grounding_refs(full_payload.get("source_refs", [])),
             "verification": _visualization_verification_receipts(visualizations),
@@ -646,12 +631,6 @@ def enrich_observation_payload(
                 for item in full_payload.get("visualizations", [])
                 if isinstance(item, dict) and item.get("visualization_id")
             ],
-        }
-    latest_goal = request_state.completion_state.get("latest_goal")
-    if isinstance(payload, dict) and isinstance(latest_goal, dict):
-        payload["coverage_delta"] = {
-            "can_answer": latest_goal.get("can_answer"),
-            "missing_outputs": latest_goal.get("missing_evidence", []),
         }
     payload = _deduplicate_observation_payload(observation, payload)
     return observation.model_copy(
@@ -696,6 +675,7 @@ def _visualization_verification_receipts(visualizations) -> list[dict]:
             })
         receipts.append({
             "visualization_id": item.get("visualization_id"),
+            "verification": item.get("verification"),
             "full_fidelity": bool(item.get("data_ref")) and bool(datasets) and all(
                 isinstance(dataset.get("row_count"), int)
                 for dataset in datasets
@@ -816,7 +796,6 @@ def _apply_todo_payload(request_state: RequestStateModel, full_payload: dict) ->
             request_state.max_iterations,
             min(20, len(request_state.todo_list) * 3 + 2),
         )
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
 def _complete_answer_todo_after_terminal(
@@ -825,7 +804,6 @@ def _complete_answer_todo_after_terminal(
     full_payload: dict,
 ) -> None:
     if not request_state.todo_list:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
     if current_index is None:
@@ -842,7 +820,6 @@ def _complete_answer_todo_after_terminal(
             "todo_index": current_index,
             "todo": current_todo,
         }
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current_todo = normalize_todo_for_completion(current_todo)
     if not _has_final_answer_payload(full_payload):
@@ -856,7 +833,6 @@ def _complete_answer_todo_after_terminal(
             "todo_index": current_index,
             "todo": current_todo,
         }
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     ref = "final_answer:latest"
     current_todo = _complete_todo_at_index(
@@ -875,7 +851,6 @@ def _complete_answer_todo_after_terminal(
         "todo_index": current_index,
         "todo": current_todo,
     }
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
 def _advance_todo_after_artifact(
@@ -891,11 +866,9 @@ def _advance_todo_after_artifact(
     advancing a todo whose user-visible acceptance criteria are still unmet.
     """
     if not request_state.todo_list:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "in_progress"), None)
     if current_index is None:
-        request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
         return
     current = normalize_todo_for_completion(dict(request_state.todo_list[current_index]))
     task_type = str(current.get("task_type") or "").strip().lower()
@@ -919,7 +892,6 @@ def _advance_todo_after_artifact(
         "todo_index": current_index,
         "todo": current,
     }
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
 
 
 def _sync_todos_from_artifact_state(request_state: RequestStateModel) -> bool:

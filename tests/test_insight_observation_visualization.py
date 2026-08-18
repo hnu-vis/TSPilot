@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from core.key_insight.runtime import register_key_insights_from_payload
-from runtime.request_state import build_request_state
+from core.visualization import VisualizationMaterializer
+from runtime.request_state import build_request_state, public_final_answer
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightItem
@@ -15,8 +16,6 @@ from schemas.state import RequestStateModel
 from schemas.tool import ToolCall
 from tools.anomaly import AnomalyInput
 from tools.forecast import ForecastInput
-from tools.format_answer import FormatAnswerInput, FormatAnswerTool
-from runtime.request_state import public_final_answer
 
 
 def _evidence() -> DatabaseEvidence:
@@ -40,7 +39,7 @@ def _evidence() -> DatabaseEvidence:
     )
 
 
-def test_collection_insight_preserves_item_identity_and_generates_answer_visualization():
+def test_collection_insight_preserves_item_identity_for_visualization():
     request_state = RequestStateModel(
         request_id="req_observation_viz",
         message="最近三天的价格",
@@ -76,27 +75,27 @@ def test_collection_insight_preserves_item_identity_and_generates_answer_visuali
             "analysis_id": "ana_recent_three_days",
             "analysis_goal": "recent three days",
             "input_evidence_id": "evi_observation_viz",
-            "result": {
-                "insights": [
-                    {
-                        "insight_key": "price.recent_3_days",
-                        "name": "recent three days",
-                        "insight_type": "value",
-                        "semantic_class": "measurement_series",
-                        "derivation": "select_recent",
-                        "value_shape": "series",
-                        "statement": "The recent three daily prices are 10, 12, and 15.",
-                        "value": [
-                            {"item_id": "day-1", "timestamp": "2023-01-01", "value": 10.0},
-                            {"item_id": "day-2", "timestamp": "2023-01-02", "value": 12.0},
-                            {"item_id": "day-3", "timestamp": "2023-01-03", "value": 15.0},
-                        ],
-                        "calculation_trace": {"selection_rule": "recent three observations"},
-                    }
+            "produced_insights": [{
+                "insight_id": "ins_recent_three_days",
+                "insight_key": "price.recent_3_days",
+                "name": "recent three days",
+                "insight_type": "value",
+                "semantic_class": "measurement_series",
+                "derivation": "select_recent",
+                "value_shape": "series",
+                "statement": "The recent three daily prices are 10, 12, and 15.",
+                "items": [
+                    {"item_id": "day-1", "timestamp": "2023-01-01", "value": 10.0},
+                    {"item_id": "day-2", "timestamp": "2023-01-02", "value": 12.0},
+                    {"item_id": "day-3", "timestamp": "2023-01-03", "value": 15.0},
                 ],
-                "metrics": {},
-                "details": {},
-            },
+                "method": "code_interpreter",
+                "evidence_refs": [
+                    {"source_type": "analysis", "source_id": "ana_recent_three_days"},
+                    {"source_type": "query", "source_id": "evi_observation_viz"},
+                ],
+                "calculation_trace": {"selection_rule": "recent three observations"},
+            }],
         },
     )
 
@@ -104,31 +103,19 @@ def test_collection_insight_preserves_item_identity_and_generates_answer_visuali
     assert coverage.verified == ["recent three days"]
     assert insight.value_shape == "series"
     assert [item.item_id for item in insight.items] == ["day-1", "day-2", "day-3"]
-    assert all(item.evidence_refs for item in insight.items)
+    assert insight.evidence_refs
 
-    answer = asyncio.run(
-        FormatAnswerTool().execute(
-            FormatAnswerInput(response_plan=FinalResponsePlan(
-                summary=insight.statement,
-                sections=[PlannedAnswerSection(
-                    section_type="insights", content=insight.statement, source_refs=[f"insight:{insight.insight_id}"],
-                )],
-                visual_goals=[VisualGoal(
-                    purpose="show recent observations", title="Recent three days",
-                    required_roles=["observations"],
-                    layers=[VisualLayerPlan(
-                        role="observations", source_ref=f"insight:{insight.insight_id}", mark="line",
-                        encoding={"x": "timestamp", "y": "value"},
-                    )],
-                )],
-            )),
-            request_state=request_state,
-        )
-    )
-    visualization = next(item for item in answer["visualizations"] if f"insight:{insight.insight_id}" in item["source_refs"])
-    assert visualization["schema_version"] == "3"
-    assert len(visualization["bindings"]) == 3
-    assert answer["claims"][0]["item_ids"] == ["day-1", "day-2", "day-3"]
+    visualization = VisualizationMaterializer(request_state).materialize(VisualGoal(
+        purpose="show recent observations", title="Recent three days",
+        required_roles=["observations"],
+        layers=[VisualLayerPlan(
+            role="observations", source_ref=f"insight:{insight.insight_id}", mark="line",
+            encoding={"x": "timestamp", "y": "value"},
+        )],
+    ))
+    assert visualization.schema_version == "3"
+    assert len(visualization.bindings) == 3
+    assert {binding.item_id for binding in visualization.bindings} == {"day-1", "day-2", "day-3"}
 
 
 def test_pairwise_insight_items_can_point_to_source_items():

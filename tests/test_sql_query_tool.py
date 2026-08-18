@@ -529,7 +529,13 @@ async def test_sql_query_automatic_mode_executes_llm_generated_query(monkeypatch
     assert result["diagnostics"]["llm_query_generation"]["task_coverage"]["missing"] == [
         "trend conclusion still needs analysis"
     ]
-    prompt_payload = __import__("json").loads(llm.messages[0][1][1].split("LLM SQL Query Generation JSON:\n", 1)[1])
+    prompt_text = llm.messages[0][1][1]
+    prompt_label = next(
+        label
+        for label in ("LLM SQL Query Generation JSON:\n", "LLM 查询生成输入 JSON：\n")
+        if label in prompt_text
+    )
+    prompt_payload = __import__("json").loads(prompt_text.split(prompt_label, 1)[1])
     schema_linking = prompt_payload["request"]["schema_preview"]["schema_linking"]
     assert schema_linking["sources"][0]["name"] == "prices"
     assert result["diagnostics"]["schema_linking_generation"]["sources"][0]["name"] == "prices"

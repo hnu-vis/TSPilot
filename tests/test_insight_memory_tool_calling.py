@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, Field
@@ -15,7 +16,10 @@ from core.key_insight.retriever import (
     _contract_anchor_details,
     _recipe_dependency_closure,
 )
+from runtime.react_loop import ReActLoop
 from runtime.tool_executor import ToolExecutor
+from schemas.agent_turn import ReActTurn
+from schemas.database_context import DatabaseContext
 from schemas.key_insight import KeyInsight, KeyInsightRequest, MemoryCard, MemoryDetail
 from schemas.task_contract import TaskContract, TaskContractOutput
 from schemas.state import ConversationStateModel, RequestStateModel
@@ -173,7 +177,7 @@ class FallbackPlanningLLM:
         }))
 
 
-def _registry(tool_name: str = "sql_query") -> ToolRegistry:
+def _registry(tool_name: str = "sql_query", *, result_target: str = "evidence") -> ToolRegistry:
     return ToolRegistry(
         [
             ToolSpec(
@@ -184,7 +188,7 @@ def _registry(tool_name: str = "sql_query") -> ToolRegistry:
                 tool=EchoTool(),
                 prompt_visible=True,
                 runtime_access="none",
-                result_target="evidence",
+                result_target=result_target,
                 produces_terminal_payload=False,
                 supports_streaming=False,
             )
@@ -207,9 +211,14 @@ async def test_tool_executor_injects_memory_insight_requests_into_tool_call():
     executor = ToolExecutor(_registry(), memory_retriever=retriever)
     request_state = _request_state()
     request_state.iteration = 1
-    result = await executor.execute(
+    prepared = await executor.prepare(
         "sql_query",
         {"message": request_state.message},
+        request_state,
+    )
+    react_input = executor.react_action_input(prepared)
+    result = await executor.execute_prepared(
+        prepared,
         request_state,
         ConversationStateModel(conversation_id="conv_memory"),
     )
@@ -217,13 +226,97 @@ async def test_tool_executor_injects_memory_insight_requests_into_tool_call():
     insight_requests = result.full_payload["insight_requests"]
     assert insight_requests[0]["name"] == "max_value"
     assert insight_requests[0]["insight_type"] == "extreme"
-    assert insight_requests[0]["requirements"]["source"] == "memory"
-    assert request_state.tool_history[-1].tool_input["insight_requests"] == insight_requests
-    assert request_state.tool_history[-1].tool_input["constraints"]["memory_diagnostics"]["selected_card_ids"] == [
-        "recipe.sql_query.extreme.max_value"
-    ]
+    assert "source" not in insight_requests[0].get("requirements", {})
+    assert request_state.tool_history[-1].tool_input == prepared.action_input
+    assert set(react_input) == {"message", "insight_requests"}
+    assert react_input["insight_requests"] == prepared.action_input["insight_requests"]
+    assert "database_context" not in react_input
+    assert "intent_profile" not in react_input
+    assert "history" not in react_input
+    assert "memory_diagnostics" not in request_state.tool_history[-1].tool_input.get("constraints", {})
     assert retriever.calls[0][0] == "sql_query"
     assert request_state.completion_state["memory_context"]["tool_calls"][0]["source"] == "tool_scoped_memory_retrieval"
+
+
+def test_react_action_input_uses_capability_contract_and_artifact_refs():
+    executor = ToolExecutor(_registry("forecast"))
+    evidence = {
+        "evidence_id": "evi_full",
+        "result_type": "timeseries",
+        "data": {"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+    }
+
+    visible = executor.react_proposed_action_input(
+        "forecast",
+        {
+            "database_evidence": evidence,
+            "horizon": 12,
+            "model_name": "linear_regression",
+            "series_name": "price",
+            "constraints": {"confidence": 0.9, "_runtime_only": True},
+            "database_context": {"database_id": "hidden"},
+            "history": [{"role": "user", "content": "hidden"}],
+        },
+    )
+
+    assert visible == {
+        "database_evidence": "evidence:evi_full",
+        "horizon": 12,
+        "model_name": "linear_regression",
+        "series_name": "price",
+        "constraints": {"confidence": 0.9},
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_turn_emits_minimal_thought_executed_action_and_coverage_observation():
+    class _OneTurnAgent:
+        async def next_turn(self, request_state, conversation_state):
+            return ReActTurn(
+                thought=(
+                    "当前没有数据库证据；需要先查询最大值，这个最小动作将产生回答所需的原子 Insight。"
+                ),
+                action="sql_query",
+                action_input={"message": "查询最大值"},
+            )
+
+    state = _request_state("查询最大值")
+    state.database_context = DatabaseContext(database_id="demo", database_type="sql")
+    state.requested_capabilities = ["query"]
+    state.max_iterations = 1
+    executor = ToolExecutor(_registry(result_target="none"), memory_retriever=ToolScopedRetriever())
+    loop = ReActLoop(
+        data_agent=_OneTurnAgent(),
+        tool_executor=executor,
+        settings=SimpleNamespace(
+            conversation_log_enabled=False,
+            resolved_conversation_log_dir=".",
+        ),
+    )
+
+    events = [
+        event async for event in loop._iterate(
+            state,
+            ConversationStateModel(conversation_id="conv_memory"),
+        )
+    ]
+
+    thought = next(event.payload for event in events if event.event_type == "thought")
+    action = next(event.payload for event in events if event.event_type == "action")
+    output = next(event.payload for event in events if event.event_type == "action_output")
+    assert set(thought) == {"iteration", "thought"}
+    assert set(action) == {"iteration", "action", "action_input"}
+    assert action["action"] == "sql_query"
+    assert set(action["action_input"]) == {"message", "insight_requests"}
+    assert "database_context" not in action["action_input"]
+    assert "memory_diagnostics" not in json.dumps(action["action_input"])
+    assert output["observations"]["coverage_delta"] == {
+        "can_answer": False,
+        "missing_outputs": ["database_evidence"],
+    }
+    assert set(state.react_transcript[0].model_dump()) == {
+        "iteration", "thought", "action", "action_input", "observation",
+    }
 
 
 @pytest.mark.asyncio
@@ -253,15 +346,16 @@ async def test_code_interpreter_explicit_contract_is_not_expanded_by_memory():
         "name": "Period change",
         "insight_type": "difference",
     }
+    state = _request_state("calculate change")
 
     merged = await executor._apply_insight_memory(
         "code_interpreter",
         {"analysis_goal": "calculate change", "insight_requests": [explicit], "constraints": {}},
-        _request_state("calculate change"),
+        state,
     )
 
     assert merged["insight_requests"] == [explicit]
-    diagnostics = merged["constraints"]["memory_diagnostics"]
+    diagnostics = state.completion_state["memory_context"]["tool_calls"][0]
     assert diagnostics["explicit_contract_authoritative"] is True
     assert diagnostics["insight_request_count"] == 0
 

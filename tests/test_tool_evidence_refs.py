@@ -16,7 +16,13 @@ from tools.forecast import ForecastInput, ForecastTool
 class _BinderLLM:
     async def ainvoke(self, _messages):
         return SimpleNamespace(content=json.dumps({
-            "bindings": [{"insight_key": "point_count", "statement": "There are six points."}]
+            "bindings": [{
+                "insight_key": "point_count",
+                "supported": True,
+                "unsupported_reason": None,
+                "statement": "There are six points.",
+                "derived_from": [],
+            }]
         }))
 
 

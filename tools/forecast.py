@@ -16,6 +16,7 @@ from core.database.dialects import dialect_for_database
 from core.timeseries.evidence_resolution import resolve_database_evidence
 from core.timeseries.forecast_registry import default_forecast_model_name, get_forecast_model
 from core.timeseries.normalization import normalize_timeseries_evidence
+from runtime.timeout_policy import load_timeout_policy
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsightRequest
 from schemas.timeseries import ForecastPlan, ForecastResult, TimeSeriesSeries
@@ -104,8 +105,25 @@ class _ForecastInputAssessment(BaseModel):
 
 
 class ForecastTool(BaseTool):
-    def __init__(self, llm=None):
+    def __init__(
+        self,
+        llm=None,
+        *,
+        llm_timeout_seconds: float | None = None,
+        external_request_timeout_seconds: float | None = None,
+    ):
+        policy = load_timeout_policy().tool("forecast")
         self._llm = llm
+        self._llm_timeout_seconds = float(
+            llm_timeout_seconds
+            if llm_timeout_seconds is not None
+            else policy.stage_seconds("llm_call_seconds")
+        )
+        self._external_request_timeout_seconds = float(
+            external_request_timeout_seconds
+            if external_request_timeout_seconds is not None
+            else policy.stage_seconds("external_request_seconds")
+        )
 
     async def execute(self, validated_input: ForecastInput, **kwargs) -> dict:
         request_state = kwargs.get("request_state")
@@ -157,15 +175,22 @@ class ForecastTool(BaseTool):
         model_name = validated_input.model_name or constraints.get("model_name") or default_forecast_model_name()
         model = get_forecast_model(model_name)
         if forecast_plan.mode == "rolling":
-            model_output = _rolling_forecast(
-                model=model,
-                series=series,
-                horizon=horizon,
-                chunk_steps=forecast_plan.recommended_chunk_steps or forecast_plan.max_direct_steps,
-                params=constraints,
+            model_output = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _rolling_forecast,
+                    model=model,
+                    series=series,
+                    horizon=horizon,
+                    chunk_steps=forecast_plan.recommended_chunk_steps or forecast_plan.max_direct_steps,
+                    params=constraints,
+                ),
+                timeout=self._external_request_timeout_seconds,
             )
         else:
-            model_output = model.forecast(series, horizon=horizon, params=constraints)
+            model_output = await asyncio.wait_for(
+                asyncio.to_thread(model.forecast, series, horizon=horizon, params=constraints),
+                timeout=self._external_request_timeout_seconds,
+            )
         forecast_points = model_output.forecast_points
         return ForecastResult(
             forecast_id=f"forecast_{database_evidence.evidence_id}",
@@ -244,7 +269,9 @@ class ForecastTool(BaseTool):
                     runnable = self._llm.with_structured_output(
                         _ForecastInputAssessment, method="json_schema", include_raw=True,
                     )
-                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    bundle = await asyncio.wait_for(
+                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     if isinstance(bundle, dict):
                         parsed = bundle.get("parsed")
                         if parsed is None:
@@ -252,7 +279,9 @@ class ForecastTool(BaseTool):
                     else:
                         parsed = bundle
                     return parsed if isinstance(parsed, _ForecastInputAssessment) else _ForecastInputAssessment.model_validate(parsed)
-                response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                response = await asyncio.wait_for(
+                    self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                )
                 return _ForecastInputAssessment.model_validate_json(str(getattr(response, "content", response)))
             except Exception as exc:
                 last_error = exc

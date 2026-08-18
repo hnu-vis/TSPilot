@@ -6,15 +6,18 @@ Define the system prompt and prompt builder for the single outer `data_agent`.
 
 ## Prompt contract
 
-The model must produce one ReAct block per turn:
+The model must produce one JSON ReAct turn with:
 
-- `Thought:`
-- `Action:`
-- `Action Input:`
+- `thought`
+- `task_contract`
+- `previous_observation_assessment`
+- `action`
+- `action_input`
 
 `Observation:` is runtime-owned and must not be emitted by the model.
 
-`Action Input` must be a single JSON object.
+`action_input` must be a single JSON object. `thought` is the only decision
+explanation; separate intention and reason fields are not part of the contract.
 
 ## Model-visible context
 
@@ -22,15 +25,16 @@ The prompt builder may expose only a bounded view of runtime state:
 
 - current user message
 - normalized `database_context`
-- optional legacy `selected_database` / `selected_database_type`
 - time range and constraints
 - bounded recent conversation messages
 - minimal execution state
 - current todo list
-- latest observation summaries
-- latest evidence / analysis payloads
-- verified insights
-- visualizations
+- a compact artifact reference inventory
+- bounded immutable artifact facts needed to quote exact values in the final
+  answer; these facts are presentation receipts, not inputs for new calculation
+- the latest Action Output observation
+- verified Insight state
+- a bounded recent Thought / Action / Observation trajectory
 - `prompt_context_summary` when older context has been compacted
 
 The model-visible context must not expose runtime completion or repair state as
@@ -51,6 +55,7 @@ The model must treat anything outside that window as unavailable.
 - `code_interpreter`
 - `forecast`
 - `anomaly`
+- `visualization`
 - `rag`
 - `skill`
 - `terminate`
@@ -62,29 +67,45 @@ The model must treat anything outside that window as unavailable.
 - provide the action input contract for each action
 - instruct the model to prefer evidence-grounded output
 - instruct the model to rely on verified insights only
-- instruct the model to prefer deterministic recovery over guessing
+- instruct the model to use grounded LLM-guided repair or return structured
+  unavailability instead of guessing
 - instruct the model to identify user-visible task outputs before choosing tools
 - prevent fixed tool-chain templates for database-computable statistics
 
 ## Task-first evidence rule
 
 - First translate the request into a task output contract: required measures, dimensions, time scope, grouping, comparisons, derived quantities, model outputs, and evidence quality notes.
-- After each observation, write `previous_observation_assessment` as the gap between the task output contract and current evidence: `covered`, `missing`, `can_answer`, and `next_action_reason`.
+- After each observation, write `previous_observation_assessment` as the gap
+  between the task output contract and current evidence. Do not duplicate this
+  decision as separate intention/reason fields. The assessment accepts only the
+  immediately active Todo; runtime computes Todo transitions.
 - Choose tools to produce missing contract fields from grounded evidence; do not hard-code a tool chain for a task phrase.
 - Database-computable work should be satisfied by `sql_query` when returned columns or result shape explicitly cover the contract.
 - Use `code_interpreter` after SQL evidence is grounded for requested derived or analytical Key Insights.
 - Every call must carry exact, non-empty `insight_requests`; Python code is optional because generation is internal.
 - Generated Python receives canonical variables `df`, `time`, `value`, `time_col`, `value_col`, `series`, and `analysis_context`, plus compatibility variables. It emits only `computed_insights` and optional `derived_evidence`.
 - Formal statements and Insight semantics are added by the independent LLM Insight Binder without changing computed values.
+- A user-facing conclusion is one atomic Insight. Its calculation method and
+  provenance belong in `calculation_trace` and `evidence_refs`; method/basis and
+  display-context carrier Insights must not be requested separately.
+- A visualization Action explicitly cites the verified target Insight. The
+  visualization tool parses its evidence lineage and loads the related complete
+  data; the outer Action does not duplicate contextual artifact refs.
+- A line or area is meaningful only with at least two grounded points per
+  series. Scalar method/boundary receipts cannot become decorative line layers.
 - `missing` is only for explicitly requested core outputs that cannot be answered from current evidence. Do not put optional drill-downs, caveats, nicer formatting, or quality notes in `missing`.
 - Do not set `can_answer=true` while `missing` contains core requested outputs. If the core request is answerable, set `can_answer=true` and keep `missing` empty. Terminate with truly missing core outputs only when the terminal input explicitly includes `unavailable_outputs` and `unavailable_reason`; both fields must remain visible in the compact terminate action contract.
+- Final citations prefer exact semantic Insight keys. Opaque Insight IDs are
+  copied verbatim when needed and are never reconstructed by the model.
+- Machine-readable timestamps remain unchanged in structured artifacts,
+  citations, locators, JSON, and code. User-facing prose, titles, and chart
+  annotations render absolute times naturally in the response language while
+  retaining the precision and timezone required by the evidence.
 
 ## Example ReAct turn
 
-```text
-Thought: I need evidence before deciding the insights.
-Action: sql_query
-Action Input: {"message":"最近7天CPU有什么趋势？","database_context":{"database_id":"prometheus-prod","database_type":"prometheus","display_name":"Prometheus Prod"},"time_range":{"start":"2026-07-07T00:00:00Z","end":"2026-07-14T00:00:00Z"},"constraints":{"max_points":100},"history":[]}
+```json
+{"thought":"当前没有数据库证据；需要先取得完整区间序列，再判断可计算的趋势 Insight。","task_contract":null,"previous_observation_assessment":null,"action":"sql_query","action_input":{"message":"查询最近7天 CPU 的完整时序数据，供趋势计算和可视验证使用。","time_range":{"start":"2026-07-07T00:00:00Z","end":"2026-07-14T00:00:00Z"}}}
 ```
 
 ## Action input contracts
@@ -107,15 +128,16 @@ Optional fields:
 Required fields:
 
 - `message`
-- `database_context`
-- `time_range`
-- `constraints`
 
 Optional fields:
 
-- `selected_database`
-- `selected_database_type`
-- `history`
+- `purpose`
+- `time_range`
+- `constraints`
+- `insight_requests`
+
+Runtime database context, intent profile, selected-database metadata, and
+conversation history are injected internally and are not Action fields.
 
 ### `forecast`
 
@@ -295,10 +317,11 @@ The prompt should guide the model with this order:
 - `Action` must name exactly one allowed action
 - `Action Input` must satisfy the selected action contract
 - `Observation` is not model output
-- prefer deterministic recovery or a failed observation over guessing when required fields are missing
+- use the structured LLM repair path or a failed observation instead of guessing
 - treat `sql_query` output as evidence, not as a final answer
 - use only selected `insight_set` insights from the current request flow in final narration
-- prefer `linechart` for time-indexed or ratio/comparison insights when the evidence supports it
+- let visualization choose a grounded renderer-native mark from the verified
+  relationship and its related data
 - do not emit hidden state changes outside the structured block
 - do not emit `Observation`
 - treat `terminate` as the final model-visible action

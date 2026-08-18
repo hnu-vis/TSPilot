@@ -12,6 +12,7 @@ from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
 from schemas.output import FinalResponsePlan, PlannedAnswerSection, VisualGoal, VisualLayerPlan
+from schemas.visual_verification import VisualizationVerification
 from tools.base import StructuredToolError
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
@@ -72,6 +73,112 @@ def test_format_answer_references_existing_visualization_without_second_llm_call
     assert visualization["datasets"][0]["series"] == []
     assert visualization["datasets"][0]["source_ref"] == "view:evidence:evi_prices:default"
     assert result["claims"][0]["visualization_ids"] == [visualization["visualization_id"]]
+
+
+def test_format_answer_creates_a_visible_claim_for_an_approved_unmapped_verification(tmp_path):
+    state = _state()
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_trend",
+        insight_key="observed_trend",
+        name="Observed trend",
+        insight_type="trend",
+        statement="Prices rose across the observed interval.",
+        value={"direction": "up"},
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
+    )]
+    complete = VisualizationMaterializer(state).materialize(
+        _trend_goal(),
+        verification=VisualizationVerification(
+            target_insight_ids=["insight_trend"],
+            verification_question="Does the complete series rise across the interval?",
+            interpretation="The complete observed series supports the upward-trend insight.",
+        ),
+    )
+    descriptor = VisualizationArtifactStore(tmp_path).put(complete)
+    state.visualizations = [descriptor]
+    plan = FinalResponsePlan(
+        summary="Prices rose.",
+        sections=[],
+        visualization_ids=[descriptor.visualization_id],
+    )
+
+    result = asyncio.run(FormatAnswerTool().execute(
+        FormatAnswerInput(response_plan=plan),
+        request_state=state,
+    ))
+
+    assert result["claims"] == [{
+        "claim_id": f"claim_visualization_{descriptor.visualization_id}",
+        "text": "The complete observed series supports the upward-trend insight.",
+        "insight_ids": ["insight_trend"],
+        "item_ids": [],
+        "analysis_ids": [],
+        "artifact_type": None,
+        "artifact_ids": [],
+        "evidence_ids": [],
+        "visualization_ids": [descriptor.visualization_id],
+    }]
+
+
+def test_visual_verification_links_claims_through_target_insight_provenance(tmp_path):
+    state = _state()
+    analysis = AnalysisResult(
+        analysis_id="ana_trend",
+        analysis_goal="calculate the observed trend",
+        code_hash="sha256:trend",
+        input_evidence_id="evi_prices",
+        input_row_count=3,
+        status="succeeded",
+        summary="Calculated the trend.",
+        computed_insights=[ComputedInsight(
+            insight_key="observed_trend",
+            value={"direction": "up"},
+            calculation_trace={"formula": "last > first"},
+        )],
+    )
+    state.analysis_artifacts[analysis.analysis_id] = analysis
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_trend",
+        insight_key="observed_trend",
+        name="Observed trend",
+        insight_type="trend",
+        statement="Prices rose across the observed interval.",
+        value={"direction": "up"},
+        method="code_interpreter",
+        evidence_refs=[
+            InsightEvidenceRef(source_type="analysis", source_id="ana_trend"),
+            InsightEvidenceRef(source_type="query", source_id="evi_prices"),
+        ],
+    )]
+    descriptor = VisualizationArtifactStore(tmp_path).put(
+        VisualizationMaterializer(state).materialize(
+            _trend_goal(),
+            verification=VisualizationVerification(
+                target_insight_ids=["insight_trend"],
+                verification_question="Does the complete series rise across the interval?",
+                interpretation="The complete series lets the user inspect the trend.",
+            ),
+        )
+    )
+    state.visualizations = [descriptor]
+    plan = FinalResponsePlan(
+        summary="Prices rose.",
+        sections=[PlannedAnswerSection(
+            section_type="analysis",
+            content="Prices rose across the observed interval.",
+            source_refs=["analysis:ana_trend"],
+        )],
+        visualization_ids=[descriptor.visualization_id],
+    )
+
+    result = asyncio.run(FormatAnswerTool().execute(
+        FormatAnswerInput(response_plan=plan),
+        request_state=state,
+    ))
+
+    assert result["claims"][0]["analysis_ids"] == ["ana_trend"]
+    assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
 
 
 def test_format_answer_accepts_selected_visualization_as_section_source(tmp_path):

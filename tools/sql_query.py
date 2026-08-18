@@ -18,6 +18,7 @@ from schemas.database_context import DatabaseContext
 from schemas.key_insight import KeyInsightRequest
 from core.key_insight.contracts import insight_request_contract_error
 from tools.base import BaseTool, StructuredToolError
+from runtime.timeout_policy import TimeoutPolicy, load_timeout_policy
 
 
 class _ExplicitQueryInput(BaseModel):
@@ -109,8 +110,25 @@ class SqlQueryInput(BaseModel):
 class _ExplicitQueryExecutor(BaseTool):
     """Run a safe model-authored read-only query."""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        connection_timeout_seconds: float | None = None,
+        query_timeout_seconds: float | None = None,
+    ):
+        policy = load_timeout_policy(settings.resolved_timeout_config_path).tool("sql_query")
         self._settings = settings
+        self._connection_timeout_seconds = float(
+            connection_timeout_seconds
+            if connection_timeout_seconds is not None
+            else policy.stage_seconds("connection_seconds")
+        )
+        self._query_timeout_seconds = float(
+            query_timeout_seconds
+            if query_timeout_seconds is not None
+            else policy.stage_seconds("query_seconds")
+        )
 
     async def execute(self, validated_input: _ExplicitQueryInput, **kwargs) -> dict:
         return await self.execute_query_input(validated_input, mode="explicit")
@@ -176,7 +194,7 @@ class _ExplicitQueryExecutor(BaseTool):
                     query=query,
                     query_language=validated_input.query_language or self._infer_query_language(config),
                     constraints=validated_input.constraints,
-                    timeout=int(validated_input.constraints.get("timeout", config.get("query_timeout", 60))),
+                    timeout=int(self._query_timeout_seconds),
                 )
             except StructuredToolError:
                 raise
@@ -300,7 +318,11 @@ class _ExplicitQueryExecutor(BaseTool):
             raise FileNotFoundError(
                 f"Database config for '{database_id}' was not found in {self._settings.resolved_database_config_dir}"
             )
-        return dict(config)
+        return {
+            **dict(config),
+            "timeout": int(self._connection_timeout_seconds),
+            "query_timeout": int(self._query_timeout_seconds),
+        }
 
     def _validate_read_only(self, query: str, query_language: str | None) -> None:
         dialect_for_database(self._database_type_from_language(query_language, query)).validate_read_only(query, query_language)
@@ -589,9 +611,28 @@ class _ExplicitQueryExecutor(BaseTool):
 class SqlQueryTool(BaseTool):
     """Unified database query tool for planned and explicit read-only queries."""
 
-    def __init__(self, settings: Settings, llm=None):
-        self._explicit_query_executor = _ExplicitQueryExecutor(settings)
-        self._llm_query_generator = LLMQueryGenerator(llm) if llm is not None else None
+    def __init__(
+        self,
+        settings: Settings,
+        llm=None,
+        *,
+        timeout_policy: TimeoutPolicy | None = None,
+    ):
+        policy = timeout_policy or load_timeout_policy(settings.resolved_timeout_config_path)
+        tool_timeouts = policy.tool("sql_query")
+        self._explicit_query_executor = _ExplicitQueryExecutor(
+            settings,
+            connection_timeout_seconds=tool_timeouts.stage_seconds("connection_seconds"),
+            query_timeout_seconds=tool_timeouts.stage_seconds("query_seconds"),
+        )
+        self._llm_query_generator = (
+            LLMQueryGenerator(
+                llm,
+                timeout_seconds=tool_timeouts.stage_seconds("llm_call_seconds"),
+            )
+            if llm is not None
+            else None
+        )
         self._settings = settings
 
     async def execute(self, validated_input: SqlQueryInput, **kwargs) -> dict:

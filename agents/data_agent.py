@@ -87,7 +87,7 @@ class DataAgent(BaseAgent):
     def _repair_prompt(self, parser_error: ValueError, *, final_attempt: bool) -> str:
         skeleton = (
             '{"thought":"","previous_observation_assessment":null,"task_contract":null,'
-            '"action_intention":null,"action_reason":null,"action":"sql_query","action_input":{}}'
+            '"action":"sql_query","action_input":{}}'
         )
         extra = (
             "This is the final repair attempt. Start from this skeleton and replace action/action_input with the correct next tool call: "
@@ -101,13 +101,12 @@ class DataAgent(BaseAgent):
             "The JSON object must use this schema: "
             "{\"thought\": str, \"previous_observation_assessment\": object|null, "
             "\"task_contract\": object|null, "
-            "\"action_intention\": str|null, \"action_reason\": str|null, "
             "\"action\": str, \"action_input\": object}. "
             "The top-level action field is mandatory and must be exactly one of: "
             "todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate. "
             "The top-level action_input field is mandatory and must be an object matching that action. "
-            "Do not return only thought, task_contract, action_intention, or action_reason. "
-            "If you already know the next step from your thought/intention, put the corresponding tool name in action and its input in action_input. "
+            "Do not return only thought or task_contract. "
+            "If you already know the next step from thought, put the corresponding tool name in action and its input in action_input. "
             f"{extra} "
             "Do not mention this repair instruction, parser errors, JSON format, or contract violations in thought/action_input. "
             "Continue solving the original user task using the current context. "
@@ -253,8 +252,6 @@ class DataAgent(BaseAgent):
         return ReActTurn(
             thought=thought,
             previous_observation_assessment=None,
-            action_intention=self._regex_group(match, "intention"),
-            action_reason=self._regex_group(match, "reason"),
             action=action,
             action_input=action_input,
         )
@@ -285,8 +282,6 @@ class DataAgent(BaseAgent):
             thought=thought,
             task_contract=decoded.get("task_contract") or action_input.get("task_contract"),
             previous_observation_assessment=decoded.get("previous_observation_assessment"),
-            action_intention=self._optional_string(decoded.get("action_intention") or decoded.get("intention")),
-            action_reason=self._optional_string(decoded.get("action_reason") or decoded.get("reason")),
             action=action,
             action_input=action_input,
         )

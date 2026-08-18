@@ -12,6 +12,7 @@ from app.routes.chat import router as chat_router
 from app.routes.resources import router as resources_router
 from app.routes.visualizations import router as visualizations_router
 from app.deps import get_insight_memory_learning_worker
+import app.deps as runtime_dependencies
 from core.key_insight.learning import reset_legacy_insight_memory_once, separate_insight_memory_scopes_once
 
 
@@ -37,6 +38,10 @@ async def lifespan(_app: FastAPI):
     finally:
         if worker is not None:
             await worker.stop()
+        registry_factory = runtime_dependencies.get_tool_registry
+        cache_info = getattr(registry_factory, "cache_info", None)
+        if callable(cache_info) and cache_info().currsize:
+            await registry_factory().close()
 
 
 def create_app() -> FastAPI:

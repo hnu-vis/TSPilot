@@ -403,7 +403,7 @@ async def update_ai_model_config(section: str, payload: AIModelConfigUpdatePaylo
         values["api_key"] = payload.api_key.strip() or None
     connection_id = get_model_config_store().upsert_ai(section, values)
     from app.deps import clear_runtime_model_dependencies
-    clear_runtime_model_dependencies()
+    await clear_runtime_model_dependencies()
     response = await get_models_config()
     response["saved_id"] = connection_id
     return response
@@ -417,7 +417,7 @@ async def activate_ai_model_config(section: str, connection_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     from app.deps import clear_runtime_model_dependencies
-    clear_runtime_model_dependencies()
+    await clear_runtime_model_dependencies()
     return await get_models_config()
 
 
@@ -429,7 +429,7 @@ async def delete_ai_model_config(section: str, connection_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     from app.deps import clear_runtime_model_dependencies
-    clear_runtime_model_dependencies()
+    await clear_runtime_model_dependencies()
     return await get_models_config()
 
 

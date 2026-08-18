@@ -95,7 +95,7 @@ def test_parse_turn_rejects_bare_todowrite_input():
         DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(bare_input))
 
 
-def test_parse_turn_accepts_dbgpt_style_step_fields():
+def test_parse_turn_ignores_removed_redundant_step_fields():
     payload = {
         "thought": "需要先看原始样本。",
         "action_intention": "拉取原始数据",
@@ -111,8 +111,91 @@ def test_parse_turn_accepts_dbgpt_style_step_fields():
     turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload, ensure_ascii=False))
 
     assert turn.action == "sql_query"
-    assert turn.action_intention == "拉取原始数据"
-    assert turn.action_reason == "确认过滤条件"
+    assert "action_intention" not in turn.model_dump()
+    assert "action_reason" not in turn.model_dump()
+
+
+def test_previous_observation_assessment_ignores_removed_duplicate_fields():
+    payload = {
+        "thought": "The latest evidence covers the active query todo.",
+        "previous_observation_assessment": {
+            "completed_active_todo": True,
+            "reason": "The evidence artifact contains the requested rows.",
+            "covered": ["rows"],
+            "missing": [],
+            "covered_insights": ["legacy.covered"],
+            "missing_insights": ["legacy.missing"],
+            "unavailable_insights": ["legacy.unavailable"],
+            "next_insight_need": "legacy duplicate",
+            "next_action_reason": "legacy duplicate of Thought",
+        },
+        "action": "terminate",
+        "action_input": {"response_plan": {"summary": "done", "sections": [], "visualization_ids": []}},
+    }
+
+    turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload))
+    assessment = turn.previous_observation_assessment.model_dump()
+
+    assert "covered_insights" not in assessment
+    assert "missing_insights" not in assessment
+    assert "unavailable_insights" not in assessment
+    assert "next_insight_need" not in assessment
+    assert "next_action_reason" not in assessment
+    assert "covered" not in assessment
+    assert "completed_todos" not in assessment
+    assert "next_active_todo" not in assessment
+
+
+def test_visualization_turn_accepts_natural_language_thought_with_grounded_target():
+    payload = {
+        "thought": "最新结果已经给出了价格变化区间，现在用完整价格序列高亮该区间供用户核验。",
+        "action": "visualization",
+        "action_input": {
+            "message": "在完整价格折线上高亮该变化区间。",
+            "source_refs": ["insight:price_trend"],
+        },
+    }
+
+    turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload))
+    assert turn.action == "visualization"
+    assert turn.thought == payload["thought"]
+
+
+@pytest.mark.parametrize(
+    "source_refs,expected_error",
+    [
+        (["evidence:evi_prices"], "verified target Insight"),
+    ],
+)
+def test_visualization_turn_requires_target_insight_refs(source_refs, expected_error):
+    payload = {
+        "thought": (
+            "Verified Insights: price_trend; "
+            "Verification question: does the complete series support the calculated trend; "
+            "Context: evidence:evi_prices with complete interval coverage."
+        ),
+        "action": "visualization",
+        "action_input": {"message": "Show the trend.", "source_refs": source_refs},
+    }
+
+    with pytest.raises(ValueError, match=expected_error):
+        DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload))
+
+
+def test_visualization_turn_does_not_require_repeating_insight_lineage():
+    payload = {
+        "thought": (
+            "Verified Insights: price_trend; "
+            "Verification question: does the complete series support the calculated trend; "
+            "Context: the verified Insight carries complete query lineage."
+        ),
+        "action": "visualization",
+        "action_input": {"message": "Show the trend.", "source_refs": ["insight:price_trend"]},
+    }
+
+    turn = DataAgent(prompt_builder=None, llm=None)._parse_turn(json.dumps(payload))
+
+    assert turn.action_input["source_refs"] == ["insight:price_trend"]
 
 
 def test_repair_prompt_requires_explicit_action_and_action_input():
@@ -126,7 +209,7 @@ def test_repair_prompt_requires_explicit_action_and_action_input():
     assert "action field is mandatory" in repair_prompt
     assert "action_input field is mandatory" in repair_prompt
     assert "todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate" in repair_prompt
-    assert "Do not return only thought, task_contract, action_intention, or action_reason" in repair_prompt
+    assert "Do not return only thought or task_contract" in repair_prompt
     repairs = request_state.completion_state["llm_diagnostics"]["react_turn_repairs"]
     assert repairs[0]["source"] == "data_agent.next_turn"
     assert repairs[0]["repair_index"] == 0

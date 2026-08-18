@@ -24,7 +24,13 @@ class _BinderLLM:
     async def ainvoke(self, messages):
         self.calls.append(messages)
         return SimpleNamespace(content=json.dumps({
-            "bindings": [{"insight_key": self.key, "statement": f"Computed {self.key}."}]
+            "bindings": [{
+                "insight_key": self.key,
+                "supported": True,
+                "unsupported_reason": None,
+                "statement": f"Computed {self.key}.",
+                "derived_from": [],
+            }]
         }))
 
 

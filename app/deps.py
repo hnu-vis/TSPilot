@@ -18,6 +18,7 @@ from core.key_insight.retriever import HybridInsightMemoryRetriever
 from runtime.plain_chat import PlainChatService
 from runtime.react_loop import ReActLoop
 from runtime.tool_executor import ToolExecutor
+from runtime.timeout_policy import TimeoutPolicy, load_timeout_policy
 from app.settings import get_settings
 from app.model_config import get_model_config_store
 from tools.registry import build_tool_registry
@@ -27,6 +28,11 @@ from core.visualization import VisualizationArtifactStore
 @lru_cache(maxsize=1)
 def get_prompt_builder() -> DataAgentPromptBuilder:
     return DataAgentPromptBuilder()
+
+
+@lru_cache(maxsize=1)
+def get_timeout_policy() -> TimeoutPolicy:
+    return load_timeout_policy(get_settings().resolved_timeout_config_path)
 
 
 @lru_cache(maxsize=1)
@@ -41,6 +47,7 @@ def get_llm():
         model=model_settings.model,
         temperature=model_settings.temperature,
         streaming=False,
+        timeout=get_timeout_policy().services.llm_transport_seconds,
         model_kwargs={"response_format": {"type": "json_object"}},
     )
 
@@ -57,13 +64,17 @@ def get_data_agent_llm():
         model=model_settings.model,
         temperature=model_settings.temperature,
         streaming=False,
+        timeout=get_timeout_policy().services.llm_transport_seconds,
     )
 
 
 @lru_cache(maxsize=1)
 def get_tool_registry():
     return build_tool_registry(
-        get_settings(), llm=get_llm(), visualization_artifact_store=get_visualization_artifact_store()
+        get_settings(),
+        llm=get_llm(),
+        visualization_artifact_store=get_visualization_artifact_store(),
+        timeout_policy=get_timeout_policy(),
     )
 
 
@@ -74,7 +85,11 @@ def get_visualization_artifact_store() -> VisualizationArtifactStore:
 
 @lru_cache(maxsize=1)
 def get_tool_executor() -> ToolExecutor:
-    return ToolExecutor(get_tool_registry(), memory_retriever=get_insight_memory_retriever())
+    return ToolExecutor(
+        get_tool_registry(),
+        memory_retriever=get_insight_memory_retriever(),
+        timeout_policy=get_timeout_policy(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -85,6 +100,7 @@ def get_insight_memory_retriever() -> HybridInsightMemoryRetriever:
         api_key=model_settings.embedding_api_key or "",
         api_base=model_settings.embedding_api_base,
         model=model_settings.embedding_model,
+        timeout_seconds=get_timeout_policy().services.embedding_request_seconds,
     )
     return HybridInsightMemoryRetriever(
         llm=get_llm(),
@@ -117,6 +133,7 @@ def get_insight_memory_learning_worker() -> InsightMemoryLearningWorker:
         api_key=model_settings.embedding_api_key or "",
         api_base=model_settings.embedding_api_base,
         model=model_settings.embedding_model,
+        timeout_seconds=get_timeout_policy().services.embedding_request_seconds,
     )
     learner = InsightMemoryLearner(
         llm=get_llm(),
@@ -148,6 +165,7 @@ def get_react_loop() -> ReActLoop:
         tool_executor=get_tool_executor(),
         settings=settings,
         insight_learning_outbox=get_insight_learning_outbox() if settings.insight_memory_learning_enabled else None,
+        timeout_policy=get_timeout_policy(),
     )
 
 
@@ -167,6 +185,7 @@ def get_react_loop_for_model(model_connection_id: str | None = None) -> ReActLoo
         api_key=model_settings.embedding_api_key or "",
         api_base=model_settings.embedding_api_base,
         model=model_settings.embedding_model,
+        timeout_seconds=get_timeout_policy().services.embedding_request_seconds,
     )
     retriever = HybridInsightMemoryRetriever(
         llm=structured_llm,
@@ -176,13 +195,21 @@ def get_react_loop_for_model(model_connection_id: str | None = None) -> ReActLoo
         score_threshold=settings.memory_embedding_score_threshold,
     )
     tool_registry = build_tool_registry(
-        settings, llm=structured_llm, visualization_artifact_store=get_visualization_artifact_store()
+        settings,
+        llm=structured_llm,
+        visualization_artifact_store=get_visualization_artifact_store(),
+        timeout_policy=get_timeout_policy(),
     )
     return ReActLoop(
         data_agent=DataAgent(prompt_builder=get_prompt_builder(), llm=agent_llm),
-        tool_executor=ToolExecutor(tool_registry, memory_retriever=retriever),
+        tool_executor=ToolExecutor(
+            tool_registry,
+            memory_retriever=retriever,
+            timeout_policy=get_timeout_policy(),
+        ),
         settings=settings,
         insight_learning_outbox=get_insight_learning_outbox() if settings.insight_memory_learning_enabled else None,
+        timeout_policy=get_timeout_policy(),
     )
 
 
@@ -200,14 +227,17 @@ def _create_chat_llm(model_settings, *, structured: bool):
         "model": model_settings.model,
         "temperature": model_settings.temperature,
         "streaming": False,
+        "timeout": get_timeout_policy().services.llm_transport_seconds,
     }
     if structured:
         kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
     return ChatOpenAI(**kwargs)
 
 
-def clear_runtime_model_dependencies() -> None:
+async def clear_runtime_model_dependencies() -> None:
     """Recreate model-backed dependencies for subsequent requests after an update."""
+    if get_tool_registry.cache_info().currsize:
+        await get_tool_registry().close()
     for factory in (
         get_data_agent,
         get_tool_executor,

@@ -4,6 +4,7 @@ from core.key_insight import register_key_insights_from_payload
 from runtime.conversation_state import sync_from_request
 from runtime.tool_executor import ToolExecutor
 from schemas.database import DatabaseEvidence
+from schemas.key_insight import InsightEvidenceRef, InsightItem, KeyInsight
 from schemas.state import ConversationStateModel, RequestStateModel
 from schemas.timeseries import AnomalyResult
 from schemas.tool import ToolCall
@@ -54,9 +55,61 @@ def test_sql_evidence_registers_boundary_and_extreme_insights():
     assert insights_by_name["end_value"].value == 12.0
     assert insights_by_name["highest_value"].value == 12.0
     assert insights_by_name["lowest_value"].value == 8.0
+    assert insights_by_name["highest_value"].items[0].value == 12.0
+    assert insights_by_name["highest_value"].items[0].timestamp == "2023-02-03"
+    assert insights_by_name["lowest_value"].items[0].value == 8.0
+    assert insights_by_name["lowest_value"].items[0].timestamp == "2023-01-05"
     assert set(coverage.verified) >= {"start_value", "end_value", "highest_value", "lowest_value"}
     assert "record_count" not in insights_by_name
     assert "data_coverage" not in insights_by_name
+
+
+def test_equivalent_recomputation_does_not_erase_located_insight_items():
+    request_state = _request_state()
+    request_state.insight_set.insights = [KeyInsight(
+        insight_id="ins_sql_max",
+        insight_key="max_value",
+        name="Maximum",
+        insight_type="extreme",
+        statement="Maximum is 12 at the located row.",
+        value=12.0,
+        items=[InsightItem(item_id="max_row", value=12.0, timestamp="2023-02-03")],
+        method="sql_query",
+        status="verified",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_btc")],
+    )]
+    request_state.tool_history.append(ToolCall(
+        tool_name="code_interpreter",
+        iteration=2,
+        tool_input={
+            "insight_requests": [{
+                "name": "Maximum",
+                "insight_type": "extreme",
+                "insight_key": "max_value",
+            }]
+        },
+    ))
+
+    register_key_insights_from_payload(request_state, "code_interpreter", {
+        "analysis_id": "ana_duplicate_max",
+        "produced_insights": [{
+            "insight_id": "ins_analysis_max",
+            "insight_key": "max_value",
+            "name": "Maximum",
+            "insight_type": "extreme",
+            "statement": "Maximum is 12.",
+            "value": {"value": 12.0, "timestamp": "2023-02-03"},
+            "items": [],
+            "method": "code_interpreter",
+            "status": "verified",
+            "evidence_refs": [{"source_type": "analysis", "source_id": "ana_duplicate_max"}],
+            "calculation_trace": {"method": "max"},
+        }],
+    })
+
+    canonical = request_state.insight_set.insights[0]
+    assert canonical.insight_id == "ins_sql_max"
+    assert canonical.items[0].timestamp == "2023-02-03"
 
 
 def test_sql_evidence_without_insight_requests_does_not_register_default_insights():

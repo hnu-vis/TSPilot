@@ -1,6 +1,7 @@
 """LLM-driven read-only query generation."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from core.database.dialects import dialect_for_database
 from runtime.language import detect_response_language
 from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
+from runtime.timeout_policy import load_timeout_policy
 
 
 def _looks_like_single_object(value: dict) -> bool:
@@ -194,8 +196,13 @@ class LLMQueryGenerationResult:
 class LLMQueryGenerator:
     """Ask an LLM to generate a datasource-grounded read-only query."""
 
-    def __init__(self, llm):
+    def __init__(self, llm, *, timeout_seconds: float | None = None):
         self._llm = llm
+        self._timeout_seconds = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else load_timeout_policy().tool("sql_query").stage_seconds("llm_call_seconds")
+        )
 
     async def generate_schema_linking(
         self,
@@ -285,7 +292,10 @@ class LLMQueryGenerator:
         )
 
     async def _invoke_model(self, messages, *, request_state=None, source: str = "sql_query.generation") -> str:
-        response = await self._llm.ainvoke(messages)
+        response = await asyncio.wait_for(
+            self._llm.ainvoke(messages),
+            timeout=self._timeout_seconds,
+        )
         content = getattr(response, "content", response)
         if isinstance(content, list):
             content = "".join(

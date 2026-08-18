@@ -56,6 +56,9 @@ def _observation_view(observation: ToolObservation | dict | None, *, consumer: s
     tool_name = str(payload.get("tool_name") or "")
     visible_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     rendered_payload = _payload_view(tool_name, visible_payload, consumer=consumer)
+    # summary is the Observation headline; repeating it inside payload adds no
+    # decision information and inflates every later ReAct turn.
+    rendered_payload.pop("summary", None)
     if isinstance(visible_payload.get("coverage_delta"), dict):
         rendered_payload["coverage_delta"] = _sanitize_value(
             visible_payload["coverage_delta"],
@@ -139,6 +142,7 @@ def _database_payload_view(payload: dict, *, consumer: str) -> dict:
         # three overlapping representations of its rows. Exact values and
         # full data remain available through evidence/insight state.
         view.pop("data_preview", None)
+        view.pop("database", None)
         view["full_fidelity"] = _full_fidelity(diagnostics)
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         if isinstance(metadata.get("time_range"), dict):
@@ -192,6 +196,9 @@ def _analysis_payload_view(payload: dict, *, consumer: str) -> dict:
         ], max_dict_items=12),
         "diagnostics": _diagnostics_view(diagnostics),
     }
+    if consumer == "model":
+        for redundant in ("analysis_goal", "code_type", "code_hash", "diagnostics"):
+            view.pop(redundant, None)
     executed_code = diagnostics.get("executed_code_preview") if isinstance(diagnostics.get("executed_code_preview"), dict) else {}
     generated_code = diagnostics.get("generated_code_preview") if isinstance(diagnostics.get("generated_code_preview"), dict) else {}
     code_view = executed_code or generated_code
@@ -302,8 +309,8 @@ def _visualization_payload_view(payload: dict) -> dict:
         ],
         "grounded_by": payload.get("grounded_by", []),
         "verification": payload.get("verification", []),
-        "coverage_delta": payload.get("coverage_delta"),
         "required_data_request": _sanitize_value(payload.get("required_data_request"), max_string_chars=900),
+        "unavailable_reason": _sanitize_value(payload.get("unavailable_reason"), max_string_chars=900),
     })
 
 

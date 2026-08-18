@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from prompts.data_agent import DataAgentPromptBuilder
+from core.harness.observation_view import model_observation_view
 from runtime.request_state import apply_observation, build_conversation_state, build_request_state
 from schemas.api import ChatRequest
 from schemas.action_output import ActionOutput
 from schemas.task_contract import TaskContract
-from schemas.tool import ReActTranscriptStep, ToolObservation
-from schemas.visualization import VisualizationPayload
+from schemas.tool import ToolObservation
 from app.settings import get_settings
 
 
@@ -18,16 +18,12 @@ def test_sql_query_prompt_keeps_schema_linking_inside_tool():
     builder = DataAgentPromptBuilder()
     system_prompt = builder.build_system_prompt()
 
-    assert "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, rag, skill, terminate." in system_prompt
+    assert "Allowed actions: todowrite, sql_query, code_interpreter, forecast, anomaly, visualization, rag, skill, terminate." in system_prompt
     assert "For terminate" in system_prompt
     assert "For format_answer" not in system_prompt
-    assert "Use automatic message-based input for normal database requests" in system_prompt
-    assert "field confirmation, query generation, or query planning" in system_prompt
-    assert "schema linking" not in system_prompt.lower()
-    assert "schema linking participates as auxiliary grounding" not in system_prompt
-    assert "Do not write an explicit database query from user-facing names" not in system_prompt
-    assert "Context is budgeted" in system_prompt
-    assert "diagnostics.prompt_sampling" in system_prompt
+    assert "For sql_query, provide only natural-language message" in system_prompt
+    assert "outer ReAct agent must not write SQL" in system_prompt
+    assert "Tool-internal rules live inside tools" in system_prompt
 
 
 def test_prompt_uses_dbgpt_style_todowrite_planning_rule():
@@ -46,13 +42,10 @@ def test_prompt_uses_dbgpt_style_todowrite_planning_rule():
     builder = DataAgentPromptBuilder()
     system_prompt = builder.build_system_prompt()
     context = builder.build_context(request_state, conversation_state)
-    todowrite_action = next(action for action in context["available_actions"] if action["action"] == "todowrite")
+    todowrite_action = next(action for action in context["tools"] if action["action"] == "todowrite")
 
-    assert "3 or more independently verifiable user-visible steps" in system_prompt
-    assert "BEFORE starting work" in system_prompt
-    assert "query text, row counts" in system_prompt
-    assert "one grounded action can fully cover every deliverable" not in system_prompt
     assert "3 or more independently verifiable user-visible steps" in todowrite_action["use_when"]
+    assert todowrite_action["parameters"] == ["message", "todos", "task_contract?"]
 
 
 def test_prompt_keeps_anomaly_audit_out_of_code_interpreter_output():
@@ -63,6 +56,15 @@ def test_prompt_keeps_anomaly_audit_out_of_code_interpreter_output():
     assert "metrics/details containers" in system_prompt
     assert "details.outlier_rule" not in system_prompt
     assert "details.excluded_rows" not in system_prompt
+
+
+def test_prompt_keeps_insight_content_atomic_and_visual_refs_explicit():
+    system_prompt = DataAgentPromptBuilder().build_system_prompt()
+
+    assert "Do not create separate method, basis, provenance, input-count, or display-context Insights" in system_prompt
+    assert "Put only visually inspectable conclusion Insights in source_refs" in system_prompt
+    assert "prefer insight:<exact insight_key>" in system_prompt
+    assert "never reconstruct or abbreviate an opaque identifier" in system_prompt
 
 
 def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():
@@ -112,7 +114,7 @@ def test_outer_react_context_omits_internal_presentation_inventory_and_compacts_
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
 
-    assert set(context["artifacts"]) == {"refs"}
+    assert set(context["artifacts"]) == {"refs", "facts"}
     history = context["recent_trajectory"][0]
     assert history == {
         "iteration": 1,
@@ -153,19 +155,22 @@ def test_prompt_context_exposes_task_contract_as_state():
 
     assert context["state"]["task_contract"]["required_outputs"][0]["id"] == "total_count"
     assert "task_contract" in system_prompt
-    assert "required_outputs" in system_prompt
+    assert "Task-contract coverage is semantic" in system_prompt
 
 
-def test_prompt_context_handles_diagnostics_without_data_preview():
-    payload = {
-        "summary": "analysis ok",
-        "diagnostics": {"runtime_ms": 12, "summary_stats": {"rows_count": 0}},
+def test_prompt_context_contains_only_the_compact_outer_contract():
+    settings = get_settings()
+    request = ChatRequest(message="analysis", database_context={"database_id": "demo", "database_type": "unit"})
+    state = build_request_state(request, settings)
+    conversation = build_conversation_state(request, state.conversation_id or "conv")
+
+    context = DataAgentPromptBuilder().build_context(state, conversation)
+
+    assert set(context) == {"task", "tools", "state", "artifacts", "last_observation", "recent_trajectory"}
+    assert set(context["state"]) == {
+        "execution", "next_action_constraints", "todo_progress", "task_contract", "insight_state",
     }
-
-    summarized = DataAgentPromptBuilder()._summarize_observation_payload(payload)
-
-    assert "runtime_ms" not in summarized["diagnostics"]
-    assert summarized["diagnostics"]["prompt_sampling"]["visible_counts"] == {}
+    assert set(context["state"]["execution"]) == {"iteration", "max_iterations"}
 
 
 def test_prompt_context_does_not_expose_sql_query_task_coverage_as_global_guidance():
@@ -202,10 +207,14 @@ def test_prompt_context_does_not_expose_sql_query_task_coverage_as_global_guidan
         _EvidenceSpec(),
     )
 
+    observation = model_observation_view(request_state.observations[-1])
+    request_state.latest_action_output = ActionOutput(
+        tool_name="sql_query", success=True, content="Loaded 1 row.", observations=observation or {},
+    )
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
 
     assert "diagnostics.task_coverage" not in DataAgentPromptBuilder().build_system_prompt()
-    assert "task_coverage" not in context["evidence"]["latest"]["diagnostics"]
+    assert "task_coverage" not in str(context["last_observation"])
     assert "missing_or_uncertain" not in str(context)
 
 
@@ -239,52 +248,44 @@ def test_prompt_builder_summarizes_heavy_context():
         "diagnostics": {},
     }
     apply_observation(request_state, observation, full_payload, _EvidenceSpec())
-    request_state.visualizations = [
-        VisualizationPayload(
-            visualization_id="viz_demo",
-            visualization_type="chart",
-            visualization_kind="line",
-            renderer="linechart",
-            title="Demo",
-            summary="Demo chart",
-            chart={
-                "x_axis_data": [f"t{i}" for i in range(100)],
-                "series_data": [{"name": "value", "data": list(range(100))}],
-            },
-        )
-    ]
-
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    sql_action = next(action for action in context["available_actions"] if action["action"] == "sql_query")
+    sql_action = next(action for action in context["tools"] if action["action"] == "sql_query")
 
-    assert any(action["action"] == "todowrite" for action in context["available_actions"])
-    assert any(action["action"] == "code_interpreter" for action in context["available_actions"])
-    assert any(action["action"] == "terminate" for action in context["available_actions"])
-    assert not any(action["action"] == "format_answer" for action in context["available_actions"])
-    assert "prefer message" in sql_action["input"]
-    assert "schema-linked generation" not in sql_action["input"]
-    assert "automatic database querying" in sql_action["input"]
-    assert context["state"]["execution"]["artifacts"]["has_database_evidence"] is True
-    assert context["state"]["execution"]["last_successful_tool"] == "sql_query"
-    assert len(context["evidence"]["latest"]["data"]["points"]) <= 8
-    sampling = context["evidence"]["latest"]["diagnostics"]["prompt_sampling"]
-    assert sampling["sampled_for_prompt"] is True
-    assert sampling["full_counts"]["points_count"] == 100
-    assert sampling["visible_counts"]["points_count"] == 8
-    assert context["evidence"]["prior_queries"] == []
-    assert context["outputs"]["visualizations"][0]["chart_summary"]["x_axis_count"] == 100
-    assert "chart" not in context["outputs"]["visualizations"][0]
-    assert "latest_database_evidence" not in context
-    assert "visualizations" not in context
+    assert any(action["action"] == "todowrite" for action in context["tools"])
+    assert any(action["action"] == "code_interpreter" for action in context["tools"])
+    assert any(action["action"] == "terminate" for action in context["tools"])
+    assert sql_action["parameters"] == ["message", "purpose?", "insight_requests?"]
+    assert context["artifacts"]["refs"]["database_evidence"] == ["evidence:evi_demo"]
+    fact = context["artifacts"]["facts"][0]
+    assert fact["source_ref"] == "evidence:evi_demo"
+    assert fact["row_count"] == 100
+    assert len(fact["records"]) == 12
+    assert "data" not in fact
+    assert "rows" not in str(context)
 
 
-def test_prompt_builder_exposes_sql_observation_details():
+def test_prompt_hides_presentation_point_budget_from_outer_reasoning():
+    settings = get_settings()
+    request = ChatRequest(
+        message="分析完整趋势并可视验证",
+        database_context={"database_id": "demo", "database_type": "unit"},
+        constraints={"max_points": 48, "timezone": "UTC"},
+    )
+    state = build_request_state(request, settings)
+    conversation = build_conversation_state(request, state.conversation_id or "conv")
+
+    context = DataAgentPromptBuilder().build_context(state, conversation)
+
+    assert context["task"]["constraints"] == {"timezone": "UTC"}
+    assert "max_points" not in str(context["task"])
+
+
+def test_prompt_builder_exposes_compact_sql_observation_receipt():
     settings = get_settings()
     request = ChatRequest(message="算平均值")
     request_state = build_request_state(request, settings)
     conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
-    request_state.observations.append(
-        ToolObservation(
+    raw_observation = ToolObservation(
             tool_name="sql_query",
             success=True,
             summary="ok",
@@ -301,57 +302,63 @@ def test_prompt_builder_exposes_sql_observation_details():
                 },
             },
         )
+    request_state.observations.append(raw_observation)
+    request_state.latest_action_output = ActionOutput(
+        tool_name="sql_query",
+        success=True,
+        content="ok",
+        observations=model_observation_view(raw_observation) or {},
     )
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    payload = context["recent_observations"][0]["payload"]
+    payload = context["last_observation"]["payload"]
 
-    assert payload["query"] == "SELECT AVG(value) AS avg_value FROM metrics"
-    assert payload["query_language"] == "sql"
     assert payload["columns"] == ["avg_value"]
-    assert payload["data_preview"]["rows"] == [{"avg_value": 12.3}, {"avg_value": 13.4}]
-    assert payload["diagnostics"]["summary_stats"] == {"rows_count": 2}
-    assert "irrelevant" not in payload["diagnostics"]
+    assert payload["row_count"] == 2
+    assert "query" not in payload
+    assert "query_language" not in payload
+    assert "data_preview" not in payload
+    assert "diagnostics" not in payload
 
 
-def test_prompt_builder_prefers_structured_react_transcript():
+def test_prompt_builder_uses_compact_action_output_trajectory():
     settings = get_settings()
     request = ChatRequest(message="算平均值")
     request_state = build_request_state(request, settings)
     conversation_state = build_conversation_state(request, request_state.conversation_id or "conv")
-    request_state.react_transcript.append(
-        ReActTranscriptStep(
-            iteration=1,
-            question="算平均值",
-            thought="需要查询数据库。",
-            action_intention="查询均值",
-            action_reason="当前没有证据",
-            action="sql_query",
-            action_input={"query": "SELECT AVG(value) FROM metrics"},
-            observation=ToolObservation(
-                tool_name="sql_query",
-                success=True,
-                summary="Loaded 1 row.",
-                payload={
-                    "query": "SELECT AVG(value) FROM metrics",
-                    "query_language": "sql",
-                    "data": {"rows": [{"avg": 12.3}]},
-                },
-            ),
-        )
-    )
+    request_state.memory_fragments.append({
+        "iteration": 1,
+        "action": "sql_query",
+        "action_input": {"message": "查询平均值", "history": [{"role": "user"}]},
+        "observation": {
+            "summary": "Loaded 1 row.",
+            "resource_ref": "evidence:evi_avg",
+            "coverage_delta": {"can_answer": False, "missing_outputs": ["analysis"]},
+            "data": {"rows": [{"avg": 12.3}]},
+        },
+        "resource_ref": "evidence:evi_avg",
+        "status": "succeeded",
+    })
 
     builder = DataAgentPromptBuilder()
     prompt = builder.build_user_prompt(request_state, conversation_state)
     context = builder.build_context(request_state, conversation_state)
 
-    assert "Question: 算平均值" in prompt
-    assert "Thought: 需要查询数据库。" in prompt
-    assert "Action Intention: 查询均值" in prompt
-    assert "Action Reason: 当前没有证据" in prompt
-    assert "Action: sql_query" in prompt
-    assert "Observation:" in prompt
-    assert context["recent_react_transcript"][0]["action"] == "sql_query"
+    trajectory = context["recent_trajectory"][0]
+    assert trajectory == {
+        "iteration": 1,
+        "action": "sql_query",
+        "status": "succeeded",
+        "resource_ref": "evidence:evi_avg",
+        "summary": "Loaded 1 row.",
+        "coverage_delta": {"can_answer": False, "missing_outputs": ["analysis"]},
+    }
+    assert '"action": "sql_query"' in prompt
+    assert '"summary": "Loaded 1 row."' in prompt
+    assert "action_intention" not in prompt
+    assert "action_reason" not in prompt
+    assert '"history"' not in prompt
+    assert '"data"' not in prompt
 
 
 def test_prompt_builder_bounds_long_query_context():
@@ -381,10 +388,8 @@ def test_prompt_builder_bounds_long_query_context():
     apply_observation(request_state, observation, full_payload, _EvidenceSpec())
 
     context = DataAgentPromptBuilder().build_context(request_state, conversation_state)
-    evidence = context["evidence"]["latest"]
 
-    assert len(evidence["query"]) < len(long_query)
-    assert "truncated" in evidence["query"]
-    assert context["evidence"]["prior_queries"] == []
-    assert "truncated" in evidence["metadata"]["raw_schema"]
-    assert "truncated_items" in evidence["diagnostics"]["query_trace"]["large"][-1]
+    assert long_query not in str(context)
+    assert "raw_schema" not in str(context)
+    assert "query_trace" not in str(context)
+    assert context["artifacts"]["refs"]["database_evidence"] == ["evidence:evi_long"]

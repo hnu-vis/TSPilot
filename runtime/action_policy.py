@@ -20,7 +20,7 @@ def validate_action(
     action_name: str,
     action_input: dict | None = None,
     *,
-    action_reason: str | None = None,
+    thought: str | None = None,
 ) -> tuple[bool, str | None]:
     if action_name not in VALID_ACTIONS:
         return False, f"Action '{action_name}' is not part of the runtime contract."
@@ -61,6 +61,12 @@ def validate_action(
                 "todowrite is only valid before evidence or analysis work starts. "
                 "Continue with the current evidence gap or terminate if the answer is covered.",
             )
+    if action_name == "visualization" and _latest_visualization_is_current_unavailable(request_state):
+        return (
+            False,
+            "Visual verification is already resolved as unavailable for the current source state. "
+            "Terminate with its unavailable_reason, or obtain materially new source evidence before requesting visualization again.",
+        )
     constraints = runtime_action_constraints(request_state)
     required_actions = {
         str(item.get("action") or "").strip()
@@ -96,7 +102,7 @@ def validate_action(
     repeat_failure_reason = _repeated_failed_action_without_strategy_change(
         request_state,
         action_name,
-        action_reason=action_reason,
+        thought=thought,
     )
     if repeat_failure_reason:
         return False, repeat_failure_reason
@@ -175,34 +181,23 @@ def _terminal_boundary_violation(
     request_state: RequestStateModel,
     action_input: dict | None = None,
 ) -> str | None:
-    """Return a minimal DB-GPT-style terminal guard violation.
-
-    Terminate should end the ReAct loop once useful tool observations exist. It
-    should not prove full semantic coverage of every model-authored contract
-    output; that made finalization brittle. The hard boundary here is only:
-    database-backed answers need at least one evidence/artifact, and explicitly
-    required specialized capabilities need their corresponding artifact.
-    """
+    """Block finalization until the current evidence receipt covers the goal."""
 
     if request_state.database_context is None:
         return None
-    missing = _missing_explicit_terminal_capabilities(request_state)
-    if missing:
-        if _repair_retry_exhausted(request_state) and _terminal_input_covers_items(action_input, missing):
-            return None
-        if _latest_database_evidence_is_empty(request_state) and _terminal_input_explains_unavailable_outputs(request_state, action_input):
-            return None
-        return (
-            "Final answer is blocked because an explicitly requested tool output is missing: "
-            + ", ".join(missing)
-            + "."
-        )
-    if not _available_artifact_refs(request_state):
-        return (
-            "Final answer is blocked because no database-backed observation or artifact is available yet. "
-            "Call sql_query or another evidence-producing tool first."
-        )
-    return None
+    goal = evaluate_goal_completion(request_state)
+    if goal.can_answer:
+        return None
+    missing = list(goal.missing_evidence)
+    if _repair_retry_exhausted(request_state) and _terminal_input_covers_items(action_input, missing):
+        return None
+    if _latest_database_evidence_is_empty(request_state) and _terminal_input_explains_unavailable_outputs(request_state, action_input):
+        return None
+    return (
+        f"{goal.reason} Missing evidence: {', '.join(missing)}."
+        if missing
+        else goal.reason
+    )
 
 
 def _repair_retry_exhausted(request_state: RequestStateModel) -> bool:
@@ -228,32 +223,27 @@ def _terminal_input_covers_items(action_input: dict | None, items: list[str]) ->
     return bool(unavailable) and all(item in unavailable for item in items)
 
 
-def _missing_explicit_terminal_capabilities(request_state: RequestStateModel) -> list[str]:
-    capabilities = _effective_capabilities(request_state)
-    missing: list[str] = []
-    if "forecast" in capabilities and not _latest_forecast_is_usable(request_state):
-        missing.append("forecast")
-    if "anomaly" in capabilities and request_state.latest_anomaly is None:
-        missing.append("anomaly")
-    if (
-        "analysis" in capabilities
-        and request_state.latest_analysis_id is None
-        and _requires_code_analysis(request_state)
-    ):
-        missing.append("analysis")
-    if "visualization" in capabilities and not request_state.visualizations:
-        missing.append("visualization")
-    if "query" in capabilities or "database_evidence" in capabilities or "database" in capabilities:
-        if request_state.latest_database_evidence is None or _latest_database_evidence_is_empty(request_state):
-            missing.append("database_evidence")
-    return missing
+def _latest_visualization_is_current_unavailable(request_state: RequestStateModel) -> bool:
+    return _latest_current_unavailable_visualization(request_state) is not None
+
+
+def _latest_current_unavailable_visualization(request_state: RequestStateModel) -> dict | None:
+    for observation in reversed(request_state.observations):
+        if not observation.success:
+            continue
+        if observation.tool_name in {"sql_query", "anomaly", "forecast", "code_interpreter"}:
+            return None
+        if observation.tool_name == "visualization":
+            payload = observation.payload if isinstance(observation.payload, dict) else {}
+            return payload if str(payload.get("status") or "").strip() == "unavailable" else None
+    return None
 
 
 def _repeated_failed_action_without_strategy_change(
     request_state: RequestStateModel,
     action_name: str,
     *,
-    action_reason: str | None,
+    thought: str | None,
 ) -> str | None:
     if action_name in TERMINAL_ACTIONS or action_name == "todowrite":
         return None
@@ -268,17 +258,16 @@ def _repeated_failed_action_without_strategy_change(
             break
     if len(failures) < 2:
         return None
-    gap = latest_gap_assessment(request_state) or {}
     strategy_text = " ".join(
         str(value).strip()
-        for value in (action_reason, gap.get("next_action_reason"))
+        for value in (thought,)
         if str(value or "").strip()
     )
     if strategy_text:
         return None
     return (
         f"Action '{action_name}' has failed repeatedly. "
-        "Assess the latest failure and provide a changed next_action_reason/action_reason before retrying the same tool."
+        "Thought must assess the latest failure and explain a materially changed strategy before retrying the same tool."
     )
 
 
@@ -393,24 +382,22 @@ def _terminal_input_explains_unavailable_outputs(
 ) -> bool:
     gap = latest_gap_assessment(request_state)
     if not gap or not isinstance(action_input, dict):
-        latest_goal = request_state.completion_state.get("latest_goal")
-        if not isinstance(latest_goal, dict) or not isinstance(action_input, dict):
+        if not isinstance(action_input, dict):
             return False
+        goal = evaluate_goal_completion(request_state)
         blocking_items = [
             str(item).strip()
-            for item in latest_goal.get("missing_evidence", [])
+            for item in goal.missing_evidence
             if str(item).strip()
         ]
     else:
         blocking_items = _gap_blocking_items(gap)
         if not blocking_items:
-            latest_goal = request_state.completion_state.get("latest_goal")
-            if isinstance(latest_goal, dict):
-                blocking_items = [
-                    str(item).strip()
-                    for item in latest_goal.get("missing_evidence", [])
-                    if str(item).strip()
-                ]
+            blocking_items = [
+                str(item).strip()
+                for item in evaluate_goal_completion(request_state).missing_evidence
+                if str(item).strip()
+            ]
     if not blocking_items:
         return False
     unavailable_outputs = action_input.get("unavailable_outputs")
@@ -507,6 +494,29 @@ def runtime_action_constraints(request_state: RequestStateModel) -> dict:
 
     downstream_analysis = _latest_query_requests_downstream_analysis(request_state)
     completion = evaluate_goal_completion(request_state)
+    unavailable_visualization = _latest_current_unavailable_visualization(request_state)
+    if unavailable_visualization is not None and completion.can_answer:
+        unavailable_reason = str(
+            unavailable_visualization.get("unavailable_reason")
+            or "The current evidence cannot support a reliable visual verification."
+        ).strip()
+        reason = (
+            "Visual verification is resolved as unavailable for the current source state. "
+            "Finalize from the available grounded evidence and disclose why no chart was published."
+        )
+        return {
+            "required_actions": [{
+                "action": "terminate",
+                "reason": reason,
+                "input_guidance": {
+                    "unavailable_outputs": ["visualization"],
+                    "unavailable_reason": unavailable_reason,
+                },
+            }],
+            "prohibited_actions": sorted(VALID_ACTIONS - {"terminate"}),
+            "missing_outputs": [],
+            "reason": reason,
+        }
     frame = build_observation_frame(
         request_state,
         requires_initial_todo_plan=_requires_initial_todo_plan(request_state),
@@ -533,11 +543,25 @@ def _latest_visualization_source_request(request_state: RequestStateModel) -> di
         if not isinstance(request, dict):
             return None
         required_action = str(request.get("required_action") or "").strip()
-        fulfilled = any(
+        owner_completed = any(
             later.success and later.tool_name == required_action
             for later in observations[index + 1:]
         )
-        return None if fulfilled else request
+        if not owner_completed:
+            return request
+        # A successful owner action proves only artifact production. It does not
+        # prove that the requested Insight or visual context is semantically
+        # sufficient. Force a new visualization turn to re-evaluate the updated
+        # state; only that turn may close or replace this dependency.
+        return {
+            "required_action": "visualization",
+            "purpose": "Re-evaluate the visual-verification dependency against the updated artifact and Insight state.",
+            "required_shape": request.get("required_shape") or "visual_verification",
+            "required_fields": request.get("required_fields") or [],
+            "required_properties": request.get("required_properties") or [],
+            "input_source_refs": request.get("input_source_refs") or [],
+            "originating_request": request,
+        }
     return None
 
 
@@ -642,14 +666,11 @@ def build_policy_observation(
         if isinstance(item, dict) and str(item.get("action") or "").strip()
     ]
     allowed_next_actions = required or sorted(VALID_ACTIONS - prohibited)
-    latest_goal = request_state.completion_state.get("latest_goal")
-    missing_capabilities = []
-    if isinstance(latest_goal, dict):
-        missing_capabilities = [
-            str(item).strip()
-            for item in latest_goal.get("missing_evidence", [])
-            if str(item).strip()
-        ]
+    missing_capabilities = [
+        str(item).strip()
+        for item in evaluate_goal_completion(request_state).missing_evidence
+        if str(item).strip()
+    ]
     return ToolObservation(
         tool_name=action_name,
         success=False,

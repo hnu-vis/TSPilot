@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.artifact_sources import primary_analysis_input, resolve_artifact_sources
+from core.artifact_sources import primary_analysis_input, resolve_artifact_sources, source_prompt_manifest
 from core.harness import build_action_space, build_observation_frame
 from core.completion import apply_previous_observation_assessment
 from core.visualization import PresentationCatalog, VisualizationArtifactStore
@@ -27,7 +27,13 @@ from runtime.action_policy import _latest_visualization_source_request
 class _BinderLlm:
     async def ainvoke(self, _messages):
         return SimpleNamespace(content=json.dumps({
-            "bindings": [{"insight_key": "forecast_change", "statement": "Forecast rises by 30%."}],
+            "bindings": [{
+                "insight_key": "forecast_change",
+                "supported": True,
+                "unsupported_reason": None,
+                "statement": "Forecast rises by 30%.",
+                "derived_from": [],
+            }],
         }))
 
 
@@ -48,7 +54,18 @@ class _NeedsForecastCalculationLlm:
                 "insight_type": "change",
             }],
         }
-        if "semantic projection stage" in prompt:
+        if "You are the visual verification planner inside" in prompt:
+            payload = {
+                "decision": "needs_sources",
+                "target_insight_ids": [],
+                "verification_question": None,
+                "interpretation": None,
+                "visual_relation": "forecast_change",
+                "required_context": ["forecast direction and percentage change"],
+                "non_visual_insight_ids": [],
+                "required_data_request": requirement,
+            }
+        elif "semantic projection stage" in prompt:
             payload = {"semantic_views": [], "required_data_request": requirement}
         else:
             payload = {"visual_goals": [], "required_data_request": requirement}
@@ -96,7 +113,13 @@ class _MultiSourceAnalysisLlm:
                 ),
             }))
         return SimpleNamespace(content=json.dumps({
-            "bindings": [{"insight_key": "forecast_change", "statement": "Forecast rises by 30%."}],
+            "bindings": [{
+                "insight_key": "forecast_change",
+                "supported": True,
+                "unsupported_reason": None,
+                "statement": "Forecast rises by 30%.",
+                "derived_from": [],
+            }],
         }))
 
 
@@ -156,6 +179,34 @@ def test_resolver_exposes_complete_forecast_and_anomaly_datasets():
     assert by_ref["anomaly:anomaly_evi_demo"]["anomaly_status"] == {"detected_count": 1}
 
 
+def test_source_prompt_manifest_exposes_complete_schema_but_no_records():
+    state = _state()
+    rows = [
+        {
+            "timestamp": f"2026-01-{index // 24 + 1:02d}T{index % 24:02d}:00:00Z",
+            "value": float(index),
+        }
+        for index in range(40)
+    ]
+    rows.append({
+        "timestamp": "2026-02-10T00:00:00Z",
+        "value": 40.0,
+        "late_dimension": "appears after earlier records",
+    })
+    state.latest_database_evidence.data = {"rows": rows}
+    state.database_evidence_artifacts["evi_demo"] = state.latest_database_evidence
+
+    manifest = source_prompt_manifest(resolve_artifact_sources(state, ["evidence:evi_demo"]))
+
+    dataset = manifest[0]["datasets"][0]
+    assert {field["name"] for field in dataset["schema_fields"]} == {
+        "timestamp", "value", "late_dimension",
+    }
+    assert "preview" not in dataset
+    assert "rows" not in dataset
+    assert "appears after earlier records" not in str(manifest)
+
+
 def test_explicit_forecast_is_the_primary_analysis_table_not_its_database_ancestor():
     sources = resolve_artifact_sources(
         _state(), ["forecast:forecast_demo", "evidence:evi_demo"],
@@ -200,6 +251,24 @@ def test_tool_executor_unwraps_single_evidence_ref_for_specialized_tools():
     assert normalized["database_evidence"] == "evidence:evi_demo"
 
 
+def test_visualization_runtime_injects_presentation_budget_without_outer_reasoning_field():
+    executor = ToolExecutor.__new__(ToolExecutor)
+    state = _state()
+    state.constraints = {"max_points": 48, "timezone": "UTC"}
+
+    normalized = executor._normalize_action_input(
+        "visualization",
+        {"message": "Verify the series.", "constraints": {"theme": "dark"}},
+        state,
+    )
+
+    assert normalized["constraints"] == {
+        "max_points": 48,
+        "timezone": "UTC",
+        "theme": "dark",
+    }
+
+
 @pytest.mark.asyncio
 async def test_code_interpreter_calculates_directly_from_forecast_source():
     result = await CodeInterpreterTool(llm=_BinderLlm()).execute(
@@ -211,9 +280,10 @@ async def test_code_interpreter_calculates_directly_from_forecast_source():
                 "start = forecast_rows[0]['value']\n"
                 "end = forecast_rows[-1]['value']\n"
                 "change_pct = (end - start) / start * 100\n"
-                "result = {'computed_insights': [{'insight_key': 'forecast_change', "
-                "'value': {'direction': 'up', 'change_pct': change_pct}, "
-                "'calculation_trace': {'source_ref': 'forecast:forecast_demo', 'operation': 'endpoint_change'}}], "
+                    "result = {'computed_insights': [{'insight_key': 'forecast_change', "
+                    "'value': {'direction': 'up', 'change_pct': change_pct}, "
+                    "'calculation_trace': {'source_ref': 'forecast:forecast_demo', 'operation': 'endpoint_change'}, "
+                    "'derived_evidence_names': ['forecast_change_summary']}], "
                 "'derived_evidence': [{'name': 'forecast_change_summary', "
                 "'scalar': {'direction': 'up', 'change_pct': change_pct}, "
                 "'transform_summary': 'Endpoint change from forecast points'}]}"
@@ -361,7 +431,7 @@ def test_visualization_dependency_does_not_advance_active_todo():
     assert [todo["status"] for todo in state.todo_list] == ["in_progress", "pending"]
 
 
-def test_llm_completed_todos_marker_advances_current_step_after_hard_gate():
+def test_completed_active_todo_advances_current_step_after_hard_gate():
     state = _state()
     state.todo_list = [
         {"content": "Query history", "task_type": "query", "status": "in_progress", "priority": 1},
@@ -377,12 +447,9 @@ def test_llm_completed_todos_marker_advances_current_step_after_hard_gate():
     result = apply_previous_observation_assessment(
         state,
         PreviousObservationAssessment(
-            completed_active_todo=False,
-            completed_todos=[1],
-            next_active_todo=2,
+            completed_active_todo=True,
             reason="The history query is covered by the cited SQL artifact.",
             evidence_refs=["evidence:evi_demo"],
-            covered=["Query history"],
             missing=["Detect anomalies"],
             can_answer=False,
         ),
@@ -411,7 +478,6 @@ def test_completed_todo_result_ref_uses_owning_artifact_type():
             completed_active_todo=True,
             reason="The anomaly artifact satisfies the active Todo.",
             evidence_refs=["evidence:evi_demo", "anomaly:anomaly_evi_demo"],
-            covered=["Detect anomalies"],
             missing=["Answer"],
             can_answer=False,
         ),
@@ -462,7 +528,10 @@ def test_failed_visualization_dependency_remains_pending_until_success():
     state.observations.append(ToolObservation(
         tool_name="forecast", success=True, summary="Forecast succeeded", payload={},
     ))
-    assert _latest_visualization_source_request(state) is None
+    retry = _latest_visualization_source_request(state)
+    assert retry is not None
+    assert retry["required_action"] == "visualization"
+    assert retry["originating_request"] == dependency
 
 
 @pytest.mark.asyncio

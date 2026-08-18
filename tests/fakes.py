@@ -160,11 +160,9 @@ class SandboxAnalysisLLM:
                         "    for key, raw_value in row.items():\n"
                         "        if key in {'timestamp', 'time', '_time'}:\n"
                         "            continue\n"
-                        "        try:\n"
+                        "        if isinstance(raw_value, (int, float)):\n"
                         "            values.append(float(raw_value))\n"
                         "            break\n"
-                        "        except (TypeError, ValueError):\n"
-                        "            continue\n"
                         "deltas = [right - left for left, right in zip(values, values[1:])]\n"
                         "result = {\n"
                         "    'computed_insights': [{'insight_key': 'pairwise_deltas', 'value': {'value_count': len(values), 'delta_count': len(deltas), 'max_delta': max(deltas) if deltas else None, 'min_delta': min(deltas) if deltas else None, 'first_three_deltas': deltas[:3]}, 'calculation_trace': {'operation': 'adjacent difference'}}],\n"
@@ -556,12 +554,31 @@ class BitcoinMultiQueryLLM:
     def __init__(self):
         self.calls = 0
         self.agent_turn = 0
+        self._pending_query: tuple[str, str] | None = None
 
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        if "LLM SQL Query Generation JSON:" in user_prompt:
-            raise AssertionError("BitcoinMultiQueryLLM uses explicit Flux queries.")
+        if any(
+            label in user_prompt
+            for label in ("LLM SQL Query Generation JSON:\n", "LLM 查询生成输入 JSON：\n")
+        ):
+            if self._pending_query is None:
+                raise AssertionError("SQL generation was invoked without a pending natural-language query goal.")
+            purpose, query = self._pending_query
+            self._pending_query = None
+            return _FakeResponse(json.dumps({
+                "query": query,
+                "query_language": "flux",
+                "purpose": purpose,
+                "expected_result_type": "table",
+                "selected_fields": [],
+                "assumptions": [],
+                "confidence": 0.99,
+            }, ensure_ascii=False))
+        internal_response = _query_generation_response(user_prompt)
+        if internal_response is not None:
+            return internal_response
         _context_from_prompt(user_prompt)
 
         self.agent_turn += 1
@@ -630,14 +647,13 @@ class BitcoinMultiQueryLLM:
             )
         if self.agent_turn in queries:
             purpose, query = queries[self.agent_turn]
+            self._pending_query = (purpose, query)
             return _turn(
                 purpose,
                 "sql_query",
                 {
-                    "database_context": database_context,
-                    "query_language": "flux",
+                    "message": purpose,
                     "purpose": purpose,
-                    "query": query,
                 },
             )
         return _turn(
@@ -658,24 +674,161 @@ class _FakeResponse:
         self.content = content
 
 
+def _required_action_names(context: dict) -> list[str]:
+    state = context.get("state") if isinstance(context.get("state"), dict) else {}
+    constraints = context.get("next_action_constraints")
+    if not isinstance(constraints, dict):
+        constraints = state.get("next_action_constraints") if isinstance(state, dict) else {}
+    if not isinstance(constraints, dict):
+        return []
+    return [
+        str(item.get("action"))
+        for item in constraints.get("required_actions") or []
+        if isinstance(item, dict) and item.get("action")
+    ]
+
+
+def _required_action_guidance(context: dict, action: str) -> dict:
+    state = context.get("state") if isinstance(context.get("state"), dict) else {}
+    constraints = context.get("next_action_constraints")
+    if not isinstance(constraints, dict):
+        constraints = state.get("next_action_constraints") if isinstance(state, dict) else {}
+    if not isinstance(constraints, dict):
+        return {}
+    for item in constraints.get("required_actions") or []:
+        if isinstance(item, dict) and item.get("action") == action:
+            guidance = item.get("input_guidance")
+            return dict(guidance) if isinstance(guidance, dict) else {}
+    return {}
+
+
+def _artifact_ref_values(context: dict, kind: str) -> list[str]:
+    artifacts = context.get("artifacts") if isinstance(context.get("artifacts"), dict) else {}
+    refs = artifacts.get("refs") if isinstance(artifacts.get("refs"), dict) else {}
+    raw = refs.get(kind)
+    values = raw if isinstance(raw, list) else [raw] if raw else []
+    return [str(item) for item in values if isinstance(item, str) and item]
+
+
+def _artifact_facts(context: dict, kind: str | None = None) -> list[dict]:
+    artifacts = context.get("artifacts") if isinstance(context.get("artifacts"), dict) else {}
+    facts = artifacts.get("facts") if isinstance(artifacts.get("facts"), list) else []
+    return [
+        item for item in facts
+        if isinstance(item, dict) and (kind is None or item.get("kind") == kind)
+    ]
+
+
+def _verified_insight_summary(context: dict) -> str | None:
+    lines = []
+    for insight in _verified_insights(context):
+        statement = str(insight.get("statement") or insight.get("name") or insight.get("insight_key") or "Insight")
+        if "value" in insight:
+            statement += f" Value: {json.dumps(insight['value'], ensure_ascii=False, default=str)}"
+        if insight.get("items"):
+            statement += f" Items: {json.dumps(insight['items'], ensure_ascii=False, default=str)}"
+        lines.append(statement)
+    return "\n".join(lines) or None
+
+
+def _query_results_text(context: dict) -> str | None:
+    blocks = []
+    for fact in _artifact_facts(context, "database_evidence"):
+        purpose = str(fact.get("purpose") or fact.get("summary") or fact.get("source_ref") or "Database query")
+        records = [item for item in fact.get("records") or [] if isinstance(item, dict)]
+        columns = [str(item) for item in fact.get("columns") or []]
+        if not columns and records:
+            columns = list(records[0])
+        block = [f"查询目的：{purpose}", f"实际返回行数：{int(fact.get('row_count') or 0)}"]
+        query = str(fact.get("query") or "")
+        if query:
+            block.extend([f"```{fact.get('query_language') or 'text'}", query, "```"])
+        if len(records) == 1 and len(records[0]) == 1:
+            key, value = next(iter(records[0].items()))
+            block.append(f"结果值：{key} = {value}")
+        elif records and columns:
+            block.append("| " + " | ".join(columns) + " |")
+            block.append("| " + " | ".join("---" for _ in columns) + " |")
+            for record in records:
+                block.append("| " + " | ".join(str(record.get(column, "")) for column in columns) + " |")
+        blocks.append("\n".join(block))
+    return "\n\n".join(blocks) or None
+
+
+def _latest_artifact_ref(refs: dict, kind: str) -> str | None:
+    raw = refs.get(kind)
+    values = raw if isinstance(raw, list) else [raw] if raw else []
+    return next((str(item) for item in reversed(values) if isinstance(item, str) and item), None)
+
+
+def _verified_insights(context: dict) -> list[dict]:
+    state = context.get("state") if isinstance(context.get("state"), dict) else {}
+    insight_state = state.get("insight_state") if isinstance(state.get("insight_state"), dict) else {}
+    return [
+        item
+        for item in insight_state.get("recent_insights") or []
+        if isinstance(item, dict) and item.get("status") == "verified"
+    ]
+
+
+def _verified_insight_keys(context: dict) -> list[str]:
+    return [str(item["insight_key"]) for item in _verified_insights(context) if item.get("insight_key")]
+
+
+def _visualization_source_refs(context: dict) -> list[str]:
+    refs = [
+        f"insight:{item['insight_id']}"
+        for item in _verified_insights(context)
+        if item.get("insight_id")
+    ]
+    for kind in ("database_evidence", "analysis", "derived_evidence", "forecast", "anomaly"):
+        refs.extend(_artifact_ref_values(context, kind))
+    return list(dict.fromkeys(refs))
+
+
 def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
+    context = _LAST_CONTEXT or {}
+    required_actions = _required_action_names(context)
+    if "terminate" in required_actions and action != "terminate":
+        guidance = _required_action_guidance(context, "terminate")
+        thought = "The grounded outputs are answerable and the latest receipt requires final assembly."
+        action = "terminate"
+        action_input = {
+            "summary_goal": str(context.get("message") or "Answer from grounded artifacts."),
+            **guidance,
+        }
+    elif "visualization" in required_actions and action != "visualization":
+        source_refs = _visualization_source_refs(context)
+        insight_keys = _verified_insight_keys(context)
+        thought = (
+            f"Verified Insights: {', '.join(insight_keys) or 'none'}; "
+            "Verification question: does the complete contextual series support the calculated relationship; "
+            f"Context: {', '.join(source_refs) or 'no grounded refs'} with complete interval coverage."
+        )
+        action = "visualization"
+        action_input = {
+            "message": str(context.get("message") or "Verify the grounded analytical relationship."),
+            "source_refs": source_refs,
+            "constraints": dict(context.get("constraints") or {}),
+        }
     if action == "terminate" and "response_plan" not in action_input:
-        context = _LAST_CONTEXT or {}
         presentation = ((context.get("artifacts") or {}).get("presentation") or {})
         presentation_sources = [
             item for item in presentation.get("sources") or [] if isinstance(item, dict) and item.get("source_ref")
         ]
         source_refs: list[str] = [str(item["source_ref"]) for item in presentation_sources]
+        source_refs.extend(_artifact_ref_values(context, "analysis"))
+        source_refs.extend(_artifact_ref_values(context, "database_evidence"))
         latest_evidence = context.get("latest_database_evidence") or {}
-        if not source_refs and latest_evidence.get("evidence_id"):
+        if not source_refs and isinstance(latest_evidence, dict) and latest_evidence.get("evidence_id"):
             source_refs.append(f"evidence:{latest_evidence['evidence_id']}")
         if not source_refs:
             source_refs.extend(f"analysis:{analysis_id}" for analysis_id in _analysis_ids(context))
         latest_forecast = context.get("latest_forecast") or {}
-        if not presentation_sources and latest_forecast.get("forecast_id"):
+        if not presentation_sources and isinstance(latest_forecast, dict) and latest_forecast.get("forecast_id"):
             source_refs.append(f"forecast:{latest_forecast['forecast_id']}")
         latest_anomaly = context.get("latest_anomaly") or {}
-        if not presentation_sources and latest_anomaly.get("anomaly_id"):
+        if not presentation_sources and isinstance(latest_anomaly, dict) and latest_anomaly.get("anomaly_id"):
             source_refs.append(f"anomaly:{latest_anomaly['anomaly_id']}")
         grounded_summary = next(
             (
@@ -688,35 +841,80 @@ def _turn(thought: str, action: str, action_input: dict) -> _FakeResponse:
         summary = str(
             action_input.get("direct_answer")
             or grounded_summary
+            or _verified_insight_summary(context)
             or action_input.get("summary_goal")
             or context.get("message")
             or "Answer assembled from the available evidence."
         )
         source_kinds = {str(item.get("kind")) for item in presentation_sources}
+        requested_sections = [str(item) for item in action_input.get("section_plan") or []]
         section_type = (
-            "forecast" if "forecast" in source_kinds or latest_forecast.get("forecast_id")
-            else "anomaly" if "anomaly" in source_kinds or latest_anomaly.get("anomaly_id")
+            "query_results" if "query_results" in requested_sections
+            else "forecast" if "forecast" in source_kinds or (isinstance(latest_forecast, dict) and latest_forecast.get("forecast_id"))
+            else "anomaly" if "anomaly" in source_kinds or (isinstance(latest_anomaly, dict) and latest_anomaly.get("anomaly_id"))
             else "analysis" if "analysis" in source_kinds or _analysis_ids(context)
             else "answer"
         )
-        action_input = {
-            "response_plan": {
-                "title": None,
-                "summary": summary,
-                "sections": [{
+        if section_type == "query_results":
+            sections = [{
+                "section_type": "query_results",
+                "heading": None,
+                "content": _query_results_text(context) or summary,
+                "source_refs": _artifact_ref_values(context, "database_evidence"),
+            }]
+        else:
+            sections = []
+            for artifact_kind, result_section in (
+                ("analysis", "analysis"),
+                ("anomaly", "anomaly"),
+                ("forecast", "forecast"),
+            ):
+                artifact_refs = _artifact_ref_values(context, artifact_kind)
+                if artifact_refs:
+                    sections.append({
+                        "section_type": result_section,
+                        "heading": None,
+                        "content": summary,
+                        "source_refs": artifact_refs,
+                    })
+            if not sections:
+                sections = [{
                     "section_type": section_type,
                     "heading": None,
                     "content": summary,
                     "source_refs": list(dict.fromkeys(source_refs)),
-                }],
+                }]
+        unavailable_outputs = list(action_input.get("unavailable_outputs") or [])
+        unavailable_reason = action_input.get("unavailable_reason")
+        latest_observation = (context.get("latest_observation_summaries") or [{}])[-1]
+        latest_payload = latest_observation.get("payload") if isinstance(latest_observation, dict) else None
+        latest_payload = latest_payload if isinstance(latest_payload, dict) else latest_observation
+        if (
+            isinstance(latest_observation, dict)
+            and latest_observation.get("tool_name") == "visualization"
+            and isinstance(latest_payload, dict)
+            and latest_payload.get("status") == "unavailable"
+        ):
+            if "visualization" not in unavailable_outputs:
+                unavailable_outputs.append("visualization")
+            unavailable_reason = str(
+                latest_payload.get("unavailable_reason")
+                or latest_observation.get("summary")
+                or "Visual verification was unavailable."
+            )
+        action_input = {
+            "response_plan": {
+                "title": None,
+                "summary": summary,
+                "sections": sections,
                 "visualization_ids": [
                     item.get("visualization_id")
-                    for item in (context.get("outputs") or {}).get("visualizations", [])
+                    for item in context.get("visualizations") or []
                     if isinstance(item, dict) and item.get("visualization_id")
                 ],
             },
-            "unavailable_outputs": action_input.get("unavailable_outputs") or [],
-            "unavailable_reason": action_input.get("unavailable_reason"),
+            "unavailable_outputs": unavailable_outputs,
+            "unavailable_reason": unavailable_reason,
         }
     payload = {
         "thought": thought,
@@ -773,24 +971,127 @@ def _evidence_refs_from_payload(payload: dict) -> list[str]:
 
 
 def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
+    if (
+        "User Task:" not in user_prompt
+        and "Outer ReAct State:" not in user_prompt
+        and "visualization" in _required_action_names(_LAST_CONTEXT or {})
+    ):
+        return _FakeResponse(json.dumps({
+            "decision": "not_visualizable",
+            "target_insight_ids": [],
+            "verification_question": None,
+            "interpretation": "The fake unit-test model cannot inspect a rendered visual relationship.",
+            "visual_relation": None,
+            "required_context": [],
+            "non_visual_insight_ids": [],
+            "required_data_request": None,
+        }, ensure_ascii=False))
     try:
         internal_payload = json.loads(user_prompt)
     except (TypeError, json.JSONDecodeError):
         internal_payload = None
+    if (
+        isinstance(internal_payload, dict)
+        and isinstance(internal_payload.get("todos"), list)
+        and "user_request" in internal_payload
+    ):
+        bindings = []
+        todos = internal_payload["todos"]
+        for position, item in enumerate(todos):
+            content = str(item.get("content") or "").lower() if isinstance(item, dict) else ""
+            if any(token in content for token in ("查询", "查库", "query", "retrieve")):
+                task_type = "query"
+            elif any(token in content for token in ("异常", "anomal")):
+                task_type = "anomaly"
+            elif any(token in content for token in ("预测", "forecast", "predict")):
+                task_type = "forecast"
+            elif any(token in content for token in ("可视", "图表", "visual", "chart")):
+                task_type = "visualization"
+            elif position == len(todos) - 1 or any(token in content for token in ("总结", "汇总", "answer")):
+                task_type = "answer"
+            else:
+                task_type = "code_interpreter"
+            bindings.append({
+                "index": int(item.get("index", position)) if isinstance(item, dict) else position,
+                "task_type": task_type,
+                "reason": f"The Todo's acceptance result belongs to {task_type}.",
+            })
+        return _FakeResponse(json.dumps({"bindings": bindings}, ensure_ascii=False))
+    if (
+        isinstance(internal_payload, dict)
+        and isinstance(internal_payload.get("insight_requests"), list)
+        and "canonical_inputs" in internal_payload
+        and "artifact_sources" in internal_payload
+    ):
+        requested_keys = [
+            str(item.get("insight_key"))
+            for item in internal_payload["insight_requests"]
+            if isinstance(item, dict) and item.get("insight_key")
+        ]
+        computed_entries = ",\n".join(
+            "        " + repr({
+                "insight_key": insight_key,
+                "value": {
+                    "row_count": "__ROW_COUNT__",
+                    "first_value": "__FIRST_VALUE__",
+                    "last_value": "__LAST_VALUE__",
+                },
+                "calculation_trace": {
+                    "operation": "summarize canonical numeric observations",
+                    "input": "rows",
+                },
+            })
+            for insight_key in requested_keys
+        )
+        computed_entries = (
+            computed_entries
+            .replace("'__ROW_COUNT__'", "len(rows)")
+            .replace("'__FIRST_VALUE__'", "values[0] if values else None")
+            .replace("'__LAST_VALUE__'", "values[-1] if values else None")
+        )
+        code = (
+            "values = []\n"
+            "for row in rows:\n"
+            "    for field_name, raw_value in row.items():\n"
+            "        if field_name in {'timestamp', 'time', '_time'}:\n"
+            "            continue\n"
+            "        if isinstance(raw_value, (int, float)):\n"
+            "            values.append(float(raw_value))\n"
+            "            break\n"
+            "result = {\n"
+            "    'computed_insights': [\n"
+            f"{computed_entries}\n"
+            "    ],\n"
+            "    'derived_evidence': [],\n"
+            "}\n"
+        )
+        return _FakeResponse(json.dumps({"code": code}, ensure_ascii=False))
     if isinstance(internal_payload, dict) and isinstance(internal_payload.get("computed_insights"), list):
+        requests_by_key = {
+            item.get("insight_key"): item
+            for item in internal_payload.get("requests", [])
+            if isinstance(item, dict) and item.get("insight_key")
+        }
         return _FakeResponse(json.dumps({
             "bindings": [
                 {
                     "insight_key": item.get("insight_key"),
+                    "supported": True,
+                    "unsupported_reason": None,
                     "statement": f"Computed {item.get('insight_key')} from grounded evidence.",
+                    "derived_from": requests_by_key.get(item.get("insight_key"), {}).get("derived_from", []),
                     "item_annotations": [],
                 }
                 for item in internal_payload["computed_insights"]
                 if isinstance(item, dict) and item.get("insight_key")
             ]
         }, ensure_ascii=False))
-    if "LLM Schema Linking JSON:" in user_prompt:
-        payload = json.loads(user_prompt.split("LLM Schema Linking JSON:\n", 1)[1])
+    schema_label = next(
+        (label for label in ("LLM Schema Linking JSON:\n", "LLM 模式映射输入 JSON：\n") if label in user_prompt),
+        None,
+    )
+    if schema_label:
+        payload = json.loads(user_prompt.split(schema_label, 1)[1])
         schema_preview = payload.get("schema_preview") or {}
         tables = schema_preview.get("tables_or_measurements") or []
         table = tables[0] if tables and isinstance(tables[0], dict) else {}
@@ -813,9 +1114,13 @@ def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
                 ensure_ascii=False,
             )
         )
-    if "LLM SQL Query Generation JSON:" not in user_prompt:
+    query_label = next(
+        (label for label in ("LLM SQL Query Generation JSON:\n", "LLM 查询生成输入 JSON：\n") if label in user_prompt),
+        None,
+    )
+    if query_label is None:
         return None
-    payload = json.loads(user_prompt.split("LLM SQL Query Generation JSON:\n", 1)[1])
+    payload = json.loads(user_prompt.split(query_label, 1)[1])
     request = payload.get("request") or {}
     schema_preview = request.get("schema_preview") or {}
     database_type = str(request.get("database_type") or "").lower()
@@ -888,11 +1193,28 @@ def _compat_context(context: dict) -> dict:
     presentation = artifacts.get("presentation") if isinstance(artifacts.get("presentation"), dict) else {}
     presentation_sources = [item for item in presentation.get("sources") or [] if isinstance(item, dict)]
     execution = state.get("execution") or {}
-    inventory = state.get("artifact_inventory") if isinstance(state.get("artifact_inventory"), dict) else {}
     observations = _observation_summaries(context)
     latest_observation = observations[-1] if observations else {}
     latest_observation_payload = latest_observation.get("payload") if isinstance(latest_observation.get("payload"), dict) else latest_observation
-    latest_evidence = evidence.get("latest") or _latest_ref_payload(refs, "database_evidence") or _latest_ref_payload(refs, "evidence")
+    latest_sql_observation = next(
+        (
+            item
+            for item in reversed(observations)
+            if item.get("tool_name") == "sql_query" and item.get("success") is not False
+        ),
+        None,
+    )
+    latest_sql_payload = (
+        latest_sql_observation.get("payload")
+        if isinstance(latest_sql_observation, dict) and isinstance(latest_sql_observation.get("payload"), dict)
+        else latest_sql_observation
+    )
+    latest_evidence = (
+        evidence.get("latest")
+        or _latest_ref_payload(refs, "database_evidence")
+        or _latest_ref_payload(refs, "evidence")
+        or latest_sql_payload
+    )
     if not latest_evidence:
         presentation_evidence = next((item for item in reversed(presentation_sources) if item.get("kind") == "evidence"), None)
         if presentation_evidence:
@@ -903,6 +1225,14 @@ def _compat_context(context: dict) -> dict:
             }
     if not latest_evidence and latest_observation.get("tool_name") == "sql_query" and latest_observation.get("success") is not False:
         latest_evidence = latest_observation_payload
+    if not latest_evidence:
+        evidence_ref = _latest_artifact_ref(refs, "database_evidence") or _latest_artifact_ref(refs, "evidence")
+        if evidence_ref:
+            latest_evidence = {
+                "evidence_id": evidence_ref.split(":", 1)[-1],
+                "resource_ref": evidence_ref,
+                "result_type": "timeseries",
+            }
     analyses = _ref_payloads(refs, "analysis")
     if not analyses:
         analyses = [
@@ -917,20 +1247,35 @@ def _compat_context(context: dict) -> dict:
         analyses.append(latest_observation_payload)
     if not analyses:
         analyses = _analysis_refs(refs)
-    analysis_count = len(analyses) or int(inventory.get("analysis_count") or 0)
+    analysis_count = len(analyses)
     latest_anomaly = outputs.get("latest_anomaly") or _latest_ref_payload(refs, "anomaly")
     if not latest_anomaly and latest_observation.get("tool_name") == "anomaly" and latest_observation.get("success") is not False:
         latest_anomaly = latest_observation_payload
-    if not latest_anomaly and inventory.get("has_anomaly"):
-        latest_anomaly = {"anomaly_id": "latest"}
+    if not latest_anomaly:
+        anomaly_ref = _latest_artifact_ref(refs, "anomaly")
+        if anomaly_ref:
+            latest_anomaly = {
+                "anomaly_id": anomaly_ref.split(":", 1)[-1],
+                "resource_ref": anomaly_ref,
+            }
     latest_forecast = outputs.get("latest_forecast") or _latest_ref_payload(refs, "forecast")
     if not latest_forecast and latest_observation.get("tool_name") == "forecast" and latest_observation.get("success") is not False:
         latest_forecast = latest_observation_payload
-    if not latest_forecast and inventory.get("has_forecast"):
-        latest_forecast = {"forecast_id": "latest"}
+    if not latest_forecast:
+        forecast_ref = _latest_artifact_ref(refs, "forecast")
+        if forecast_ref:
+            latest_forecast = {
+                "forecast_id": forecast_ref.split(":", 1)[-1],
+                "resource_ref": forecast_ref,
+            }
     todo_list = state.get("todo_list")
     if not todo_list:
         todo_list = _todo_list_from_progress(state.get("todo_progress"))
+    visualizations = outputs.get("visualizations") or [
+        {"visualization_id": ref.split(":", 1)[1]}
+        for ref in _artifact_ref_values(context, "visualization")
+        if ref.startswith("visualization:")
+    ]
     return {
         **context,
         "message": task.get("message"),
@@ -946,6 +1291,7 @@ def _compat_context(context: dict) -> dict:
         "planning_complete": state.get("planning_complete"),
         "requested_capabilities": state.get("requested_capabilities"),
         "task_contract": state.get("task_contract"),
+        "next_action_constraints": state.get("next_action_constraints") or {},
         "focus": state.get("focus"),
         "latest_database_evidence": latest_evidence,
         "query_history": evidence.get("prior_queries") or [],
@@ -957,7 +1303,7 @@ def _compat_context(context: dict) -> dict:
         "latest_anomaly": latest_anomaly,
         "latest_rag": outputs.get("latest_rag"),
         "latest_skill": outputs.get("latest_skill"),
-        "visualizations": outputs.get("visualizations") or [],
+        "visualizations": visualizations,
         "latest_observation_summaries": observations,
         "available_actions": context.get("available_actions") or [],
     }
@@ -1086,11 +1432,9 @@ def _analysis_action_input(evidence, goal: str) -> dict:
             "    for key in value_keys:\n"
             "        if row.get(key) is None:\n"
             "            continue\n"
-            "        try:\n"
+            "        if isinstance(row.get(key), (int, float)):\n"
             "            values.append(float(row.get(key)))\n"
             "            break\n"
-            "        except (TypeError, ValueError):\n"
-            "            continue\n"
             "result = {'computed_insights': [{'insight_key': 'series_summary', 'value': {'row_count': len(rows), 'first_value': values[0] if values else None, 'last_value': values[-1] if values else None}, 'calculation_trace': {'operation': 'summarize canonical values', 'input_row_count': len(rows)}}], 'derived_evidence': []}\n"
         ),
     }
@@ -1106,10 +1450,8 @@ def _financial_metrics_code() -> str:
         "        if row.get(key) is not None:\n"
         "            raw = row.get(key)\n"
         "            break\n"
-        "    try:\n"
+        "    if isinstance(raw, (int, float)):\n"
         "        values.append(float(raw))\n"
-        "    except (TypeError, ValueError):\n"
-        "        continue\n"
         "returns = [(right / left) - 1 for left, right in zip(values, values[1:]) if left != 0]\n"
         "total_return = (values[-1] / values[0] - 1) if len(values) >= 2 and values[0] != 0 else None\n"
         "volatility = statistics.stdev(returns) if len(returns) > 1 else 0.0\n"

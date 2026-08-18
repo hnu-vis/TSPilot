@@ -180,7 +180,7 @@ def test_terminate_requires_forecast_tool_output_when_forecast_is_requested():
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["forecast", "visualization"]
 
 
 def test_downstream_analysis_constraints_follow_active_analysis_todo_only():
@@ -324,6 +324,148 @@ def test_visual_verification_must_be_newer_than_analytical_sources():
     assert current.can_answer is True
 
 
+def test_action_output_coverage_is_recomputed_after_current_visualization_is_stored():
+    evidence = DatabaseEvidence(
+        evidence_id="evi_market",
+        result_type="timeseries",
+        database="demo",
+        summary="Loaded rows.",
+        data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+    )
+    request_state = RequestStateModel(
+        request_id="req-visual-coverage-receipt",
+        message="展示最高点",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "visualization"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm",
+            "goal": "展示最高点",
+            "required_outputs": [{
+                "id": "visual_verification",
+                "description": "完整区间上的最高点可视验证",
+                "output_type": "visualization",
+                "evidence_kind": "visualization",
+            }],
+        }),
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        observations=[ToolObservation(
+            tool_name="visualization",
+            success=True,
+            summary="Created one visual verification.",
+            payload={"status": "created", "visualization_ids": ["viz_current"]},
+        )],
+        action_outputs=[
+            ActionOutput(
+                tool_name="sql_query",
+                success=True,
+                content="Loaded rows.",
+                observations={},
+                meta={"iteration": 1},
+            )
+        ],
+    )
+    request_state.visualizations = [
+        SimpleNamespace(visualization_id="viz_current", source_refs=["evidence:evi_market"])
+    ]
+    output = ActionOutput(
+        tool_name="visualization",
+        success=True,
+        content="Created one visual verification.",
+        observations={"status": "created"},
+        view={"payload": {"status": "created"}},
+        memory_fragment={"observation": {"status": "created"}},
+        meta={"iteration": 2},
+    )
+    loop = ReActLoop(
+        data_agent=None,
+        tool_executor=None,
+        settings=SimpleNamespace(conversation_log_enabled=False, resolved_conversation_log_dir="."),
+    )
+
+    loop._store_action_output(request_state, output)
+
+    expected = {"can_answer": True, "missing_outputs": []}
+    assert output.observations["coverage_delta"] == expected
+    assert output.view["payload"]["coverage_delta"] == expected
+    assert output.memory_fragment["observation"]["coverage_delta"] == expected
+    assert request_state.observations[-1].payload["coverage_delta"] == expected
+    assert evaluate_goal_completion(request_state).can_answer is True
+
+
+def test_current_unavailable_visual_verification_closes_the_react_capability():
+    evidence = DatabaseEvidence(
+        evidence_id="evi_market",
+        result_type="timeseries",
+        database="demo",
+        summary="Loaded rows.",
+        data={"points": [{"timestamp": "2023-01-01", "value": 1.0}]},
+    )
+    request_state = RequestStateModel(
+        request_id="req-unavailable-visual-verification",
+        message="证明价格变化的原因",
+        status="running",
+        database_context=DatabaseContext(database_id="demo", database_type="influxdb"),
+        requested_capabilities=["query", "visualization"],
+        task_contract=TaskContract.model_validate({
+            "source": "llm",
+            "goal": "说明变化原因",
+            "required_outputs": [{
+                "id": "visual_verification",
+                "description": "变化原因的视觉验证",
+                "output_type": "visualization",
+                "evidence_kind": "visualization",
+            }],
+        }),
+        latest_database_evidence=evidence,
+        database_evidence_artifacts={evidence.evidence_id: evidence},
+        observations=[ToolObservation(
+            tool_name="visualization",
+            success=True,
+            summary="No visualization was published.",
+            payload={
+                "status": "unavailable",
+                "unavailable_reason": "Observational data cannot visually verify a causal explanation.",
+            },
+        )],
+    )
+    request_state.completion_state["latest_gap_assessment"] = {
+        "can_answer": False,
+        "missing": ["visualization"],
+    }
+
+    completion = evaluate_goal_completion(request_state)
+    constraints = runtime_action_constraints(request_state)
+    retry_allowed, retry_reason = validate_action(
+        request_state,
+        "visualization",
+        {"message": "Retry the same causal chart."},
+    )
+    allowed, reason = validate_action(request_state, "terminate", {
+        "response_plan": {
+            "summary": "现有观察数据不能验证因果解释。",
+            "sections": [],
+            "visualization_ids": [],
+        },
+        "unavailable_outputs": ["visualization"],
+        "unavailable_reason": "Observational data cannot visually verify a causal explanation.",
+    })
+
+    assert completion.can_answer is True
+    assert completion.missing_evidence == []
+    assert constraints["required_actions"][0]["action"] == "terminate"
+    assert constraints["required_actions"][0]["input_guidance"] == {
+        "unavailable_outputs": ["visualization"],
+        "unavailable_reason": "Observational data cannot visually verify a causal explanation.",
+    }
+    assert "visualization" in constraints["prohibited_actions"]
+    assert retry_allowed is False
+    assert "resolved as unavailable" in (retry_reason or "")
+    assert allowed is True
+    assert reason is None
+
+
 def test_timeseries_analysis_requires_visual_verification_even_when_contract_omits_delivery_output():
     request_state = RequestStateModel(
         request_id="req-inferred-visual-verification",
@@ -459,7 +601,7 @@ def test_terminate_rejects_incomplete_forecast_artifact_when_forecast_is_request
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["forecast"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["forecast", "visualization"]
 
 
 def test_terminate_requires_anomaly_tool_when_contract_requires_anomaly_evidence():
@@ -488,7 +630,6 @@ def test_terminate_requires_anomaly_tool_when_contract_requires_anomaly_evidence
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["series"],
                 "missing": ["anomaly_points"],
                 "can_answer": False,
             }
@@ -623,7 +764,6 @@ def test_terminate_requires_authoritative_anomaly_artifact_for_outlier_contract(
         },
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["series", "pct_change", "outlier_treatment"],
                 "missing": [],
                 "can_answer": True,
             }
@@ -652,10 +792,8 @@ def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["highest", "lowest"],
                 "missing": ["start_value", "end_value", "change_pct"],
                 "can_answer": False,
-                "next_action_reason": "Query boundary values for the same time range.",
             }
         },
     )
@@ -665,7 +803,7 @@ def test_terminate_blocked_when_latest_gap_assessment_has_missing_outputs():
     assert allowed is False
     assert reason is not None
     assert "not fully covered" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
+    assert evaluate_goal_completion(request_state).missing_evidence == [
         "start_value",
         "end_value",
         "change_pct",
@@ -702,7 +840,6 @@ def test_terminate_blocked_when_task_contract_outputs_not_covered():
         },
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["total_count"],
                 "missing": ["earliest_rows"],
                 "can_answer": False,
             }
@@ -713,7 +850,7 @@ def test_terminate_blocked_when_task_contract_outputs_not_covered():
 
     assert allowed is False
     assert "Task contract required outputs" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["earliest_rows"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["earliest_rows"]
 
 
 def test_terminate_blocks_derived_contract_outputs_without_code_analysis():
@@ -748,7 +885,6 @@ def test_terminate_blocks_derived_contract_outputs_without_code_analysis():
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["start_value", "end_value", "pct_change", "high_low"],
                 "missing": [],
                 "can_answer": True,
             }
@@ -760,7 +896,7 @@ def test_terminate_blocks_derived_contract_outputs_without_code_analysis():
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["analysis", "visualization"]
 
 
 def test_terminate_blocks_analysis_capability_without_task_contract_until_code_runs():
@@ -784,7 +920,6 @@ def test_terminate_blocks_analysis_capability_without_task_contract_until_code_r
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["database_evidence"],
                 "missing": [],
                 "can_answer": True,
             }
@@ -796,7 +931,7 @@ def test_terminate_blocks_analysis_capability_without_task_contract_until_code_r
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["analysis"]
 
 
 def test_terminate_cannot_mark_required_analysis_unavailable_after_code_failure():
@@ -839,7 +974,6 @@ def test_terminate_cannot_mark_required_analysis_unavailable_after_code_failure(
         ],
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["start_value", "end_value"],
                 "missing": ["pct_change"],
                 "can_answer": False,
             }
@@ -859,7 +993,7 @@ def test_terminate_cannot_mark_required_analysis_unavailable_after_code_failure(
     assert allowed is False
     assert reason is not None
     assert "Required specialized tool output is missing" in reason
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["analysis"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["analysis", "visualization"]
 
 
 def test_terminate_allows_derived_contract_outputs_with_code_analysis():
@@ -914,7 +1048,6 @@ def test_terminate_allows_derived_contract_outputs_with_code_analysis():
         },
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["start_value", "end_value", "pct_change", "high_low"],
                 "missing": [],
                 "can_answer": True,
             }
@@ -923,8 +1056,9 @@ def test_terminate_allows_derived_contract_outputs_with_code_analysis():
 
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "涨跌幅 20%。"})
 
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert reason is not None
+    assert "visualization" in reason
 
 
 def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos():
@@ -988,15 +1122,6 @@ def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos()
         },
         completion_state={
             "latest_gap_assessment": {
-                "covered": [
-                    "query_text",
-                    "row_count",
-                    "start_value",
-                    "end_value",
-                    "pct_change",
-                    "max_value",
-                    "min_value",
-                ],
                 "missing": [],
                 "can_answer": True,
             }
@@ -1005,8 +1130,9 @@ def test_terminate_allows_answer_when_global_gap_covers_stale_non_answer_todos()
 
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "基于 code 结果回答。"})
 
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert reason is not None
+    assert "visualization" in reason
 
 
 def test_terminate_still_blocks_stale_non_answer_todos_without_global_gap_coverage():
@@ -1032,7 +1158,7 @@ def test_terminate_still_blocks_stale_non_answer_todos_without_global_gap_covera
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "证据不足。"})
 
     assert allowed is False
-    assert reason == "Final answer is blocked because non-answer todo steps are still incomplete."
+    assert "Non-answer todo steps are still incomplete" in (reason or "")
 
 
 def test_terminate_allows_unavailable_outputs_from_empty_database_evidence_with_active_query_todo():
@@ -1067,10 +1193,8 @@ def test_terminate_allows_unavailable_outputs_from_empty_database_evidence_with_
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["empty_database_result"],
                 "missing": ["start_value", "end_value", "pct_change", "high_low"],
                 "can_answer": False,
-                "next_action_reason": "The selected range contains no rows, so requested metrics are unavailable.",
             }
         },
     )
@@ -1087,7 +1211,7 @@ def test_terminate_allows_unavailable_outputs_from_empty_database_evidence_with_
 
     assert allowed is True
     assert reason is None
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == [
+    assert evaluate_goal_completion(request_state).missing_evidence == [
         "start_value",
         "end_value",
         "pct_change",
@@ -1122,10 +1246,8 @@ def test_terminate_allows_human_labels_for_unavailable_outputs_when_database_evi
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["r1", "r4"],
                 "missing": ["r2", "r3"],
                 "can_answer": False,
-                "next_action_reason": "The selected range contains no rows, so requested metrics are unavailable.",
             }
         },
     )
@@ -1142,10 +1264,10 @@ def test_terminate_allows_human_labels_for_unavailable_outputs_when_database_evi
 
     assert allowed is True
     assert reason is None
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["r2", "r3"]
+    assert evaluate_goal_completion(request_state).missing_evidence == ["r2", "r3"]
 
 
-def test_terminate_allows_explicit_unavailable_task_contract_outputs():
+def test_terminate_rejects_unproven_unavailable_task_contract_outputs():
     request_state = RequestStateModel(
         request_id="req-contract-unavailable",
         message="返回总数和最早 3 条。",
@@ -1175,7 +1297,6 @@ def test_terminate_allows_explicit_unavailable_task_contract_outputs():
         },
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["total_count"],
                 "missing": ["earliest_rows"],
                 "can_answer": False,
             }
@@ -1192,8 +1313,8 @@ def test_terminate_allows_explicit_unavailable_task_contract_outputs():
         },
     )
 
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert "earliest_rows" in (reason or "")
 
 
 def test_terminate_allowed_when_latest_gap_assessment_can_answer():
@@ -1221,7 +1342,6 @@ def test_terminate_allowed_when_latest_gap_assessment_can_answer():
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["start_value", "end_value", "change_pct", "min_value", "max_value"],
                 "missing": [],
                 "can_answer": True,
             }
@@ -1232,7 +1352,7 @@ def test_terminate_allowed_when_latest_gap_assessment_can_answer():
 
     assert allowed is True
     assert reason is None
-    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+    assert evaluate_goal_completion(request_state).can_answer is True
 
 
 def test_terminate_allows_nonblocking_missing_when_gap_can_answer_true():
@@ -1250,10 +1370,8 @@ def test_terminate_allows_nonblocking_missing_when_gap_can_answer_true():
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": ["异常检测已完成", "趋势总结可回答"],
                 "missing": ["可选异常点逐条解释"],
                 "can_answer": True,
-                "next_action_reason": "可以回答并说明限制。",
             }
         },
     )
@@ -1262,7 +1380,7 @@ def test_terminate_allows_nonblocking_missing_when_gap_can_answer_true():
 
     assert allowed is True
     assert reason is None
-    assert request_state.completion_state["latest_goal"]["can_answer"] is True
+    assert evaluate_goal_completion(request_state).can_answer is True
 
 
 def test_terminate_allowed_with_explicit_unavailable_gap_outputs():
@@ -1280,10 +1398,8 @@ def test_terminate_allowed_with_explicit_unavailable_gap_outputs():
         ),
         completion_state={
             "latest_gap_assessment": {
-                "covered": [],
                 "missing": ["start_value", "end_value", "change_pct"],
                 "can_answer": False,
-                "next_action_reason": "The selected range has no rows after query repair.",
             }
         },
     )
@@ -1320,12 +1436,12 @@ def test_repeated_failed_action_requires_changed_strategy_reason():
     assert reason is not None
     assert "failed repeatedly" in reason
 
-    request_state.completion_state["latest_gap_assessment"] = {
-        "missing": ["price"],
-        "next_action_reason": "Simplify the query and fetch raw rows before aggregation.",
-    }
-
-    assert validate_action(request_state, "sql_query", {"message": "查询价格"}) == (True, None)
+    assert validate_action(
+        request_state,
+        "sql_query",
+        {"message": "查询价格"},
+        thought="The failures show aggregation is invalid; fetch raw rows with a simpler request.",
+    ) == (True, None)
 
 
 class _OneTurnAgent:
@@ -1346,7 +1462,34 @@ class _TerminateAgent:
         )
 
 
-class _UnusedExecutor:
+class _PreparedExecutorAdapter:
+    def react_proposed_action_input(self, action_name, action_input):
+        return dict(action_input)
+
+    async def prepare(self, action_name, action_input, request_state):
+        return SimpleNamespace(action_name=action_name, action_input=dict(action_input))
+
+    def react_action_input(self, prepared):
+        return dict(prepared.action_input)
+
+    async def execute_prepared(self, prepared, request_state, conversation_state):
+        result = await self.execute(
+            prepared.action_name,
+            prepared.action_input,
+            request_state,
+            conversation_state,
+        )
+        result.action_output = ActionOutput(
+            tool_name=prepared.action_name,
+            success=result.observation.success,
+            content=result.observation.summary,
+            observations=result.observation.payload,
+            terminate=bool(getattr(result.tool_spec, "produces_terminal_payload", False)),
+        )
+        return result
+
+
+class _UnusedExecutor(_PreparedExecutorAdapter):
     async def execute(self, *args, **kwargs):
         raise AssertionError("tool executor should not run")
 
@@ -1356,7 +1499,7 @@ class _TerminalSpec:
     produces_terminal_payload = True
 
 
-class _TerminalExecutor:
+class _TerminalExecutor(_PreparedExecutorAdapter):
     async def execute(self, action_name, action_input, *args, **kwargs):
         assert action_name == "terminate"
         return type(
@@ -1417,10 +1560,8 @@ async def test_gap_assessment_without_active_todo_does_not_block_action_executio
                     completed_active_todo=True,
                     reason="No active todo; this is a gap assessment only.",
                     evidence_refs=["evidence:evi_demo"],
-                    covered=["time_series"],
                     missing=["anomaly_result"],
                     can_answer=False,
-                    next_action_reason="Run anomaly on the evidence.",
                 ),
                 action="anomaly",
                 action_input={"database_evidence": "evidence:evi_demo"},
@@ -1430,7 +1571,7 @@ async def test_gap_assessment_without_active_todo_does_not_block_action_executio
         result_target = "analysis"
         produces_terminal_payload = False
 
-    class _Executor:
+    class _Executor(_PreparedExecutorAdapter):
         async def execute(self, action_name, action_input, *args, **kwargs):
             assert action_name == "anomaly"
             return type(
@@ -1459,7 +1600,7 @@ async def test_gap_assessment_without_active_todo_does_not_block_action_executio
 
     events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
 
-    assert any(event.event_type == "observation" and event.payload["tool_name"] == "anomaly" for event in events)
+    assert any(event.event_type == "action_output" and event.payload["tool_name"] == "anomaly" for event in events)
     assert not any(
         event.event_type == "observation"
         and event.payload["tool_name"] == "todo_assessment"
@@ -1957,7 +2098,7 @@ async def test_runtime_does_not_run_separate_plan_requirement_gate():
         max_iterations=1,
     )
 
-    class _Executor:
+    class _Executor(_PreparedExecutorAdapter):
         async def execute(self, action_name, action_input, *args, **kwargs):
             assert action_name == "sql_query"
             return type(
@@ -1988,7 +2129,7 @@ async def test_runtime_does_not_run_separate_plan_requirement_gate():
     )
 
     events = [event async for event in loop._iterate(request_state, ConversationStateModel(conversation_id="conv"))]
-    observation = next(event for event in events if event.event_type == "observation")
+    observation = next(event for event in events if event.event_type == "action_output")
 
     assert observation.payload["success"] is True
     assert observation.payload["tool_name"] == "sql_query"
@@ -2078,8 +2219,8 @@ def test_policy_blocks_terminal_answer_until_database_goal_has_evidence():
     allowed, reason = validate_action(request_state, "terminate")
 
     assert allowed is False
-    assert "not complete" in (reason or "")
-    assert request_state.completion_state["latest_goal"]["missing_evidence"] == ["database_evidence"]
+    assert "No database-backed evidence" in (reason or "")
+    assert evaluate_goal_completion(request_state).missing_evidence == ["database_evidence"]
 
 
 def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
@@ -2113,7 +2254,6 @@ def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
                 tool_name="sql_query",
                 tool_input={},
                 iteration=1,
-                reason="load latest price",
             )
         ],
     )
@@ -2122,9 +2262,9 @@ def test_policy_allows_terminate_despite_sql_runtime_coverage_hint():
 
     assert allowed is True
     assert reason is None
-    latest_goal = request_state.completion_state["latest_goal"]
-    assert latest_goal["can_answer"] is True
-    assert latest_goal["missing_evidence"] == []
+    goal = evaluate_goal_completion(request_state)
+    assert goal.can_answer is True
+    assert goal.missing_evidence == []
 
 
 def test_runtime_keeps_query_todo_active_when_sql_missing_projected_value_field():
@@ -2166,7 +2306,6 @@ def test_runtime_keeps_query_todo_active_when_sql_missing_projected_value_field(
             completed_active_todo=True,
             reason="查询已返回行。",
             evidence_refs=["evidence:evi_missing_price"],
-            covered=["price"],
             missing=[],
             can_answer=False,
         ),
@@ -2209,7 +2348,6 @@ def test_runtime_allows_sql_prerequisite_repair_during_code_interpreter_todo():
             completed_active_todo=True,
             reason="补齐了 code 所需数值证据。",
             evidence_refs=["evidence:evi_price"],
-            covered=["evidence"],
             missing=["metrics"],
             can_answer=False,
         ),
@@ -2221,7 +2359,7 @@ def test_runtime_allows_sql_prerequisite_repair_during_code_interpreter_todo():
     assert request_state.completion_state["latest_step"]["completed"] is False
 
 
-def test_terminal_boundary_defers_anomaly_trace_quality_to_completion_review():
+def test_terminal_boundary_blocks_inconsistent_anomaly_trace():
     analysis = {
         "analysis_id": "ana_raw",
         "analysis_goal": "calculate return volatility drawdown",
@@ -2268,8 +2406,8 @@ def test_terminal_boundary_defers_anomaly_trace_quality_to_completion_review():
 
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "done"})
 
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert "inconsistent" in (reason or "")
 
 
 def test_runtime_keeps_query_todo_active_for_schema_only_sql_observation():
@@ -2547,8 +2685,8 @@ def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
                 "source": "llm",
                 "goal": "查询历史价格并预测",
                 "required_outputs": [
-                    {"id": "historical_price_series", "description": "历史价格序列"},
-                    {"id": "forecast_24h", "description": "24小时预测"},
+                    {"id": "historical_price_series", "description": "历史价格序列", "evidence_kind": "database"},
+                    {"id": "forecast_24h", "description": "24小时预测", "evidence_kind": "forecast"},
                 ],
                 "constraints": {},
                 "assumptions": [],
@@ -2586,10 +2724,7 @@ def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
             completed_active_todo=True,
             reason="历史序列和预测输出均已由现有证据覆盖。",
             evidence_refs=["evidence:evi_price"],
-            covered=["historical_price_series", "forecast_24h"],
             missing=[],
-            completed_todos=[1, 2],
-            next_active_todo=3,
             can_answer=True,
         ),
     )
@@ -2600,8 +2735,8 @@ def test_runtime_reconciles_stale_non_answer_todos_when_contract_is_covered():
     assert request_state.todo_list[1]["result_ref"] == "forecast:forecast_price"
     assert request_state.todo_list[2]["task_type"] == "answer"
     allowed, reason = validate_action(request_state, "terminate", {"direct_answer": "已完成。"})
-    assert allowed is True
-    assert reason is None
+    assert allowed is False
+    assert "visualization" in (reason or "")
 
 
 def test_runtime_rejects_global_reconcile_with_unknown_evidence_ref():
@@ -2637,9 +2772,7 @@ def test_runtime_rejects_global_reconcile_with_unknown_evidence_ref():
             completed_active_todo=True,
             reason="历史序列已覆盖。",
             evidence_refs=["evidence:missing"],
-            covered=["historical_price_series"],
             missing=[],
-            next_active_todo=2,
             can_answer=True,
         ),
     )
@@ -2856,13 +2989,18 @@ def test_runtime_advances_todo_after_successful_actions():
     code_interpreter = {
         "analysis_id": "ana_demo",
         "analysis_goal": "趋势",
-        "code_type": "python_rows_v1",
+            "code_type": "code_interpreter_v2",
         "code_hash": "hash",
         "input_evidence_id": "evi_demo",
         "input_row_count": 1,
         "status": "succeeded",
         "summary": "ok",
-        "result": {"summary": "ok", "metrics": {}, "details": {}},
+            "computed_insights": [{
+                "insight_key": "trend",
+                "value": "upward",
+                "calculation_trace": {"formula": "last - first"},
+            }],
+            "derived_evidence": [],
         "diagnostics": {},
     }
     apply_observation(

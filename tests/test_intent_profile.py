@@ -7,21 +7,21 @@ from schemas.api import ChatRequest
 from schemas.database_context import DatabaseContext
 
 
-def test_fallback_intent_profile_tracks_forecast_requirement():
+def test_fallback_intent_profile_does_not_infer_forecast_from_keywords():
     profile = build_intent_profile_fallback("请预测 appliances_energy_wh 接下来几个点的走势")
 
-    assert "forecast" in profile["requested_capabilities"]
-    assert "forecast" in profile["required_outputs"]
+    assert profile["requested_capabilities"] == ["query"]
+    assert profile["required_outputs"] == ["conclusion"]
 
 
-def test_fallback_intent_profile_tracks_anomaly_requirement():
+def test_fallback_intent_profile_does_not_infer_anomaly_from_keywords():
     profile = build_intent_profile_fallback("检查 appliances_energy_wh 有没有异常点")
 
-    assert "anomaly" in profile["requested_capabilities"]
-    assert "anomaly" in profile["required_outputs"]
+    assert profile["requested_capabilities"] == ["query"]
+    assert profile["required_outputs"] == ["conclusion"]
 
 
-def test_request_state_initializes_fallback_requirements_for_mixed_forecast_request():
+def test_request_state_uses_minimal_profile_until_llm_intent_is_available():
     request_state = build_request_state(
         ChatRequest(
             message="给出起始值、结束值、涨跌幅、最高最低，然后预测接下来 6 个点",
@@ -30,13 +30,11 @@ def test_request_state_initializes_fallback_requirements_for_mixed_forecast_requ
         Settings(),
     )
 
-    assert "analysis" in request_state.requested_capabilities
-    assert "forecast" in request_state.requested_capabilities
+    assert request_state.requested_capabilities == ["query"]
 
 
-def test_fallback_intent_profile_tracks_boundary_change_and_extrema_outputs():
+def test_fallback_intent_profile_does_not_encode_analysis_heuristics():
     profile = build_intent_profile_fallback("计算起始值、结束值、涨跌幅、最高最低")
 
-    assert "analysis" in profile["requested_capabilities"]
-    assert "analysis" in profile["required_outputs"]
-    assert "code_interpreter" not in profile["required_outputs"]
+    assert profile["requested_capabilities"] == ["query"]
+    assert profile["required_outputs"] == ["conclusion"]

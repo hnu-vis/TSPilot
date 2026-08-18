@@ -17,6 +17,14 @@ Define trace events for one request execution.
 Contract note:
 
 - `terminate` is a runtime-owned completion event emitted after the terminal payload is persisted.
+- canonical `thought` contains only `iteration` and the decision record
+- canonical `action` contains only `iteration`, the selected action, and the
+  compact runtime-validated semantic input; SSE exposes the same data through
+  `step.meta` / `tool_call` compatibility events
+- canonical `observation` carries the result summary, grounded artifact receipt,
+  and coverage result; it does not repeat Thought or Action metadata
+- runtime-only database context, history, retrieval diagnostics, and duplicate
+  question/phase/intention/reason fields are not part of the ReAct transcript
 
 ## Responsibilities
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.completion import normalize_todo_for_completion
 from core.harness import default_capability_registry
+from runtime.timeout_policy import load_timeout_policy
 from tools.base import BaseTool
 
 
@@ -95,8 +96,13 @@ class _TodoCapabilityBindings(BaseModel):
 
 
 class TodoWriteTool(BaseTool):
-    def __init__(self, llm=None):
+    def __init__(self, llm=None, *, llm_timeout_seconds: float | None = None):
         self._llm = llm
+        self._llm_timeout_seconds = float(
+            llm_timeout_seconds
+            if llm_timeout_seconds is not None
+            else load_timeout_policy().tool("todowrite").stage_seconds("llm_call_seconds")
+        )
 
     async def execute(self, validated_input: TodoWriteInput, **kwargs) -> dict:
         total_todos = len(validated_input.todos)
@@ -177,7 +183,9 @@ class TodoWriteTool(BaseTool):
                     runnable = self._llm.with_structured_output(
                         _TodoCapabilityBindings, method="json_schema", include_raw=True,
                     )
-                    bundle = await asyncio.wait_for(runnable.ainvoke(messages), timeout=30)
+                    bundle = await asyncio.wait_for(
+                        runnable.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     if isinstance(bundle, dict):
                         parsed = bundle.get("parsed")
                         if parsed is None:
@@ -189,7 +197,9 @@ class TodoWriteTool(BaseTool):
                         else _TodoCapabilityBindings.model_validate(parsed)
                     )
                 else:
-                    response = await asyncio.wait_for(self._llm.ainvoke(messages), timeout=30)
+                    response = await asyncio.wait_for(
+                        self._llm.ainvoke(messages), timeout=self._llm_timeout_seconds
+                    )
                     result = _TodoCapabilityBindings.model_validate_json(str(getattr(response, "content", response)))
                 by_index = {item.index: item for item in result.bindings}
                 expected = set(range(len(todos)))

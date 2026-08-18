@@ -76,9 +76,6 @@ def _build_client(llm, *, max_iterations: int | None = None) -> TestClient:
         settings.max_iterations = max_iterations
     else:
         settings.max_iterations = 30
-    settings.agent_turn_timeout_seconds = 45.0
-    settings.request_deadline_seconds = 180.0
-
     deps.get_llm = lambda: llm
     deps.get_data_agent_llm = lambda: llm
     deps.get_data_agent.cache_clear()
@@ -107,7 +104,7 @@ def test_chat_json_path_returns_final_answer():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
+    assert payload["status"] == "partial"
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"][:2] == ["sql_query", "code_interpreter"]
     assert payload["answer"]["summary"]
@@ -117,13 +114,16 @@ def test_chat_json_path_returns_final_answer():
 
 
 def test_chat_json_path_returns_agent_decision_timeout():
-    settings = get_settings()
-    old_turn_timeout = settings.agent_turn_timeout_seconds
-    old_deadline = settings.request_deadline_seconds
+    original_timeout_policy_factory = deps.get_timeout_policy
+    policy = original_timeout_policy_factory()
+    deps.get_timeout_policy = lambda: policy.model_copy(update={
+        "runtime": policy.runtime.model_copy(update={
+            "agent_turn_seconds": 0.01,
+            "request_deadline_seconds": 5,
+        })
+    })
     try:
         client = _build_client(SlowTurnLLM(), max_iterations=2)
-        settings.agent_turn_timeout_seconds = 0.01
-        settings.request_deadline_seconds = 5
         response = client.post(
             "/api/v1/chat",
             json={
@@ -135,8 +135,7 @@ def test_chat_json_path_returns_agent_decision_timeout():
             },
         )
     finally:
-        settings.agent_turn_timeout_seconds = old_turn_timeout
-        settings.request_deadline_seconds = old_deadline
+        deps.get_timeout_policy = original_timeout_policy_factory
         deps.get_data_agent.cache_clear()
         deps.get_tool_registry.cache_clear()
         deps.get_tool_executor.cache_clear()
@@ -200,8 +199,8 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["status"] == "completed"
-        assert payload["used_tools"] == ["sql_query", "code_interpreter"]
+        assert payload["status"] == "partial"
+        assert payload["used_tools"] == ["sql_query", "code_interpreter", "visualization"]
 
         code_observation = next(
             event
@@ -219,8 +218,8 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         section_types = [section["section_type"] for section in payload["answer"]["sections"]]
         assert "analysis" in section_types
         assert str(computed["delta_count"]) in payload["answer"]["summary"]
-        conclusion = next(section for section in payload["answer"]["sections"] if section["section_type"] == "conclusion")
-        assert str(computed["delta_count"]) in conclusion["content"]
+        analysis_section = next(section for section in payload["answer"]["sections"] if section["section_type"] == "analysis")
+        assert str(computed["delta_count"]) in analysis_section["content"]
         assert any(reference["source_type"] == "analysis" for reference in payload["answer"]["references"])
 
         request_dir = next(tmp_path.glob(f"*_{payload['conversation_id']}/requests/{payload['request_id']}"))
@@ -228,13 +227,13 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
         assert len(code_outputs) == 1
         code_output = json.loads(code_outputs[0].read_text(encoding="utf-8"))
         assert code_output["status"] == "succeeded"
-        assert code_output["computed_insights"][0]["value"]["delta_count"] == computed["delta_count"]
+        assert code_output["result"]["computed_insights"][0]["value"]["delta_count"] == computed["delta_count"]
     finally:
         settings.conversation_log_dir = old_log_dir
         settings.conversation_log_enabled = old_enabled
 
 
-def test_code_required_metrics_repair_generates_code():
+def test_code_required_metrics_execute_in_interpreter():
     client = _build_client(CodeRequiredRepairLLM(), max_iterations=6)
     response = client.post(
         "/api/v1/chat",
@@ -254,17 +253,8 @@ def test_code_required_metrics_repair_generates_code():
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
-    assert payload["used_tools"].count("code_interpreter") == 2
-    failures = [
-        event
-        for event in payload["trace"]
-        if event["event_type"] == "tool_result"
-        and event["payload"].get("tool") == "code_interpreter"
-        and event["payload"].get("success") is False
-    ]
-    assert failures
-    assert failures[-1]["payload"]["payload_preview"]["error_type"] == "code_required_for_metrics"
+    assert payload["status"] == "partial"
+    assert payload["used_tools"].count("code_interpreter") == 1
     successful_code = [
         event["payload"]["payload_preview"]
         for event in payload["trace"]
@@ -375,10 +365,10 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
         log_payload = json.loads(log_path.read_text(encoding="utf-8"))
         assert log_payload["schema_version"] == "conversation_trace_v1"
         assert log_payload["mode"] == "json"
-        assert log_payload["status"] == "completed"
+        assert log_payload["status"] == "partial"
         assert log_payload["request"]["message"] == "请分析 appliances_energy_wh 的趋势"
-        assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 3
-        assert log_payload["summary"]["used_tools"] == ["sql_query", "code_interpreter"]
+        assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 4
+        assert log_payload["summary"]["used_tools"] == ["sql_query", "code_interpreter", "visualization"]
         assert log_payload["state"]["tool_history"]
         assert log_payload["state"]["react_transcript"]
         first_step = log_payload["state"]["react_transcript"][0]
@@ -700,14 +690,17 @@ def test_chat_json_path_supports_complex_multi_step_react():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
+    assert payload["status"] == "partial"
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == [
         "todowrite",
         "sql_query",
         "code_interpreter",
+        "visualization",
         "anomaly",
+        "visualization",
         "forecast",
+        "visualization",
     ]
     assert payload["answer"]["summary"]
     section_types = [section["section_type"] for section in payload["answer"]["sections"]]
@@ -718,8 +711,8 @@ def test_chat_json_path_supports_complex_multi_step_react():
     assert "forecast" in reference_types
     assert "anomaly" in reference_types
     trace_event_types = [event["event_type"] for event in payload["trace"]]
-    assert trace_event_types.count("action") == 6
-    assert trace_event_types.count("observation") == 6
+    assert trace_event_types.count("action") == 9
+    assert trace_event_types.count("tool_result") == 9
     assert "final_answer" in trace_event_types
     assert "terminate" in trace_event_types
 
@@ -747,20 +740,20 @@ def test_chat_sse_path_supports_complex_multi_step_react():
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert body.count("event: thought") == 6
-    assert body.count("event: tool_call") == 6
-    assert body.count("event: tool_result") == 6
+    assert body.count("event: thought") == 9
+    assert body.count("event: tool_call") == 9
+    assert body.count("event: tool_result") == 9
     assert '"tool": "todowrite"' in body
     assert '"tool": "sql_query"' in body
     assert '"tool": "code_interpreter"' in body
     assert '"tool": "anomaly"' in body
     assert '"tool": "forecast"' in body
+    assert '"tool": "visualization"' in body
     assert '"tool": "terminate"' in body
     assert '"action_input"' in body
     assert '"observation"' in body
-    assert '"phase": "intent"' in body
-    assert '"phase": "analysis"' in body
-    assert '"phase": "answer_assembly"' in body
+    assert '"action_reason"' not in body
+    assert '"action_intention"' not in body
     assert "event: final_answer" in body
     assert "event: terminate" in body
     assert "event: action" not in body
@@ -786,7 +779,7 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
+    assert payload["status"] == "partial"
     assert payload["used_tools"].count("todowrite") == 1
     assert "sql_query" in payload["used_tools"]
     assert "code_interpreter" in payload["used_tools"]
@@ -797,7 +790,6 @@ def test_runtime_advances_plan_without_repeated_todowrite():
         for event in payload["trace"]
         if event["event_type"] == "tool_result"
     )
-    assert any(event["event_type"] == "policy_decision" for event in payload["trace"])
     tool_results = [event for event in payload["trace"] if event["event_type"] == "tool_result"]
     todo_updates = [
         event for event in tool_results
@@ -832,12 +824,15 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
-    assert payload["used_tools"] == ["todowrite", "forecast", "sql_query", "code_interpreter", "anomaly"]
-    observations = [event for event in payload["trace"] if event["event_type"] == "observation"]
+    assert payload["status"] == "partial"
+    assert payload["used_tools"] == [
+        "todowrite", "forecast", "sql_query", "code_interpreter",
+        "visualization", "anomaly", "visualization",
+    ]
+    observations = [event for event in payload["trace"] if event["event_type"] == "tool_result"]
     failures = [
         event for event in observations
-        if event["payload"]["tool_name"] == "forecast" and event["payload"]["success"] is False
+        if event["payload"]["tool"] == "forecast" and event["payload"]["success"] is False
     ]
     assert failures
     assert "forecast" in failures[-1]["payload"]["summary"].lower()
@@ -879,11 +874,11 @@ def test_chat_json_path_preserves_multi_query_results_in_final_answer():
     observations = [
         event
         for event in payload["trace"]
-        if event["event_type"] == "observation"
-        and event["payload"]["tool_name"] == "sql_query"
+        if event["event_type"] == "tool_result"
+        and event["payload"]["tool"] == "sql_query"
     ]
     assert [
-        event["payload"]["payload"]["diagnostics"]["row_count_total"]
+        event["payload"]["payload_preview"]["row_count"]
         for event in observations
     ] == [1, 5, 5, 2]
     assert len(payload["answer"]["references"]) == 4

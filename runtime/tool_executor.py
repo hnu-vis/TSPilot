@@ -1,9 +1,11 @@
 """Tool execution runtime."""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
 import re
+import time
 from typing import Any
 
 from core.harness import ActionOutputBuildInput, ActionOutputBuilder, default_capability_registry
@@ -12,7 +14,9 @@ from schemas.state import ConversationStateModel, RequestStateModel
 from schemas.tool import ToolCall, ToolObservation
 from runtime.action_policy import runtime_action_constraints
 from runtime.output_selection import select_outputs_for_action
+from runtime.timeout_policy import TimeoutPolicy, load_timeout_policy
 from tools.registry import ToolRegistry, ToolSpec
+from tools.base import StructuredToolError
 
 
 @dataclass
@@ -25,14 +29,32 @@ class ExecutionResult:
     action_output: ActionOutput
 
 
+@dataclass
+class PreparedAction:
+    """Validated runtime action and the exact compact input that will execute."""
+
+    tool_spec: ToolSpec
+    validated_input: Any
+    action_input: dict
+
+
 class ToolExecutor:
     """Resolve, validate, and invoke one tool."""
 
-    def __init__(self, registry: ToolRegistry, memory_retriever: Any | None = None):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        memory_retriever: Any | None = None,
+        timeout_policy: TimeoutPolicy | None = None,
+    ):
         self._registry = registry
         self._memory_retriever = memory_retriever
+        self._timeout_policy = timeout_policy or load_timeout_policy()
         self._capability_registry = default_capability_registry()
         self._action_output_builder = ActionOutputBuilder()
+
+    async def close(self) -> None:
+        await self._registry.close()
 
     async def execute(
         self,
@@ -40,9 +62,55 @@ class ToolExecutor:
         action_input: dict,
         request_state: RequestStateModel,
         conversation_state: ConversationStateModel,
-        action_reason: str | None = None,
     ) -> ExecutionResult:
+        budget = self.execution_timeout_seconds(action_name)
+        started = time.monotonic()
+        prepared = await self.prepare(
+            action_name,
+            action_input,
+            request_state,
+            timeout_seconds=budget,
+        )
+        return await self.execute_prepared(
+            prepared,
+            request_state,
+            conversation_state,
+            timeout_seconds=self._remaining_timeout(budget, started),
+        )
+
+    def execution_timeout_seconds(self, action_name: str) -> float:
+        configured = self._registry.resolve(action_name).execution_timeout_seconds
+        if configured is not None and float(configured) > 0:
+            return float(configured)
+        return float(self._timeout_policy.tool(action_name).execution_seconds)
+
+    async def prepare(
+        self,
+        action_name: str,
+        action_input: dict,
+        request_state: RequestStateModel,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> PreparedAction:
         tool_spec = self._registry.resolve(action_name)
+        budget = float(timeout_seconds) if timeout_seconds is not None else self.execution_timeout_seconds(action_name)
+        task = asyncio.create_task(
+            self._prepare_resolved(tool_spec, action_name, action_input, request_state)
+        )
+        try:
+            return await asyncio.wait_for(task, timeout=budget)
+        except TimeoutError as exc:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                raise task.exception()
+            raise self._timeout_error(action_name, budget, phase="preparation") from exc
+
+    async def _prepare_resolved(
+        self,
+        tool_spec: ToolSpec,
+        action_name: str,
+        action_input: dict,
+        request_state: RequestStateModel,
+    ) -> PreparedAction:
         normalized_input = self._normalize_action_input(action_name, action_input, request_state)
         normalized_input = await self._apply_insight_memory(action_name, normalized_input, request_state)
         if action_name == "code_interpreter":
@@ -51,12 +119,50 @@ class ToolExecutor:
                 request_state,
             )
         validated = tool_spec.input_model.model_validate(normalized_input)
+        compact_input = _compact_input(validated.model_dump(mode="json", exclude_none=True))
+        return PreparedAction(
+            tool_spec=tool_spec,
+            validated_input=validated,
+            action_input=compact_input,
+        )
+
+    async def execute_prepared(
+        self,
+        prepared: PreparedAction,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ExecutionResult:
+        tool_spec = prepared.tool_spec
+        budget = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else self.execution_timeout_seconds(tool_spec.tool_name)
+        )
+        task = asyncio.create_task(
+            self._execute_prepared_unbounded(prepared, request_state, conversation_state)
+        )
+        try:
+            return await asyncio.wait_for(task, timeout=budget)
+        except TimeoutError as exc:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                raise task.exception()
+            raise self._timeout_error(tool_spec.tool_name, budget, phase="execution") from exc
+
+    async def _execute_prepared_unbounded(
+        self,
+        prepared: PreparedAction,
+        request_state: RequestStateModel,
+        conversation_state: ConversationStateModel,
+    ) -> ExecutionResult:
+        tool_spec = prepared.tool_spec
+        validated = prepared.validated_input
         request_state.tool_history.append(
             ToolCall(
-                tool_name=action_name,
-                tool_input=validated.model_dump(mode="json"),
+                tool_name=tool_spec.tool_name,
+                tool_input=prepared.action_input,
                 iteration=request_state.iteration,
-                reason=action_reason,
             )
         )
 
@@ -77,12 +183,12 @@ class ToolExecutor:
         summary = tool_spec.tool.summarize(full_payload)
         action_output = self._action_output_builder.build(
             ActionOutputBuildInput(
-                tool_name=action_name,
+                tool_name=tool_spec.tool_name,
                 success=True,
                 summary=summary,
                 full_payload=full_payload,
                 result_target=tool_spec.result_target,
-                action_input=validated.model_dump(mode="json"),
+                action_input=prepared.action_input,
                 iteration=request_state.iteration,
                 request_id=request_state.request_id,
                 produces_terminal_payload=tool_spec.produces_terminal_payload,
@@ -96,6 +202,38 @@ class ToolExecutor:
             action_output=action_output,
         )
 
+    @staticmethod
+    def _remaining_timeout(total_seconds: float, started: float) -> float:
+        return max(0.001, float(total_seconds) - (time.monotonic() - started))
+
+    @staticmethod
+    def _timeout_error(tool_name: str, timeout_seconds: float, *, phase: str) -> StructuredToolError:
+        return StructuredToolError(
+            f"Tool '{tool_name}' exceeded its {float(timeout_seconds):g}s {phase} timeout.",
+            error_type="tool_execution_timeout",
+            retryable=True,
+            recommended_next_action=tool_name,
+            diagnostics={
+                "tool": tool_name,
+                "phase": phase,
+                "timeout_seconds": float(timeout_seconds),
+            },
+        )
+
+    def react_action_input(self, prepared: PreparedAction) -> dict:
+        """Return the executed semantic contract without runtime-owned context."""
+
+        return self.react_proposed_action_input(
+            prepared.tool_spec.tool_name,
+            prepared.action_input,
+        )
+
+    def react_proposed_action_input(self, action_name: str, action_input: dict) -> dict:
+        """Return a compact semantic view for an attempted outer action."""
+
+        fields = self._capability_registry.semantic_input_fields_for_action(action_name)
+        return _react_action_input(action_input, semantic_fields=fields)
+
     def _normalize_action_input(self, action_name: str, action_input: dict, request_state: RequestStateModel) -> dict:
         normalized = dict(action_input or {})
         if action_name == "terminate":
@@ -106,7 +244,9 @@ class ToolExecutor:
             return normalized
         if action_name == "visualization":
             normalized.setdefault("message", request_state.message)
-            constraints = normalized.get("constraints") if isinstance(normalized.get("constraints"), dict) else {}
+            constraints = dict(request_state.constraints or {})
+            if isinstance(normalized.get("constraints"), dict):
+                constraints.update(normalized["constraints"])
             next_constraints = runtime_action_constraints(request_state)
             for item in next_constraints.get("required_actions", []) or []:
                 if not isinstance(item, dict) or item.get("action") != "visualization":
@@ -138,7 +278,12 @@ class ToolExecutor:
             self._drop_unselected_optional_choice(normalized, "model_name")
         if action_name == "code_interpreter":
             normalized.setdefault("analysis_goal", request_state.message)
-            if not normalized.get("source_refs"):
+            if normalized.get("source_refs"):
+                # Exact refs already select the grounded inputs. A parallel
+                # "latest" selector is redundant and can become ambiguous as
+                # request state advances.
+                normalized.pop("database_evidence", None)
+            else:
                 normalized.setdefault("database_evidence", "latest")
             return {
                 key: value
@@ -361,11 +506,7 @@ class ToolExecutor:
         # help plan a missing contract, but it must never expand or replace an
         # explicit one after the outer agent has selected the required outputs.
         retrieved_requests = [] if action_name == "code_interpreter" and explicit else [
-            self._retrieved_insight_request_payload(
-                item,
-                retrieval.insight_request_sources.get(item.insight_key, [])
-                or (selected_card_ids if len(selected_card_ids) == len(retrieval.insight_requests) == 1 else []),
-            )
+            self._retrieved_insight_request_payload(item)
             for item in retrieval.insight_requests
         ]
         merged["insight_requests"] = self._dedupe_insight_requests([*explicit, *retrieved_requests])
@@ -375,26 +516,16 @@ class ToolExecutor:
         diagnostics["insight_request_count"] = len(retrieved_requests)
         if action_name == "code_interpreter" and explicit:
             diagnostics["explicit_contract_authoritative"] = True
-        constraints = merged.setdefault("constraints", {})
-        if isinstance(constraints, dict) and diagnostics:
-            constraints["memory_diagnostics"] = diagnostics
         memory_context = request_state.completion_state.setdefault("memory_context", {})
         tool_calls = memory_context.setdefault("tool_calls", []) if isinstance(memory_context, dict) else []
         if isinstance(tool_calls, list):
             tool_calls.append({"tool_name": action_name, **diagnostics})
         return merged
 
-    def _retrieved_insight_request_payload(self, request, source_card_ids: list[str]) -> dict:
-        payload = request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
-        if not source_card_ids:
-            return payload
-        requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
-        payload["requirements"] = {
-            **requirements,
-            "source": "memory",
-            "memory_card_ids": list(dict.fromkeys(source_card_ids)),
-        }
-        return payload
+    def _retrieved_insight_request_payload(self, request) -> dict:
+        # Retrieval provenance belongs to completion_state.memory_context, not
+        # to the semantic tool contract consumed by the model and tool.
+        return request.model_dump(mode="json", exclude_none=True) if hasattr(request, "model_dump") else dict(request)
 
     def _dedupe_insight_requests(self, requests: list) -> list:
         result: list = []
@@ -577,6 +708,59 @@ class ToolExecutor:
             item["rows_count"] = len(rows)
             item["rows"] = _sample_edges(rows, limit=12)
         return item
+
+
+def _compact_input(value):
+    """Drop empty defaults while preserving false/zero values and semantics."""
+    if isinstance(value, dict):
+        compact = {
+            str(key): _compact_input(item)
+            for key, item in value.items()
+            if item not in (None, "", [], {})
+        }
+        return {key: item for key, item in compact.items() if item not in (None, "", [], {})}
+    if isinstance(value, list):
+        return [_compact_input(item) for item in value]
+    return value
+
+
+def _react_action_input(value: dict, *, semantic_fields: set[str]) -> dict:
+    selected = (
+        {key: item for key, item in value.items() if key in semantic_fields}
+        if semantic_fields
+        else dict(value)
+    )
+    constraints = selected.get("constraints")
+    if isinstance(constraints, dict):
+        runtime_constraint_keys = {
+            "memory_diagnostics",
+            "unsupported_insight_requests",
+            "insight_request_hints",
+            "dialect_complexity_policy",
+        }
+        selected["constraints"] = {
+            key: item for key, item in constraints.items()
+            if not str(key).startswith("_") and key not in runtime_constraint_keys
+        }
+    return _compact_react_value(selected)
+
+
+def _compact_react_value(value):
+    """Compact action values and address artifacts by reference, not copies."""
+
+    if isinstance(value, dict):
+        evidence_id = str(value.get("evidence_id") or "").strip()
+        if evidence_id and ("data" in value or "result_type" in value):
+            return f"evidence:{evidence_id}"
+        compact = {
+            str(key): _compact_react_value(item)
+            for key, item in value.items()
+            if item not in (None, "", [], {})
+        }
+        return {key: item for key, item in compact.items() if item not in (None, "", [], {})}
+    if isinstance(value, list):
+        return [_compact_react_value(item) for item in value]
+    return value
 
 
 def _sample_edges(items: list, limit: int) -> list:

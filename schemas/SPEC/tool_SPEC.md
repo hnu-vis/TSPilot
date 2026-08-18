@@ -8,6 +8,7 @@ Define the normalized wrapper types for outer action execution.
 
 - `ToolCall`
 - `ToolObservation`
+- `ReActTranscriptStep`
 - `ToolError`
 
 ## `ToolCall`
@@ -17,13 +18,27 @@ Fields:
 - `tool_name: str`
 - `tool_input: dict`
 - `iteration: int`
-- `reason: str | null`
 
 Contract notes:
 
 - `tool_name` must resolve to exactly one registered outer action
 - `tool_input` must match the selected action contract
 - `ToolCall` is an execution record, not the model output itself
+- decision reasoning lives once in `ReActTranscriptStep.thought`; it is not
+  duplicated on each `ToolCall`
+
+## `ReActTranscriptStep`
+
+Fields:
+
+- `iteration: int`
+- `thought: str | null`
+- `action: str`
+- `action_input: dict`
+- `observation: ToolObservation | null`
+
+The transcript does not repeat the user question, phase, action intention, or
+action reason.
 
 ## `ToolObservation`
 

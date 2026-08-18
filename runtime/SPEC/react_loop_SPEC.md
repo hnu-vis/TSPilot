@@ -25,12 +25,10 @@ The prompt builder may include only a bounded, runtime-curated view of state:
 
 - current user message
 - normalized `database_context`
-- legacy database aliases only when present in the incoming request
 - current control state
-- latest evidence / analysis / visualization payloads
-- bounded recent messages
-- bounded tool history and observations
-- `prompt_context_summary` when older context has been compacted
+- compact artifact references and verified Insight state
+- latest Action Output observation
+- bounded recent trajectory receipts
 
 The model must not assume it can see:
 
@@ -40,11 +38,13 @@ The model must not assume it can see:
 
 ## ReAct turn contract
 
-Each model turn must be parsed as one `ReActTurn` with:
+Each model turn must be parsed as one JSON `ReActTurn` with:
 
-- `Thought`
-- `Action`
-- `Action Input`
+- `thought`
+- optional `task_contract`
+- optional `previous_observation_assessment`
+- `action`
+- `action_input`
 
 `Observation` is runtime-owned and must never be emitted by the model.
 
@@ -55,6 +55,7 @@ Each model turn must be parsed as one `ReActTurn` with:
 - `code_interpreter`
 - `forecast`
 - `anomaly`
+- `visualization`
 - `rag`
 - `skill`
 - `terminate`
@@ -65,47 +66,42 @@ Each model turn must be parsed as one `ReActTurn` with:
 2. build the prompt context
 3. ask the model for one ReAct turn
 4. parse the turn into `schemas.agent_turn.ReActTurn`
-5. validate `action` and `action_input`
-6. if `action` is an outer tool, invoke exactly one tool through `ToolExecutor`
-7. normalize the result into `ToolObservation`
-8. append trace events
-9. update request and conversation state
-10. if the executed tool has `produces_terminal_payload = true`, persist the assembled final answer, emit a runtime `terminate` event, and end the loop
-11. otherwise re-enter the loop until a stop condition is hit
+5. validate the selected action against runtime policy; visualization Thoughts
+   that omit verified targets, an inspectable relation, or complete context,
+   and visualization Actions that omit target Insight refs, are repaired by the
+   LLM before reaching this step; related artifacts are resolved from Insight
+   lineage inside the visualization tool
+6. normalize and validate the input once through `ToolExecutor.prepare`
+7. emit Action from the prepared semantic input, excluding runtime-owned
+   context and diagnostics
+8. invoke that exact prepared action once
+9. normalize the result into `ToolObservation`, update canonical state, then
+   compute its coverage receipt
+10. append the minimal Thought / Action / Observation transcript and trace
+11. update request and conversation state
+12. if the executed tool has `produces_terminal_payload = true`, persist the assembled final answer, emit a runtime `terminate` event, and end the loop
+13. otherwise re-enter the loop until a stop condition is hit
 
 ## Action dispatch rules
 
 - all allowed actions must resolve through `ToolExecutor`
 - one loop iteration may emit at most one `ToolCall` and one `ToolObservation`
 - a failed parse or validation must not create a partial `ToolCall`
+- a rejected or input-invalid attempted action may still be shown in the trace,
+  but it is never recorded as an executed `ToolCall`
 
-## Current insight-routing behavior
+## Insight and visualization routing
 
-The outer agent does not yet plan insight execution at the level of
-"query-native insight" versus "analysis-native insight".
-
-Current practical routing is:
-
-1. retrieve evidence through `sql_query`
-2. inspect the returned evidence family
-3. if the family is non-timeseries (`statistics`, `table`, `schema`,
-   `metric_list`), prefer `terminate`
-4. if the family is `timeseries`, use `code_interpreter`, `anomaly`, or
-   `forecast` only when the current ReAct gap assessment requires them, then `terminate`
-
-This means the main routing boundary for many requests currently depends on the
-evidence family selected by `sql_query`, not on a dedicated insight execution
-plan.
-
-Design note:
-
-- mixed requests such as "先给均值，再分析趋势" should eventually be split by a
-  dedicated planning layer into query-native insights and analysis-native insights
-- that planning layer is not yet implemented in the current runtime contract
-- the future planning layer must remain backend-agnostic: runtime should reason
-  over logical query plans and evidence shapes, not over SQL-only assumptions
-- the actual backend query may be SQL, Flux, PromQL, or another adapter-native
-  request format, and traces should preserve that distinction explicitly
+1. `sql_query` owns grounded database Evidence and atomic query-native Insights.
+2. `code_interpreter` owns calculated Insights and reusable derived Evidence;
+   generated computation and independent LLM semantic binding are separate.
+3. `anomaly` and `forecast` own their specialized artifacts; code may derive
+   requested conclusions from them but cannot replace them.
+4. `visualization` starts from verified Insights, selects an inspectable
+   relation, projects complete contextual artifacts, materializes the chart, and
+   passes semantic and production-render audits before publication.
+5. Completion is evaluated from the current task contract, Insights, and
+   artifacts on demand. A broad artifact does not cover a missing exact output.
 
 ## Validation rules
 

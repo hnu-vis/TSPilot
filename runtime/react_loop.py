@@ -21,12 +21,13 @@ from runtime.request_state import (
     build_final_response,
     public_final_answer_payload,
 )
-from core.completion import apply_previous_observation_assessment
+from core.completion import apply_previous_observation_assessment, evaluate_goal_completion
 from runtime.trace import TraceEventModel
 from runtime.token_usage import token_usage_summary
 from schemas.api import ChatResponse
 from schemas.state import ConversationStateModel, RequestStateModel
 from runtime.tool_executor import ToolExecutor
+from runtime.timeout_policy import TimeoutPolicy, load_timeout_policy
 from agents.data_agent import DataAgent
 from schemas.tool import ToolObservation
 from tools.base import StructuredToolError
@@ -50,14 +51,20 @@ class ReActLoop:
         tool_executor: ToolExecutor,
         settings: Settings,
         insight_learning_outbox: InsightLearningOutbox | None = None,
+        timeout_policy: TimeoutPolicy | None = None,
     ):
         self._data_agent = data_agent
         self._tool_executor = tool_executor
         self._settings = settings
+        policy_path = getattr(settings, "resolved_timeout_config_path", None)
+        self._timeout_policy = timeout_policy or load_timeout_policy(policy_path)
         self._insight_learning_outbox = insight_learning_outbox
         self._trace_logger = ConversationTraceLogger(settings)
         self._transition_engine = StateTransitionEngine()
         self._action_output_builder = ActionOutputBuilder()
+
+    async def close(self) -> None:
+        await self._tool_executor.close()
 
     async def run(
         self,
@@ -216,24 +223,30 @@ class ReActLoop:
                     {"message": f"Failed to obtain a valid model turn: {exc}"},
                 )
                 return
+            executed_action_input = self._tool_executor.react_proposed_action_input(
+                turn.action,
+                turn.action_input,
+            )
             yield append_trace(
                 request_state,
                 "thought",
                 {
                     "iteration": request_state.iteration,
                     "thought": turn.thought,
-                    "task_contract": (
-                        turn.task_contract.model_dump(mode="json")
-                        if turn.task_contract
-                        else None
-                    ),
-                    "action_intention": turn.action_intention,
-                    "action_reason": turn.action_reason,
                 },
             )
             try:
                 contract = apply_task_contract(request_state, turn.task_contract)
             except Exception as exc:
+                yield append_trace(
+                    request_state,
+                    "action",
+                    {
+                        "iteration": request_state.iteration,
+                        "action": turn.action,
+                        "action_input": executed_action_input,
+                    },
+                )
                 observation = build_policy_observation(
                     request_state,
                     turn.action,
@@ -254,8 +267,6 @@ class ReActLoop:
                     action=turn.action,
                     action_input=turn.action_input,
                     observation=observation,
-                    action_intention=turn.action_intention,
-                    action_reason=turn.action_reason,
                 )
                 yield append_trace(
                     request_state,
@@ -264,29 +275,6 @@ class ReActLoop:
                 )
                 sync_from_request(request_state, conversation_state)
                 continue
-
-            yield append_trace(
-                request_state,
-                "action",
-                {
-                    "iteration": request_state.iteration,
-                    "thought": turn.thought,
-                    "previous_observation_assessment": (
-                        turn.previous_observation_assessment.model_dump(mode="json")
-                        if turn.previous_observation_assessment
-                        else None
-                    ),
-                    "task_contract": (
-                        contract.model_dump(mode="json")
-                        if contract is not None
-                        else None
-                    ),
-                    "action": turn.action,
-                    "action_input": turn.action_input,
-                    "action_intention": turn.action_intention,
-                    "action_reason": turn.action_reason,
-                },
-            )
 
             if turn.previous_observation_assessment is not None:
                 had_active_todo = any(
@@ -308,6 +296,15 @@ class ReActLoop:
                     },
                 )
                 if had_active_todo and turn.previous_observation_assessment.completed_active_todo and not assessment.completed:
+                    yield append_trace(
+                        request_state,
+                        "action",
+                        {
+                            "iteration": request_state.iteration,
+                            "action": turn.action,
+                            "action_input": executed_action_input,
+                        },
+                    )
                     observation = ToolObservation(
                         tool_name="todo_assessment",
                         success=False,
@@ -336,8 +333,6 @@ class ReActLoop:
                         action=turn.action,
                         action_input=turn.action_input,
                         observation=observation,
-                        action_intention=turn.action_intention,
-                        action_reason=turn.action_reason,
                     )
                     yield append_trace(
                         request_state,
@@ -351,9 +346,18 @@ class ReActLoop:
                 request_state,
                 turn.action,
                 turn.action_input,
-                action_reason=turn.action_reason,
+                thought=turn.thought,
             )
             if not allowed:
+                yield append_trace(
+                    request_state,
+                    "action",
+                    {
+                        "iteration": request_state.iteration,
+                        "action": turn.action,
+                        "action_input": executed_action_input,
+                    },
+                )
                 observation = build_policy_observation(request_state, turn.action, reason or "Invalid action.")
                 request_state.observations.append(observation)
                 action_output = self._store_observation_action_output(
@@ -370,8 +374,6 @@ class ReActLoop:
                     action=turn.action,
                     action_input=turn.action_input,
                     observation=observation,
-                    action_intention=turn.action_intention,
-                    action_reason=turn.action_reason,
                 )
                 yield append_trace(
                     request_state,
@@ -384,12 +386,33 @@ class ReActLoop:
             try:
                 tool_started_at = datetime.now(timezone.utc).isoformat()
                 tool_started_monotonic = time.monotonic()
-                tool_task = asyncio.create_task(self._tool_executor.execute(
+                tool_timeout_seconds = self._remaining_tool_timeout(turn.action, deadline)
+                action_emitted = False
+                prepared = await self._tool_executor.prepare(
                     turn.action,
                     turn.action_input,
                     request_state,
+                    timeout_seconds=tool_timeout_seconds,
+                )
+                executed_action_input = self._tool_executor.react_action_input(prepared)
+                yield append_trace(
+                    request_state,
+                    "action",
+                    {
+                        "iteration": request_state.iteration,
+                        "action": turn.action,
+                        "action_input": executed_action_input,
+                    },
+                )
+                action_emitted = True
+                tool_task = asyncio.create_task(self._tool_executor.execute_prepared(
+                    prepared,
+                    request_state,
                     conversation_state,
-                    action_reason=turn.action_reason or turn.thought,
+                    timeout_seconds=max(
+                        0.001,
+                        tool_timeout_seconds - (time.monotonic() - tool_started_monotonic),
+                    ),
                 ))
                 async for heartbeat in self._heartbeat_until_done(
                     request_state,
@@ -412,6 +435,16 @@ class ReActLoop:
                         pass
                 raise
             except Exception as exc:
+                if not action_emitted:
+                    yield append_trace(
+                        request_state,
+                        "action",
+                        {
+                            "iteration": request_state.iteration,
+                            "action": turn.action,
+                            "action_input": executed_action_input,
+                        },
+                    )
                 if "tool_started_monotonic" in locals() and "tool_started_at" in locals():
                     tool_timing = self._tool_timing(tool_started_monotonic, tool_started_at)
                 else:
@@ -449,7 +482,7 @@ class ReActLoop:
                 action_output = self._store_observation_action_output(
                     request_state,
                     observation,
-                    action_input=turn.action_input,
+                    action_input=executed_action_input,
                     result_target="tool_error",
                 )
                 self._attach_action_output_timing(action_output, tool_timing)
@@ -458,10 +491,8 @@ class ReActLoop:
                     iteration=request_state.iteration,
                     thought=turn.thought,
                     action=turn.action,
-                    action_input=turn.action_input,
+                    action_input=executed_action_input,
                     observation=observation,
-                    action_intention=turn.action_intention,
-                    action_reason=turn.action_reason,
                 )
                 yield append_trace(
                     request_state,
@@ -480,21 +511,21 @@ class ReActLoop:
             execution_result.action_output = self._action_output_builder.refresh_after_transition(
                 execution_result.action_output,
                 transition_result.observation,
-                action_input=turn.action_input,
+                action_input=executed_action_input,
                 request_id=request_state.request_id,
             )
             self._attach_action_output_timing(execution_result.action_output, tool_timing)
             self._attach_todo_snapshot(execution_result.action_output, request_state)
             self._store_action_output(request_state, execution_result.action_output)
+            if request_state.observations:
+                execution_result.observation = request_state.observations[-1]
             append_react_transcript_step(
                 request_state,
                 iteration=request_state.iteration,
                 thought=turn.thought,
                 action=turn.action,
-                action_input=turn.action_input,
+                action_input=executed_action_input,
                 observation=execution_result.observation,
-                action_intention=turn.action_intention,
-                action_reason=turn.action_reason,
             )
             yield append_trace(
                 request_state,
@@ -552,7 +583,7 @@ class ReActLoop:
         )
 
     def _request_deadline(self) -> float | None:
-        seconds = float(getattr(self._settings, "request_deadline_seconds", 0) or 0)
+        seconds = float(self._timeout_policy.runtime.request_deadline_seconds)
         if seconds <= 0:
             return None
         return time.monotonic() + seconds
@@ -561,23 +592,30 @@ class ReActLoop:
         return deadline is not None and time.monotonic() >= deadline
 
     def _remaining_agent_timeout(self, deadline: float | None) -> float:
-        per_turn = float(getattr(self._settings, "agent_turn_timeout_seconds", 45.0) or 45.0)
+        per_turn = float(self._timeout_policy.runtime.agent_turn_seconds)
         if deadline is None:
             return max(0.1, per_turn)
         remaining = max(0.1, deadline - time.monotonic())
         return max(0.1, min(per_turn, remaining))
 
+    def _remaining_tool_timeout(self, action_name: str, deadline: float | None) -> float:
+        per_tool = self._tool_executor.execution_timeout_seconds(action_name)
+        if deadline is None:
+            return max(0.001, per_tool)
+        remaining = max(0.001, deadline - time.monotonic())
+        return max(0.001, min(per_tool, remaining))
+
     def _timeout_payload(self, request_state: RequestStateModel, *, deadline: float | None, message: str) -> dict:
         remaining = None if deadline is None else round(max(0.0, deadline - time.monotonic()), 3)
-        latest_goal = request_state.completion_state.get("latest_goal")
+        goal = evaluate_goal_completion(request_state).model_dump()
         return {
             "iteration": request_state.iteration,
             "message": message,
             "remaining_deadline_seconds": remaining,
-            "agent_turn_timeout_seconds": float(getattr(self._settings, "agent_turn_timeout_seconds", 45.0) or 45.0),
-            "request_deadline_seconds": float(getattr(self._settings, "request_deadline_seconds", 0) or 0),
+            "agent_turn_timeout_seconds": float(self._timeout_policy.runtime.agent_turn_seconds),
+            "request_deadline_seconds": float(self._timeout_policy.runtime.request_deadline_seconds),
             "available_artifacts": self._artifact_inventory_payload(request_state),
-            "goal_coverage": latest_goal if isinstance(latest_goal, dict) else None,
+            "goal_coverage": goal,
         }
 
     def _artifact_inventory_payload(self, request_state: RequestStateModel) -> dict:
@@ -610,6 +648,7 @@ class ReActLoop:
     def _store_action_output(self, request_state: RequestStateModel, action_output):
         request_state.action_outputs.append(action_output)
         request_state.latest_action_output = action_output
+        self._synchronize_coverage_receipt(request_state, action_output)
         if isinstance(action_output.memory_fragment, dict):
             request_state.memory_fragments.append(action_output.memory_fragment)
         elif isinstance(action_output.memory_fragment, str) and action_output.memory_fragment.strip():
@@ -630,6 +669,36 @@ class ReActLoop:
                 "iteration": (action_output.meta or {}).get("iteration"),
                 "status": "succeeded" if action_output.success else "failed",
             }
+
+    def _synchronize_coverage_receipt(self, request_state: RequestStateModel, action_output) -> None:
+        """Compute coverage after the current action is part of canonical state."""
+
+        goal = evaluate_goal_completion(request_state).model_dump()
+        coverage = {
+            "can_answer": bool(goal.get("can_answer")),
+            "missing_outputs": list(goal.get("missing_evidence") or []),
+        }
+
+        if isinstance(action_output.observations, dict):
+            action_output.observations = {**action_output.observations, "coverage_delta": coverage}
+        if isinstance(action_output.view, dict):
+            view = dict(action_output.view)
+            payload = dict(view.get("payload") or {})
+            payload["coverage_delta"] = coverage
+            view["payload"] = payload
+            action_output.view = view
+        if isinstance(action_output.memory_fragment, dict):
+            fragment = dict(action_output.memory_fragment)
+            observation = dict(fragment.get("observation") or {})
+            observation["coverage_delta"] = coverage
+            fragment["observation"] = observation
+            action_output.memory_fragment = fragment
+        if request_state.observations:
+            latest = request_state.observations[-1]
+            if latest.tool_name == action_output.tool_name:
+                payload = dict(latest.payload or {})
+                payload["coverage_delta"] = coverage
+                request_state.observations[-1] = latest.model_copy(update={"payload": payload})
 
     def _instant_tool_timing(self) -> dict:
         started_at = datetime.now(timezone.utc).isoformat()
@@ -722,9 +791,9 @@ class ReActLoop:
 
     def _coverage_updated_payload(self, request_state: RequestStateModel, action_output) -> dict:
         coverage = getattr(request_state, "insight_coverage", None)
-        latest_goal = request_state.completion_state.get("latest_goal")
+        goal = evaluate_goal_completion(request_state).model_dump()
         latest_step = request_state.completion_state.get("latest_step")
-        if coverage is None and not isinstance(latest_goal, dict) and not isinstance(latest_step, dict):
+        if coverage is None and not isinstance(latest_step, dict):
             return {}
         payload = {
             "tool": action_output.tool_name,
@@ -733,8 +802,7 @@ class ReActLoop:
         }
         if coverage is not None:
             payload["insight_coverage"] = coverage.model_dump(mode="json") if hasattr(coverage, "model_dump") else coverage
-        if isinstance(latest_goal, dict):
-            payload["goal_coverage"] = latest_goal
+        payload["goal_coverage"] = goal
         if isinstance(latest_step, dict):
             payload["step_coverage"] = latest_step
         return payload
@@ -869,8 +937,6 @@ class ReActLoop:
                     "message": payload.get("thought") or "正在判断下一步。",
                     "iteration": payload.get("iteration"),
                     "thought": payload.get("thought"),
-                    "intention": payload.get("action_intention"),
-                    "reason": payload.get("action_reason"),
                 },
             )
             yield append_trace(
@@ -897,13 +963,8 @@ class ReActLoop:
                     "type": "step.meta",
                     "step": iteration,
                     "id": step_id,
-                    "thought": payload.get("thought"),
                     "action": action_name,
                     "action_input": payload.get("action_input", {}),
-                    "task_contract": payload.get("task_contract"),
-                    "action_intention": payload.get("action_intention"),
-                    "action_reason": payload.get("action_reason"),
-                    "previous_observation_assessment": payload.get("previous_observation_assessment"),
                 },
             )
             yield append_trace(
@@ -924,9 +985,6 @@ class ReActLoop:
                     "tool": action_name,
                     "summary": self._message_for_action(action_name),
                     "iteration": iteration,
-                    "thought": payload.get("thought"),
-                    "intention": payload.get("action_intention"),
-                    "reason": payload.get("action_reason"),
                     "action_input": payload.get("action_input", {}),
                     "input_preview": self._input_preview(action_name, payload.get("action_input", {})),
                 },

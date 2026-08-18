@@ -111,7 +111,7 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
                 reason="Latest ReAct gap assessment says the user request is not fully covered.",
                 missing_evidence=gap_missing or ["gap_assessment_not_answerable"],
                 answerable_from=refs,
-                next_action_hint=gap.get("next_action_reason") or "Choose the next action that fills the assessed evidence gap.",
+                next_action_hint="Choose the smallest action that fills the assessed evidence gap.",
             )
         if can_answer is True and refs:
             return GoalCompletionEvaluation(
@@ -119,6 +119,21 @@ def evaluate_goal_completion(request_state: RequestStateModel) -> GoalCompletion
                 "Latest ReAct gap assessment says available evidence covers the user request.",
                 answerable_from=refs,
             )
+    incomplete_todos = [
+        str(todo.get("content") or todo.get("task_type") or "unfinished task")
+        for todo in request_state.todo_list
+        if isinstance(todo, dict)
+        and todo.get("status") != "completed"
+        and str(todo.get("task_type") or "").strip().lower() != "answer"
+    ]
+    if incomplete_todos:
+        return GoalCompletionEvaluation(
+            can_answer=False,
+            reason="Non-answer todo steps are still incomplete and no current gap assessment proves coverage.",
+            missing_evidence=incomplete_todos,
+            answerable_from=refs,
+            next_action_hint="Complete or explicitly assess the remaining non-answer todo steps.",
+        )
     if refs:
         return GoalCompletionEvaluation(True, "Available observations or artifacts exist for the final answer.", answerable_from=refs)
 
@@ -231,7 +246,7 @@ def _timeseries_analysis_requires_visual_verification(request_state: RequestStat
 
 def _visual_verification_is_current(request_state: RequestStateModel) -> bool:
     if not request_state.visualizations:
-        return False
+        return _latest_visualization_is_current_unavailable(request_state)
     visualization_iteration = _latest_successful_output_iteration(request_state, "visualization")
     source_iteration = max(
         (
@@ -241,6 +256,18 @@ def _visual_verification_is_current(request_state: RequestStateModel) -> bool:
         default=-1,
     )
     return visualization_iteration >= source_iteration
+
+
+def _latest_visualization_is_current_unavailable(request_state: RequestStateModel) -> bool:
+    for observation in reversed(request_state.observations):
+        if not observation.success:
+            continue
+        if observation.tool_name in {"sql_query", "anomaly", "forecast", "code_interpreter"}:
+            return False
+        if observation.tool_name == "visualization":
+            payload = observation.payload if isinstance(observation.payload, dict) else {}
+            return str(payload.get("status") or "").strip() == "unavailable"
+    return False
 
 
 def _latest_successful_output_iteration(request_state: RequestStateModel, action: str) -> int:
@@ -396,6 +423,10 @@ def _contract_allowed_source_types(output) -> set[str]:
     evidence_kind = str(getattr(output, "evidence_kind", "") or "").strip().lower()
     if not evidence_kind:
         return set()
+    if evidence_kind in {"insight", "key_insight", "derived_insight"}:
+        # These describe the evidence form, not the tool that owns the value.
+        # Source ownership is established by the Insight's typed provenance.
+        return set()
     if evidence_kind in {"query", "database", "database_evidence", "sql", "raw"}:
         return {"query", "database", "database_evidence", "sql_query"}
     if evidence_kind in {"analysis", "derived", "statistical", "computed", "calculated"}:
@@ -506,35 +537,16 @@ def _missing_contract_outputs(request_state: RequestStateModel, gap: dict | None
     if gap.get("can_answer") is not True:
         gap_missing = set(_gap_blocking_items(gap))
         if gap_missing:
-            uncovered_gap_missing = [
+            explicitly_missing = [
                 output.id
                 for output in required
                 if _contract_output_matches_gap_item(output, gap_missing)
-                and not _contract_output_is_covered_by_state(request_state, output)
             ]
-            return uncovered_gap_missing or state_missing
+            return explicitly_missing or state_missing
         return state_missing
-    covered = {
-        str(item).strip()
-        for item in gap.get("covered", [])
-        if str(item).strip()
-    }
-    missing = {
-        str(item).strip()
-        for item in gap.get("missing", [])
-        if str(item).strip()
-    }
-    missing_required = []
-    for output in required:
-        keys = {output.id, output.description}
-        if _contract_output_is_covered_by_state(request_state, output):
-            continue
-        if keys & missing:
-            missing_required.append(output.id)
-            continue
-        if not keys & covered:
-            missing_required.append(output.id)
-    return missing_required
+    # `can_answer` is an LLM assessment, not evidence. Exact contract outputs
+    # remain missing until canonical artifact/Insight state covers them.
+    return state_missing
 
 
 def _contract_output_is_covered_by_state(request_state: RequestStateModel, output) -> bool:
@@ -558,7 +570,7 @@ def _contract_output_is_covered_by_state(request_state: RequestStateModel, outpu
     if _contract_output_is_covered_by_verified_insight(request_state, output):
         return True
     if not capabilities:
-        return bool(_all_answer_refs(request_state))
+        return False
     return False
 
 
@@ -692,11 +704,7 @@ def apply_previous_observation_assessment(
     if reconciled is not None:
         return reconciled
 
-    assessment_completed_current = (
-        assessment.completed_active_todo
-        or _assessment_lists_current_todo(assessment, current, current_index)
-    )
-    if not assessment_completed_current:
+    if not assessment.completed_active_todo:
         evaluation = CompletionEvaluation(
             False,
             assessment.reason or "LLM assessment did not mark the active todo complete.",
@@ -749,33 +757,7 @@ def apply_previous_observation_assessment(
     else:
         request_state.plan_current_step = len(request_state.todo_list)
         request_state.planning_complete = True
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
     return evaluation
-
-
-def _assessment_lists_current_todo(
-    assessment: PreviousObservationAssessment,
-    current: dict,
-    current_index: int,
-) -> bool:
-    """Honor the LLM's explicit completed_todos set for the active step.
-
-    The normal hard gate still verifies that the immediately previous tool and
-    cited artifact actually satisfy this Todo, so this does not auto-complete
-    from artifact existence alone.
-    """
-
-    markers = {
-        str(item).strip().lower()
-        for item in assessment.completed_todos
-        if str(item).strip()
-    }
-    candidates = {
-        str(current_index + 1),
-        str(current.get("id") or "").strip().lower(),
-        str(current.get("content") or "").strip().lower(),
-    }
-    return bool((markers & candidates) - {""})
 
 
 def gap_assessment_payload(assessment: PreviousObservationAssessment) -> dict:
@@ -783,11 +765,7 @@ def gap_assessment_payload(assessment: PreviousObservationAssessment) -> dict:
         "completed_active_todo": assessment.completed_active_todo,
         "reason": assessment.reason,
         "evidence_refs": list(assessment.evidence_refs),
-        "covered": list(assessment.covered),
         "missing": list(assessment.missing),
-        "completed_todos": list(assessment.completed_todos),
-        "next_active_todo": assessment.next_active_todo,
-        "next_action_reason": assessment.next_action_reason,
         "can_answer": assessment.can_answer,
     }
 
@@ -830,7 +808,10 @@ def _gap_missing_is_covered_by_artifacts(request_state: RequestStateModel, missi
         "analysis": request_state.latest_analysis_id is not None or _key_insights_cover_required_analysis(request_state),
         "database_evidence": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
         "query": request_state.latest_database_evidence is not None and not _latest_database_evidence_is_empty(request_state),
-        "visualization": bool(request_state.visualizations),
+        # A current semantic/render audit may prove that the requested claim is
+        # not visually verifiable. That is a resolved verification outcome,
+        # not a missing chart that should be retried forever.
+        "visualization": _visual_verification_is_current(request_state),
     }
     for key in missing_keys:
         if key in structured_coverage:
@@ -879,6 +860,16 @@ def _hard_gate_previous_assessment(
     tool_name = previous_observation.tool_name
     payload = previous_observation.payload if isinstance(previous_observation.payload, dict) else {}
     refs = assessment.evidence_refs or evidence_refs_for_payload(payload)
+    if assessment.evidence_refs:
+        invalid_refs = _invalid_evidence_refs(request_state, assessment.evidence_refs)
+        if invalid_refs:
+            return CompletionEvaluation(
+                False,
+                "LLM assessment referenced evidence that does not exist.",
+                missing_evidence=invalid_refs,
+                evidence_refs=assessment.evidence_refs,
+                next_action_hint="Use only current grounded artifact refs from the Observation.",
+            )
     current_task_type = str(current.get("task_type") or "").strip().lower()
     if current_task_type in {"generic", "plan"}:
         current_task_type = "" if current_task_type == "generic" else "query"
@@ -1108,16 +1099,14 @@ def _reconcile_todos_from_global_assessment(
         request_state.todo_list[index] = completed_todo
         completed_any = True
 
-    next_index = _requested_next_active_todo_index(request_state, assessment)
-    if next_index is None:
-        next_index = next(
-            (
-                index for index, todo in enumerate(request_state.todo_list)
-                if todo.get("status") != "completed"
-                and str(todo.get("task_type") or "").strip().lower() == "answer"
-            ),
-            None,
-        )
+    next_index = next(
+        (
+            index for index, todo in enumerate(request_state.todo_list)
+            if todo.get("status") != "completed"
+            and str(todo.get("task_type") or "").strip().lower() == "answer"
+        ),
+        None,
+    )
     if next_index is None:
         next_index = next((index for index, todo in enumerate(request_state.todo_list) if todo.get("status") == "pending"), None)
 
@@ -1141,7 +1130,11 @@ def _reconcile_todos_from_global_assessment(
         bool(completed_any),
         assessment.reason or "LLM progress assessment reconciled todo progress with covered task contract outputs.",
         evidence_refs=refs,
-        next_action_hint=assessment.next_action_reason,
+        next_action_hint=(
+            "Choose the smallest action that covers the remaining task output."
+            if not assessment.can_answer
+            else None
+        ),
     )
     request_state.completion_state["latest_step"] = _assessment_state(
         evaluation,
@@ -1150,36 +1143,7 @@ def _reconcile_todos_from_global_assessment(
         todo=current,
         accepted=evaluation.completed,
     )
-    request_state.completion_state["latest_goal"] = evaluate_goal_completion(request_state).model_dump()
     return evaluation
-
-
-def _requested_next_active_todo_index(
-    request_state: RequestStateModel,
-    assessment: PreviousObservationAssessment,
-) -> int | None:
-    target = assessment.next_active_todo
-    if target is None:
-        return None
-    if isinstance(target, int):
-        return next(
-            (
-                index for index, todo in enumerate(request_state.todo_list)
-                if todo.get("priority") == target or index + 1 == target
-            ),
-            None,
-        )
-    normalized_target = str(target).strip().lower()
-    if not normalized_target:
-        return None
-    return next(
-        (
-            index for index, todo in enumerate(request_state.todo_list)
-            if str(todo.get("content") or "").strip().lower() == normalized_target
-            or str(todo.get("task_type") or "").strip().lower() == normalized_target
-        ),
-        None,
-    )
 
 
 def _artifact_ref_for_todo(request_state: RequestStateModel, task_type: str) -> str | None:

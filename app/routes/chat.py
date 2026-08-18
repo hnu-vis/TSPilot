@@ -54,13 +54,22 @@ async def chat(request: ChatRequest):
         return StreamingResponse(plain_event_stream(), media_type="text/event-stream")
 
     react_loop = get_react_loop_for_model(normalized.model_id)
+    owns_react_loop = bool(normalized.model_id)
 
     if not normalized.stream:
-        response = await react_loop.run(request_state, conversation_state)
-        return JSONResponse(content=response.model_dump(mode="json"))
+        try:
+            response = await react_loop.run(request_state, conversation_state)
+            return JSONResponse(content=response.model_dump(mode="json"))
+        finally:
+            if owns_react_loop:
+                await react_loop.close()
 
     async def event_stream() -> AsyncIterator[str]:
-        async for event in react_loop.run_sse(request_state, conversation_state):
-            yield _sse_frame(event.event_type, event.payload)
+        try:
+            async for event in react_loop.run_sse(request_state, conversation_state):
+                yield _sse_frame(event.event_type, event.payload)
+        finally:
+            if owns_react_loop:
+                await react_loop.close()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
