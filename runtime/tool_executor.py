@@ -494,18 +494,33 @@ class ToolExecutor:
             return normalized_input
         if self._memory_retriever is None:
             return normalized_input
+        merged = dict(normalized_input)
+        explicit = self._normalize_insight_requests(merged.get("insight_requests"), merged)
+        merged["insight_requests"] = explicit
+        # An explicit Code Interpreter request is already the exact computation
+        # contract selected by the outer agent. Retrieval cannot affect that
+        # contract, so do not pay for reranking and reconciliation only to
+        # discard their output afterwards.
+        if action_name == "code_interpreter" and explicit:
+            self._record_insight_memory_diagnostics(
+                request_state,
+                action_name,
+                {
+                    "source": "explicit_tool_contract",
+                    "memory_enabled": False,
+                    "selected_card_ids": [],
+                    "insight_request_count": 0,
+                    "explicit_contract_authoritative": True,
+                },
+            )
+            return merged
         retrieval = await self._memory_retriever.retrieve(
             request_state=request_state,
             tool_name=action_name,
-            action_input=normalized_input,
+            action_input=merged,
         )
-        merged = dict(normalized_input)
-        explicit = self._normalize_insight_requests(merged.get("insight_requests"), merged)
         selected_card_ids = [hit.card_id for hit in retrieval.hits]
-        # A Code Interpreter call is an exact computation contract. Memory may
-        # help plan a missing contract, but it must never expand or replace an
-        # explicit one after the outer agent has selected the required outputs.
-        retrieved_requests = [] if action_name == "code_interpreter" and explicit else [
+        retrieved_requests = [
             self._retrieved_insight_request_payload(item)
             for item in retrieval.insight_requests
         ]
@@ -514,13 +529,19 @@ class ToolExecutor:
         diagnostics["source"] = "tool_scoped_memory_retrieval"
         diagnostics["selected_card_ids"] = selected_card_ids
         diagnostics["insight_request_count"] = len(retrieved_requests)
-        if action_name == "code_interpreter" and explicit:
-            diagnostics["explicit_contract_authoritative"] = True
+        self._record_insight_memory_diagnostics(request_state, action_name, diagnostics)
+        return merged
+
+    def _record_insight_memory_diagnostics(
+        self,
+        request_state: RequestStateModel,
+        action_name: str,
+        diagnostics: dict,
+    ) -> None:
         memory_context = request_state.completion_state.setdefault("memory_context", {})
         tool_calls = memory_context.setdefault("tool_calls", []) if isinstance(memory_context, dict) else []
         if isinstance(tool_calls, list):
             tool_calls.append({"tool_name": action_name, **diagnostics})
-        return merged
 
     def _retrieved_insight_request_payload(self, request) -> dict:
         # Retrieval provenance belongs to completion_state.memory_context, not

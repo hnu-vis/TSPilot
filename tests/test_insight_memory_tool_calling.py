@@ -33,6 +33,15 @@ class EchoInput(BaseModel):
     insight_requests: list[KeyInsightRequest] = Field(default_factory=list)
 
 
+class CodeEchoInput(BaseModel):
+    database_evidence: str | dict = "latest"
+    source_refs: list[str] = Field(default_factory=list)
+    analysis_goal: str
+    insight_requests: list[KeyInsightRequest] = Field(min_length=1)
+    code: str | None = None
+    constraints: dict = Field(default_factory=dict)
+
+
 class EchoOutput(BaseModel):
     summary: str
     insight_requests: list[dict] = Field(default_factory=list)
@@ -177,13 +186,18 @@ class FallbackPlanningLLM:
         }))
 
 
-def _registry(tool_name: str = "sql_query", *, result_target: str = "evidence") -> ToolRegistry:
+def _registry(
+    tool_name: str = "sql_query",
+    *,
+    result_target: str = "evidence",
+    input_model: type[BaseModel] = EchoInput,
+) -> ToolRegistry:
     return ToolRegistry(
         [
             ToolSpec(
                 tool_name=tool_name,
                 description="echo sql",
-                input_model=EchoInput,
+                input_model=input_model,
                 output_model=EchoOutput,
                 tool=EchoTool(),
                 prompt_visible=True,
@@ -338,9 +352,12 @@ async def test_tool_executor_skips_insight_memory_for_analysis_artifact_tools():
 
 
 @pytest.mark.asyncio
-async def test_code_interpreter_explicit_contract_is_not_expanded_by_memory():
+async def test_code_interpreter_explicit_contract_skips_memory_retrieval():
     retriever = ToolScopedRetriever()
-    executor = ToolExecutor(_registry(), memory_retriever=retriever)
+    executor = ToolExecutor(
+        _registry("code_interpreter", input_model=CodeEchoInput),
+        memory_retriever=retriever,
+    )
     explicit = {
         "insight_key": "period.change",
         "name": "Period change",
@@ -348,16 +365,71 @@ async def test_code_interpreter_explicit_contract_is_not_expanded_by_memory():
     }
     state = _request_state("calculate change")
 
-    merged = await executor._apply_insight_memory(
+    result = await executor.execute(
         "code_interpreter",
-        {"analysis_goal": "calculate change", "insight_requests": [explicit], "constraints": {}},
+        {"analysis_goal": "calculate change", "insight_requests": [explicit]},
         state,
+        ConversationStateModel(conversation_id="conv_memory"),
     )
 
-    assert merged["insight_requests"] == [explicit]
+    assert retriever.calls == []
+    assert len(result.full_payload["insight_requests"]) == 1
+    assert {
+        key: result.full_payload["insight_requests"][0][key]
+        for key in explicit
+    } == explicit
     diagnostics = state.completion_state["memory_context"]["tool_calls"][0]
+    assert diagnostics["source"] == "explicit_tool_contract"
+    assert diagnostics["memory_enabled"] is False
     assert diagnostics["explicit_contract_authoritative"] is True
     assert diagnostics["insight_request_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_code_interpreter_without_explicit_contract_uses_memory_retrieval():
+    retriever = ToolScopedRetriever()
+    executor = ToolExecutor(
+        _registry("code_interpreter", input_model=CodeEchoInput),
+        memory_retriever=retriever,
+    )
+    state = _request_state("calculate maximum")
+
+    result = await executor.execute(
+        "code_interpreter",
+        {"analysis_goal": "calculate maximum"},
+        state,
+        ConversationStateModel(conversation_id="conv_memory"),
+    )
+
+    assert [call[0] for call in retriever.calls] == ["code_interpreter"]
+    assert result.full_payload["insight_requests"][0]["name"] == "max_value"
+    diagnostics = state.completion_state["memory_context"]["tool_calls"][0]
+    assert diagnostics["source"] == "tool_scoped_memory_retrieval"
+
+
+@pytest.mark.asyncio
+async def test_sql_query_with_explicit_contract_can_still_use_memory_retrieval():
+    retriever = ToolScopedRetriever()
+    executor = ToolExecutor(_registry(), memory_retriever=retriever)
+    explicit = {
+        "insight_key": "period.minimum",
+        "name": "Period minimum",
+        "insight_type": "extreme",
+        "requirements": {"operator": "min"},
+    }
+    state = _request_state("calculate minimum and maximum")
+
+    result = await executor.execute(
+        "sql_query",
+        {"message": state.message, "insight_requests": [explicit]},
+        state,
+        ConversationStateModel(conversation_id="conv_memory"),
+    )
+
+    assert [call[0] for call in retriever.calls] == ["sql_query"]
+    assert {
+        item["name"] for item in result.full_payload["insight_requests"]
+    } == {"Period minimum", "max_value"}
 
 
 @pytest.mark.asyncio
