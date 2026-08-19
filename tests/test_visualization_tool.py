@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from app.server import create_app
 from app.settings import get_settings
@@ -51,7 +52,9 @@ class _PlannerLlm:
         if _is_projection_prompt(_messages):
             self.projection_prompts.append(_messages)
             return SimpleNamespace(
-                content=self.projection_payload or _projection_for_chart_payload(self.payload),
+                content=_projection_ir_payload(
+                    self.projection_payload or _projection_for_chart_payload(self.payload)
+                ),
                 response_metadata={},
             )
         self.calls += 1
@@ -61,7 +64,7 @@ class _PlannerLlm:
                 content=self.audit_payloads[min(len(self.audit_prompts) - 1, len(self.audit_payloads) - 1)],
                 response_metadata={},
             )
-        return SimpleNamespace(content=self.payload, response_metadata={})
+        return SimpleNamespace(content=_chart_ir_payload(self.payload), response_metadata={})
 
 
 class _SequencePlannerLlm:
@@ -74,7 +77,7 @@ class _SequencePlannerLlm:
             return SimpleNamespace(content=_verification_payload(_messages), response_metadata={})
         if _is_projection_prompt(_messages):
             return SimpleNamespace(
-                content=_projection_for_chart_payload(self.payloads[-1]),
+                content=_projection_ir_payload(_projection_for_chart_payload(self.payloads[-1])),
                 response_metadata={},
             )
         if "independently audit" in str(_messages[0][1]):
@@ -85,7 +88,7 @@ class _SequencePlannerLlm:
             )
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
-        return SimpleNamespace(content=payload, response_metadata={})
+        return SimpleNamespace(content=_chart_ir_payload(payload), response_metadata={})
 
 
 def _is_projection_prompt(messages) -> bool:
@@ -96,19 +99,172 @@ def _is_verification_prompt(messages) -> bool:
     return "You are the visual verification planner inside" in str(messages[0][1])
 
 
+def _is_chart_prompt(messages) -> bool:
+    return "You produce a closed, renderer-independent Visual IR" in str(messages[0][1])
+
+
+def _strict_dependency_payload(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    result = dict(value)
+    result.setdefault("message", None)
+    result.setdefault("required_fields", [])
+    result.setdefault("required_properties", [])
+    result.setdefault("input_evidence", None)
+    result.setdefault("input_source_refs", [])
+    result.setdefault("insight_requests", [])
+    result["insight_requests"] = [
+        {
+            "name": item["name"],
+            "insight_type": item["insight_type"],
+            "insight_key": item.get("insight_key"),
+        }
+        for item in result["insight_requests"]
+    ]
+    return result
+
+
+def _projection_ir_payload(payload: str | dict) -> str:
+    decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    views = []
+    for raw_view in decoded.get("semantic_views", []):
+        view = dict(raw_view)
+        view.setdefault("record_path", None)
+        view.setdefault("mode", "records")
+        if view["mode"] == "events":
+            view["mode"] = "wide_events"
+        view.setdefault("fields", [])
+        view.setdefault("events", [])
+        views.append(view)
+    return json.dumps({
+        "semantic_views": views,
+        "required_data_request": _strict_dependency_payload(decoded.get("required_data_request")),
+    })
+
+
+def _chart_ir_payload(payload: str | dict) -> str:
+    decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    requirement = _strict_dependency_payload(decoded.get("required_data_request"))
+    if requirement is not None:
+        return json.dumps({"visual_goals": [], "required_data_request": requirement})
+    if any(
+        layer.get("layer_type")
+        for goal in decoded.get("visual_goals", [])
+        for layer in goal.get("layers", [])
+    ):
+        for goal in decoded.get("visual_goals", []):
+            for layer in goal.get("layers", []):
+                layer.pop("mark", None)
+        return json.dumps(decoded)
+    goals = []
+    for raw_goal in decoded.get("visual_goals", []):
+        chart_presentation = raw_goal.get("presentation") or {}
+        data_zoom = chart_presentation.get("dataZoom") or []
+        zoom = data_zoom[0] if data_zoom else {}
+        layers = []
+        for raw_layer in raw_goal.get("layers", []):
+            encoding_items = []
+            for channel, raw_value in (raw_layer.get("encoding") or {}).items():
+                normalized_channel = {"timestamp": "x", "time": "x", "value": "y"}.get(channel, channel)
+                if normalized_channel not in {"x", "y", "value", "lower", "upper", "series", "label"}:
+                    continue
+                field = raw_value if isinstance(raw_value, str) else raw_value.get("field") if isinstance(raw_value, dict) else None
+                if field:
+                    encoding_items.append({"channel": normalized_channel, "field": field})
+            mark = str(raw_layer.get("mark") or "line")
+            transforms = raw_layer.get("transform") or []
+            between = next(
+                (
+                    item
+                    for item in transforms
+                    if item.get("operator") == "between" and isinstance(item.get("value"), list)
+                ),
+                None,
+            )
+            if between:
+                layer_type = "interval_overlay"
+            elif mark == "band":
+                layer_type = "band"
+            elif mark in {"point", "scatter", "rule", "rect"}:
+                layer_type = "event_points"
+            elif mark in {"bar", "boxplot"}:
+                layer_type = "comparison"
+            else:
+                layer_type = "series"
+            layer_presentation = raw_layer.get("presentation") or {}
+            line_style = layer_presentation.get("lineStyle") or {}
+            width = float(line_style.get("width") or 2)
+            symbol = str(layer_presentation.get("symbol") or raw_layer.get("symbol") or "none")
+            if symbol not in {"none", "circle", "diamond", "triangle", "pin"}:
+                symbol = "circle"
+            layers.append({
+                "layer_type": layer_type,
+                "role": raw_layer["role"],
+                "source_ref": raw_layer["source_ref"],
+                "encodings": encoding_items,
+                "interval_source_ref": None,
+                "interval_start_field": None,
+                "interval_end_field": None,
+                "interval_start_value": between["value"][0] if between else None,
+                "interval_end_value": between["value"][1] if between else None,
+                "emphasis": "strong" if width >= 3 else "subtle" if width <= 1.5 else "normal",
+                "line_style": line_style.get("type", "solid"),
+                "symbol": symbol,
+                "axis": "secondary" if layer_presentation.get("yAxisIndex") == 1 else "primary",
+                "label": raw_layer.get("label"),
+            })
+        legend = chart_presentation.get("legend") or {}
+        tooltip = chart_presentation.get("tooltip") or {}
+        goals.append({
+            "purpose": raw_goal["purpose"],
+            "title": raw_goal["title"],
+            "priority": raw_goal.get("priority", "primary"),
+            "summary": raw_goal.get("summary"),
+            "required_roles": raw_goal.get("required_roles", []),
+            "show_legend": legend.get("show", True),
+            "tooltip": tooltip.get("trigger", "axis") if tooltip.get("show", True) else "none",
+            "enable_zoom": bool(data_zoom),
+            "viewport_start": zoom.get("startValue"),
+            "viewport_end": zoom.get("endValue"),
+            "y_scale": "log" if any(item.get("type") == "log" for item in chart_presentation.get("yAxis", [])) else "linear",
+            "layers": layers,
+        })
+    return json.dumps({"visual_goals": goals, "required_data_request": None})
+
+
+def _strict_test_payload(payload: str | dict, messages) -> str:
+    if _is_verification_prompt(messages):
+        decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        if "outcome" not in decoded:
+            decoded = {"outcome": decoded}
+        outcome = decoded["outcome"]
+        outcome["required_data_request"] = _strict_dependency_payload(
+            outcome.get("required_data_request")
+        )
+        return json.dumps(decoded)
+    if _is_projection_prompt(messages):
+        return _projection_ir_payload(payload)
+    if _is_chart_prompt(messages):
+        return _chart_ir_payload(payload)
+    decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    if "required_data_request" in decoded:
+        decoded["required_data_request"] = _strict_dependency_payload(decoded.get("required_data_request"))
+    return json.dumps(decoded)
+
+
 def _verification_payload(messages) -> str:
     prompt = str(messages[0][1])
     insight_ids = list(dict.fromkeys(re.findall(r'"insight_id":\s*"([^"]+)"', prompt)))
-    return json.dumps({
-        "decision": "visualize",
-        "target_insight_ids": insight_ids,
-        "verification_question": "Does the grounded visual evidence support the requested relationship?",
-        "interpretation": "Inspect the complete contextual data and the highlighted analytical relationship.",
-        "visual_relation": "grounded_comparison",
-        "required_context": ["complete contextual evidence"],
-        "non_visual_insight_ids": [],
-        "required_data_request": None,
-    })
+    return json.dumps({"outcome": {
+            "decision": "visualize",
+            "target_insight_ids": insight_ids,
+            "verification_question": "Does the grounded visual evidence support the requested relationship?",
+            "interpretation": "Inspect the complete contextual data and the highlighted analytical relationship.",
+            "visual_relation": "grounded_comparison",
+            "required_context": ["complete contextual evidence"],
+            "non_visual_insight_ids": [],
+            "required_data_request": None,
+        }})
 
 
 def _projection_for_chart_payload(payload: str) -> str:
@@ -169,7 +325,7 @@ class _WorkflowPlannerLlm:
         else:
             payload = self.plans[min(self.plan_calls, len(self.plans) - 1)]
             self.plan_calls += 1
-        return SimpleNamespace(content=payload, response_metadata={})
+        return SimpleNamespace(content=_strict_test_payload(payload, messages), response_metadata={})
 
 
 class _TwoStagePlannerLlm:
@@ -201,7 +357,7 @@ class _TwoStagePlannerLlm:
             self.chart_calls += 1
             self.chart_prompts.append(messages)
             payload = self.chart
-        return SimpleNamespace(content=json.dumps(payload), response_metadata={})
+        return SimpleNamespace(content=_strict_test_payload(payload, messages), response_metadata={})
 
 
 class _RepairingTwoStagePlannerLlm:
@@ -226,7 +382,7 @@ class _RepairingTwoStagePlannerLlm:
         else:
             payload = self.charts[min(self.chart_calls, len(self.charts) - 1)]
             self.chart_calls += 1
-        return SimpleNamespace(content=json.dumps(payload), response_metadata={})
+        return SimpleNamespace(content=_strict_test_payload(payload, messages), response_metadata={})
 
 
 class _VerificationOnlyLlm:
@@ -236,7 +392,35 @@ class _VerificationOnlyLlm:
     async def ainvoke(self, messages):
         if not _is_verification_prompt(messages):
             raise AssertionError("visualization must stop after the verification decision")
-        return SimpleNamespace(content=json.dumps(self.payload), response_metadata={})
+        return SimpleNamespace(content=_strict_test_payload(self.payload, messages), response_metadata={})
+
+
+class _StrictPlannerLlm:
+    def __init__(self, *, projection: dict, chart: dict):
+        self.projection = projection
+        self.chart = chart
+        self.structured_calls = []
+
+    def with_structured_output(self, schema, **kwargs):
+        self.structured_calls.append({"schema": schema, **kwargs})
+        owner = self
+
+        class _Runnable:
+            async def ainvoke(self, messages):
+                if _is_verification_prompt(messages):
+                    content = _verification_payload(messages)
+                elif _is_projection_prompt(messages):
+                    content = _projection_ir_payload(owner.projection)
+                else:
+                    content = _chart_ir_payload(owner.chart)
+                payload = json.loads(content)
+                return {
+                    "raw": SimpleNamespace(content=content, response_metadata={}),
+                    "parsed": schema.model_validate(payload),
+                    "parsing_error": None,
+                }
+
+        return _Runnable()
 
 
 class _RenderAuditStub:
@@ -398,6 +582,92 @@ def test_verified_numeric_scalar_inventory_supports_only_lossless_graphical_mark
     assert source["render_capabilities"]["timestamped_numeric"] is False
     assert source["render_capabilities"]["renderable"] is True
     assert source["render_capabilities"]["renderer_series_type"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_visualization_uses_provider_strict_schema_for_every_active_planning_stage(tmp_path):
+    projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose complete observations",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": "$.records",
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+            "events": [],
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Show complete observations",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["observations"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": False,
+            "viewport_start": None,
+            "viewport_end": None,
+            "y_scale": "linear",
+            "layers": [{
+                "layer_type": "series",
+                "role": "observations",
+                "source_ref": "semantic:observations",
+                "mark": "line",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "y", "field": "measure"},
+                ],
+                "interval_source_ref": None,
+                "interval_start_field": None,
+                "interval_end_field": None,
+                "interval_start_value": None,
+                "interval_end_value": None,
+                "emphasis": "normal",
+                "line_style": "solid",
+                "symbol": "none",
+                "axis": "primary",
+                "label": "Observed value",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _StrictPlannerLlm(projection=projection, chart=chart)
+
+    result = await VisualizationTool(
+        llm=llm,
+        artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(VisualizationInput(message="Show the observed series."), request_state=_state(5))
+
+    assert result["status"] == "created"
+    assert len(llm.structured_calls) == 3
+    assert all(call["method"] == "json_schema" for call in llm.structured_calls)
+    assert all(call["strict"] is True for call in llm.structured_calls)
+    assert all(call["include_raw"] is True for call in llm.structured_calls)
+
+    def assert_closed_required_objects(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object" or "properties" in node:
+                assert node.get("additionalProperties") is False
+                assert set(node.get("required", [])) == set(node.get("properties", {}))
+            for value in node.values():
+                assert_closed_required_objects(value)
+        elif isinstance(node, list):
+            for value in node:
+                assert_closed_required_objects(value)
+
+    for call in llm.structured_calls:
+        provider_schema = convert_to_openai_tool(
+            call["schema"], strict=True,
+        )["function"]["parameters"]
+        assert_closed_required_objects(provider_schema)
 
 
 @pytest.mark.asyncio
@@ -927,7 +1197,7 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
             '{"visual_goals":[{"purpose":"show complete pattern","title":"Complete series",'
             '"priority":"primary","summary":null,"required_roles":["base_series"],"layers":['
             '{"role":"base_series","source_ref":"view:evidence:evi_full:default","mark":"line",'
-            '"encoding":{"color":{"value":"blue"}},"label":"Value"}]}],"required_data_request":null}',
+            '"encoding":{"x":"missing_timestamp","y":"value"},"label":"Value"}]}],"required_data_request":null}',
             '{"visual_goals":[{"purpose":"show complete pattern","title":"Complete series",'
             '"priority":"primary","summary":null,"required_roles":["base_series"],"layers":['
             '{"role":"base_series","source_ref":"view:evidence:evi_full:default","mark":"line",'
@@ -1395,9 +1665,241 @@ async def test_visualization_preserves_full_series_and_highlights_interval_insid
     assert len(visualization.datasets[1].series[0].points) == 25
     assert visualization.presentation["dataZoom"][0] == {
         "type": "inside",
+        "filterMode": "filter",
         "startValue": "2026-01-02T00:00:00Z",
         "endValue": "2026-01-04T00:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+async def test_visualization_expands_wide_turning_record_and_compiles_interval_overlay(tmp_path):
+    state = _state(100)
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_turning_window",
+        insight_key="turning_window",
+        name="Most significant rise-then-fall window",
+        insight_type="analysis",
+        statement="The located window rises to a peak and then falls.",
+        value={
+            "start_time": "2026-01-02T12:00:00Z",
+            "peak_time": "2026-01-03T00:00:00Z",
+            "end_time": "2026-01-03T12:00:00Z",
+            "start_price": 36.0,
+            "peak_price": 48.0,
+            "end_price": 60.0,
+        },
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+    )]
+    projection = {
+        "semantic_views": [
+            {
+                "view_id": "full_series",
+                "name": "Complete observed series",
+                "purpose": "Provide full temporal context",
+                "grain": "observation",
+                "source_ref": "view:evidence:evi_full:default",
+                "record_path": "$.records",
+                "mode": "records",
+                "fields": [
+                    {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                    {"name": "price", "semantic_role": "observed_price", "source_path": "$.value"},
+                ],
+                "events": [],
+            },
+            {
+                "view_id": "turning_bounds",
+                "name": "Turning window bounds",
+                "purpose": "Expose authoritative interval boundaries",
+                "grain": "interval",
+                "source_ref": "insight:insight_turning_window",
+                "record_path": "$.value",
+                "mode": "records",
+                "fields": [
+                    {"name": "start", "semantic_role": "interval_start", "source_path": "$.start_time"},
+                    {"name": "end", "semantic_role": "interval_end", "source_path": "$.end_time"},
+                ],
+                "events": [],
+            },
+            {
+                "view_id": "turning_events",
+                "name": "Turning window events",
+                "purpose": "Expand start, peak, and end into located event rows",
+                "grain": "event",
+                "source_ref": "insight:insight_turning_window",
+                "record_path": "$.value",
+                "mode": "events",
+                "fields": [],
+                "events": [
+                    {"event_role": "start", "timestamp_path": "$.start_time", "value_path": "$.start_price"},
+                    {"event_role": "peak", "timestamp_path": "$.peak_time", "value_path": "$.peak_price"},
+                    {"event_role": "end", "timestamp_path": "$.end_time", "value_path": "$.end_price"},
+                ],
+            },
+        ],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Verify the turning window in complete context",
+            "title": "Rise-then-fall turning window",
+            "priority": "primary",
+            "summary": "The complete series, selected interval, and located events share one time axis.",
+            "required_roles": ["complete_series", "turning_interval", "turning_events"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": True,
+            "viewport_start": "2026-01-02T00:00:00Z",
+            "viewport_end": "2026-01-04T00:00:00Z",
+            "y_scale": "linear",
+            "layers": [
+                {
+                    "layer_type": "series", "role": "complete_series", "source_ref": "semantic:full_series",
+                    "mark": "line", "encodings": [{"channel": "x", "field": "time"}, {"channel": "y", "field": "price"}],
+                    "interval_source_ref": None, "interval_start_field": None, "interval_end_field": None,
+                    "interval_start_value": None, "interval_end_value": None, "emphasis": "subtle",
+                    "line_style": "solid", "symbol": "none", "axis": "primary", "label": "Observed price",
+                },
+                {
+                    "layer_type": "interval_overlay", "role": "turning_interval", "source_ref": "semantic:full_series",
+                    "mark": "line", "encodings": [{"channel": "x", "field": "time"}, {"channel": "y", "field": "price"}],
+                    "interval_source_ref": "semantic:turning_bounds", "interval_start_field": "start", "interval_end_field": "end",
+                    "interval_start_value": None, "interval_end_value": None, "emphasis": "strong",
+                    "line_style": "dashed", "symbol": "none", "axis": "primary", "label": "Turning interval",
+                },
+                {
+                    "layer_type": "event_points", "role": "turning_events", "source_ref": "semantic:turning_events",
+                    "mark": "point", "encodings": [{"channel": "x", "field": "timestamp"}, {"channel": "y", "field": "value"}, {"channel": "series", "field": "event_role"}],
+                    "interval_source_ref": None, "interval_start_field": None, "interval_end_field": None,
+                    "interval_start_value": None, "interval_end_value": None, "emphasis": "strong",
+                    "line_style": "solid", "symbol": "circle", "axis": "primary", "label": "Turning event",
+                },
+            ],
+        }],
+        "required_data_request": None,
+    }
+    llm = _TwoStagePlannerLlm(projection=projection, chart=chart)
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(llm=llm, artifact_store=store).execute(
+        VisualizationInput(
+            message="Show the complete series and verify the rise-then-fall turning window.",
+            source_refs=["insight:turning_window"],
+        ),
+        request_state=state,
+    )
+
+    visualization = store.get(result["visualization_ids"][0])
+    assert visualization is not None
+    assert llm.projection_calls == 1
+    assert llm.chart_calls == 1
+    assert [dataset.row_count for dataset in visualization.datasets] == [100, 25, 3]
+    assert visualization.layers[1].transform == [{
+        "type": "filter",
+        "field": "time",
+        "operator": "between",
+        "value": ["2026-01-02T12:00:00Z", "2026-01-03T12:00:00Z"],
+    }]
+    assert {series.role.rsplit(":", 1)[-1] for series in visualization.datasets[2].series} == {
+        "start", "peak", "end",
+    }
+    assert [layer.mark for layer in visualization.layers] == ["line", "line", "point"]
+
+
+@pytest.mark.asyncio
+async def test_long_event_table_stays_row_preserving_and_compiles_to_point_mark(tmp_path):
+    bad_projection = {
+        "semantic_views": [{
+            "view_id": "turning_events",
+            "name": "Located turning events",
+            "purpose": "Expose already-long event records",
+            "grain": "event",
+            "source_ref": "view:derived_evidence:dev_endpoints",
+            "record_path": "$.records",
+            "mode": "wide_events",
+            "fields": [],
+            "events": [{
+                "event_role": "located_event",
+                "timestamp_path": "$.timestamp",
+                "value_path": "$.value",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    repaired_projection = {
+        "semantic_views": [{
+            "view_id": "turning_events",
+            "name": "Located turning events",
+            "purpose": "Expose already-long event records",
+            "grain": "event",
+            "source_ref": "view:derived_evidence:dev_endpoints",
+            "record_path": "$.records",
+            "mode": "records",
+            "fields": [
+                {"name": "role", "semantic_role": "event_role", "source_path": "$.role"},
+                {"name": "time", "semantic_role": "event_time", "source_path": "$.timestamp"},
+                {"name": "value", "semantic_role": "event_value", "source_path": "$.value"},
+            ],
+            "events": [],
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Verify located events",
+            "title": "Located turning events",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["turning_events"],
+            "show_legend": True,
+            "tooltip": "item",
+            "enable_zoom": False,
+            "viewport_start": None,
+            "viewport_end": None,
+            "y_scale": "linear",
+            "layers": [{
+                "layer_type": "event_points",
+                "role": "turning_events",
+                "source_ref": "semantic:turning_events",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "y", "field": "value"},
+                    {"channel": "label", "field": "role"},
+                ],
+                "interval_source_ref": None,
+                "interval_start_field": None,
+                "interval_end_field": None,
+                "interval_start_value": None,
+                "interval_end_value": None,
+                "emphasis": "strong",
+                "line_style": "solid",
+                "symbol": "diamond",
+                "axis": "primary",
+                "label": "Turning events",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _RepairingTwoStagePlannerLlm(
+        projections=[bad_projection, repaired_projection],
+        chart=chart,
+    )
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(llm=llm, artifact_store=store).execute(
+        VisualizationInput(
+            message="Show the located turning events.",
+            source_refs=["view:derived_evidence:dev_endpoints"],
+        ),
+        request_state=_state_with_analysis_views(),
+    )
+
+    visualization = store.get(result["visualization_ids"][0])
+    assert visualization is not None
+    assert len(llm.projection_prompts) == 2
+    assert visualization.datasets[0].row_count == 2
+    assert visualization.layers[0].mark == "point"
+    assert [point.label for point in visualization.datasets[0].series[0].points] == ["start", "end"]
 
 
 @pytest.mark.asyncio

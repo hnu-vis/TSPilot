@@ -19,7 +19,13 @@ from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
-from schemas.output import VisualGoal
+from schemas.output import (
+    VisualFilterTransform,
+    VisualGoal,
+    VisualGoalIR,
+    VisualLayerIR,
+    VisualLayerPlan,
+)
 from schemas.key_insight import KeyInsightRequest
 from schemas.state import RequestStateModel
 from schemas.visual_verification import VisualizationVerification
@@ -122,6 +128,16 @@ class SemanticFieldPlan(BaseModel):
     source_path: str = Field(min_length=1)
 
 
+class SemanticEventPlan(BaseModel):
+    """Expand one source record into one located event row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_role: str = Field(min_length=1)
+    timestamp_path: str = Field(min_length=1)
+    value_path: str = Field(min_length=1)
+
+
 class SemanticViewPlan(BaseModel):
     """A grounded semantic view prepared for independent chart planning."""
 
@@ -132,14 +148,30 @@ class SemanticViewPlan(BaseModel):
     purpose: str = Field(min_length=1)
     grain: str = Field(min_length=1)
     source_ref: str = Field(min_length=1)
-    record_path: str | None = None
-    fields: list[SemanticFieldPlan] = Field(min_length=1)
+    record_path: str | None
+    mode: Literal["records", "wide_events"]
+    fields: list[SemanticFieldPlan]
+    events: list[SemanticEventPlan]
 
     @model_validator(mode="after")
     def unique_semantic_columns(self):
+        if self.mode == "records" and not self.fields:
+            raise ValueError("records semantic view requires fields")
+        if self.mode == "wide_events" and not self.events:
+            raise ValueError("wide_events semantic view requires event mappings")
+        if self.mode == "records" and self.events:
+            raise ValueError("records semantic view cannot include event mappings")
+        if self.mode == "wide_events" and self.fields:
+            raise ValueError("wide_events semantic view cannot include record fields")
         names = [item.name for item in self.fields]
         if len(names) != len(set(names)):
             raise ValueError("semantic view field names must be unique")
+        event_roles = [item.event_role for item in self.events]
+        if len(event_roles) != len(set(event_roles)):
+            raise ValueError("semantic event roles must be unique")
+        event_paths = [(item.timestamp_path, item.value_path) for item in self.events]
+        if len(event_paths) != len(set(event_paths)):
+            raise ValueError("wide semantic events must use distinct timestamp/value path pairs")
         return self
 
 
@@ -181,6 +213,144 @@ class VisualizationEvidenceRequest(BaseModel):
             raise ValueError("code_interpreter visualization dependency requires insight_requests")
         if self.required_action in {"anomaly", "forecast"}:
             self.insight_requests = []
+        return self
+
+
+class _StructuredInsightRequest(BaseModel):
+    """Closed insight dependency emitted only at the visualization LLM boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    insight_type: str = Field(min_length=1)
+    insight_key: str | None
+
+    def to_runtime(self) -> KeyInsightRequest:
+        return KeyInsightRequest(
+            name=self.name,
+            insight_type=self.insight_type,
+            insight_key=self.insight_key,
+        )
+
+
+class _StructuredEvidenceRequest(BaseModel):
+    """Strict structured-output form of VisualizationEvidenceRequest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_action: Literal["sql_query", "anomaly", "forecast", "code_interpreter"]
+    purpose: str = Field(min_length=1)
+    message: str | None
+    required_shape: str = Field(min_length=1)
+    required_fields: list[str]
+    required_properties: list[str]
+    input_evidence: str | None
+    input_source_refs: list[str]
+    insight_requests: list[_StructuredInsightRequest]
+
+    def to_runtime(self) -> VisualizationEvidenceRequest:
+        return VisualizationEvidenceRequest(
+            required_action=self.required_action,
+            purpose=self.purpose,
+            message=self.message,
+            required_shape=self.required_shape,
+            required_fields=self.required_fields,
+            required_properties=self.required_properties,
+            input_evidence=self.input_evidence,
+            input_source_refs=self.input_source_refs,
+            insight_requests=[item.to_runtime() for item in self.insight_requests],
+        )
+
+
+class _StructuredVerificationBranch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_insight_ids: list[str]
+    verification_question: str | None
+    interpretation: str | None
+    visual_relation: str | None
+    required_context: list[str]
+    non_visual_insight_ids: list[str]
+
+
+class _StructuredVisualizeDecision(_StructuredVerificationBranch):
+    decision: Literal["visualize"]
+    required_data_request: None
+
+
+class _StructuredNeedsSourcesDecision(_StructuredVerificationBranch):
+    decision: Literal["needs_sources"]
+    required_data_request: _StructuredEvidenceRequest
+
+
+class _StructuredNotVisualizableDecision(_StructuredVerificationBranch):
+    decision: Literal["not_visualizable"]
+    required_data_request: None
+
+
+class _StructuredVerificationDecision(BaseModel):
+    """Provider-enforced exclusive visual-verification decision branch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: (
+        _StructuredVisualizeDecision
+        | _StructuredNeedsSourcesDecision
+        | _StructuredNotVisualizableDecision
+    )
+
+    def to_runtime(self) -> VisualVerificationDecision:
+        decision = self.outcome
+        requirement = decision.required_data_request
+        return VisualVerificationDecision(
+            decision=decision.decision,
+            target_insight_ids=decision.target_insight_ids,
+            verification_question=decision.verification_question,
+            interpretation=decision.interpretation,
+            visual_relation=decision.visual_relation,
+            required_context=decision.required_context,
+            non_visual_insight_ids=decision.non_visual_insight_ids,
+            required_data_request=(
+                requirement.to_runtime()
+                if requirement is not None
+                else None
+            ),
+        )
+
+
+class _StructuredSemanticProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    semantic_views: list[SemanticViewPlan]
+    required_data_request: _StructuredEvidenceRequest | None
+
+    @model_validator(mode="after")
+    def require_views_or_data_request(self):
+        if bool(self.semantic_views) == bool(self.required_data_request):
+            raise ValueError("semantic projection must produce either semantic_views or required_data_request")
+        return self
+
+    def to_runtime(self) -> SemanticProjectionPlan:
+        return SemanticProjectionPlan(
+            semantic_views=self.semantic_views,
+            required_data_request=(
+                self.required_data_request.to_runtime()
+                if self.required_data_request is not None
+                else None
+            ),
+        )
+
+
+class _StructuredVisualizationPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    visual_goals: list[VisualGoalIR]
+    required_data_request: _StructuredEvidenceRequest | None
+
+    @model_validator(mode="after")
+    def require_goal_or_data_request(self):
+        if bool(self.visual_goals) == bool(self.required_data_request):
+            raise ValueError("chart planning must produce either visual_goals or required_data_request")
         return self
 
 
@@ -276,11 +446,11 @@ class VisualizationTool(BaseTool):
                 repair_context=(
                     None
                     if projection_attempt == 0
-                    else {
-                        "execution_error": projection_error,
-                        "rejected_projection": projection.model_dump(mode="json") if projection else None,
-                        "allowed_default_source_paths": _default_source_paths(inventory),
-                    }
+                    else _planning_diagnostic(
+                        ValueError(projection_error),
+                        stage="semantic_projection_execution",
+                        allowed_values=_default_source_paths(inventory),
+                    )
                 ),
             )
             if projection.required_data_request:
@@ -308,31 +478,21 @@ class VisualizationTool(BaseTool):
             )
 
         semantic_inventory = catalog.semantic_inventory(semantic_refs)
-        plan = await self._plan(
-            validated_input, semantic_inventory, request_state, verification=verification,
-        )
         complete = None
-        for materialization_attempt in range(3):
-            if plan.required_data_request:
-                requirement = plan.required_data_request
-                try:
-                    requirement = _normalize_requirement_input(requirement, catalog)
-                except ValueError as exc:
-                    if materialization_attempt >= 2:
-                        raise _semantic_error(exc, inventory) from exc
-                    plan = await self._plan(
-                        validated_input,
-                        semantic_inventory,
-                        request_state,
-                        verification=verification,
-                        repair_context={
-                            "requirement_grounding_error": str(exc),
-                            "rejected_plan": plan.model_dump(mode="json"),
-                        },
-                    )
-                    continue
-                return _dependency_result(requirement, request_state)
+        repair_context = None
+        for planning_attempt in range(3):
             try:
+                plan = await self._plan(
+                    validated_input,
+                    semantic_inventory,
+                    request_state,
+                    verification=verification,
+                    catalog=catalog,
+                    repair_context=repair_context,
+                )
+                if plan.required_data_request:
+                    requirement = _normalize_requirement_input(plan.required_data_request, catalog)
+                    return _dependency_result(requirement, request_state)
                 complete = VisualizationMaterializer(
                     request_state,
                     catalog=catalog,
@@ -345,19 +505,17 @@ class VisualizationTool(BaseTool):
                 for goal, payload in zip(plan.visual_goals, complete, strict=True):
                     validator.validate(goal, payload)
             except ValueError as exc:
-                if materialization_attempt >= 2:
+                if planning_attempt >= 2:
                     return _unavailable_result(
                         f"Visual verification could not be materialized without semantic ambiguity: {exc}"
                     )
-                plan = await self._plan(
-                    validated_input,
-                    semantic_inventory,
-                    request_state,
-                    verification=verification,
-                    repair_context={
-                        "materialization_error": str(exc),
-                        "rejected_plan": plan.model_dump(mode="json"),
-                    },
+                repair_context = _planning_diagnostic(
+                    exc,
+                    stage=(
+                        "requirement_grounding"
+                        if "input" in str(exc).casefold() and "source" in str(exc).casefold()
+                        else "materialization"
+                    ),
                 )
                 continue
             # Publish the first grounded candidate that satisfies executable
@@ -383,8 +541,6 @@ class VisualizationTool(BaseTool):
         request_state: RequestStateModel,
         *,
         source_preferences: set[str],
-        repair_context: dict | None = None,
-        contract_repair_attempt: int = 0,
     ) -> VisualVerificationDecision:
         if self._llm is None:
             raise RuntimeError("visual verification planning requires an LLM")
@@ -394,10 +550,9 @@ class VisualizationTool(BaseTool):
             "You are the visual verification planner inside a strict outer ReAct loop. Start from the user's question, "
             "not from chart types or available columns. Decide which verified Key Insights can be meaningfully inspected through "
             "a visual relationship and which complete contextual artifacts a human needs to confirm or challenge them. "
-            "Return exactly one JSON object matching: {\"decision\":\"visualize\"|\"needs_sources\"|\"not_visualizable\","
-            "\"target_insight_ids\":[str],\"verification_question\":str|null,\"interpretation\":str|null,"
-            "\"visual_relation\":str|null,\"required_context\":[str],\"non_visual_insight_ids\":[str],"
-            "\"required_data_request\":object|null}. "
+            "Return one outcome object matching the provider schema. The outcome is a discriminated branch: visualize and "
+            "not_visualizable require required_data_request=null; needs_sources requires one complete data request. These branches "
+            "are structurally exclusive, so first choose the decision and then populate only its valid branch. "
             "Use only exact verified insight_id values from the supplied Insight inventory. Key Insights define what is being "
             "verified; complete Evidence, Derived Evidence, Forecast, and Anomaly artifacts provide the visual context. Do not turn "
             "an isolated scalar into a decorative chart. Trends, comparisons, rankings with a complete candidate set, distributions, "
@@ -417,13 +572,13 @@ class VisualizationTool(BaseTool):
             f"Preferred source refs: {json.dumps(sorted(source_preferences), ensure_ascii=False)}\n"
             f"Referenced data contracts: {json.dumps(data_source_inventory, ensure_ascii=False)}\n"
             f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
-            f"Repair context: {json.dumps(repair_context, ensure_ascii=False) if repair_context else 'none'}"
+            "Repair context: none"
         )
         messages = [("system", prompt), ("user", request.message)]
         started_at = time.perf_counter()
         response, content, parsed, parse_error = await _invoke_structured(
             self._llm,
-            VisualVerificationDecision,
+            _StructuredVerificationDecision,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
             trace_title="Visual Verification Planning",
@@ -441,25 +596,13 @@ class VisualizationTool(BaseTool):
             if parse_error is not None:
                 raise parse_error
             allowed = {item["insight_id"] for item in insight_inventory}
-            referenced = set(parsed.target_insight_ids) | set(parsed.non_visual_insight_ids)
+            decision = parsed.to_runtime()
+            referenced = set(decision.target_insight_ids) | set(decision.non_visual_insight_ids)
             unknown = referenced - allowed
             if unknown:
                 raise ValueError(f"visual verification plan references unknown or unverified insights: {sorted(unknown)}")
-            return parsed
+            return decision
         except (json.JSONDecodeError, ValueError) as exc:
-            if contract_repair_attempt < 2:
-                return await self._select_verification(
-                    request,
-                    inventory,
-                    request_state,
-                    source_preferences=source_preferences,
-                    repair_context={
-                        **(repair_context or {}),
-                        "contract_error": str(exc),
-                        "rejected_response": content,
-                    },
-                    contract_repair_attempt=contract_repair_attempt + 1,
-                )
             raise _semantic_error(ValueError(f"invalid visual verification decision: {exc}"), inventory) from exc
 
     async def _audit_candidate(
@@ -553,7 +696,6 @@ class VisualizationTool(BaseTool):
         verification: VisualVerificationDecision,
         source_preferences: set[str],
         repair_context: dict | None = None,
-        contract_repair_attempt: int = 0,
     ) -> SemanticProjectionPlan:
         if self._llm is None:
             raise RuntimeError("visualization planning requires an LLM")
@@ -573,7 +715,9 @@ class VisualizationTool(BaseTool):
             "scalar views for a timestamp and value already present together in a target Insight item. "
             "Return exactly one JSON object matching: "
             "{\"semantic_views\":[{\"view_id\":str,\"name\":str,\"purpose\":str,\"grain\":str,"
-            "\"source_ref\":str,\"record_path\":str|null,\"fields\":[{\"name\":str,\"semantic_role\":str,\"source_path\":str}]}],"
+            "\"source_ref\":str,\"record_path\":str|null,\"mode\":\"records\"|\"wide_events\","
+            "\"fields\":[{\"name\":str,\"semantic_role\":str,\"source_path\":str}],"
+            "\"events\":[{\"event_role\":str,\"timestamp_path\":str,\"value_path\":str}]}],"
             "\"required_data_request\":{\"required_action\":\"sql_query\"|\"anomaly\"|\"forecast\"|\"code_interpreter\","
             "\"purpose\":str,\"message\":str|null,\"required_shape\":str,\"required_fields\":[str],"
             "\"required_properties\":[str],\"input_evidence\":str|null,\"input_source_refs\":[str],\"insight_requests\":[{"
@@ -589,6 +733,13 @@ class VisualizationTool(BaseTool):
             "array, so a candidate such as $.items[*].items flattens the inner item arrays into records before source_path is applied. "
             "Wildcards belong only in record_path, never in source_path. Prefer a flatter owning Derived Evidence view when it already "
             "contains the same complete analytical records. "
+            "Use mode=records with non-empty fields and events=[] for every row-preserving projection, including an already-long "
+            "event table with role, timestamp, and value columns. Use mode=wide_events with fields=[] only when exactly one selected "
+            "source record contains several located time/value pairs such as start, peak, and end; each events item must use a distinct "
+            "timestamp/value path pair and "
+            "expands timestamp_path and value_path into one output row with fixed columns event_role, timestamp, and value. This is the "
+            "representation for a one-row wide analytical record that semantically owns multiple points. Never apply wide_events to an "
+            "already-long multi-row event source, and do not present a one-row wide record as a line. "
             "Leave record_path null only when using the source's default records. "
             "Paths use $.field.nested syntax. A view uses one exact grounded source_ref; later chart planning can compose multiple views. "
             "With record_path null, use the top-level names shown in schema_fields (for example $.timestamp or $.value). "
@@ -640,7 +791,7 @@ class VisualizationTool(BaseTool):
         started_at = time.perf_counter()
         response, content, parsed, parse_error = await _invoke_structured(
             self._llm,
-            SemanticProjectionPlan,
+            _StructuredSemanticProjection,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
             trace_title="Semantic Projection",
@@ -658,25 +809,8 @@ class VisualizationTool(BaseTool):
         try:
             if parse_error is not None:
                 raise parse_error
-            return parsed
+            return parsed.to_runtime()
         except (json.JSONDecodeError, ValueError) as exc:
-            if contract_repair_attempt < 2:
-                return await self._project(
-                    request,
-                    inventory,
-                    request_state,
-                    verification=verification,
-                    source_preferences=source_preferences,
-                    repair_context={
-                        **(repair_context or {}),
-                        "contract_error": f"invalid semantic projection plan: {exc}",
-                        "rejected_response": content,
-                        "schema_instruction": (
-                            "Return a corrected plan object. input_evidence must be one exact source_ref from the inventory or null."
-                        ),
-                    },
-                    contract_repair_attempt=contract_repair_attempt + 1,
-                )
             raise _semantic_error(
                 ValueError(f"invalid semantic projection plan: {exc}"), inventory, scope="semantic_projection",
             ) from exc
@@ -687,30 +821,27 @@ class VisualizationTool(BaseTool):
         inventory: dict,
         request_state: RequestStateModel,
         verification: VisualVerificationDecision,
+        catalog: PresentationCatalog,
         repair_context: dict | None = None,
-        contract_repair_attempt: int = 0,
     ) -> VisualizationPlan:
         if self._llm is None:
             raise RuntimeError("visualization planning requires an LLM")
         target_insights = _target_insight_inventory(request_state, verification.target_insight_ids)
         prompt = prompt_locale_instruction(request_state.response_language) + (
-            "You are the chart-planning stage for grounded visualization. The semantic projection stage has already interpreted "
-            "the referenced artifacts and organized their existing values into semantic views. A question-first visual verification "
-            "planner has already selected the claim relationship this candidate must let a human inspect. Target Insight semantics and "
-            "directly held values are supplied separately; semantic data views expose contracts and references, not records. "
-            "Return exactly one JSON object matching: "
-            "{\"visual_goals\":[{\"purpose\":str,\"title\":str,\"priority\":\"primary\"|\"supporting\","
-            "\"summary\":str|null,\"required_roles\":[str],\"presentation\":object,\"layers\":[{\"role\":str,"
-            "\"source_ref\":str,\"mark\":str,\"encoding\":object,\"transform\":[object],"
-            "\"presentation\":object,\"label\":str|null}]}],\"required_data_request\":{"
-            "\"required_action\":\"sql_query\"|\"anomaly\"|\"forecast\"|\"code_interpreter\",\"purpose\":str,"
-            "\"message\":str|null,\"required_shape\":str,\"required_fields\":[str],"
-            "\"required_properties\":[str],\"input_evidence\":str|null,\"input_source_refs\":[str],\"insight_requests\":[{"
-            "\"name\":str,\"insight_type\":str,\"insight_key\":str|null}]}|null}. "
-            "Design the visual expression from the user's goal and the semantic meaning of the views. Compose as many views and "
-            "layers as needed for context, conclusions, intervals, events, and comparisons. Use exact semantic source refs and column "
-            "names from the inventory. mark is any ECharts-native series type. required_roles are your own concise description of "
-            "what the completed chart expresses; every required role must have a materialized layer with the same role. "
+            "You produce a closed, renderer-independent Visual IR for grounded visualization. Semantic projection has already "
+            "organized existing values into views, and the provider enforces the supplied JSON schema. Do not write ECharts options, "
+            "raw presentation objects, transforms, filters, datasets, or series. Select semantic layer intent and exact grounded fields; "
+            "the compiler owns renderer syntax, styles, filtering, axes, tooltip, legend, and dataZoom. Return exactly one branch: "
+            "non-empty visual_goals with required_data_request=null, or visual_goals=[] with a complete required_data_request. "
+            "Every schema field is required; use null, false, normal, solid, none, primary, or an empty list when it does not apply. "
+            "Each layer uses layer_type=series, event_points, band, interval_overlay, or comparison. encodings is a list of "
+            "{channel,field}; series/event_points/comparison/interval_overlay require x and y, while band requires x/lower/upper. "
+            "Do not select a renderer mark; the compiler maps layer_type to the supported renderer series type. "
+            "For interval_overlay, source_ref is the multi-point context series. Prefer interval_source_ref plus exact start/end field "
+            "names from one semantic interval view; leave literal boundary values null. Use literal start/end only when no semantic "
+            "boundary view exists. All interval fields must be null for other layer types. Use render_contract.allowed_layer_types and "
+            "point_count as executable constraints: a line or area requires at least two points per series, while event_points may use "
+            "one or more located records. required_roles must have same-role layers. "
             "Every forecast chart must include a historical-actual layer whenever the supplied semantic views contain its historical "
             "ancestor, plus a distinct forecast layer connected at the prediction boundary. Do not replace the historical baseline with "
             "a scalar direction/change Insight; Insights may annotate the two series. If a forecast view is present but its historical "
@@ -727,25 +858,16 @@ class VisualizationTool(BaseTool):
             "A trend claim is inspected through its complete contextual series and, when grounded derived series exists, a real fitted or "
             "smoothed trend series. Put a direction statement in the chart title/summary/legend, never in an artificial one-point scatter. "
             "A line or area layer must have at least two grounded points after filtering; never encode a one-record scalar or boundary receipt as a line. "
-            "For a localized interval claim inside a longer time series, preserve the complete source series, overlay the exact Insight-owned "
-            "interval as a visibly emphasized layer, and use chart-level dataZoom to open on a broader observation window that strictly contains "
-            "the highlighted interval and real surrounding context. Choose that viewport from the supplied timestamps and analytical meaning; "
-            "do not use a fixed duration, fixed percentage, or point-count heuristic. Keep the full series reachable through an inside zoom and a "
-            "desktop slider, and use filterMode=filter so values outside the current x viewport do not flatten its y scale. "
+            "For a localized interval claim, preserve the complete source series and add interval_overlay against the same series. Set "
+            "enable_zoom=true and choose viewport_start/viewport_end from grounded timestamps so the initial viewport strictly contains "
+            "the highlighted interval and real surrounding context. The compiler keeps the complete series reachable and applies filterMode=filter. "
             "A layer's role and label must be entailed by the field_semantics of its encoded columns. Never present a central estimate "
             "as a lower bound, upper bound, interval, anomaly, or decision; styling, duplicate layers, and renamed roles do not create "
             "missing semantics. If any user-required visual meaning is absent from the semantic views, return visual_goals=[] and one "
             "complete required_data_request instead. Return exactly one branch, and include name plus insight_type in every "
             "code_interpreter or SQL-owned atomic insight_request. Use anomaly for missing anomaly results, forecast for missing or invalidated prediction "
             "outputs, and code_interpreter only for derived calculations over valid existing artifacts; code must never replace a "
-            "specialized forecast or anomaly owner. input_evidence must be one exact semantic source_ref "
-            "from the inventory or null, never prose. "
-            "Chart-level presentation owns axes, coordinate systems, visualMap, dataZoom, brush, toolbox, legend, and tooltip. "
-            "Layer presentation owns series styling and interaction. Presentation must not contain data/source/dataset/dimensions/series/encode. "
-            "Every graphical layer must use explicit grounded field encodings. line, area, bar, point, and boxplot require explicit x "
-            "and y/value; band requires x, lower, and upper. Never omit encoding fields and rely on automatic selection. "
-            "Filters may select existing semantic-view rows but may not calculate or modify values. Filter operator must be exactly one "
-            "of eq, neq, in, not_in, exists, not_exists, gt, gte, lt, lte, or between; do not use SQL symbols such as =. "
+            "specialized forecast or anomaly owner. input_evidence must be one exact semantic source_ref from the inventory or null, never prose. "
             "Text cards and tables are unsupported. "
             "Do not weaken the requested purpose and do not invent a fallback chart.\n"
             f"Visualization request: {request.message}\n"
@@ -760,7 +882,7 @@ class VisualizationTool(BaseTool):
         started_at = time.perf_counter()
         response, content, parsed, parse_error = await _invoke_structured(
             self._llm,
-            VisualizationPlan,
+            _StructuredVisualizationPlan,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
             trace_title="Chart Planning",
@@ -778,22 +900,246 @@ class VisualizationTool(BaseTool):
         try:
             if parse_error is not None:
                 raise parse_error
-            return parsed
         except (json.JSONDecodeError, ValueError) as exc:
-            if contract_repair_attempt < 2:
-                return await self._plan(
-                    request,
-                    inventory,
-                    request_state,
-                    verification=verification,
-                    repair_context={
-                        **(repair_context or {}),
-                        "contract_error": f"invalid chart plan: {exc}",
-                        "rejected_response": content,
-                    },
-                    contract_repair_attempt=contract_repair_attempt + 1,
-                )
             raise _semantic_error(ValueError(f"invalid chart plan: {exc}"), inventory) from exc
+        return _compile_visualization_plan(parsed, catalog)
+
+
+def _compile_visualization_plan(
+    plan: _StructuredVisualizationPlan,
+    catalog: PresentationCatalog,
+) -> VisualizationPlan:
+    if plan.required_data_request is not None:
+        return VisualizationPlan(
+            visual_goals=[],
+            required_data_request=plan.required_data_request.to_runtime(),
+        )
+    return VisualizationPlan(
+        visual_goals=[_compile_visual_goal(goal, catalog) for goal in plan.visual_goals],
+        required_data_request=None,
+    )
+
+
+def _compile_visual_goal(goal: VisualGoalIR, catalog: PresentationCatalog) -> VisualGoal:
+    presentation: dict[str, Any] = {
+        "legend": {"show": goal.show_legend},
+        "tooltip": (
+            {"show": False}
+            if goal.tooltip == "none"
+            else {"trigger": goal.tooltip}
+        ),
+        "grid": {"containLabel": True},
+        "yAxis": [{"type": "log" if goal.y_scale == "log" else "value"}],
+    }
+    if any(layer.axis == "secondary" for layer in goal.layers):
+        presentation["yAxis"].append({"type": "value"})
+    if goal.enable_zoom:
+        zoom_window = {}
+        if goal.viewport_start is not None and goal.viewport_end is not None:
+            zoom_window = {
+                "startValue": goal.viewport_start,
+                "endValue": goal.viewport_end,
+            }
+        presentation["dataZoom"] = [
+            {"type": "inside", "filterMode": "filter", **zoom_window},
+            {"type": "slider", "filterMode": "filter", **zoom_window},
+        ]
+    return VisualGoal(
+        purpose=goal.purpose,
+        title=goal.title,
+        priority=goal.priority,
+        summary=goal.summary,
+        required_roles=goal.required_roles,
+        presentation=presentation,
+        layers=[_compile_visual_layer(layer, catalog) for layer in goal.layers],
+    )
+
+
+def _compile_visual_layer(
+    layer: VisualLayerIR,
+    catalog: PresentationCatalog,
+) -> VisualLayerPlan:
+    interval_fields = (
+        layer.interval_source_ref,
+        layer.interval_start_field,
+        layer.interval_end_field,
+    )
+    interval_values = (layer.interval_start_value, layer.interval_end_value)
+    if layer.layer_type == "interval_overlay":
+        uses_source = all(interval_fields)
+        uses_values = all(value is not None for value in interval_values)
+        if uses_source == uses_values:
+            raise ValueError(
+                "interval_overlay requires exactly one boundary source or one literal boundary pair"
+            )
+    elif any(value is not None for value in (*interval_fields, *interval_values)):
+        raise ValueError("interval boundary fields are valid only for interval_overlay")
+
+    _validate_visual_ir_source(layer, catalog)
+    mark = {
+        "series": "line",
+        "event_points": "point",
+        "band": "band",
+        "interval_overlay": "line",
+        "comparison": "bar",
+    }[layer.layer_type]
+    encoding = {item.channel: item.field for item in layer.encodings}
+    transforms: list[VisualFilterTransform] = []
+    if layer.layer_type == "interval_overlay":
+        if layer.interval_source_ref is not None:
+            start, end = _interval_boundaries(
+                catalog,
+                layer.interval_source_ref,
+                str(layer.interval_start_field),
+                str(layer.interval_end_field),
+            )
+        else:
+            start, end = layer.interval_start_value, layer.interval_end_value
+        transforms.append(VisualFilterTransform(
+            field=encoding["x"],
+            operator="between",
+            value=[start, end],
+        ))
+
+    line_width = {"subtle": 1.5, "normal": 2, "strong": 3}[layer.emphasis]
+    opacity = {"subtle": 0.65, "normal": 0.9, "strong": 1.0}[layer.emphasis]
+    presentation: dict[str, Any] = {
+        "opacity": opacity,
+        "emphasis": {"focus": "series"},
+    }
+    if mark in {"line", "area"}:
+        presentation["lineStyle"] = {
+            "width": line_width,
+            "type": layer.line_style,
+        }
+        presentation["showSymbol"] = layer.symbol != "none"
+    if layer.symbol != "none":
+        presentation["symbol"] = layer.symbol
+        presentation["symbolSize"] = 12 if layer.emphasis == "strong" else 9
+    if layer.axis == "secondary":
+        presentation["yAxisIndex"] = 1
+    return VisualLayerPlan(
+        role=layer.role,
+        source_ref=layer.source_ref,
+        mark=mark,
+        encoding=encoding,
+        transform=transforms,
+        presentation=presentation,
+        label=layer.label,
+    )
+
+
+def _validate_visual_ir_source(
+    layer: VisualLayerIR,
+    catalog: PresentationCatalog,
+) -> None:
+    """Validate renderer-independent intent against an executable data contract."""
+
+    source = catalog.resolve(layer.source_ref)
+    if source.kind != "view":
+        # Legacy catalog sources remain materializable, but only typed data views
+        # expose the closed render contract used by the new planning boundary.
+        return
+
+    fields = {
+        str(item.get("name")): str(item.get("data_type") or "unknown")
+        for item in source.value.schema_fields
+        if isinstance(item, dict) and item.get("name")
+    }
+    encodings = {item.channel: item.field for item in layer.encodings}
+    unknown = sorted(set(encodings.values()) - set(fields))
+    if unknown:
+        raise ValueError(
+            f"visual IR layer '{layer.role}' references unavailable fields {unknown} "
+            f"from {source.ref}; available fields: {sorted(fields)}"
+        )
+
+    rows = list(source.value.rows or ([source.value.scalar] if source.value.scalar else []))
+    point_count = len(rows)
+    minimum_points = 2 if layer.layer_type in {"series", "band", "interval_overlay"} else 1
+    if point_count < minimum_points:
+        raise ValueError(
+            f"visual IR {layer.layer_type} layer '{layer.role}' requires at least "
+            f"{minimum_points} grounded points; source {source.ref} has {point_count}"
+        )
+
+    numeric_channels = {"y", "value", "lower", "upper"}
+    invalid_numeric = sorted(
+        f"{channel}={field}"
+        for channel, field in encodings.items()
+        if channel in numeric_channels and fields.get(field) != "number"
+    )
+    if invalid_numeric:
+        raise ValueError(
+            f"visual IR layer '{layer.role}' has incompatible numeric encodings "
+            f"{invalid_numeric}"
+        )
+
+    x_field = encodings.get("x")
+    x_type = fields.get(x_field or "")
+    expected_x_types = (
+        {"category", "string", "boolean"}
+        if layer.layer_type == "comparison"
+        else {"time"}
+    )
+    if x_field and x_type not in expected_x_types:
+        raise ValueError(
+            f"visual IR {layer.layer_type} layer '{layer.role}' has incompatible "
+            f"x encoding {x_field}={x_type}; expected {sorted(expected_x_types)}"
+        )
+
+
+def _interval_boundaries(
+    catalog: PresentationCatalog,
+    source_ref: str,
+    start_field: str,
+    end_field: str,
+) -> tuple[Any, Any]:
+    source = catalog.resolve(source_ref)
+    if source.kind != "view":
+        raise ValueError(f"interval boundary source '{source_ref}' must be a semantic view")
+    records = list(source.value.rows or ([source.value.scalar] if source.value.scalar else []))
+    pairs = {
+        (record.get(start_field), record.get(end_field))
+        for record in records
+        if record.get(start_field) is not None and record.get(end_field) is not None
+    }
+    if len(pairs) != 1:
+        raise ValueError(
+            f"interval boundary source '{source_ref}' must expose exactly one distinct "
+            f"{start_field}/{end_field} pair"
+        )
+    return next(iter(pairs))
+
+
+def _planning_diagnostic(
+    error: Exception,
+    *,
+    stage: str,
+    allowed_values: Any = None,
+) -> dict:
+    message = str(error)
+    lowered = message.casefold()
+    if "requires at least two grounded points" in lowered:
+        code = "INSUFFICIENT_SERIES_POINTS"
+    elif "unavailable field" in lowered or "unavailable in every record" in lowered:
+        code = "UNKNOWN_FIELD"
+    elif "unknown presentation source" in lowered:
+        code = "UNKNOWN_SOURCE"
+    elif "incompatible" in lowered:
+        code = "INCOMPATIBLE_VISUAL_DOMAIN"
+    elif "interval" in lowered and "bound" in lowered:
+        code = "INVALID_INTERVAL_BOUNDARY"
+    else:
+        code = "VISUAL_PLAN_EXECUTION_FAILED"
+    diagnostic = {
+        "stage": stage,
+        "error_code": code,
+        "message": message[:1200],
+    }
+    if allowed_values is not None:
+        diagnostic["allowed_values"] = allowed_values
+    return diagnostic
 
 
 async def _invoke_structured(
@@ -814,7 +1160,12 @@ async def _invoke_structured(
             messages=messages,
         ) as trace_span:
             if hasattr(llm, "with_structured_output"):
-                runnable = llm.with_structured_output(schema, method="json_mode", include_raw=True)
+                runnable = llm.with_structured_output(
+                    schema,
+                    method="json_schema",
+                    include_raw=True,
+                    strict=True,
+                )
                 bundle = await asyncio.wait_for(
                     runnable.ainvoke(messages),
                     timeout=timeout_seconds,

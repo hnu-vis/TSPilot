@@ -40,7 +40,7 @@ class FakeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -115,7 +115,7 @@ class SandboxAnalysisLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -193,7 +193,7 @@ class CasualLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -217,7 +217,7 @@ class CodeRequiredRepairLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -279,7 +279,7 @@ class ComplexReActLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -379,7 +379,7 @@ class RepeatingTodoLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -460,7 +460,7 @@ class TodoScopeLLM:
     async def ainvoke(self, messages, config=None, stop=None, **kwargs):
         self.calls += 1
         user_prompt = messages[-1][1]
-        query_response = _query_generation_response(user_prompt)
+        query_response = _query_generation_response(user_prompt, messages)
         if query_response is not None:
             return query_response
         context = _context_from_prompt(user_prompt)
@@ -576,7 +576,7 @@ class BitcoinMultiQueryLLM:
                 "assumptions": [],
                 "confidence": 0.99,
             }, ensure_ascii=False))
-        internal_response = _query_generation_response(user_prompt)
+        internal_response = _query_generation_response(user_prompt, messages)
         if internal_response is not None:
             return internal_response
         _context_from_prompt(user_prompt)
@@ -970,22 +970,23 @@ def _evidence_refs_from_payload(payload: dict) -> list[str]:
     return refs
 
 
-def _query_generation_response(user_prompt: str) -> _FakeResponse | None:
-    if (
-        "User Task:" not in user_prompt
-        and "Outer ReAct State:" not in user_prompt
-        and "visualization" in _required_action_names(_LAST_CONTEXT or {})
-    ):
-        return _FakeResponse(json.dumps({
-            "decision": "not_visualizable",
-            "target_insight_ids": [],
-            "verification_question": None,
-            "interpretation": "The fake unit-test model cannot inspect a rendered visual relationship.",
-            "visual_relation": None,
-            "required_context": [],
-            "non_visual_insight_ids": [],
-            "required_data_request": None,
-        }, ensure_ascii=False))
+def _query_generation_response(user_prompt: str, messages=None) -> _FakeResponse | None:
+    prompt_text = "\n".join(
+        str(message[1])
+        for message in (messages or [])
+        if isinstance(message, (tuple, list)) and len(message) > 1
+    )
+    if "You are the visual verification planner inside" in prompt_text:
+        return _FakeResponse(json.dumps({"outcome": {
+                "decision": "not_visualizable",
+                "target_insight_ids": [],
+                "verification_question": None,
+                "interpretation": "The fake unit-test model cannot inspect a rendered visual relationship.",
+                "visual_relation": None,
+                "required_context": [],
+                "non_visual_insight_ids": [],
+                "required_data_request": None,
+            }}, ensure_ascii=False))
     try:
         internal_payload = json.loads(user_prompt)
     except (TypeError, json.JSONDecodeError):

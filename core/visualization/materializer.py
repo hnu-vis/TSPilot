@@ -491,39 +491,78 @@ class PresentationCatalog:
                 source_bindings = _projection_bindings(source)
                 bindings: dict[str, VisualizationBinding] = {}
                 field_semantics: dict[str, str] = {}
-                projected_columns: dict[str, list[Any]] = {}
-                for mapping in getattr(plan, "fields", []) or []:
-                    name = str(getattr(mapping, "name", "") or "").strip()
-                    path = str(getattr(mapping, "source_path", "") or "").strip()
-                    values: list[Any] = []
-                    resolved_count = 0
-                    for record in records:
-                        try:
-                            values.append(_value_at_path(record, path))
-                            resolved_count += 1
-                        except ValueError:
-                            values.append(None)
-                    if resolved_count == 0:
-                        structures = [_structure_outline([record]) for record in records[:4]]
+                mode = str(getattr(plan, "mode", "records") or "records")
+                if mode == "wide_events":
+                    if len(records) != 1:
                         raise ValueError(
-                            f"semantic source path '{path}' is unavailable in every record within "
-                            f"record_path {record_path!r}; available record paths: "
-                            f"{_record_path_candidates(_projection_root(source))}; "
-                            f"representative record structures: {structures}"
+                            f"wide_events semantic projection requires exactly one selected source "
+                            f"record; source {source.ref} produced {len(records)} records. Use records "
+                            "mode for an already-long event table."
                         )
-                    projected_columns[name] = values
-                    field_semantics[name] = str(getattr(mapping, "semantic_role", "") or name)
-                for row_index, record in enumerate(records):
-                    output = {
-                        name: values[row_index]
-                        for name, values in projected_columns.items()
+                    field_semantics = {
+                        "event_role": "event_role",
+                        "timestamp": "event_time",
+                        "value": "event_value",
                     }
-                    binding = source_bindings.get(str(record.get("item_id") or "")) or source_bindings.get("")
-                    if binding is not None:
-                        binding_id = f"semantic:{getattr(plan, 'view_id', 'view')}:{row_index}"
-                        bindings[binding_id] = binding.model_copy(update={"binding_id": binding_id})
-                        output["__binding_id"] = binding_id
-                    projected.append(output)
+                    event_index = 0
+                    for record in records:
+                        binding = source_bindings.get(str(record.get("item_id") or "")) or source_bindings.get("")
+                        for event in getattr(plan, "events", []) or []:
+                            timestamp_path = str(getattr(event, "timestamp_path", "") or "")
+                            value_path = str(getattr(event, "value_path", "") or "")
+                            try:
+                                timestamp = _value_at_path(record, timestamp_path)
+                                value = _value_at_path(record, value_path)
+                            except ValueError as exc:
+                                raise ValueError(
+                                    f"semantic event paths '{timestamp_path}'/'{value_path}' are unavailable "
+                                    f"within record_path {record_path!r}"
+                                ) from exc
+                            output = {
+                                "event_role": str(getattr(event, "event_role", "") or "event"),
+                                "timestamp": timestamp,
+                                "value": value,
+                            }
+                            if binding is not None:
+                                binding_id = f"semantic:{getattr(plan, 'view_id', 'view')}:{event_index}"
+                                bindings[binding_id] = binding.model_copy(update={"binding_id": binding_id})
+                                output["__binding_id"] = binding_id
+                            projected.append(output)
+                            event_index += 1
+                else:
+                    projected_columns: dict[str, list[Any]] = {}
+                    for mapping in getattr(plan, "fields", []) or []:
+                        name = str(getattr(mapping, "name", "") or "").strip()
+                        path = str(getattr(mapping, "source_path", "") or "").strip()
+                        values: list[Any] = []
+                        resolved_count = 0
+                        for record in records:
+                            try:
+                                values.append(_value_at_path(record, path))
+                                resolved_count += 1
+                            except ValueError:
+                                values.append(None)
+                        if resolved_count == 0:
+                            structures = [_structure_outline([record]) for record in records[:4]]
+                            raise ValueError(
+                                f"semantic source path '{path}' is unavailable in every record within "
+                                f"record_path {record_path!r}; available record paths: "
+                                f"{_record_path_candidates(_projection_root(source))}; "
+                                f"representative record structures: {structures}"
+                            )
+                        projected_columns[name] = values
+                        field_semantics[name] = str(getattr(mapping, "semantic_role", "") or name)
+                    for row_index, record in enumerate(records):
+                        output = {
+                            name: values[row_index]
+                            for name, values in projected_columns.items()
+                        }
+                        binding = source_bindings.get(str(record.get("item_id") or "")) or source_bindings.get("")
+                        if binding is not None:
+                            binding_id = f"semantic:{getattr(plan, 'view_id', 'view')}:{row_index}"
+                            bindings[binding_id] = binding.model_copy(update={"binding_id": binding_id})
+                            output["__binding_id"] = binding_id
+                        projected.append(output)
                 view_id = str(getattr(plan, "view_id", "") or "").strip()
                 ref = f"semantic:{view_id}"
                 if ref in self._sources:
@@ -531,7 +570,7 @@ class PresentationCatalog:
                 self._register_view(
                     ref,
                     name=str(getattr(plan, "name", "") or view_id),
-                    shape=str(getattr(plan, "grain", "") or "records"),
+                    shape=("event_set" if mode == "wide_events" else str(getattr(plan, "grain", "") or "records")),
                     rows=projected,
                     scalar=None,
                     lineage=[source.ref],
@@ -556,6 +595,7 @@ class PresentationCatalog:
                 "source_ref": source.ref, "kind": "data_view", "name": value.name, "shape": value.shape,
                 "row_count": len(value.rows) or int(value.scalar is not None), "schema_fields": value.schema_fields,
                 "render_capabilities": capabilities,
+                "render_contract": _render_contract(value),
                 "lineage": value.lineage,
                 "time_range": _row_time_range(value.rows),
                 "materialization_complete": materialization_complete,
@@ -1273,6 +1313,46 @@ def _render_capabilities(schema_fields: list[dict], *, scalar: bool) -> dict:
         "scalar_only": scalar,
         "renderer_series_type": "open",
         "renderable": renderable,
+    }
+
+
+def _render_contract(value: DataViewValue) -> dict:
+    """Compute executable visual consumers from materialized shape and cardinality."""
+
+    fields_by_type: dict[str, list[str]] = {}
+    for field in value.schema_fields:
+        if not isinstance(field, dict):
+            continue
+        fields_by_type.setdefault(str(field.get("data_type") or "unknown"), []).append(
+            str(field.get("name") or "")
+        )
+    point_count = len(value.rows) or int(value.scalar is not None)
+    time_fields = [field for field in fields_by_type.get("time", []) if field]
+    number_fields = [field for field in fields_by_type.get("number", []) if field]
+    category_fields = [
+        field
+        for data_type in ("category", "string", "boolean")
+        for field in fields_by_type.get(data_type, [])
+        if field
+    ]
+    allowed: list[str] = []
+    if point_count >= 1 and time_fields and number_fields:
+        allowed.append("event_points")
+    if point_count >= 2 and time_fields and number_fields:
+        allowed.append("series")
+    if point_count >= 2 and time_fields and len(number_fields) >= 2:
+        allowed.append("band")
+    if point_count >= 1 and category_fields and number_fields:
+        allowed.append("comparison")
+    if point_count >= 1 and len(time_fields) >= 2:
+        allowed.append("interval_bounds")
+    return {
+        "data_shape": value.shape,
+        "point_count": point_count,
+        "allowed_layer_types": allowed,
+        "time_fields": time_fields,
+        "number_fields": number_fields,
+        "category_fields": category_fields,
     }
 
 

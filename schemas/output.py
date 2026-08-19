@@ -113,6 +113,83 @@ class VisualGoal(BaseModel):
         return self
 
 
+class VisualEncodingIR(BaseModel):
+    """One closed field binding in the LLM-authored visualization IR."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel: Literal["x", "y", "value", "lower", "upper", "series", "label"]
+    field: str = Field(min_length=1)
+
+
+class VisualLayerIR(BaseModel):
+    """Renderer-independent, closed layer intent compiled into a VisualLayerPlan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    layer_type: Literal["series", "event_points", "band", "interval_overlay", "comparison"]
+    role: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    encodings: list[VisualEncodingIR]
+    interval_source_ref: str | None
+    interval_start_field: str | None
+    interval_end_field: str | None
+    interval_start_value: str | int | float | None
+    interval_end_value: str | int | float | None
+    emphasis: Literal["normal", "subtle", "strong"]
+    line_style: Literal["solid", "dashed", "dotted"]
+    symbol: Literal["none", "circle", "diamond", "triangle", "pin"]
+    axis: Literal["primary", "secondary"]
+    label: str | None
+
+    @model_validator(mode="after")
+    def validate_layer_contract(self):
+        channels = [item.channel for item in self.encodings]
+        if len(channels) != len(set(channels)):
+            raise ValueError(f"visual IR layer '{self.role}' contains duplicate encoding channels")
+        channel_set = set(channels)
+        if self.layer_type == "band":
+            required = {"x", "lower", "upper"}
+        else:
+            required = {"x", "y"}
+        missing = required - channel_set
+        if missing:
+            raise ValueError(f"visual IR layer '{self.role}' is missing channels {sorted(missing)}")
+        return self
+
+
+class VisualGoalIR(BaseModel):
+    """Closed chart goal authored by the LLM before deterministic compilation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    purpose: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    priority: Literal["primary", "supporting"]
+    summary: str | None
+    required_roles: list[str]
+    show_legend: bool
+    tooltip: Literal["axis", "item", "none"]
+    enable_zoom: bool
+    viewport_start: str | int | float | None
+    viewport_end: str | int | float | None
+    y_scale: Literal["linear", "log"]
+    layers: list[VisualLayerIR] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_role_layer_bijection(self):
+        layer_roles = {layer.role.strip().casefold() for layer in self.layers}
+        missing = [
+            role for role in self.required_roles
+            if role.strip().casefold() not in layer_roles
+        ]
+        if missing:
+            raise ValueError(f"every required visual role requires a same-role IR layer; missing={missing}")
+        if (self.viewport_start is None) != (self.viewport_end is None):
+            raise ValueError("visual viewport requires both start and end")
+        return self
+
+
 class FinalResponsePlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str | None = None
