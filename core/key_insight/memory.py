@@ -243,6 +243,9 @@ def default_insight_recipes() -> list[dict]:
             "insight_type": "extreme",
             "name": "max_value",
             "preferred_tool": "sql_query",
+            "calculation_trace": {
+                "method": "Select the row with the maximum numeric value in the current grounded evidence."
+            },
             "insight_request_template": {"name": "max_value", "insight_type": "extreme", "requirements": {"operator": "max"}},
             "expected_result_schema": {"insights": [{"name": "max_value", "insight_type": "extreme"}]},
             "verification_notes": _default_verification_requirements(),
@@ -253,6 +256,9 @@ def default_insight_recipes() -> list[dict]:
             "insight_type": "extreme",
             "name": "min_value",
             "preferred_tool": "sql_query",
+            "calculation_trace": {
+                "method": "Select the row with the minimum numeric value in the current grounded evidence."
+            },
             "insight_request_template": {"name": "min_value", "insight_type": "extreme", "requirements": {"operator": "min"}},
             "expected_result_schema": {"insights": [{"name": "min_value", "insight_type": "extreme"}]},
             "verification_notes": _default_verification_requirements(),
@@ -263,6 +269,9 @@ def default_insight_recipes() -> list[dict]:
             "insight_type": "extreme_time",
             "name": "max_time",
             "preferred_tool": "sql_query",
+            "calculation_trace": {
+                "method": "Select the maximum-value row and return the timestamp associated with that row."
+            },
             "insight_request_template": {"name": "max_time", "insight_type": "extreme_time", "requirements": {"operator": "max"}},
             "expected_result_schema": {"insights": [{"name": "max_time", "insight_type": "extreme_time"}]},
             "verification_notes": _default_verification_requirements(),
@@ -273,6 +282,9 @@ def default_insight_recipes() -> list[dict]:
             "insight_type": "extreme_time",
             "name": "min_time",
             "preferred_tool": "sql_query",
+            "calculation_trace": {
+                "method": "Select the minimum-value row and return the timestamp associated with that row."
+            },
             "insight_request_template": {"name": "min_time", "insight_type": "extreme_time", "requirements": {"operator": "min"}},
             "expected_result_schema": {"insights": [{"name": "min_time", "insight_type": "extreme_time"}]},
             "verification_notes": _default_verification_requirements(),
@@ -283,6 +295,9 @@ def default_insight_recipes() -> list[dict]:
             "insight_type": "change",
             "name": "range_change",
             "preferred_tool": "code_interpreter",
+            "calculation_trace": {
+                "method": "Use comparable start and end values to compute absolute change and percentage change relative to the start value."
+            },
             "insight_request_template": {"insight_type": "change", "requirements": {"needs_start_value": True, "needs_end_value": True}},
             "expected_result_schema": {
                 "insights": [{"name": "percentage_change", "insight_type": "change"}],
@@ -386,6 +401,7 @@ def _detail_from_recipe(recipe: InsightRecipe, card: MemoryCard) -> MemoryDetail
         card=card,
         insight_request=insight_request,
         preferred_tool=recipe.preferred_tool,
+        calculation_trace=recipe.calculation_trace,
         guidance="; ".join(recipe.verification_notes or []) or None,
         examples=[],
     )
@@ -429,4 +445,3 @@ def _default_verification_requirements() -> list[str]:
         "must include calculation trace or output schema for computed values",
         "must not reuse old numeric values as final evidence",
     ]
-

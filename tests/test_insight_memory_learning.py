@@ -70,7 +70,12 @@ def _terminal_state(tmp_path, *, request_id: str = "req-learning"):
         subject=request.subject,
         method="sql_query",
         evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi-secret")],
-        calculation_trace={"row": {"value": 420}, "value_key": "value", "time_key": "time"},
+        calculation_trace={
+            "method": "Select the last ordered observation for the requested metric.",
+            "row": {"value": 420},
+            "value_key": "value",
+            "time_key": "time",
+        },
     )
     state.insight_set.requests = [request]
     state.insight_set.insights = [insight]
@@ -97,6 +102,9 @@ def test_terminal_learning_candidate_is_referenced_verified_and_value_free(tmp_p
     assert candidate.insight_request.dimensions == {"building": "<instance-value-omitted>"}
     assert candidate.insight_request.requirements["row_filters"]["building"] == "<instance-value-omitted>"
     assert candidate.insight_request.requirements["time_position"] == "end"
+    assert candidate.calculation_semantics["method"] == (
+        "Select the last ordered observation for the requested metric."
+    )
     assert "420" not in serialized
     assert "evi-secret" not in serialized
     assert "memory_card_ids" not in serialized
@@ -381,6 +389,8 @@ async def test_batch_learner_abstracts_reviews_and_commits(monkeypatch, tmp_path
     recipe = written[0][1].recipes[0]
     assert recipe.recipe_id.startswith("recipe_learned_")
     assert recipe.description == "Generate the latest appliances energy observation."
+    assert recipe.calculation_trace is not None
+    assert recipe.calculation_trace.method == "Select the last ordered observation for the requested metric."
     assert list((tmp_path / "learning" / "completed").glob("*.json"))
 
 

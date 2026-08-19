@@ -511,13 +511,14 @@ function MemoryCardItem({ card, selected, onSelect }: { card: MemoryCard; select
   );
 }
 
-function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
+export function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
   const { t } = useI18n();
   const request = detail.insight_request || {};
   const requirements = asRecord(request.requirements);
   const tags = detail.card.tags || [];
   const isPlaybook = detail.card.kind === 'insight_recipe';
   const source = detail.card.updated_at ? 'Learned' : 'System default';
+  const rawContract = compactMemoryContract(detail.insight_request);
   const contractRows = compactRows([
     [t('Key Insight type'), request.insight_type || tags[0]],
     [t('Subject'), request.subject],
@@ -526,9 +527,9 @@ function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
     [t('Scope'), tags[Math.max(tags.length - 1, 0)]],
   ]);
   const generationRows = compactRows([
-    [t('Preferred tool'), detail.preferred_tool],
+    [t('Tool'), detail.preferred_tool],
+    [t('Method'), detail.calculation_trace?.method],
     [t('Required evidence'), isPlaybook ? undefined : tags.slice(1, -1)],
-    [t('Derivation'), request.derivation],
     [t('Time position'), requirements.time_position],
     [t('Operator'), requirements.operator],
     [t('Dimensions'), request.dimensions],
@@ -566,7 +567,7 @@ function MemoryDetailCard({ detail }: { detail: MemoryDetail }) {
           <div><dt>{t('Memory ID')}</dt><dd><code>{detail.id}</code></dd></div>
           <div><dt>{t('Tags')}</dt><dd>{(detail.card.tags || []).join(' · ') || t('None')}</dd></div>
         </dl>
-        {detail.insight_request && <pre className="debug-json">{JSON.stringify(detail.insight_request, null, 2)}</pre>}
+        {rawContract && <pre className="debug-json">{JSON.stringify(rawContract, null, 2)}</pre>}
         {detail.examples && detail.examples.length > 0 && (
           <div className="chip-list compact">
             {detail.examples.slice(0, 4).map((item) => <span key={item}>{item}</span>)}
@@ -603,6 +604,23 @@ function compactRows(rows: Array<[string, unknown]>): Array<[string, unknown]> {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+export function compactMemoryContract(value: unknown): unknown {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) => compactMemoryContract(item))
+      .filter((item) => item !== undefined);
+    return items.length ? items : undefined;
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, compactMemoryContract(item)] as const)
+      .filter(([, item]) => item !== undefined);
+    return entries.length ? Object.fromEntries(entries) : undefined;
+  }
+  return value;
 }
 
 function formatContractValue(value: unknown): string {

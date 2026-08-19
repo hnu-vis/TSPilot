@@ -186,20 +186,24 @@ describe('InspectorPanel code insight details', () => {
             insight_key: 'overall_trend',
             value: 2.31,
             calculation_trace: {
-              analysis_method: 'ordinary least squares',
+              method: 'ordinary least squares',
               valid_observations: 144,
             },
           }],
           produced_insights: [{
             insight_id: 'ins_overall_trend',
-            insight_key: 'overall_trend',
-            name: 'Overall trend',
+            insight_key: 'bitcoin_usd_turning_point_interval',
+            name: 'bitcoin_usd_turning_point_interval',
             insight_type: 'trend',
             statement: 'The series has an overall upward trend.',
             value: 2.31,
             method: 'code_interpreter',
             status: 'verified',
-            calculation_trace: 'Used ordinary least squares over 144 valid observations.',
+            calculation_trace: {
+              method: 'Used ordinary least squares over 144 valid observations.',
+              valid_observations: 144,
+              formula: 'value ~ elapsed_hours',
+            },
           }, {
             insight_id: 'ins_change_rate',
             insight_key: 'change_rate',
@@ -210,8 +214,8 @@ describe('InspectorPanel code insight details', () => {
             method: 'code_interpreter',
             status: 'verified',
             calculation_trace: [
-              { step: 'select endpoints' },
-              { formula: '(end - start) / start * 100' },
+              { method: 'Select the first and last valid observations.' },
+              { method: 'Compare the two endpoint values.', formula: '(end - start) / start * 100' },
             ],
           }],
           insight_coverage: {
@@ -237,11 +241,28 @@ describe('InspectorPanel code insight details', () => {
     );
 
     expect(markup).toContain('Source');
-    expect(markup).toContain('Key Insight selection');
-    expect(markup).toContain('The series has an overall upward trend.');
+    expect(markup).toContain('Calculation methods');
     expect(markup).toContain('Used ordinary least squares over 144 valid observations.');
-    expect(markup).toContain('select endpoints');
-    expect(markup).toContain('(end - start) / start * 100');
-    expect(markup.match(/Calculation trace/g)).toHaveLength(2);
+    expect(markup).toContain('Select the first and last valid observations.');
+    expect(markup).toContain('Compare the two endpoint values.');
+    expect(markup).not.toContain('Key Insight selection');
+    const analysisGoalIndex = markup.lastIndexOf('Estimate the overall trend.');
+    const insightSectionIndex = markup.indexOf('Calculation methods', analysisGoalIndex);
+    const traceIndex = markup.indexOf('Used ordinary least squares', insightSectionIndex);
+    const sourceIndex = markup.indexOf('Source', insightSectionIndex);
+    const resultIndex = markup.indexOf('Result', sourceIndex);
+    const methodSection = markup.slice(insightSectionIndex, sourceIndex);
+    expect(methodSection.match(/bitcoin_usd_turning_point_interval/g)).toHaveLength(1);
+    expect(methodSection).toContain('Change rate');
+    expect(methodSection).not.toContain('The series has an overall upward trend.');
+    expect(methodSection).not.toContain('2.31');
+    expect(methodSection).not.toContain('verified');
+    expect(methodSection).not.toContain('valid_observations');
+    expect(methodSection).not.toContain('value ~ elapsed_hours');
+    expect(methodSection).not.toContain('(end - start) / start * 100');
+    expect(analysisGoalIndex).toBeLessThan(insightSectionIndex);
+    expect(insightSectionIndex).toBeLessThan(traceIndex);
+    expect(traceIndex).toBeLessThan(sourceIndex);
+    expect(sourceIndex).toBeLessThan(resultIndex);
   });
 });

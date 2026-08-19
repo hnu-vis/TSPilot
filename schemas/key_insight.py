@@ -136,6 +136,12 @@ class InsightDefinition(BaseModel):
     updated_at: str | None = None
 
 
+class RecipeCalculationTrace(BaseModel):
+    """Reusable calculation method retained from a verified runtime trace."""
+
+    method: str = Field(min_length=1)
+
+
 class InsightRecipe(BaseModel):
     recipe_id: str
     insight_type: str
@@ -149,6 +155,7 @@ class InsightRecipe(BaseModel):
     insight_request_template: dict = Field(default_factory=dict)
     expected_result_schema: dict = Field(default_factory=dict)
     verification_notes: list[str] = Field(default_factory=list)
+    calculation_trace: RecipeCalculationTrace | None = None
     scope: str = "global"
     source: str = "system"
     updated_at: str | None = None
@@ -205,6 +212,7 @@ class MemoryDetail(BaseModel):
     card: MemoryCard
     insight_request: KeyInsightRequest | None = None
     preferred_tool: str | None = None
+    calculation_trace: RecipeCalculationTrace | None = None
     guidance: str | None = None
     examples: list[str] = Field(default_factory=list)
 

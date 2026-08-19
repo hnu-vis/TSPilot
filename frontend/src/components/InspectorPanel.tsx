@@ -501,6 +501,8 @@ function CodeInterpreterPreview({
         </div>
       )}
 
+      {insightDetail && <CalculationMethods detail={insightDetail} />}
+
       <div className="query-run-insights" aria-label={t('Code interpreter insights')}>
         {detail.inputRowCount !== null && (
           <div>
@@ -535,7 +537,6 @@ function CodeInterpreterPreview({
         />
       )}
 
-      {insightDetail && <InsightContent detail={insightDetail} embedded />}
     </section>
   );
 }
@@ -626,17 +627,38 @@ function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
   );
 }
 
-function InsightContent({
-  detail,
-  embedded = false,
-}: {
-  detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']>;
-  embedded?: boolean;
-}) {
+function CalculationMethods({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']> }) {
+  const { t } = useI18n();
+  const methods = detail.produced.flatMap((insight) => {
+    const method = calculationMethodFromTrace(insight.calculation_trace);
+    return method ? [{ insightId: insight.insight_id, name: insight.name, method }] : [];
+  });
+  if (methods.length === 0) return null;
+  return (
+    <div className="tool-result-section calculation-methods">
+      <div className="sample-table-caption">
+        <span>
+          <Code2 size={14} />
+          {t('Calculation methods')}
+        </span>
+      </div>
+      <div className="calculation-method-list">
+        {methods.map((item) => (
+          <article key={item.insightId} className="calculation-method-item">
+            <strong>{item.name}</strong>
+            <p>{item.method}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InsightContent({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']> }) {
   const { t } = useI18n();
   const coverageItems = insightCoverageItems(detail.coverage);
   return (
-    <div className={embedded ? 'tool-result-section code-insight-results' : 'key-insight-content'}>
+    <div className="key-insight-content">
       <div className="inspector-card-title sql-detail-title">
         <CheckCircle2 size={16} />
         <h3>{t('Key Insight selection')}</h3>
@@ -1000,6 +1022,19 @@ function hasCalculationTrace(trace: CalculationTrace | undefined): trace is Calc
 
 function formatCalculationTrace(trace: CalculationTrace) {
   return typeof trace === 'string' ? trace : JSON.stringify(trace, null, 2);
+}
+
+function calculationMethodFromTrace(trace: CalculationTrace | undefined): string | null {
+  const entries = Array.isArray(trace) ? trace : [trace];
+  const methods = entries.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const value = (entry as Record<string, unknown>).method;
+    if (typeof value === 'string') return value.trim() ? [value.trim()] : [];
+    if (typeof value === 'number' || typeof value === 'boolean') return [String(value)];
+    if (value && typeof value === 'object') return [JSON.stringify(value)];
+    return [];
+  });
+  return [...new Set(methods)].join('\n') || null;
 }
 
 function deduplicateStructuredEntries(

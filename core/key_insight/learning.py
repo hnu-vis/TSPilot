@@ -42,6 +42,7 @@ from schemas.key_insight import (
     InsightRecipe,
     MemoryCard,
     MemoryDetail,
+    RecipeCalculationTrace,
     normalize_insight_key,
 )
 from schemas.state import RequestStateModel
@@ -176,6 +177,7 @@ def extract_learning_candidates(request_state: RequestStateModel) -> list[Insigh
             dependency_insight_keys=list(insight.derived_from),
             calculation_semantics={
                 "derivation": insight.derivation,
+                "method": _calculation_trace_method(insight.calculation_trace),
                 "trace_fields": (
                     sorted(insight.calculation_trace.keys())
                     if isinstance(insight.calculation_trace, dict)
@@ -469,6 +471,7 @@ class InsightMemoryLearner:
                     payload,
                     valid_ids=valid_ids,
                     database_id=jobs[0].candidate.database_id,
+                    calculation_methods=_candidate_calculation_methods(jobs),
                 )
                 return result, {"attempts": usage}
             except Exception as exc:
@@ -481,6 +484,7 @@ class InsightMemoryLearner:
         *,
         valid_ids: set[str],
         database_id: str,
+        calculation_methods: dict[str, str] | None = None,
     ) -> list[AbstractedInsightRecipe]:
         items = payload.get("abstracted") if isinstance(payload, dict) else None
         if not isinstance(items, list):
@@ -508,6 +512,11 @@ class InsightMemoryLearner:
                 raise ValueError(f"Invalid abstracted Key Insight request contract: {contract_error}")
             item.recipe.scope = database_id
             item.recipe.source = "verified_key_insight"
+            if calculation_methods is not None:
+                item.recipe.calculation_trace = _recipe_calculation_trace(
+                    item.candidate_ids,
+                    calculation_methods,
+                )
             item.definition.scope = database_id
             item.definition.source = "verified_key_insight"
             result.append(item)
@@ -647,6 +656,7 @@ class InsightMemoryLearner:
                     abstracted_ids=abstracted_ids,
                     allowed_targets=allowed_targets,
                     database_id=jobs[0].candidate.database_id,
+                    calculation_methods=_candidate_calculation_methods(jobs),
                 )
                 return decisions, {"attempts": usage}
             except Exception as exc:
@@ -661,6 +671,7 @@ class InsightMemoryLearner:
         abstracted_ids: set[str],
         allowed_targets: dict[str, list[str]],
         database_id: str,
+        calculation_methods: dict[str, str] | None = None,
     ) -> list[InsightLearningDecision]:
         items = payload.get("decisions") if isinstance(payload, dict) else None
         if not isinstance(items, list):
@@ -706,6 +717,11 @@ class InsightMemoryLearner:
                     raise ValueError(f"Invalid decided Key Insight request contract: {contract_error}")
                 item.recipe.scope = database_id
                 item.recipe.source = "verified_key_insight"
+                if calculation_methods is not None:
+                    item.recipe.calculation_trace = _recipe_calculation_trace(
+                        item.candidate_ids,
+                        calculation_methods,
+                    )
                 item.definition.scope = database_id
                 item.definition.source = "verified_key_insight"
             decisions.append(item)
@@ -743,8 +759,13 @@ class InsightMemoryLearner:
                     recipe_id = target
                 else:
                     recipe_id = _learned_recipe_id(decision.recipe)
+                previous_recipe = recipes.get(recipe_id)
                 recipe = decision.recipe.model_copy(update={
                     "recipe_id": recipe_id,
+                    "calculation_trace": (
+                        decision.recipe.calculation_trace
+                        or (previous_recipe.calculation_trace if previous_recipe is not None else None)
+                    ),
                     "scope": database_id,
                     "source": "verified_key_insight",
                     "updated_at": utc_now_iso(),
@@ -941,6 +962,42 @@ def _referenced_insight_ids(answer) -> set[str]:
 def _strip_insight_ref(value: str) -> str:
     text = str(value or "").strip()
     return text[5:] if text.startswith("insight:") else text
+
+
+def _calculation_trace_method(trace: Any) -> str | None:
+    """Read only explicitly authored method text from a runtime calculation trace."""
+
+    entries = trace if isinstance(trace, list) else [trace]
+    methods: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        method = entry.get("method")
+        if isinstance(method, str) and method.strip():
+            methods.append(method.strip())
+    return "\n".join(dict.fromkeys(methods)) or None
+
+
+def _candidate_calculation_methods(jobs: list[InsightLearningJob]) -> dict[str, str]:
+    methods: dict[str, str] = {}
+    for job in jobs:
+        method = job.candidate.calculation_semantics.get("method")
+        if isinstance(method, str) and method.strip():
+            methods[job.candidate.candidate_id] = method.strip()
+    return methods
+
+
+def _recipe_calculation_trace(
+    candidate_ids: list[str],
+    calculation_methods: dict[str, str],
+) -> RecipeCalculationTrace | None:
+    methods = [
+        calculation_methods[candidate_id]
+        for candidate_id in candidate_ids
+        if candidate_id in calculation_methods
+    ]
+    method = "\n".join(dict.fromkeys(methods))
+    return RecipeCalculationTrace(method=method) if method else None
 
 
 def _validate_canonical_recipe_name(recipe: InsightRecipe, request: KeyInsightRequest) -> None:

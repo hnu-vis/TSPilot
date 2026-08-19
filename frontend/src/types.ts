@@ -201,6 +201,7 @@ export type MemoryDetail = {
   card: MemoryCard;
   insight_request?: Record<string, unknown> | null;
   preferred_tool?: string | null;
+  calculation_trace?: { method: string } | null;
   guidance?: string | null;
   examples?: string[];
 };

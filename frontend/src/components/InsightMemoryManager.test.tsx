@@ -1,6 +1,13 @@
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { DatabaseResource } from '../types';
-import { durationInputToSeconds, orderInsightMemoryDatabases, secondsToDurationInput } from './InsightMemoryManager';
+import type { DatabaseResource, MemoryDetail } from '../types';
+import {
+  compactMemoryContract,
+  durationInputToSeconds,
+  MemoryDetailCard,
+  orderInsightMemoryDatabases,
+  secondsToDurationInput,
+} from './InsightMemoryManager';
 
 function database(id: string, recipeCount: number, updatedAt?: string): DatabaseResource {
   return {
@@ -46,5 +53,70 @@ describe('Insight learning schedule duration conversion', () => {
     expect(durationInputToSeconds('1.5', 'hours')).toBe(5400);
     expect(durationInputToSeconds('0', 'minutes')).toBeNull();
     expect(durationInputToSeconds('169', 'hours')).toBeNull();
+  });
+});
+
+describe('compactMemoryContract', () => {
+  it('removes empty optional fields recursively while preserving meaningful false and zero values', () => {
+    expect(compactMemoryContract({
+      insight_key: 'turning_window',
+      subject: null,
+      dimensions: {},
+      requirements: {
+        include_window: true,
+        expected_count: 0,
+        filters: {},
+      },
+      derived_from: ['max_time', '', null],
+      selection: {},
+      enabled: false,
+    })).toEqual({
+      insight_key: 'turning_window',
+      requirements: {
+        include_window: true,
+        expected_count: 0,
+      },
+      derived_from: ['max_time'],
+      enabled: false,
+    });
+  });
+});
+
+describe('MemoryDetailCard', () => {
+  it('shows tool and calculation method while omitting empty raw-contract fields', () => {
+    const detail: MemoryDetail = {
+      id: 'recipe.code_interpreter.analysis.turning_window',
+      card: {
+        id: 'recipe.code_interpreter.analysis.turning_window',
+        kind: 'insight_recipe',
+        title: 'peak turning segment',
+        description: 'Identify a peak and its surrounding reversal window.',
+        tags: ['analysis', 'code_interpreter', 'bitcoin'],
+      },
+      preferred_tool: 'code_interpreter',
+      calculation_trace: {
+        method: 'Scan local peak windows and retain rising-prefix/falling-suffix reversals.',
+      },
+      insight_request: {
+        name: 'peak turning segment',
+        insight_key: 'turning_window',
+        insight_type: 'analysis',
+        subject: null,
+        dimensions: {},
+        requirements: { include_window: true },
+        derived_from: ['max_time', 'max_value'],
+        selection: {},
+      },
+    };
+
+    const markup = renderToStaticMarkup(<MemoryDetailCard detail={detail} />);
+
+    expect(markup).toContain('Tool');
+    expect(markup).toContain('Code interpreter');
+    expect(markup).toContain('Method');
+    expect(markup).toContain('Scan local peak windows and retain rising-prefix/falling-suffix reversals.');
+    expect(markup).not.toContain('&quot;subject&quot;: null');
+    expect(markup).not.toContain('&quot;dimensions&quot;: {}');
+    expect(markup).not.toContain('&quot;selection&quot;: {}');
   });
 });

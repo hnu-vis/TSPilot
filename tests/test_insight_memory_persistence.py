@@ -118,3 +118,39 @@ def test_write_database_memory_strips_system_entries(monkeypatch, tmp_path):
     assert [item["recipe_id"] for item in payload["recipes"]] == ["recipe_learned_demo"]
     assert payload["cards"] == []
     assert payload["details"] == []
+
+
+def test_recipe_calculation_method_is_persisted_and_exposed_in_memory_detail(monkeypatch, tmp_path):
+    monkeypatch.setattr(insight_memory, "insight_memory_dir", lambda: tmp_path)
+    memory = InsightMemory.model_validate({
+        "recipes": [{
+            "recipe_id": "recipe_learned_turning_window",
+            "insight_type": "analysis",
+            "name": "peak turning segment",
+            "preferred_tool": "code_interpreter",
+            "calculation_trace": {
+                "method": "Scan local peak windows and retain rising-prefix/falling-suffix reversals."
+            },
+            "insight_request_template": {
+                "name": "peak turning segment",
+                "insight_key": "turning_window",
+                "insight_type": "analysis",
+            },
+            "source": "verified_key_insight",
+            "scope": "demo",
+        }],
+    })
+
+    insight_memory.write_insight_memory(memory, "demo")
+    detail = insight_memory.memory_detail(
+        "demo",
+        "recipe.code_interpreter.analysis.turning_window",
+        include_system=False,
+    )
+
+    assert detail is not None
+    assert detail.preferred_tool == "code_interpreter"
+    assert detail.calculation_trace is not None
+    assert detail.calculation_trace.method == (
+        "Scan local peak windows and retain rising-prefix/falling-suffix reversals."
+    )

@@ -4417,6 +4417,41 @@ input:focus-visible {
   gap: 10px;
 }
 
+.calculation-method-list,
+.calculation-method-item {
+  display: grid;
+  min-width: 0;
+}
+
+.calculation-method-list {
+  gap: 8px;
+}
+
+.calculation-method-item {
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 9px;
+}
+
+.calculation-method-item strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calculation-method-item p {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
 .insight-coverage-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
