@@ -14,6 +14,7 @@ from core.key_insight.retriever import (
     MemoryHit,
     MemoryRetrievalResult,
     _contract_anchor_details,
+    _parse_json_response,
     _recipe_dependency_closure,
 )
 from runtime.react_loop import ReActLoop
@@ -184,6 +185,19 @@ class FallbackPlanningLLM:
                 "requirements": {"operator": "max"},
             }]
         }))
+
+
+class DuplicatePlanningLLM:
+    async def ainvoke(self, messages):
+        payload = json.dumps({
+            "insight_requests": [{
+                "insight_key": "price.maximum",
+                "name": "maximum price",
+                "insight_type": "extreme",
+                "requirements": {"operator": "max"},
+            }]
+        })
+        return Message(f"{payload}\n{payload}")
 
 
 def _registry(
@@ -443,6 +457,41 @@ async def test_memory_retriever_llm_failure_returns_empty_without_keyword_fallba
 
     assert result.insight_requests == []
     assert result.diagnostics["error_type"] == "memory_retrieval_failed"
+
+
+def test_memory_json_parser_deduplicates_identical_top_level_objects():
+    response = '{"insight_requests": []}\n{ "insight_requests": [] }'
+
+    assert _parse_json_response(response) == {"insight_requests": []}
+
+
+def test_memory_json_parser_rejects_conflicting_top_level_objects():
+    response = '{"insight_requests": []}\n{"insight_requests": [{"name": "different"}]}'
+
+    with pytest.raises(ValueError, match="conflicting"):
+        _parse_json_response(response)
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_accepts_duplicated_identical_insight_plan(monkeypatch):
+    monkeypatch.setattr(
+        "core.key_insight.retriever.memory_cards_view",
+        lambda database_id=None, max_cards=24: {"cards": []},
+    )
+    executor = ToolExecutor(
+        _registry(),
+        memory_retriever=InsightMemoryRetriever(llm=DuplicatePlanningLLM()),
+    )
+    state = _request_state("maximum price")
+
+    result = await executor.execute(
+        "sql_query",
+        {"message": state.message},
+        state,
+        ConversationStateModel(conversation_id=state.conversation_id),
+    )
+
+    assert result.full_payload["insight_requests"][0]["insight_key"] == "price.maximum"
 
 
 @pytest.mark.asyncio

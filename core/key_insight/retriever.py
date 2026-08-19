@@ -1114,12 +1114,38 @@ def _parse_json_response(content: Any) -> dict:
         raise ValueError("Memory retriever returned empty content.")
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if exc.msg == "Extra data":
+            return _deduplicate_json_objects(text)
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
             return json.loads(text[start : end + 1])
         raise
+
+
+def _deduplicate_json_objects(text: str) -> dict:
+    """Accept repeated, semantically identical top-level JSON objects only."""
+
+    decoder = json.JSONDecoder()
+    objects: list[dict] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        value, cursor = decoder.raw_decode(text, cursor)
+        if not isinstance(value, dict):
+            raise ValueError("Repeated JSON response must contain objects only.")
+        objects.append(value)
+
+    if len(objects) < 2:
+        raise ValueError("JSON response contains unexpected trailing data.")
+    first = objects[0]
+    if any(item != first for item in objects[1:]):
+        raise ValueError("JSON response contains conflicting top-level objects.")
+    return first
 
 
 def _trace_summary(request_state: RequestStateModel, *, zh: str, en: str) -> str:
