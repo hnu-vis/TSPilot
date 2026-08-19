@@ -144,6 +144,8 @@ export type InsightEvidenceRef = {
   locator?: Record<string, unknown>;
 };
 
+export type CalculationTrace = string | Record<string, unknown> | unknown[];
+
 export type KeyInsight = {
   insight_id: string;
   insight_key?: string;
@@ -157,7 +159,7 @@ export type KeyInsight = {
   time_range?: Record<string, unknown> | null;
   method: string;
   evidence_refs?: InsightEvidenceRef[];
-  calculation_trace?: Record<string, unknown>;
+  calculation_trace?: CalculationTrace;
   status: InsightStatus;
   confidence?: number | null;
   quality_flags?: string[];

@@ -1,4 +1,4 @@
-import type { KeyInsight, KeyInsightRequest, InsightCoverage, FinalAnswer, TraceSpan, TraceStep } from '../types';
+import type { CalculationTrace, KeyInsight, KeyInsightRequest, InsightCoverage, FinalAnswer, TraceSpan, TraceStep } from '../types';
 
 export type DisplayMetric = {
   label: string;
@@ -427,7 +427,7 @@ function keyInsightFromRecord(item: Record<string, unknown>): KeyInsight | null 
       label: stringFrom(ref.label),
       locator: asRecord(ref.locator) || {},
     })).filter((ref) => ref.source_id),
-    calculation_trace: asRecord(item.calculation_trace) || {},
+    calculation_trace: calculationTraceFrom(item.calculation_trace),
     status: stringFrom(item.status) || 'verified',
     confidence: numberFrom(item.confidence),
     quality_flags: stringsFrom(item.quality_flags),
@@ -692,6 +692,13 @@ function stringsFrom(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
+}
+
+function calculationTraceFrom(value: unknown): CalculationTrace | undefined {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (Array.isArray(value)) return value.length > 0 ? value : undefined;
+  const record = asRecord(value);
+  return record && Object.keys(record).length > 0 ? record : undefined;
 }
 
 function recordsFrom(value: unknown): Record<string, unknown>[] {

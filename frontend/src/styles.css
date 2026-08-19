@@ -4411,6 +4411,12 @@ input:focus-visible {
   gap: 10px;
 }
 
+.key-insight-content {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
 .insight-coverage-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

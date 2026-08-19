@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
 import { elapsedSecondsForTrace } from '../lib/traceTiming';
-import type { FinalAnswer, TraceSpan, TraceStep } from '../types';
+import type { CalculationTrace, FinalAnswer, TraceSpan, TraceStep } from '../types';
 import { useI18n } from '../i18n';
 
 type Props = {
@@ -111,13 +111,15 @@ function StepDetail({ step }: { step: ReturnType<typeof toDisplayStep> }) {
 
       {step.sqlDetail && hasQueryData(step.sqlDetail) && <DataPreview detail={step.sqlDetail} />}
 
-      {step.codeInterpreterDetail && <CodeInterpreterPreview detail={step.codeInterpreterDetail} />}
+      {step.codeInterpreterDetail && (
+        <CodeInterpreterPreview detail={step.codeInterpreterDetail} insightDetail={step.insightDetail} />
+      )}
 
       {step.forecastDetail && <ForecastPreview detail={step.forecastDetail} />}
 
       {step.anomalyDetail && <AnomalyPreview detail={step.anomalyDetail} />}
 
-      {step.insightDetail && <InsightPreview detail={step.insightDetail} />}
+      {step.insightDetail && !step.codeInterpreterDetail && <InsightPreview detail={step.insightDetail} />}
     </>
   );
 }
@@ -482,7 +484,13 @@ function DataPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDispl
   );
 }
 
-function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']> }) {
+function CodeInterpreterPreview({
+  detail,
+  insightDetail,
+}: {
+  detail: NonNullable<ReturnType<typeof toDisplayStep>['codeInterpreterDetail']>;
+  insightDetail: ReturnType<typeof toDisplayStep>['insightDetail'];
+}) {
   const { t } = useI18n();
   return (
     <section className="inspector-card tool-detail-card code-detail-card">
@@ -526,6 +534,8 @@ function CodeInterpreterPreview({ detail }: { detail: NonNullable<ReturnType<typ
           fallback={null}
         />
       )}
+
+      {insightDetail && <InsightContent detail={insightDetail} embedded />}
     </section>
   );
 }
@@ -609,10 +619,24 @@ function AnomalyPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
 }
 
 function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']> }) {
+  return (
+    <section className="inspector-card key-insight-preview">
+      <InsightContent detail={detail} />
+    </section>
+  );
+}
+
+function InsightContent({
+  detail,
+  embedded = false,
+}: {
+  detail: NonNullable<ReturnType<typeof toDisplayStep>['insightDetail']>;
+  embedded?: boolean;
+}) {
   const { t } = useI18n();
   const coverageItems = insightCoverageItems(detail.coverage);
   return (
-    <section className="inspector-card key-insight-preview">
+    <div className={embedded ? 'tool-result-section code-insight-results' : 'key-insight-content'}>
       <div className="inspector-card-title sql-detail-title">
         <CheckCircle2 size={16} />
         <h3>{t('Key Insight selection')}</h3>
@@ -705,7 +729,7 @@ function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
                   ))}
                 </div>
               )}
-              {insight.calculation_trace && Object.keys(insight.calculation_trace).length > 0 && (
+              {hasCalculationTrace(insight.calculation_trace) && (
                 <div className="tool-result-section">
                   <div className="sample-table-caption">
                     <span>
@@ -713,7 +737,7 @@ function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
                       {t('Calculation trace')}
                     </span>
                   </div>
-                  <pre className="debug-json">{JSON.stringify(insight.calculation_trace, null, 2)}</pre>
+                  <pre className="debug-json">{formatCalculationTrace(insight.calculation_trace)}</pre>
                 </div>
               )}
             </details>
@@ -722,7 +746,7 @@ function InsightPreview({ detail }: { detail: NonNullable<ReturnType<typeof toDi
       ) : (
         <p className="sample-note">{t('No structured key insights were produced for this step.')}</p>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -966,6 +990,16 @@ function formatCell(value: unknown) {
   if (typeof value === 'number') return Number.isFinite(value) ? value.toLocaleString() : String(value);
   if (typeof value === 'string') return value;
   return JSON.stringify(value);
+}
+
+function hasCalculationTrace(trace: CalculationTrace | undefined): trace is CalculationTrace {
+  if (typeof trace === 'string') return trace.trim().length > 0;
+  if (Array.isArray(trace)) return trace.length > 0;
+  return Boolean(trace && Object.keys(trace).length > 0);
+}
+
+function formatCalculationTrace(trace: CalculationTrace) {
+  return typeof trace === 'string' ? trace : JSON.stringify(trace, null, 2);
 }
 
 function deduplicateStructuredEntries(

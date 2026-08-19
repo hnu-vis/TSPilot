@@ -159,3 +159,89 @@ describe('InspectorPanel LLM lifecycle', () => {
     expect(markup).toContain('88');
   });
 });
+
+describe('InspectorPanel code insight details', () => {
+  it('shows text and structured calculation traces inside the code inspector', () => {
+    const step: TraceStep = {
+      id: 'iteration-2',
+      iteration: 2,
+      agent: 'data_agent',
+      phase: 'tool_call',
+      tool: 'code_interpreter',
+      status: 'complete',
+      summary: 'Computed requested insights.',
+      actionInput: {
+        analysis_goal: 'Estimate the overall trend.',
+        insight_requests: [{
+          insight_key: 'overall_trend',
+          name: 'Overall trend',
+          insight_type: 'trend',
+        }],
+      },
+      toolResult: {
+        payload_preview: {
+          analysis_goal: 'Estimate the overall trend.',
+          code_preview: 'result = {"computed_insights": [], "derived_evidence": []}',
+          computed_insights: [{
+            insight_key: 'overall_trend',
+            value: 2.31,
+            calculation_trace: {
+              analysis_method: 'ordinary least squares',
+              valid_observations: 144,
+            },
+          }],
+          produced_insights: [{
+            insight_id: 'ins_overall_trend',
+            insight_key: 'overall_trend',
+            name: 'Overall trend',
+            insight_type: 'trend',
+            statement: 'The series has an overall upward trend.',
+            value: 2.31,
+            method: 'code_interpreter',
+            status: 'verified',
+            calculation_trace: 'Used ordinary least squares over 144 valid observations.',
+          }, {
+            insight_id: 'ins_change_rate',
+            insight_key: 'change_rate',
+            name: 'Change rate',
+            insight_type: 'change',
+            statement: 'The endpoint change rate is 12%.',
+            value: 12,
+            method: 'code_interpreter',
+            status: 'verified',
+            calculation_trace: [
+              { step: 'select endpoints' },
+              { formula: '(end - start) / start * 100' },
+            ],
+          }],
+          insight_coverage: {
+            requested: ['overall_trend', 'change_rate'],
+            verified: ['overall_trend', 'change_rate'],
+            missing: [],
+            unavailable: [],
+            rejected: [],
+            partial: [],
+          },
+        },
+      },
+      updatedAt: '2026-08-19T00:00:00Z',
+    };
+
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        steps={[step]}
+        selectedNodeId="iteration-2"
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('Source');
+    expect(markup).toContain('Key Insight selection');
+    expect(markup).toContain('The series has an overall upward trend.');
+    expect(markup).toContain('Used ordinary least squares over 144 valid observations.');
+    expect(markup).toContain('select endpoints');
+    expect(markup).toContain('(end - start) / start * 100');
+    expect(markup.match(/Calculation trace/g)).toHaveLength(2);
+  });
+});
