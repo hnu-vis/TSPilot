@@ -16,6 +16,8 @@ import { VisualizationGallery } from './VisualizationGallery';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
 type AnswerReference = NonNullable<FinalAnswerType['references']>[number];
+type DisplayAnswerSection = { section: AnswerSection; sourceIndex: number };
+type ClaimVisualEvidence = { visualization: Visualization; claims: AnswerClaim[] };
 type EvidenceItem = {
   evidence_id?: string;
   purpose?: string;
@@ -88,8 +90,6 @@ type MarkdownBlock =
 
 export function FinalAnswer({
   answer,
-  tokenUsage,
-  elapsedSeconds,
 }: {
   answer: FinalAnswerType;
   tokenUsage?: TokenUsage | null;
@@ -104,9 +104,15 @@ export function FinalAnswer({
   const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
   const [activeBindingId, setActiveBindingId] = useState<string | null>(null);
   const claimEvidence = visualClaimEvidence(answer);
+  const sectionPresentations = linkVisualEvidenceToSections(sections, claimEvidence);
+  const sectionVisualizationIds = new Set(sectionPresentations.flatMap(({ visualEvidence }) => (
+    visualEvidence.map(({ visualization }) => visualization.visualization_id)
+  )));
+  const unplacedClaimEvidence = claimEvidence.filter(({ visualization }) => (
+    !sectionVisualizationIds.has(visualization.visualization_id)
+  ));
   const legacyVisualizations = (answer.visualizations || []).filter((visualization) => (
-    !visualization.verification
-    && !claimEvidence.some((item) => item.visualization.visualization_id === visualization.visualization_id)
+    !claimEvidence.some((item) => item.visualization.visualization_id === visualization.visualization_id)
   ));
 
   return (
@@ -117,17 +123,6 @@ export function FinalAnswer({
           <span>{answer.title?.trim() || copy.answer}</span>
         </div>
         <div className="answer-header-meta">
-          {typeof elapsedSeconds === 'number' && Number.isFinite(elapsedSeconds) ? (
-            <span className="answer-reference-count">
-              {elapsedSeconds.toFixed(1)}s
-            </span>
-          ) : null}
-          {tokenUsage?.totals?.total_tokens ? (
-            <span className="answer-reference-count">
-              {tokenUsage.totals.total_tokens.toLocaleString()} tokens
-              {typeof tokenUsage.totals.call_count === 'number' ? ` · ${tokenUsage.totals.call_count} calls` : ''}
-            </span>
-          ) : null}
           {references.length > 0 && (
             <span className="answer-reference-count">
               <Database size={13} />
@@ -145,22 +140,37 @@ export function FinalAnswer({
         <MarkdownContent content={summary} variant="summary" />
       </section>
 
-      {sections.length > 0 && (
+      {sectionPresentations.length > 0 && (
         <div className="answer-sections">
-          {sections.map((section, index) => (
-            <section key={`${section.section_type}-${index}`} className="answer-section">
+          {sectionPresentations.map(({ section, sourceIndex, visualEvidence }) => (
+            <section key={`${section.section_type}-${sourceIndex}`} className="answer-section">
               <SectionHeading section={section} />
               <StructuredSection section={section} summary={summary} />
+              {visualEvidence.length > 0 && (
+                <div className="answer-section-visual-evidence" aria-label={locale === 'zh' ? '对应的视觉证据' : 'Related visual evidence'}>
+                  {visualEvidence.map(({ visualization, claims }) => (
+                    <ClaimEvidenceCard
+                      key={visualization.visualization_id}
+                      visualization={visualization}
+                      claims={claims}
+                      locale={locale}
+                      activeBindingId={activeBindingId}
+                      onSelectBinding={setActiveBindingId}
+                      showClaims={false}
+                    />
+                  ))}
+                </div>
+              )}
             </section>
           ))}
         </div>
       )}
 
-      {claimEvidence.length > 0 && (
+      {unplacedClaimEvidence.length > 0 && (
         <section className="answer-section answer-visualizations-section" aria-label="Visual evidence">
           <ContentHeading icon={<Eye size={16} />} title={locale === 'zh' ? '结论与视觉证据' : 'Claims and visual evidence'} />
           <div className="answer-claim-evidence-list">
-            {claimEvidence.map(({ visualization, claims }) => (
+            {unplacedClaimEvidence.map(({ visualization, claims }) => (
               <ClaimEvidenceCard
                 key={visualization.visualization_id}
                 visualization={visualization}
@@ -186,17 +196,30 @@ export function FinalAnswer({
       )}
 
       {evidenceItems.length > 0 && (
-        <section className="answer-section answer-evidence-section">
-          <ContentHeading icon={<Database size={16} />} title={copy.evidence} />
-          <EvidenceItemsView items={evidenceItems} fallbackContent="" copy={copy} />
-        </section>
+        <details className="answer-section answer-supporting-section answer-evidence-section">
+          <summary>
+            <span className="answer-supporting-title"><Database size={16} />{copy.evidence}</span>
+            <ChevronDown size={15} className="collapsible-chevron" aria-hidden="true" />
+          </summary>
+          <div className="answer-supporting-body">
+            <EvidenceItemsView items={evidenceItems} fallbackContent="" copy={copy} />
+          </div>
+        </details>
       )}
 
       {supportingReferences.length > 0 && (
-        <section className="answer-section answer-sources-section">
-          <ContentHeading icon={<BookOpen size={16} />} title={copy.sources} />
-          <ReferenceList references={supportingReferences} copy={copy} />
-        </section>
+        <details className="answer-section answer-supporting-section answer-sources-section">
+          <summary>
+            <span className="answer-supporting-title"><BookOpen size={16} />{copy.sources}</span>
+            <span className="answer-supporting-summary-meta">
+              {copy.referenceCount(supportingReferences.length)}
+              <ChevronDown size={15} className="collapsible-chevron" aria-hidden="true" />
+            </span>
+          </summary>
+          <div className="answer-supporting-body">
+            <ReferenceList references={supportingReferences} copy={copy} />
+          </div>
+        </details>
       )}
     </div>
   );
@@ -208,29 +231,26 @@ function ClaimEvidenceCard({
   locale,
   activeBindingId,
   onSelectBinding,
+  showClaims = true,
 }: {
   visualization: Visualization;
   claims: AnswerClaim[];
   locale: AnswerLocale;
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
+  showClaims?: boolean;
 }) {
   const verification = visualization.verification;
-  const sourceLabels = Array.from(new Set(claims.flatMap((claim) => [
-    ...(claim.insight_ids || []).map((id) => `Insight · ${id}`),
-    ...(verification?.target_insight_ids || []).map((id) => `Insight · ${id}`),
-    ...(claim.analysis_ids || []).map((id) => `Analysis · ${id}`),
-    ...(claim.evidence_ids || []).map((id) => `Evidence · ${id}`),
-    ...(claim.artifact_ids || []).map((id) => `Artifact · ${id}`),
-  ])));
   return (
-    <article className="answer-claim-evidence-card">
-      <header className="answer-claim-evidence-header">
-        <span>{locale === 'zh' ? '关键结论' : 'Key claim'}</span>
-        <div className="answer-claim-evidence-claims">
-          {claims.map((claim) => <MarkdownContent key={claim.claim_id} content={claim.text} />)}
-        </div>
-      </header>
+    <article className={`answer-claim-evidence-card ${showClaims ? '' : 'section-linked'}`}>
+      {showClaims && (
+        <header className="answer-claim-evidence-header">
+          <span>{locale === 'zh' ? '关键结论' : 'Key claim'}</span>
+          <div className="answer-claim-evidence-claims">
+            {claims.map((claim) => <MarkdownContent key={claim.claim_id} content={claim.text} />)}
+          </div>
+        </header>
+      )}
       <VisualizationGallery
         visualizations={[visualization]}
         activeBindingId={activeBindingId}
@@ -239,30 +259,37 @@ function ClaimEvidenceCard({
       {verification && (
         <div className="answer-claim-evidence-reading">
           <div>
-            <strong>{locale === 'zh' ? '验证问题' : 'Verification question'}</strong>
-            <p>{verification.verification_question}</p>
-          </div>
-          <div>
             <strong>{locale === 'zh' ? '如何阅读' : 'How to read it'}</strong>
             <p>{verification.interpretation}</p>
           </div>
         </div>
       )}
-      {sourceLabels.length > 0 && (
-        <footer className="answer-claim-evidence-sources" aria-label={locale === 'zh' ? '证据来源' : 'Evidence sources'}>
-          {sourceLabels.map((label) => <code key={label}>{label}</code>)}
-        </footer>
-      )}
     </article>
   );
 }
 
-function visualClaimEvidence(answer: FinalAnswerType): Array<{ visualization: Visualization; claims: AnswerClaim[] }> {
+function visualClaimEvidence(answer: FinalAnswerType): ClaimVisualEvidence[] {
   const claims = answer.claims || [];
   return (answer.visualizations || []).flatMap((visualization) => {
-    if (!visualization.verification) return [];
     const related = claims.filter((claim) => (claim.visualization_ids || []).includes(visualization.visualization_id));
     return related.length > 0 ? [{ visualization, claims: related }] : [];
+  });
+}
+
+function linkVisualEvidenceToSections(
+  sections: DisplayAnswerSection[],
+  claimEvidence: ClaimVisualEvidence[],
+): Array<DisplayAnswerSection & { visualEvidence: ClaimVisualEvidence[] }> {
+  const placedVisualizationIds = new Set<string>();
+  return sections.map(({ section, sourceIndex }) => {
+    const sectionClaimId = `claim_section_${sourceIndex + 1}`;
+    const visualEvidence = claimEvidence.filter(({ visualization, claims }) => {
+      if (placedVisualizationIds.has(visualization.visualization_id)) return false;
+      if (!claims.some((claim) => claim.claim_id === sectionClaimId)) return false;
+      placedVisualizationIds.add(visualization.visualization_id);
+      return true;
+    });
+    return { section, sourceIndex, visualEvidence };
   });
 }
 
@@ -344,7 +371,7 @@ function EvidenceItemsView({
               />
             )}
             {visibleQuery(item.query) && (
-              <details className="answer-inline-details answer-query-details" open>
+              <details className="answer-inline-details answer-query-details">
                 <summary>
                   <span>
                     <ChevronDown size={14} className="collapsible-chevron" />
@@ -598,22 +625,22 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
   return blocks.length > 0 ? blocks : [{ type: 'paragraph', content: content.trim() }];
 }
 
-function supportingSections(sections: FinalAnswerType['sections'] | undefined, summary: string): AnswerSection[] {
+function supportingSections(sections: FinalAnswerType['sections'] | undefined, summary: string): DisplayAnswerSection[] {
   const seenContent = new Set<string>();
   const excludedTypes = new Set(['summary', 'conclusion', 'query', 'query_results']);
   const normalizedSummary = comparableText(summary);
   const normalizedTitle = (section: AnswerSection) => comparableText(section.heading || formatLabel(section.section_type));
 
-  return (sections || []).filter((section) => {
-    if (excludedTypes.has(section.section_type)) return false;
+  return (sections || []).flatMap((section, sourceIndex) => {
+    if (excludedTypes.has(section.section_type)) return [];
     const content = section.content?.trim();
-    if (!content) return false;
+    if (!content) return [];
     const normalizedContent = comparableText(content);
-    if (!normalizedContent || normalizedContent === normalizedSummary) return false;
-    if (normalizedContent === normalizedTitle(section)) return false;
-    if (seenContent.has(normalizedContent)) return false;
+    if (!normalizedContent || normalizedContent === normalizedSummary) return [];
+    if (normalizedContent === normalizedTitle(section)) return [];
+    if (seenContent.has(normalizedContent)) return [];
     seenContent.add(normalizedContent);
-    return true;
+    return [{ section, sourceIndex }];
   });
 }
 

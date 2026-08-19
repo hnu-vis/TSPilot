@@ -304,6 +304,8 @@ const zhCN: Record<string, string> = {
   Failed: '失败',
   Rejected: '执行前被拒绝',
   'Execution process': '执行过程',
+  'Collapse execution process': '收起执行过程',
+  'Expand execution process': '展开执行过程',
   'Total {duration}': '总计 {duration}',
   '{count} LLM calls': '{count} 次 LLM 调用',
   'LLM calls': 'LLM 调用',

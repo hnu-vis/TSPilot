@@ -21,6 +21,9 @@ describe('TraceTimeline', () => {
     expect(markup).toContain('aria-label="LLM calls"');
     expect(markup).toContain('aria-current="true"');
     expect(markup).toContain('trace-llm-leaf running selected');
+    expect(markup).toContain('aria-label="Collapse execution process"');
+    expect(markup).toContain('aria-expanded="true"');
+    expect(markup).toContain('aria-controls=');
     expect(markup).toContain('<button');
     expect(markup).not.toContain('qwen');
     expect(markup).not.toContain('gpt-');

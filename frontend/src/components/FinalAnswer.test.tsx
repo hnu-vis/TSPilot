@@ -21,7 +21,7 @@ describe('FinalAnswer', () => {
     expect(markup).not.toContain('内部绑定文本');
   });
 
-  it('renders the complete executed query as an open code block', () => {
+  it('keeps the complete executed query available without opening technical details by default', () => {
     const query = 'from(bucket: "bitcoin")\n  |> range(start: -30d)\n  |> max()';
     const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
       references: [{
@@ -33,7 +33,10 @@ describe('FinalAnswer', () => {
     })} />);
 
     expect(markup).toContain('实际执行的查询语句');
-    expect(markup).toContain('<details class="answer-inline-details answer-query-details" open="">');
+    expect(markup).toContain('answer-supporting-section answer-evidence-section');
+    expect(markup).not.toContain('answer-supporting-section answer-evidence-section" open');
+    expect(markup).toContain('<details class="answer-inline-details answer-query-details">');
+    expect(markup).not.toContain('answer-query-details" open');
     expect(markup).toContain('<pre class="answer-query-code"><code>from(bucket: &quot;bitcoin&quot;)');
     expect(markup).toContain('|&gt; max()</code></pre>');
     expect(markup).not.toContain('[truncated');
@@ -109,10 +112,54 @@ describe('FinalAnswer', () => {
 
     expect(markup).toContain('结论与视觉证据');
     expect(markup).toContain('价格在观察区间内上升。');
-    expect(markup).toContain('完整序列是否在区间内上升？');
+    expect(markup).not.toContain('完整序列是否在区间内上升？');
     expect(markup).toContain('从首个观测点到末个观测点读取完整序列。');
-    expect(markup).toContain('Insight · insight_trend');
-    expect(markup).toContain('Analysis · ana_trend');
+    expect(markup).not.toContain('Insight · insight_trend');
+    expect(markup).not.toContain('Analysis · ana_trend');
     expect(markup).not.toContain('<h3>可视化</h3>');
   });
+
+  it('places a visualization directly after the section whose generated claim references it', () => {
+    const visualization: Visualization = {
+      schema_version: '3',
+      visualization_id: 'viz_section',
+      purpose: 'verify the finding',
+      priority: 'primary',
+      title: 'Observed trend',
+      datasets: [],
+      layers: [],
+      bindings: [],
+      accessibility: { description: 'Observed trend.' },
+    };
+    const finding = '价格在观察区间内上涨 20%。';
+    const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
+      sections: [{ section_type: 'key_findings', heading: '关键发现', content: finding }],
+      claims: [{
+        claim_id: 'claim_section_1',
+        text: finding,
+        visualization_ids: ['viz_section'],
+      }],
+      visualizations: [visualization],
+    })} />);
+
+    expect(markup.match(/价格在观察区间内上涨 20%。/g)).toHaveLength(1);
+    expect(markup).toContain('answer-claim-evidence-card section-linked');
+    expect(markup.indexOf('关键发现')).toBeLessThan(markup.indexOf('Observed trend'));
+    expect(markup).not.toContain('结论与视觉证据');
+  });
+
+  it('keeps execution telemetry out of the user-facing answer header', () => {
+    const markup = renderToStaticMarkup(
+      <FinalAnswer
+        answer={answer()}
+        elapsedSeconds={19}
+        tokenUsage={{ totals: { total_tokens: 4665, call_count: 7 } }}
+      />,
+    );
+
+    expect(markup).not.toContain('19.0s');
+    expect(markup).not.toContain('4,665 tokens');
+    expect(markup).not.toContain('7 calls');
+  });
+
 });

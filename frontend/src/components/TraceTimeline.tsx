@@ -6,7 +6,7 @@ import {
   CircleDot,
   Loader2,
 } from 'lucide-react';
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useId, useMemo, useState } from 'react';
 import { toDisplayStep } from '../lib/traceDisplay';
 import { elapsedSecondsForTrace, runElapsedSeconds } from '../lib/traceTiming';
 import type { TraceSpan, TraceStep } from '../types';
@@ -22,6 +22,8 @@ type Props = {
 export function TraceTimeline({ steps, selectedId, onSelect, nowMs = Date.now() }: Props) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const treeId = useId();
   const elapsed = runElapsedSeconds(steps, nowMs);
   const visibleSteps = useMemo(
     () => steps.filter(isVisibleTraceStep),
@@ -30,12 +32,24 @@ export function TraceTimeline({ steps, selectedId, onSelect, nowMs = Date.now() 
 
   if (visibleSteps.length === 0) return null;
   return (
-    <section className="trace-timeline" aria-label={t('Execution process')}>
+    <section className={`trace-timeline ${isCollapsed ? 'collapsed' : ''}`} aria-label={t('Execution process')}>
       <header className="trace-timeline-header">
-        <span>{t('Execution process')}</span>
-        {elapsed !== null && <small>{t('Total {duration}', { duration: `${elapsed.toFixed(1)}s` })}</small>}
+        <button
+          type="button"
+          className="trace-timeline-toggle"
+          aria-expanded={!isCollapsed}
+          aria-controls={treeId}
+          aria-label={t(isCollapsed ? 'Expand execution process' : 'Collapse execution process')}
+          onClick={() => setIsCollapsed((current) => !current)}
+        >
+          <span>{t('Execution process')}</span>
+          <span className="trace-timeline-meta">
+            {elapsed !== null && <small>{t('Total {duration}', { duration: `${elapsed.toFixed(1)}s` })}</small>}
+            <ChevronDown size={15} className="trace-timeline-chevron" aria-hidden="true" />
+          </span>
+        </button>
       </header>
-      <ol className="trace-tree">
+      <ol id={treeId} className="trace-tree" hidden={isCollapsed}>
         {visibleSteps.map((step) => {
           const displayStep = toDisplayStep(step);
           const title = step.phase === 'policy_decision' && step.status === 'error'
