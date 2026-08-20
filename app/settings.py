@@ -34,13 +34,6 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="0.0.0.0", alias="TSPILOT_BACKEND_HOST")
     backend_port: int = Field(default=5680, alias="TSPILOT_BACKEND_PORT")
 
-    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
-    openai_api_base: str = Field(default="https://api.openai.com/v1", alias="OPENAI_API_BASE")
-    openai_model: str = Field(default="gpt-5.4-mini", alias="OPENAI_MODEL")
-    openai_temperature: float = 0.0
-    embedding_api_key: str | None = Field(default=None, alias="EMBEDDING_API_KEY")
-    embedding_api_base: str | None = Field(default=None, alias="EMBEDDING_API_BASE")
-    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
     memory_embedding_top_k: int = Field(default=6, alias="MEMORY_EMBEDDING_TOP_K")
     memory_embedding_score_threshold: float = Field(default=0.25, alias="MEMORY_EMBEDDING_SCORE_THRESHOLD")
     memory_embedding_cache_dir: str | None = Field(default=None, alias="MEMORY_EMBEDDING_CACHE_DIR")
@@ -117,14 +110,6 @@ class Settings(BaseSettings):
         if self.visualization_artifact_dir:
             return Path(self.visualization_artifact_dir).resolve()
         return (Path(self.tspilot_root) / "cache_data" / "visualizations").resolve()
-
-    @property
-    def resolved_embedding_api_key(self) -> str | None:
-        return self.embedding_api_key or self.openai_api_key
-
-    @property
-    def resolved_embedding_api_base(self) -> str:
-        return self.embedding_api_base or self.openai_api_base
 
     @property
     def resolved_memory_embedding_cache_dir(self) -> Path:

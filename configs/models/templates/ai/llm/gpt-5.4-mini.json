@@ -1,0 +1,7 @@
+{
+  "schema_version": "1",
+  "kind": "llm",
+  "id": "llm-default",
+  "model": "gpt-5.4-mini",
+  "api_base": "https://aihubmix.com/v1"
+}

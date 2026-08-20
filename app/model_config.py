@@ -1,7 +1,8 @@
 """Persistent, runtime-editable model configuration.
 
-Environment settings remain the source of defaults. This store only records explicit
-workspace overrides, so deployments can keep using environment-based configuration.
+Each configured AI connection is stored as a workspace file. This keeps runtime
+model selection, endpoint details, and credentials in one editable configuration
+surface instead of splitting them between the UI and environment variables.
 """
 from __future__ import annotations
 
@@ -55,20 +56,17 @@ class ModelConfigStore:
                 raise ValueError(f"Unknown language model connection '{llm_connection_id}'.")
             llm = selected
         embedding = self.active_connection("embedding")
-        llm_key = _optional_string(llm.get("api_key")) or self.settings.openai_api_key
-        embedding_key = _optional_string(embedding.get("api_key")) or self.settings.embedding_api_key or llm_key
-        llm_base = _string(llm.get("api_base"), self.settings.openai_api_base)
+        llm_key = _optional_string(llm.get("api_key"))
+        embedding_key = _optional_string(embedding.get("api_key")) or llm_key
+        llm_base = _required_connection_value(llm, "api_base")
         return AIModelSettings(
             api_base=llm_base,
             api_key=llm_key,
-            model=_string(llm.get("model"), self.settings.openai_model),
-            temperature=self.settings.openai_temperature,
-            embedding_api_base=_string(
-                embedding.get("api_base"),
-                self.settings.embedding_api_base or llm_base,
-            ),
+            model=_required_connection_value(llm, "model"),
+            temperature=0.0,
+            embedding_api_base=_required_connection_value(embedding, "api_base"),
             embedding_api_key=embedding_key,
-            embedding_model=_string(embedding.get("model"), self.settings.embedding_model),
+            embedding_model=_required_connection_value(embedding, "model"),
         )
 
     def public_config(self) -> dict[str, Any]:
@@ -83,9 +81,8 @@ class ModelConfigStore:
         }
 
     def connections(self, section: str) -> list[dict[str, Any]]:
-        """Return environment defaults merged with workspace-defined connections."""
+        """Return model connections persisted in workspace configuration files."""
         self._validate_section(section)
-        default = self._default_connection(section)
         section_config = self._section_config(section)
         stored_models = section_config.get("models")
         if isinstance(stored_models, list):
@@ -95,23 +92,21 @@ class ModelConfigStore:
         else:
             stored = []
         file_models = self._file_ai_connections(section)
-        by_id = {default["id"]: default}
+        by_id = {item["id"]: item for item in stored if _optional_string(item.get("id"))}
         for item in [*stored, *file_models]:
             connection_id = _string(item.get("id"), str(uuid4()))
-            resolved = self._resolve_ai_connection(item)
-            by_id[connection_id] = {**by_id.get(connection_id, {}), **resolved, "id": connection_id, "source": "workspace"}
+            by_id[connection_id] = {**by_id.get(connection_id, {}), **item, "id": connection_id, "source": "workspace"}
         return list(by_id.values())
 
     def active_connection(self, section: str) -> dict[str, Any]:
         connections = self.connections(section)
+        if not connections:
+            raise RuntimeError(f"No {section} model connections are configured. Add one in Model Management.")
         active_id = _optional_string(self._section_config(section).get("active_id"))
         return next((item for item in connections if item["id"] == active_id), connections[0])
 
     def public_connections(self, section: str) -> dict[str, Any]:
         active = self.active_connection(section)
-        fallback_key = self.settings.openai_api_key if section == "llm" else (
-            self.settings.embedding_api_key or self.settings.openai_api_key
-        )
         models = []
         for item in self.connections(section):
             models.append({
@@ -119,7 +114,7 @@ class ModelConfigStore:
                 "provider": "OpenAI compatible",
                 "api_base": item["api_base"],
                 "model": item["model"],
-                "api_key_configured": bool(_optional_string(item.get("api_key")) or fallback_key),
+                "api_key_configured": bool(_optional_string(item.get("api_key"))),
                 "is_active": item["id"] == active["id"],
                 "source": item.get("source", "workspace"),
                 "config_path": item.get("config_path"),
@@ -129,7 +124,8 @@ class ModelConfigStore:
     def upsert_ai(self, section: str, values: dict[str, Any]) -> str:
         """Create or update one connection while preserving all sibling models."""
         self._validate_section(section)
-        active_before_update = self.active_connection(section)["id"]
+        connections_before_update = self.connections(section)
+        active_before_update = self.active_connection(section)["id"] if connections_before_update else None
         connection_id = _string(values.pop("id", None), f"{section}-{uuid4().hex}")
         if section not in {"llm", "embedding"}:
             raise ValueError(f"Unsupported AI model section '{section}'.")
@@ -160,7 +156,7 @@ class ModelConfigStore:
         if previous_path is not None and previous_path != target_path:
             previous_path.unlink()
         normalized = [item for item in normalized if item.get("id") != connection_id]
-        current = {"models": normalized, "active_id": current.get("active_id") or active_before_update}
+        current = {"models": normalized, "active_id": current.get("active_id") or active_before_update or connection_id}
         ai[section] = current
         self._write(payload)
         return connection_id
@@ -181,12 +177,7 @@ class ModelConfigStore:
         connection = self.connection(section, connection_id)
         if connection is None:
             return None
-        configured = _optional_string(connection.get("api_key"))
-        if configured:
-            return configured
-        if section == "llm":
-            return self.settings.openai_api_key
-        return self.settings.embedding_api_key or self.settings.openai_api_key
+        return _optional_string(connection.get("api_key"))
 
     def delete_ai(self, section: str, connection_id: str) -> None:
         self._validate_section(section)
@@ -209,25 +200,9 @@ class ModelConfigStore:
         self._validate_section(section)
         return _mapping(_mapping(self.read_overrides().get("ai")).get(section))
 
-    def _default_connection(self, section: str) -> dict[str, Any]:
-        if section == "llm":
-            return {
-                "id": "llm-default",
-                "api_base": self.settings.openai_api_base,
-                "api_key": self.settings.openai_api_key,
-                "model": self.settings.openai_model,
-                "source": "environment",
-            }
-        return {
-            "id": "embedding-default",
-            "api_base": self.settings.embedding_api_base or self.settings.openai_api_base,
-            "api_key": self.settings.embedding_api_key or self.settings.openai_api_key,
-            "model": self.settings.embedding_model,
-            "source": "environment",
-        }
-
     def _file_ai_connections(self, section: str) -> list[dict[str, Any]]:
         directory = self._ai_model_directory(section)
+        self._bootstrap_ai_connections_from_templates(section, directory)
         if not directory.exists():
             return []
         items = []
@@ -241,31 +216,29 @@ class ModelConfigStore:
             items.append({**item, "config_path": str(path)})
         return items
 
+    def _bootstrap_ai_connections_from_templates(self, section: str, directory: Path) -> None:
+        """Initialize local, ignored connection files from credential-free templates."""
+
+        if directory.exists() and any(directory.glob("*.json")):
+            return
+        template_directory = self.settings.resolved_model_config_dir / "templates" / "ai" / section
+        if not template_directory.exists():
+            return
+        for template_path in sorted(template_directory.glob("*.json")):
+            try:
+                payload = json.loads(template_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Unable to read AI model template '{template_path}': {exc}") from exc
+            if not isinstance(payload, dict) or payload.get("kind") != section:
+                raise RuntimeError(f"AI model template '{template_path}' has an invalid kind.")
+            self._write_path(directory / template_path.name, payload)
+
     def _raw_ai_file_connection(self, section: str, connection_id: str) -> dict[str, Any] | None:
         return next((item for item in self._file_ai_connections(section) if item.get("id") == connection_id), None)
 
     def _ai_file_path_by_id(self, section: str, connection_id: str) -> Path | None:
         item = self._raw_ai_file_connection(section, connection_id)
         return Path(item["config_path"]) if item and item.get("config_path") else None
-
-    def _resolve_ai_connection(self, item: dict[str, Any]) -> dict[str, Any]:
-        resolved = dict(item)
-        if item.get("api_base_env"):
-            resolved["api_base"] = self._setting_for_env_ref(str(item["api_base_env"]))
-        if item.get("api_key_env"):
-            resolved["api_key"] = self._setting_for_env_ref(str(item["api_key_env"]))
-        return resolved
-
-    def _setting_for_env_ref(self, name: str) -> str | None:
-        values = {
-            "OPENAI_API_BASE": self.settings.openai_api_base,
-            "OPENAI_API_KEY": self.settings.openai_api_key,
-            "EMBEDDING_API_BASE": self.settings.embedding_api_base or self.settings.openai_api_base,
-            "EMBEDDING_API_KEY": self.settings.embedding_api_key or self.settings.openai_api_key,
-        }
-        if name not in values:
-            raise RuntimeError(f"Unsupported model config environment reference '{name}'.")
-        return values[name]
 
     def _ai_model_directory(self, section: str) -> Path:
         self._validate_section(section)
@@ -421,6 +394,14 @@ def _mapping(value: Any) -> dict[str, Any]:
 def _string(value: Any, default: str) -> str:
     normalized = str(value or "").strip()
     return normalized or default
+
+
+def _required_connection_value(connection: dict[str, Any], field: str) -> str:
+    value = _optional_string(connection.get(field))
+    if not value:
+        connection_id = _optional_string(connection.get("id")) or "unknown"
+        raise RuntimeError(f"Model connection '{connection_id}' is missing required field '{field}'.")
+    return value
 
 
 def _optional_string(value: Any) -> str | None:

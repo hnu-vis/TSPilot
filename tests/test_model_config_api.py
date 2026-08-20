@@ -1,6 +1,9 @@
+import json
+
 from fastapi.testclient import TestClient
 
 import app.routes.resources as resource_routes
+import app.routes.chat as chat_routes
 import app.model_config as model_config_module
 import app.deps as deps
 from app.model_config import ModelConfigStore
@@ -15,15 +18,25 @@ from core.timeseries.anomaly_registry import get_anomaly_detector, set_default_a
 def _store(tmp_path) -> ModelConfigStore:
     settings = Settings(
         _env_file=None,
-        OPENAI_API_KEY="environment-llm-secret",
-        OPENAI_API_BASE="https://llm.example.test/v1",
-        OPENAI_MODEL="reasoning-model",
-        EMBEDDING_API_KEY="environment-embedding-secret",
-        EMBEDDING_API_BASE="https://embedding.example.test/v1",
-        EMBEDDING_MODEL="vector-model",
+        OPENAI_API_KEY="ignored-environment-secret",
+        OPENAI_API_BASE="https://ignored.example.test/v1",
+        OPENAI_MODEL="ignored-model",
         TSPILOT_MODEL_CONFIG_PATH=str(tmp_path / "models.json"),
     )
-    return ModelConfigStore(settings.resolved_model_config_path, settings)
+    store = ModelConfigStore(settings.resolved_model_config_path, settings)
+    store.upsert_ai("llm", {
+        "id": "llm-default",
+        "api_base": "https://llm.example.test/v1",
+        "model": "reasoning-model",
+        "api_key": "configured-llm-secret",
+    })
+    store.upsert_ai("embedding", {
+        "id": "embedding-default",
+        "api_base": "https://embedding.example.test/v1",
+        "model": "vector-model",
+        "api_key": "configured-embedding-secret",
+    })
+    return store
 
 
 def test_model_config_http_round_trip_masks_secrets_and_updates_runtime_defaults(tmp_path, monkeypatch):
@@ -41,10 +54,11 @@ def test_model_config_http_round_trip_masks_secrets_and_updates_runtime_defaults
         "model": "reasoning-model",
         "api_key_configured": True,
         "is_active": True,
-        "source": "environment",
-        "config_path": None,
+        "source": "workspace",
+        "config_path": str(tmp_path / "models" / "ai" / "llm" / "reasoning-model.json"),
     }]
-    assert "environment-llm-secret" not in initial.text
+    assert "configured-llm-secret" not in initial.text
+    assert "ignored-model" not in initial.text
 
     updated = client.patch(
         "/api/v1/resources/models/ai/llm",
@@ -111,6 +125,32 @@ def test_model_config_rejects_invalid_endpoint_and_unregistered_models(tmp_path,
     assert invalid_models.status_code == 422
 
 
+def test_model_config_bootstraps_local_connections_from_credential_free_templates(tmp_path):
+    settings = Settings(_env_file=None, TSPILOT_MODEL_CONFIG_PATH=str(tmp_path / "models.json"))
+    template_root = settings.resolved_model_config_dir / "templates" / "ai"
+    for kind, payload in {
+        "llm": {
+            "schema_version": "1", "kind": "llm", "id": "llm-default",
+            "api_base": "https://llm.example.test/v1", "model": "reasoning-model",
+        },
+        "embedding": {
+            "schema_version": "1", "kind": "embedding", "id": "embedding-default",
+            "api_base": "https://embedding.example.test/v1", "model": "vector-model",
+        },
+    }.items():
+        path = template_root / kind / "default.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = ModelConfigStore(settings.resolved_model_config_path, settings)
+    effective = store.effective_ai()
+
+    assert effective.model == "reasoning-model"
+    assert effective.api_key is None
+    assert (settings.resolved_model_config_dir / "ai" / "llm" / "default.json").is_file()
+    assert (settings.resolved_model_config_dir / "ai" / "embedding" / "default.json").is_file()
+
+
 def test_external_machine_model_uses_one_config_file_and_runtime_registry(tmp_path, monkeypatch):
     store = _store(tmp_path)
     monkeypatch.setattr(resource_routes, "get_model_config_store", lambda: store)
@@ -164,6 +204,30 @@ def test_conversation_model_selection_builds_an_isolated_llm_from_the_selected_f
     service = deps.get_plain_chat_service_for_model(connection_id)
 
     assert service._llm == ("conversation-specific-model", "https://conversation.example.test/v1", True)
+
+
+def test_chat_rejects_a_model_connection_without_an_api_key_before_client_creation(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    connection_id = store.upsert_ai(
+        "llm",
+        {
+            "model": "missing-key-model",
+            "api_base": "https://missing-key.example.test/v1",
+        },
+    )
+    monkeypatch.setattr(chat_routes, "get_model_config_store", lambda: store)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "Hello", "model_id": connection_id},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        f"Language model connection '{connection_id}' has no API key. "
+        "Configure its API key in Model Management before sending chat requests."
+    )
 
 
 def test_external_machine_model_is_registered_from_its_file_on_startup(tmp_path, monkeypatch):

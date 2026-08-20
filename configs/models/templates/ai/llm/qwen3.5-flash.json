@@ -1,0 +1,7 @@
+{
+  "schema_version": "1",
+  "kind": "llm",
+  "id": "qwen3.5-flash",
+  "model": "qwen3.5-flash",
+  "api_base": "https://aihubmix.com/v1"
+}

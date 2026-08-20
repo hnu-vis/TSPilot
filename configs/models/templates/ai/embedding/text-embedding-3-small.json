@@ -1,0 +1,7 @@
+{
+  "schema_version": "1",
+  "kind": "embedding",
+  "id": "embedding-default",
+  "model": "text-embedding-3-small",
+  "api_base": "https://aihubmix.com/v1"
+}

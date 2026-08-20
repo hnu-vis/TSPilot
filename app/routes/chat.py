@@ -29,8 +29,19 @@ async def chat(request: ChatRequest):
     """Handle one chat request as JSON or SSE."""
 
     normalized = normalize_chat_request(request)
-    if normalized.model_id and get_model_config_store().connection("llm", normalized.model_id) is None:
+    model_store = get_model_config_store()
+    if normalized.model_id and model_store.connection("llm", normalized.model_id) is None:
         raise HTTPException(status_code=422, detail=f"Unknown language model connection '{normalized.model_id}'.")
+    selected_model = model_store.effective_ai(normalized.model_id)
+    if not selected_model.api_key:
+        connection_id = normalized.model_id or model_store.active_connection("llm")["id"]
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Language model connection '{connection_id}' has no API key. "
+                "Configure its API key in Model Management before sending chat requests."
+            ),
+        )
     settings = get_settings()
     request_state = build_request_state(normalized, settings)
     conversation_state = build_conversation_state(normalized, request_state.conversation_id or "")

@@ -14,14 +14,11 @@ Create `.env` from the example if needed:
 cp .env.example .env
 ```
 
-Set at least:
-
-```bash
-OPENAI_API_KEY=your-api-key-here
-OPENAI_API_BASE=https://aihubmix.com/v1
-OPENAI_MODEL=gpt-5.4-mini
-TSPILOT_ROOT=.
-```
+Set `TSPILOT_ROOT=.` in `.env` if you run from another directory. Then open
+**Model Management** and enter the model name, OpenAI-compatible API base URL,
+and API key. Model connections are saved locally under `configs/models/ai/`;
+credential-free examples live under `configs/models/templates/`. Model
+credentials are not read from `.env` or committed to Git.
 
 ## Install Frontend Dependencies
 
@@ -95,4 +92,4 @@ Run backend tests:
 - If `scripts/dev.sh` cannot find Python, set `BACKEND_PYTHON=/path/to/python`.
 - If ports are occupied, set `BACKEND_PORT` or `FRONTEND_PORT` before running the script.
 - If external access fails, confirm the frontend is listening on `0.0.0.0:5173` and add `10.110.1.71` to your proxy bypass list if needed.
-- If model calls fail, verify `OPENAI_API_KEY`, `OPENAI_API_BASE`, and `OPENAI_MODEL` in `.env`.
+- If model calls fail, verify the active model's name, API base URL, and API key in Model Management.

@@ -39,7 +39,7 @@ def get_timeout_policy() -> TimeoutPolicy:
 def get_llm():
     model_settings = get_model_config_store().effective_ai()
     if not model_settings.api_key:
-        raise RuntimeError("OPENAI_API_KEY is required for the LLM-based data_agent.")
+        raise RuntimeError("The active LLM connection has no API key. Configure it in Model Management.")
 
     return ChatOpenAI(
         api_key=model_settings.api_key,
@@ -56,7 +56,7 @@ def get_llm():
 def get_data_agent_llm():
     model_settings = get_model_config_store().effective_ai()
     if not model_settings.api_key:
-        raise RuntimeError("OPENAI_API_KEY is required for the LLM-based data_agent.")
+        raise RuntimeError("The active LLM connection has no API key. Configure it in Model Management.")
 
     return ChatOpenAI(
         api_key=model_settings.api_key,
@@ -221,6 +221,10 @@ def get_plain_chat_service_for_model(model_connection_id: str | None = None) -> 
 
 
 def _create_chat_llm(model_settings, *, structured: bool):
+    if not model_settings.api_key:
+        raise RuntimeError(
+            "The selected LLM connection has no API key. Configure its API key in Model Management."
+        )
     kwargs = {
         "api_key": model_settings.api_key,
         "base_url": model_settings.api_base,

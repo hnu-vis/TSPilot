@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.settings import get_settings
-from app.model_config import apply_persisted_machine_learning_defaults
+from app.model_config import apply_persisted_machine_learning_defaults, get_model_config_store
 from app.routes.chat import router as chat_router
 from app.routes.resources import router as resources_router
 from app.routes.visualizations import router as visualizations_router
@@ -30,7 +30,7 @@ async def lifespan(_app: FastAPI):
             root=settings.resolved_insight_memory_learning_dir,
             embedding_root=settings.resolved_memory_embedding_cache_dir,
         )
-        if settings.openai_api_key:
+        if get_model_config_store().effective_ai().api_key:
             worker = get_insight_memory_learning_worker()
             worker.start()
     try:
