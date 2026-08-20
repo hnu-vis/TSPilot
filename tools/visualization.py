@@ -28,7 +28,7 @@ from schemas.output import (
 )
 from schemas.key_insight import KeyInsightRequest
 from schemas.state import RequestStateModel
-from schemas.visual_verification import VisualizationVerification
+from schemas.visual_verification import VisualProofObligation, VisualizationVerification
 from schemas.visualization import VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
 
@@ -64,6 +64,7 @@ class VisualVerificationDecision(BaseModel):
     verification_question: str | None = None
     interpretation: str | None = None
     visual_relation: str | None = None
+    proof_obligations: list[VisualProofObligation] = Field(default_factory=list)
     required_context: list[str] = Field(default_factory=list)
     non_visual_insight_ids: list[str] = Field(default_factory=list)
     required_data_request: "VisualizationEvidenceRequest | None" = None
@@ -91,6 +92,7 @@ class VisualVerificationDecision(BaseModel):
             target_insight_ids=self.target_insight_ids,
             verification_question=str(self.verification_question),
             interpretation=str(self.interpretation),
+            proof_obligations=self.proof_obligations,
         )
 
 
@@ -181,13 +183,25 @@ class SemanticProjectionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     semantic_views: list[SemanticViewPlan] = Field(default_factory=list)
+    evidence_bindings: list["SemanticEvidenceBinding"] = Field(default_factory=list)
     required_data_request: "VisualizationEvidenceRequest | None" = None
 
     @model_validator(mode="after")
     def require_views_or_data_request(self):
         if bool(self.semantic_views) == bool(self.required_data_request):
             raise ValueError("semantic projection must produce either semantic_views or required_data_request, never both")
+        if self.required_data_request is not None and self.evidence_bindings:
+            raise ValueError("a semantic source request cannot include evidence bindings")
         return self
+
+
+class SemanticEvidenceBinding(BaseModel):
+    """Bind one visual proof obligation to the semantic view that satisfies it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    obligation_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
+    view_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
 
 
 class VisualizationEvidenceRequest(BaseModel):
@@ -269,6 +283,7 @@ class _StructuredVerificationBranch(BaseModel):
     verification_question: str | None
     interpretation: str | None
     visual_relation: str | None
+    proof_obligations: list[VisualProofObligation]
     required_context: list[str]
     non_visual_insight_ids: list[str]
 
@@ -308,6 +323,7 @@ class _StructuredVerificationDecision(BaseModel):
             verification_question=decision.verification_question,
             interpretation=decision.interpretation,
             visual_relation=decision.visual_relation,
+            proof_obligations=decision.proof_obligations,
             required_context=decision.required_context,
             non_visual_insight_ids=decision.non_visual_insight_ids,
             required_data_request=(
@@ -322,17 +338,21 @@ class _StructuredSemanticProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     semantic_views: list[SemanticViewPlan]
+    evidence_bindings: list[SemanticEvidenceBinding]
     required_data_request: _StructuredEvidenceRequest | None
 
     @model_validator(mode="after")
     def require_views_or_data_request(self):
         if bool(self.semantic_views) == bool(self.required_data_request):
             raise ValueError("semantic projection must produce either semantic_views or required_data_request")
+        if self.required_data_request is not None and self.evidence_bindings:
+            raise ValueError("a semantic source request cannot include evidence bindings")
         return self
 
     def to_runtime(self) -> SemanticProjectionPlan:
         return SemanticProjectionPlan(
             semantic_views=self.semantic_views,
+            evidence_bindings=self.evidence_bindings,
             required_data_request=(
                 self.required_data_request.to_runtime()
                 if self.required_data_request is not None
@@ -436,6 +456,7 @@ class VisualizationTool(BaseTool):
         projection = None
         projection_error = ""
         semantic_refs: list[str] = []
+        proof_bundle: list[dict] = []
         for projection_attempt in range(3):
             projection = await self._project(
                 validated_input,
@@ -464,6 +485,11 @@ class VisualizationTool(BaseTool):
                     continue
                 return _dependency_result(requirement, request_state)
             try:
+                proof_bundle = _resolve_semantic_evidence_bundle(
+                    verification,
+                    projection,
+                    [f"semantic:{view.view_id}" for view in projection.semantic_views],
+                )
                 semantic_refs = catalog.materialize_semantic_views(projection.semantic_views)
                 break
             except ValueError as exc:
@@ -478,6 +504,7 @@ class VisualizationTool(BaseTool):
             )
 
         semantic_inventory = catalog.semantic_inventory(semantic_refs)
+        semantic_inventory["proof_bundle"] = proof_bundle
         complete = None
         repair_context = None
         for planning_attempt in range(3):
@@ -562,6 +589,8 @@ class VisualizationTool(BaseTool):
                 "do not add an 'insight:' prefix. Insights state the conclusion; evidence, derived evidence, forecast, and anomaly artifacts "
                 "supply its context. Target a located Insight only when one item co-locates its timestamp and numeric value; do not reconstruct "
                 "a point from unrelated scalar Insights. A raw descriptive chart may have no target Insight, but must state an observable relation. "
+                "For visualize, define proof_obligations as short stable ids plus descriptions of the independently inspectable evidence roles "
+                "the chart needs (for example, complete context and a located claim); do not use field names or chart types as obligations. "
                 "Use needs_sources when the conclusion or required context is absent; do not calculate or invent a fallback. code_interpreter "
                 "requests require non-empty insight_requests; SQL may request SQL-owned atomic Insights. Use not_visualizable only when a chart "
                 "adds no inspectable evidence (for example, a causal claim unsupported by observational data).\n"
@@ -719,6 +748,7 @@ class VisualizationTool(BaseTool):
             "\"source_ref\":str,\"record_path\":str|null,\"mode\":\"records\"|\"wide_events\","
             "\"fields\":[{\"name\":str,\"semantic_role\":str,\"source_path\":str}],"
             "\"events\":[{\"event_role\":str,\"timestamp_path\":str,\"value_path\":str}]}],"
+            "\"evidence_bindings\":[{\"obligation_id\":str,\"view_id\":str}],"
             "\"required_data_request\":{\"required_action\":\"sql_query\"|\"anomaly\"|\"forecast\"|\"code_interpreter\","
             "\"purpose\":str,\"message\":str|null,\"required_shape\":str,\"required_fields\":[str],"
             "\"required_properties\":[str],\"input_evidence\":str|null,\"input_source_refs\":[str],\"insight_requests\":[{"
@@ -728,6 +758,8 @@ class VisualizationTool(BaseTool):
             "fields and events=[], while wide_events has fields=[] and non-empty events. wide_events is only for one wide record containing "
             "multiple distinct timestamp/value pairs; it emits event_role, timestamp, value. Use a separate view "
             "for another grain. Forecast visuals require historical actuals when available; request sql_query when that baseline is absent. "
+            "For every required proof obligation in the visual verification contract, add exactly one evidence_binding to the semantic view "
+            "that supplies it; several obligations may use the same view. If no grounded view can satisfy an obligation, request its owner. "
             "Do not invent uncertainty unless requested. Return either non-empty semantic_views with null required_data_request, or an empty "
             "view list with one owner request. Owners: sql_query for raw context, anomaly for anomaly detection, forecast for predictions, "
             "code_interpreter only for derived calculations and with non-empty insight_requests. input_evidence is an exact source_ref or null. "
@@ -796,6 +828,7 @@ class VisualizationTool(BaseTool):
             raise RuntimeError("visualization planning requires an LLM")
         target_insights = _target_insight_inventory(request_state, verification.target_insight_ids)
         field_contract = _closed_visual_field_contract(inventory)
+        proof_bundle = inventory.get("proof_bundle") if isinstance(inventory.get("proof_bundle"), list) else []
         prompt = prompt_locale_instruction(request_state.response_language) + (
             "You produce a closed, renderer-independent Visual IR for grounded visualization. Semantic projection has already "
             "organized existing values into views. Return one branch: non-empty visual_goals with required_data_request=null, or an empty "
@@ -814,13 +847,16 @@ class VisualizationTool(BaseTool):
             "verbatim from the entry for its source_ref into encodings and interval boundary fields. Field names are identifiers, "
             "not prose: never translate, paraphrase, or substitute an Insight name, statement, or label for a field identifier. "
             "When Repair context reports a rejected field, choose a different field from that same contract or return a genuine "
-            "required_data_request; never repeat the rejected identifier. Do not weaken the requested purpose and do not invent a fallback chart.\n"
+            "required_data_request; never repeat the rejected identifier. Every source_ref in the proof evidence bundle must be used by "
+            "a graphical layer or an interval boundary source; do not replace it with a semantically similar source. Do not weaken the "
+            "requested purpose and do not invent a fallback chart.\n"
             f"Visualization request: {request.message}\n"
             f"Visual verification contract: {json.dumps(verification.model_dump(mode='json'), ensure_ascii=False)}\n"
             f"Target Key Insights: {json.dumps(target_insights, ensure_ascii=False)}\n"
             f"Authoritative visual contract: {json.dumps(_visual_contract(request_state), ensure_ascii=False)}\n"
             f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
             f"Repair context: {json.dumps(repair_context, ensure_ascii=False) if repair_context else 'none'}\n"
+            f"Proof evidence bundle: {json.dumps(proof_bundle, ensure_ascii=False)}\n"
             f"Closed encoding field contract: {json.dumps(field_contract, ensure_ascii=False)}\n"
             f"Semantic view inventory: {json.dumps(inventory, ensure_ascii=False)}"
         )
@@ -848,22 +884,52 @@ class VisualizationTool(BaseTool):
                 raise parse_error
         except (json.JSONDecodeError, ValueError) as exc:
             raise _semantic_error(ValueError(f"invalid chart plan: {exc}"), inventory) from exc
-        return _compile_visualization_plan(parsed, catalog)
+        return _compile_visualization_plan(parsed, catalog, proof_bundle=proof_bundle)
 
 
 def _compile_visualization_plan(
     plan: _StructuredVisualizationPlan,
     catalog: PresentationCatalog,
+    *,
+    proof_bundle: list[dict] | None = None,
 ) -> VisualizationPlan:
     if plan.required_data_request is not None:
         return VisualizationPlan(
             visual_goals=[],
             required_data_request=plan.required_data_request.to_runtime(),
         )
+    _validate_visual_proof_bundle(plan.visual_goals, proof_bundle or [])
     return VisualizationPlan(
         visual_goals=[_compile_visual_goal(goal, catalog) for goal in plan.visual_goals],
         required_data_request=None,
     )
+
+
+def _validate_visual_proof_bundle(
+    goals: list[VisualGoalIR],
+    proof_bundle: list[dict],
+) -> None:
+    """Require every selected proof source to remain visible in the final IR."""
+
+    required_refs = {
+        str(item.get("source_ref") or "").strip()
+        for item in proof_bundle
+        if isinstance(item, dict) and str(item.get("source_ref") or "").strip()
+    }
+    if not required_refs:
+        return
+    used_refs = {
+        ref
+        for goal in goals
+        for layer in goal.layers
+        for ref in (layer.source_ref, layer.interval_source_ref)
+        if ref
+    }
+    missing = sorted(required_refs - used_refs)
+    if missing:
+        raise ValueError(
+            f"visual IR does not expose required proof evidence sources: {missing}"
+        )
 
 
 def _compile_visual_goal(goal: VisualGoalIR, catalog: PresentationCatalog) -> VisualGoal:
@@ -1463,6 +1529,64 @@ def _closed_visual_field_contract(inventory: dict) -> dict[str, list[dict[str, s
         if ref and entries:
             contract[ref] = entries
     return contract
+
+
+def _resolve_semantic_evidence_bundle(
+    verification: VisualVerificationDecision,
+    projection: SemanticProjectionPlan,
+    semantic_refs: list[str],
+) -> list[dict]:
+    """Close visual proof obligations against LLM-selected semantic views.
+
+    This is intentionally a verifier, not a fallback planner: it neither picks
+    a substitute view nor changes an obligation. Any incomplete binding is fed
+    back to the projection LLM through the existing repair loop.
+    """
+
+    obligations = {
+        item.obligation_id: item
+        for item in verification.proof_obligations
+    }
+    if not obligations:
+        return []
+    known_views = {
+        ref.removeprefix("semantic:")
+        for ref in semantic_refs
+        if ref.startswith("semantic:")
+    }
+    bindings: dict[str, SemanticEvidenceBinding] = {}
+    for binding in projection.evidence_bindings:
+        if binding.obligation_id not in obligations:
+            raise ValueError(
+                f"semantic evidence binding references unknown proof obligation '{binding.obligation_id}'"
+            )
+        if binding.obligation_id in bindings:
+            raise ValueError(
+                f"semantic evidence binding duplicates proof obligation '{binding.obligation_id}'"
+            )
+        if binding.view_id not in known_views:
+            raise ValueError(
+                f"semantic evidence binding for '{binding.obligation_id}' references unknown view '{binding.view_id}'"
+            )
+        bindings[binding.obligation_id] = binding
+
+    missing = sorted(
+        obligation_id
+        for obligation_id, obligation in obligations.items()
+        if obligation.required and obligation_id not in bindings
+    )
+    if missing:
+        raise ValueError(
+            f"semantic projection did not bind required visual proof obligations: {missing}"
+        )
+    return [
+        {
+            "obligation_id": obligation_id,
+            "description": obligations[obligation_id].description,
+            "source_ref": f"semantic:{binding.view_id}",
+        }
+        for obligation_id, binding in bindings.items()
+    ]
 
 
 def _missing_evidence_required(requirement: VisualizationEvidenceRequest, inventory: dict) -> StructuredToolError:

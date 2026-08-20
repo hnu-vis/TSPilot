@@ -140,6 +140,7 @@ def _projection_ir_payload(payload: str | dict) -> str:
         views.append(view)
     return json.dumps({
         "semantic_views": views,
+        "evidence_bindings": decoded.get("evidence_bindings", []),
         "required_data_request": _strict_dependency_payload(decoded.get("required_data_request")),
     })
 
@@ -240,6 +241,7 @@ def _strict_test_payload(payload: str | dict, messages) -> str:
         if "outcome" not in decoded:
             decoded = {"outcome": decoded}
         outcome = decoded["outcome"]
+        outcome.setdefault("proof_obligations", [])
         outcome["required_data_request"] = _strict_dependency_payload(
             outcome.get("required_data_request")
         )
@@ -263,6 +265,7 @@ def _verification_payload(messages) -> str:
             "verification_question": "Does the grounded visual evidence support the requested relationship?",
             "interpretation": "Inspect the complete contextual data and the highlighted analytical relationship.",
             "visual_relation": "grounded_comparison",
+            "proof_obligations": [],
             "required_context": ["complete contextual evidence"],
             "non_visual_insight_ids": [],
             "required_data_request": None,
@@ -1681,6 +1684,106 @@ async def test_visualization_carries_key_insight_verification_through_projection
 
 
 @pytest.mark.asyncio
+async def test_line_visualization_closes_proof_obligation_through_semantic_evidence_bundle(tmp_path):
+    projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Complete observed series",
+            "purpose": "Supply complete context for the claimed line relationship",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": "$.records",
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+            "events": [],
+        }],
+        "evidence_bindings": [{
+            "obligation_id": "complete_context",
+            "view_id": "observations",
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Inspect the observed relationship in complete context",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": "The complete series is the visual proof context.",
+            "required_roles": ["complete_context"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": False,
+            "viewport_start": None,
+            "viewport_end": None,
+            "y_scale": "linear",
+            "layers": [{
+                "layer_type": "series",
+                "role": "complete_context",
+                "source_ref": "semantic:observations",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "y", "field": "measure"},
+                ],
+                "interval_source_ref": None,
+                "interval_start_field": None,
+                "interval_end_field": None,
+                "interval_start_value": None,
+                "interval_end_value": None,
+                "emphasis": "normal",
+                "line_style": "solid",
+                "symbol": "none",
+                "axis": "primary",
+                "label": "Observed value",
+            }],
+        }],
+        "required_data_request": None,
+    }
+
+    class ProofBundlePlannerLlm:
+        def __init__(self):
+            self.chart_prompts = []
+
+        async def ainvoke(self, messages):
+            if _is_verification_prompt(messages):
+                return SimpleNamespace(content=_strict_test_payload({
+                    "decision": "visualize",
+                    "target_insight_ids": [],
+                    "verification_question": "Does the complete series show the requested relationship?",
+                    "interpretation": "Inspect the complete observed line.",
+                    "visual_relation": "observed time-series relationship",
+                    "proof_obligations": [{
+                        "obligation_id": "complete_context",
+                        "description": "The complete observed time series that makes the relationship inspectable.",
+                        "required": True,
+                    }],
+                    "required_context": ["complete observed series"],
+                    "non_visual_insight_ids": [],
+                    "required_data_request": None,
+                }, messages), response_metadata={})
+            if _is_projection_prompt(messages):
+                return SimpleNamespace(content=_strict_test_payload(projection, messages), response_metadata={})
+            self.chart_prompts.append(messages)
+            return SimpleNamespace(content=_strict_test_payload(chart, messages), response_metadata={})
+
+    llm = ProofBundlePlannerLlm()
+    result = await VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path)).execute(
+        VisualizationInput(message="Show the observed series."), request_state=_state(5),
+    )
+
+    verification = result["visualizations"][0]["verification"]
+    assert verification["proof_obligations"] == [{
+        "obligation_id": "complete_context",
+        "description": "The complete observed time series that makes the relationship inspectable.",
+        "required": True,
+    }]
+    assert '"source_ref": "semantic:observations"' in str(llm.chart_prompts[0][0][1])
+    assert "Proof evidence bundle" in str(llm.chart_prompts[0][0][1])
+
+
+@pytest.mark.asyncio
 async def test_visualization_repairs_invalid_insight_reference_with_llm_replanning(tmp_path):
     state = _state(25)
     state.insight_set.insights = [KeyInsight(
@@ -1722,10 +1825,11 @@ async def test_visualization_repairs_invalid_insight_reference_with_llm_replanni
                 return SimpleNamespace(content=json.dumps({"outcome": {
                     "decision": "visualize",
                     "target_insight_ids": [insight_id],
-                    "verification_question": "Does the full series confirm the maximum?",
-                    "interpretation": "Inspect the maximum against all observed values.",
-                    "visual_relation": "maximum in complete series",
-                    "required_context": ["complete series"],
+                        "verification_question": "Does the full series confirm the maximum?",
+                        "interpretation": "Inspect the maximum against all observed values.",
+                        "visual_relation": "maximum in complete series",
+                        "proof_obligations": [],
+                        "required_context": ["complete series"],
                     "non_visual_insight_ids": [],
                     "required_data_request": None,
                 }}), response_metadata={})
