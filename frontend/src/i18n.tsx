@@ -22,6 +22,8 @@ const zhCN: Record<string, string> = {
   Skills: '技能',
   'Skill management is planned': '技能管理功能正在规划中',
   Soon: '即将推出',
+  'More databases': '更多数据库',
+  'More databases are coming soon.': '更多数据库即将接入。',
   'New chat': '新对话',
   'Search chats': '搜索对话',
   'Search conversations': '搜索对话',

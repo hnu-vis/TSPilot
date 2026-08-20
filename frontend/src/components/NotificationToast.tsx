@@ -10,9 +10,10 @@ export type NotificationNotice = {
 
 type Props = NotificationNotice & {
   onDismiss: () => void;
+  compact?: boolean;
 };
 
-export function NotificationToast({ tone, title, message, onDismiss }: Props) {
+export function NotificationToast({ tone, title, message, onDismiss, compact = false }: Props) {
   const { t } = useI18n();
   const dismissRef = useRef(onDismiss);
   dismissRef.current = onDismiss;
@@ -23,11 +24,16 @@ export function NotificationToast({ tone, title, message, onDismiss }: Props) {
   }, [message, tone]);
 
   return (
-    <div className={`notification-toast ${tone}`} role={tone === 'error' ? 'alert' : 'status'} aria-live="polite">
+    <div
+      className={`notification-toast ${tone}${compact ? ' compact' : ''}`}
+      role={tone === 'error' ? 'alert' : 'status'}
+      aria-live="polite"
+      aria-label={`${title}: ${message}`}
+    >
       {tone === 'success' ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
       <div>
         <strong>{title}</strong>
-        <span>{message}</span>
+        <span title={message}>{message}</span>
       </div>
       <button type="button" aria-label={t('Dismiss notification')} onClick={onDismiss}>
         <X size={15} />

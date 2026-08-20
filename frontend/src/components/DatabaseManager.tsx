@@ -456,6 +456,19 @@ function DatabaseTypeCatalog({ onSelect, onCancel }: { onSelect: (type: string) 
             </span>
           </button>
         ))}
+        <div
+          className="database-type-card database-type-card-soon"
+          role="note"
+          aria-label={t('More databases are coming soon.')}
+        >
+          <span className="database-type-logo database-type-logo-soon" aria-hidden="true">
+            <Plus size={20} strokeWidth={1.8} />
+          </span>
+          <span className="database-type-copy">
+            <strong>{t('More databases')}</strong>
+            <small>{t('Soon')}</small>
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -535,6 +548,9 @@ function DatabaseConfigForm({
             <span className="database-selected-type">{databaseTypeLabel(value.type)}</span>
           ) : (
             <select value={value.type} onChange={(event) => updateField('type', event.target.value)}>
+              {!DATABASE_TYPES.includes(value.type) && (
+                <option value={value.type} disabled>{databaseTypeLabel(value.type)}</option>
+              )}
               {DATABASE_TYPES.map((type) => <option key={type} value={type}>{databaseTypeLabel(type)}</option>)}
             </select>
           )}

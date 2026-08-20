@@ -318,6 +318,7 @@ export function ModelManager() {
           tone={feedback.tone}
           title={t(feedback.tone === 'success' ? 'Operation completed' : 'Operation failed')}
           message={feedback.message}
+          compact
           onDismiss={() => setFeedback(null)}
         />
       )}

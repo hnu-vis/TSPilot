@@ -2119,6 +2119,18 @@ input:focus-visible {
   box-shadow: 0 7px 18px oklch(0.2 0.01 250 / 0.06);
 }
 
+.database-type-card-soon {
+  cursor: default;
+  border-style: dashed;
+  background: var(--surface-soft);
+}
+
+.database-type-card-soon:hover {
+  transform: none;
+  border-color: var(--border);
+  box-shadow: none;
+}
+
 .database-type-logo {
   display: grid;
   width: 40px;
@@ -2136,6 +2148,21 @@ input:focus-visible {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.database-type-logo-soon {
+  color: var(--muted);
+  background: transparent;
+}
+
+.database-type-card-soon .database-type-copy strong {
+  color: var(--muted);
+}
+
+.database-type-card-soon .database-type-copy small {
+  font-family: var(--font-sans);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .database-type-copy {
@@ -2337,6 +2364,37 @@ input:focus-visible {
 .notification-toast span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.notification-toast.compact {
+  width: min(150px, calc(100vw - 32px));
+  gap: 6px;
+  padding: 8px;
+}
+
+.notification-toast.compact > svg {
+  margin-top: 1px;
+}
+
+.notification-toast.compact strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notification-toast.compact span {
+  display: block;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: anywhere;
+}
+
+.notification-toast.compact button {
+  width: 22px;
+  height: 22px;
 }
 
 .database-toast button,

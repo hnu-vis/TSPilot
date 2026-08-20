@@ -4,8 +4,34 @@ import { mergeContextRecords } from './DatabaseManager';
 
 describe('database catalog', () => {
   it('provides one real brand asset for every supported connector', () => {
-    expect(DATABASE_CATALOG).toHaveLength(32);
+    expect(DATABASE_CATALOG).toHaveLength(24);
     expect(new Set(DATABASE_TYPES).size).toBe(DATABASE_TYPES.length);
+    expect(DATABASE_TYPES).toEqual([
+      'influxdb',
+      'influxdb3',
+      'kdb',
+      'prometheus',
+      'timescaledb',
+      'dolphindb',
+      'druid',
+      'questdb',
+      'tdengine',
+      'iotdb',
+      'victoriametrics',
+      'griddb',
+      'arc',
+      'm3db',
+      'cratedb',
+      'cnosdb',
+      'arcadedb',
+      'greptimedb',
+      'db2',
+      'riak_ts',
+      'bangdb',
+      'machbase',
+      'openmldb',
+      'opengemini',
+    ]);
 
     for (const database of DATABASE_CATALOG) {
       expect(database.label.length).toBeGreaterThan(1);
