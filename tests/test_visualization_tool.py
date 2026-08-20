@@ -71,6 +71,7 @@ class _SequencePlannerLlm:
     def __init__(self, payloads: list[str]):
         self.payloads = list(payloads)
         self.calls = 0
+        self.chart_prompts = []
 
     async def ainvoke(self, _messages):
         if _is_verification_prompt(_messages):
@@ -86,6 +87,7 @@ class _SequencePlannerLlm:
                 content='{"decision":"approve","issues":[],"required_data_request":null}',
                 response_metadata={},
             )
+        self.chart_prompts.append(_messages)
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
         return SimpleNamespace(content=_chart_ir_payload(payload), response_metadata={})
@@ -1098,6 +1100,64 @@ async def test_semantic_projection_repairs_from_path_execution_feedback_without_
 
 
 @pytest.mark.asyncio
+async def test_semantic_projection_repairs_mutually_exclusive_records_and_events(tmp_path):
+    invalid_projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose observations",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+            "events": [{
+                "event_role": "incorrectly_mixed_event",
+                "timestamp_path": "$.timestamp",
+                "value_path": "$.value",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    repaired_projection = {
+        **invalid_projection,
+        "semantic_views": [{
+            **invalid_projection["semantic_views"][0],
+            "events": [],
+        }],
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Show the observed series",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["observed_series"],
+            "layers": [{
+                "role": "observed_series",
+                "source_ref": "semantic:observations",
+                "mark": "line",
+                "encoding": {"x": "time", "y": "measure"},
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _RepairingTwoStagePlannerLlm(
+        projections=[invalid_projection, repaired_projection], chart=chart,
+    )
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(VisualizationInput(message="Show the observed series."), request_state=_state(5))
+
+    assert len(llm.projection_prompts) == 2
+    assert "records semantic view cannot include event mappings" in str(llm.projection_prompts[1][0][1])
+    assert result["status"] == "created"
+
+
+@pytest.mark.asyncio
 async def test_chart_requirement_repairs_ungrounded_input_evidence_with_llm(tmp_path):
     projection = {
         "semantic_views": [{
@@ -1212,6 +1272,11 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
 
     assert llm.calls == 2  # invalid materialization plus repaired chart plan
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 25
+    repaired_prompt = str(llm.chart_prompts[1][0][1])
+    assert "Closed encoding field contract" in repaired_prompt
+    assert '"name": "timestamp"' in repaired_prompt
+    assert '"name": "value"' in repaired_prompt
+    assert "missing_timestamp" in repaired_prompt
 
 
 @pytest.mark.asyncio
@@ -1613,6 +1678,72 @@ async def test_visualization_carries_key_insight_verification_through_projection
     assert '"target_insight_ids": ["insight_max"]' in str(llm.projection_prompts[0][0][1])
     assert '"source_ref": "view:evidence:evi_full:default"' in str(llm.projection_prompts[0][0][1])
     assert '"preferred_by_caller": true' in str(llm.projection_prompts[0][0][1])
+
+
+@pytest.mark.asyncio
+async def test_visualization_repairs_invalid_insight_reference_with_llm_replanning(tmp_path):
+    state = _state(25)
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_max",
+        insight_key="maximum_value",
+        name="Maximum value",
+        insight_type="extreme",
+        statement="The maximum value is 24 at the end of the interval.",
+        value=24.0,
+        method="sql_query",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+    )]
+    chart = {
+        "visual_goals": [{
+            "purpose": "verify the maximum in context",
+            "title": "Maximum in full context",
+            "priority": "primary",
+            "summary": "The full interval makes the maximum inspectable.",
+            "required_roles": ["complete_series"],
+            "layers": [{
+                "role": "complete_series",
+                "source_ref": "view:evidence:evi_full:default",
+                "mark": "line",
+                "encoding": {"x": "timestamp", "y": "value"},
+                "label": "Observed value",
+            }],
+        }],
+        "required_data_request": None,
+    }
+
+    class RepairingVerificationLlm:
+        def __init__(self):
+            self.verification_prompts = []
+
+        async def ainvoke(self, messages):
+            if _is_verification_prompt(messages):
+                self.verification_prompts.append(messages)
+                insight_id = "insight:insight_max" if len(self.verification_prompts) == 1 else "insight_max"
+                return SimpleNamespace(content=json.dumps({"outcome": {
+                    "decision": "visualize",
+                    "target_insight_ids": [insight_id],
+                    "verification_question": "Does the full series confirm the maximum?",
+                    "interpretation": "Inspect the maximum against all observed values.",
+                    "visual_relation": "maximum in complete series",
+                    "required_context": ["complete series"],
+                    "non_visual_insight_ids": [],
+                    "required_data_request": None,
+                }}), response_metadata={})
+            if _is_projection_prompt(messages):
+                return SimpleNamespace(content=_projection_ir_payload(_projection_for_chart_payload(json.dumps(chart))), response_metadata={})
+            return SimpleNamespace(content=_chart_ir_payload(chart), response_metadata={})
+
+    llm = RepairingVerificationLlm()
+    result = await VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path)).execute(
+        VisualizationInput(message="Show the maximum in context."),
+        request_state=state,
+    )
+
+    assert result["status"] == "created"
+    assert result["visualizations"][0]["verification"]["target_insight_ids"] == ["insight_max"]
+    assert len(llm.verification_prompts) == 2
+    assert "preceding candidate was rejected" in str(llm.verification_prompts[1][0][1])
+    assert "'insight:insight_max'" in str(llm.verification_prompts[1][0][1])
 
 
 @pytest.mark.asyncio

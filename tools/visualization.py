@@ -546,64 +546,71 @@ class VisualizationTool(BaseTool):
             raise RuntimeError("visual verification planning requires an LLM")
         insight_inventory = _verified_insight_inventory(request_state)
         data_source_inventory = _data_source_inventory(inventory)
-        prompt = prompt_locale_instruction(request_state.response_language) + (
-            "You are the visual verification planner inside a strict outer ReAct loop. Start from the user's question, "
-            "not from chart types or available columns. Decide which verified Key Insights can be meaningfully inspected through "
-            "a visual relationship and which complete contextual artifacts a human needs to confirm or challenge them. "
-            "Return one outcome object matching the provider schema. The outcome is a discriminated branch: visualize and "
-            "not_visualizable require required_data_request=null; needs_sources requires one complete data request. These branches "
-            "are structurally exclusive, so first choose the decision and then populate only its valid branch. "
-            "Use only exact verified insight_id values from the supplied Insight inventory. Key Insights define what is being "
-            "verified; complete Evidence, Derived Evidence, Forecast, and Anomaly artifacts provide the visual context. Do not turn "
-            "an isolated scalar into a decorative chart. Trends, comparisons, rankings with a complete candidate set, distributions, "
-            "anomalies with a baseline, forecasts with historical actuals, intervals with real bounds, associations, and located events "
-            "have natural visual verification forms. A causal explanation is not visually verified by observational correlation. "
-            "For a located event, target the Insight whose one item or record co-locates its timestamp and numeric value. When a "
-            "calculated Insight already contains that located item, classify redundant scalar time/value Insights as non-visual rather "
-            "than targeting each fragment. Never ask a chart to reconstruct one point by joining unrelated scalar Insights. "
-            "When the user explicitly requests a raw descriptive chart, decision=visualize may have no target Insight, but the question "
-            "must state the observable relationship. If a needed raw source or calculated Insight is absent, use needs_sources and the "
-            "owner action; do not compute inside visualization and do not invent a fallback. code_interpreter dependencies require exact "
-            "non-empty insight_requests. SQL may include atomic insight_requests when the missing verification target is SQL-owned. "
-            "Return not_visualizable only when a chart would not add inspectable evidence.\n"
-            f"User request: {request.message}\n"
-            f"Task visual contract: {json.dumps(_visual_contract(request_state), ensure_ascii=False)}\n"
-            f"Verified Key Insights: {json.dumps(insight_inventory, ensure_ascii=False)}\n"
-            f"Preferred source refs: {json.dumps(sorted(source_preferences), ensure_ascii=False)}\n"
-            f"Referenced data contracts: {json.dumps(data_source_inventory, ensure_ascii=False)}\n"
-            f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
-            "Repair context: none"
-        )
-        messages = [("system", prompt), ("user", request.message)]
-        started_at = time.perf_counter()
-        response, content, parsed, parse_error = await _invoke_structured(
-            self._llm,
-            _StructuredVerificationDecision,
-            messages,
-            timeout_seconds=self._llm_timeout_seconds,
-            trace_title="Visual Verification Planning",
-            trace_summary="选择需要通过图表验证的数据发现",
-        )
-        record_llm_token_usage(
-            request_state,
-            source="visualization.verification_plan",
-            response=response,
-            messages=messages,
-            output_text=content,
-            duration_ms=int((time.perf_counter() - started_at) * 1000),
-        )
-        try:
-            if parse_error is not None:
-                raise parse_error
-            allowed = {item["insight_id"] for item in insight_inventory}
-            decision = parsed.to_runtime()
-            referenced = set(decision.target_insight_ids) | set(decision.non_visual_insight_ids)
-            unknown = referenced - allowed
-            if unknown:
-                raise ValueError(f"visual verification plan references unknown or unverified insights: {sorted(unknown)}")
-            return decision
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise _semantic_error(ValueError(f"invalid visual verification decision: {exc}"), inventory) from exc
+        allowed = {item["insight_id"] for item in insight_inventory}
+        repair_error: Exception | None = None
+        for attempt in range(3):
+            repair_context = "none" if repair_error is None else (
+                "The preceding candidate was rejected by runtime validation. Re-plan the complete decision; "
+                f"do not preserve invalid values. Validation feedback: {repair_error}. "
+                f"The only valid values for target_insight_ids and non_visual_insight_ids are: {sorted(allowed)}."
+            )
+            prompt = prompt_locale_instruction(request_state.response_language) + (
+                "You are the visual verification planner inside a strict outer ReAct loop. Decide whether the user's conclusion has "
+                "an inspectable visual relationship, before choosing chart types or fields. Return one schema-valid discriminated outcome: "
+                "visualize/not_visualizable require required_data_request=null; needs_sources requires exactly one complete request. "
+                "Select only supplied verified insight_id values. target_insight_ids and non_visual_insight_ids are IDs, never source refs: "
+                "do not add an 'insight:' prefix. Insights state the conclusion; evidence, derived evidence, forecast, and anomaly artifacts "
+                "supply its context. Target a located Insight only when one item co-locates its timestamp and numeric value; do not reconstruct "
+                "a point from unrelated scalar Insights. A raw descriptive chart may have no target Insight, but must state an observable relation. "
+                "Use needs_sources when the conclusion or required context is absent; do not calculate or invent a fallback. code_interpreter "
+                "requests require non-empty insight_requests; SQL may request SQL-owned atomic Insights. Use not_visualizable only when a chart "
+                "adds no inspectable evidence (for example, a causal claim unsupported by observational data).\n"
+                f"User request: {request.message}\n"
+                f"Task visual contract: {json.dumps(_visual_contract(request_state), ensure_ascii=False)}\n"
+                f"Verified Key Insights: {json.dumps(insight_inventory, ensure_ascii=False)}\n"
+                f"Preferred source refs: {json.dumps(sorted(source_preferences), ensure_ascii=False)}\n"
+                f"Referenced data contracts: {json.dumps(data_source_inventory, ensure_ascii=False)}\n"
+                f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
+                f"Repair context: {repair_context}"
+            )
+            messages = [("system", prompt), ("user", request.message)]
+            started_at = time.perf_counter()
+            response, content, parsed, parse_error = await _invoke_structured(
+                self._llm,
+                _StructuredVerificationDecision,
+                messages,
+                timeout_seconds=self._llm_timeout_seconds,
+                trace_title="Visual Verification Planning",
+                trace_summary="选择需要通过图表验证的数据发现",
+            )
+            record_llm_token_usage(
+                request_state,
+                source="visualization.verification_plan",
+                response=response,
+                messages=messages,
+                output_text=content,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+            try:
+                if parse_error is not None:
+                    raise parse_error
+                decision = parsed.to_runtime()
+                referenced = set(decision.target_insight_ids) | set(decision.non_visual_insight_ids)
+                unknown = referenced - allowed
+                if unknown:
+                    raise ValueError(
+                        "visual verification plan references unknown or unverified insights: "
+                        f"{sorted(unknown)}"
+                    )
+                return decision
+            except (json.JSONDecodeError, ValueError, OutputParserException) as exc:
+                repair_error = exc
+
+        raise _semantic_error(
+            ValueError(f"invalid visual verification decision after LLM repair: {repair_error}"),
+            inventory,
+            scope="verification_selection",
+        ) from repair_error
 
     async def _audit_candidate(
         self,
@@ -696,24 +703,18 @@ class VisualizationTool(BaseTool):
         verification: VisualVerificationDecision,
         source_preferences: set[str],
         repair_context: dict | None = None,
+        schema_repair_attempt: int = 0,
     ) -> SemanticProjectionPlan:
         if self._llm is None:
             raise RuntimeError("visualization planning requires an LLM")
         target_insights = _target_insight_inventory(request_state, verification.target_insight_ids)
         source_contracts = _projection_source_inventory(inventory)
         prompt = prompt_locale_instruction(request_state.response_language) + (
-            "You are the semantic projection stage for grounded visualization. Understand the user's analytical goal, "
-            "the semantic contract and directly held values of each target Insight, plus the structure, schema, and lineage contracts "
-            "of referenced data. Large Insight item collections remain reference-backed; item_count states their complete size, and "
-            "the supplied items are complete only when their length equals item_count. "
-            "Referenced data records are intentionally absent from the prompt and will be resolved only during materialization. "
-            "The visual-verification contract is authoritative: project the target Insight values when they are locatable and the "
-            "complete contextual evidence needed to inspect its stated relationship. Do not replace a target Insight with a merely "
-            "similar source, and do not omit its baseline or comparison set simply because a smaller source is easier to chart. "
-            "A located point must come from one same-grain source record containing both its timestamp and numeric value. Prefer the "
-            "target Insight's $.items when those items co-locate both fields. Never split a point across scalar views or create redundant "
-            "scalar views for a timestamp and value already present together in a target Insight item. "
-            "Return exactly one JSON object matching: "
+            "You are the semantic projection stage for grounded visualization. Project the target Insight and the complete context needed "
+            "to inspect it into executable, same-grain semantic views. Source records are resolved only during materialization: use the "
+            "supplied schema, projection_root, and lineage; never calculate, infer, or manufacture values. Keep a located point in one "
+            "record that contains both timestamp and numeric value. Preserve the complete baseline/comparison context rather than replacing "
+            "it with a summary Insight. Return exactly one JSON object matching: "
             "{\"semantic_views\":[{\"view_id\":str,\"name\":str,\"purpose\":str,\"grain\":str,"
             "\"source_ref\":str,\"record_path\":str|null,\"mode\":\"records\"|\"wide_events\","
             "\"fields\":[{\"name\":str,\"semantic_role\":str,\"source_path\":str}],"
@@ -722,61 +723,15 @@ class VisualizationTool(BaseTool):
             "\"purpose\":str,\"message\":str|null,\"required_shape\":str,\"required_fields\":[str],"
             "\"required_properties\":[str],\"input_evidence\":str|null,\"input_source_refs\":[str],\"insight_requests\":[{"
             "\"name\":str,\"insight_type\":str,\"insight_key\":str|null}]}|null}. "
-            "Create semantic views that make all visually relevant existing values explicit: temporal context, measures, "
-            "central estimates, interval bounds, categories, series identities, event labels, and located decisions as appropriate. "
-            "This is semantic interpretation, not blind field extraction: choose fields from their meaning in the request and Insight, "
-            "and give the projected columns clear semantic names and roles. For sources with multiple grains, use record_path on "
-            "projection_root to select the object or array that defines one output row (for example $.items, $.value, or $.records); "
-            "then use source_path relative to each selected record. Do not repeat the record_path prefix inside source_path. "
-            "For example, record_path $.records with source_path $.metric selects each record's metric. "
-            "Use projection_root.record_path_candidates instead of guessing a record grain. A [*] segment expands each member of an "
-            "array, so a candidate such as $.items[*].items flattens the inner item arrays into records before source_path is applied. "
-            "Wildcards belong only in record_path, never in source_path. Prefer a flatter owning Derived Evidence view when it already "
-            "contains the same complete analytical records. "
-            "Use mode=records with non-empty fields and events=[] for every row-preserving projection, including an already-long "
-            "event table with role, timestamp, and value columns. Use mode=wide_events with fields=[] only when exactly one selected "
-            "source record contains several located time/value pairs such as start, peak, and end; each events item must use a distinct "
-            "timestamp/value path pair and "
-            "expands timestamp_path and value_path into one output row with fixed columns event_role, timestamp, and value. This is the "
-            "representation for a one-row wide analytical record that semantically owns multiple points. Never apply wide_events to an "
-            "already-long multi-row event source, and do not present a one-row wide record as a line. "
-            "Leave record_path null only when using the source's default records. "
-            "Paths use $.field.nested syntax. A view uses one exact grounded source_ref; later chart planning can compose multiple views. "
-            "With record_path null, use the top-level names shown in schema_fields (for example $.timestamp or $.value). "
-            "Never add a $.value prefix unless projection_root explicitly shows value as an object containing that field. "
-            "Keep every semantic view at one record grain. Every source_path must exist inside the structure selected by record_path; "
-            "do not reach into a sibling summary from an item row. If another preferred source exposes a required value more directly, "
-            "create a separate semantic view from that source and let chart planning compose the views. "
-            "Prefer the owning artifact's complete series or interval view over a downstream Insight that merely summarizes or samples it. "
-            "Use verified Insights for calculated conclusions and located annotations, not as a substitute for a complete upstream series. "
-            "For a forecast or prediction visualization, historical actuals are the default visual baseline. When the inventory contains "
-            "the forecast's historical evidence ancestor, project both the historical actual series and the forecast series so chart "
-            "planning can join them at the forecast boundary; source preferences are hints, not permission to omit that context. If the "
-            "forecast exists but its required historical actual series is genuinely unavailable, request sql_query for that context instead "
-            "of silently producing a forecast-only chart. "
-            "A prediction line is sufficient when the user and visual contract do not request uncertainty. Do not request or invent "
-            "confidence intervals merely because the source is a forecast; require interval data only when uncertainty, bounds, or a "
-            "confidence band is explicitly part of the requested visual meaning. "
-            "You may select, rename, and reorganize existing values. Never define formulas, aggregate, rescale, predict, infer, "
-            "or manufacture values. Never replace a requested decision/forecast/anomaly role with a merely similar field. "
-            "If the grounded inventory truly lacks a required business value, return semantic_views=[] and required_data_request. "
-            "Return exactly one branch: either non-empty semantic_views with required_data_request null, or an empty semantic_views "
-            "list with one complete required_data_request. code_interpreter requests require at least one insight_request containing "
-            "name and insight_type. When requesting data, semantic_views must be the literal empty list: do not include partial views, placeholder views, "
-            "null source_refs, or empty fields alongside required_data_request. "
-            "input_evidence must be one exact semantic source_ref from the inventory or null, never prose. "
-            "Choose sql_query for missing raw context, anomaly for authoritative anomaly detection or when suspicious source values "
-            "must be assessed before a specialized model is rerun, forecast for missing or invalidated prediction outputs, and "
-            "code_interpreter only for calculations over valid existing artifacts with exact non-empty insight_requests. "
-            "Never ask code_interpreter to generate, clean, repair, or replace forecast/anomaly outputs. If forecast output appears "
-            "contaminated and no matching anomaly artifact exists, request anomaly on the forecast's evidence ancestor; when that "
-            "anomaly artifact exists but the forecast quality lineage does not consume it, request forecast. A forecast rerun on the "
-            "same evidence is valid only after a matching anomaly artifact or materially different evidence exists; otherwise the "
-            "same specialized model will repeat the invalid output, so request anomaly first. code_interpreter dependencies require "
-            "insight_requests; sql_query may include only SQL-owned atomic insight requests. Use an empty list for anomaly and forecast. "
-            "Do not produce a fallback view.\n"
-            "When Repair context contains an execution error, change the rejected source_ref, record_path, or source_path as needed "
-            "after re-reading projection_root; never repeat a path that the executor reported unavailable.\n"
+            "Use one exact source_ref per view. Select record_path only from projection_root.record_path_candidates; source_path is relative "
+            "to that record, and wildcards belong only in record_path. For each view choose exactly one representation: records has non-empty "
+            "fields and events=[], while wide_events has fields=[] and non-empty events. wide_events is only for one wide record containing "
+            "multiple distinct timestamp/value pairs; it emits event_role, timestamp, value. Use a separate view "
+            "for another grain. Forecast visuals require historical actuals when available; request sql_query when that baseline is absent. "
+            "Do not invent uncertainty unless requested. Return either non-empty semantic_views with null required_data_request, or an empty "
+            "view list with one owner request. Owners: sql_query for raw context, anomaly for anomaly detection, forecast for predictions, "
+            "code_interpreter only for derived calculations and with non-empty insight_requests. input_evidence is an exact source_ref or null. "
+            "On repair, fix the reported schema, source, or path violation in the complete plan; never repeat it or create a fallback view.\n"
             f"Visualization request: {request.message}\n"
             f"Visual verification contract: {json.dumps(verification.model_dump(mode='json'), ensure_ascii=False)}\n"
             f"Target Key Insights: {json.dumps(target_insights, ensure_ascii=False)}\n"
@@ -810,7 +765,20 @@ class VisualizationTool(BaseTool):
             if parse_error is not None:
                 raise parse_error
             return parsed.to_runtime()
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, OutputParserException) as exc:
+            if schema_repair_attempt < 2:
+                return await self._project(
+                    request,
+                    inventory,
+                    request_state,
+                    verification,
+                    source_preferences,
+                    repair_context=_planning_diagnostic(
+                        exc,
+                        stage="semantic_projection_schema",
+                    ),
+                    schema_repair_attempt=schema_repair_attempt + 1,
+                )
             raise _semantic_error(
                 ValueError(f"invalid semantic projection plan: {exc}"), inventory, scope="semantic_projection",
             ) from exc
@@ -827,55 +795,33 @@ class VisualizationTool(BaseTool):
         if self._llm is None:
             raise RuntimeError("visualization planning requires an LLM")
         target_insights = _target_insight_inventory(request_state, verification.target_insight_ids)
+        field_contract = _closed_visual_field_contract(inventory)
         prompt = prompt_locale_instruction(request_state.response_language) + (
             "You produce a closed, renderer-independent Visual IR for grounded visualization. Semantic projection has already "
-            "organized existing values into views, and the provider enforces the supplied JSON schema. Do not write ECharts options, "
-            "raw presentation objects, transforms, filters, datasets, or series. Select semantic layer intent and exact grounded fields; "
-            "the compiler owns renderer syntax, styles, filtering, axes, tooltip, legend, and dataZoom. Return exactly one branch: "
-            "non-empty visual_goals with required_data_request=null, or visual_goals=[] with a complete required_data_request. "
-            "Every schema field is required; use null, false, normal, solid, none, primary, or an empty list when it does not apply. "
-            "Each layer uses layer_type=series, event_points, band, interval_overlay, or comparison. encodings is a list of "
-            "{channel,field}; series/event_points/comparison/interval_overlay require x and y, while band requires x/lower/upper. "
-            "Do not select a renderer mark; the compiler maps layer_type to the supported renderer series type. "
-            "For interval_overlay, source_ref is the multi-point context series. Prefer interval_source_ref plus exact start/end field "
-            "names from one semantic interval view; leave literal boundary values null. Use literal start/end only when no semantic "
-            "boundary view exists. All interval fields must be null for other layer types. Use render_contract.allowed_layer_types and "
-            "point_count as executable constraints: a line or area requires at least two points per series, while event_points may use "
-            "one or more located records. required_roles must have same-role layers. "
-            "Every forecast chart must include a historical-actual layer whenever the supplied semantic views contain its historical "
-            "ancestor, plus a distinct forecast layer connected at the prediction boundary. Do not replace the historical baseline with "
-            "a scalar direction/change Insight; Insights may annotate the two series. If a forecast view is present but its historical "
-            "actual view is missing, return required_data_request for sql_query rather than a forecast-only visual goal. "
-            "Default to one cohesive visual goal and one shared Cartesian plotting area for related analytical information. For a "
-            "time-series answer, overlay historical actuals, forecast lines, confidence bands, anomaly points, and located decision or "
-            "turning points on the same time axis. Use a secondary yAxis in the same grid when compatible time-aligned measures have "
-            "different units or scales. Do not create multiple grids, panels, or small multiples merely because values have different "
-            "magnitudes. Do not turn scalar summaries such as change amounts, percentages, counts, or extrema into separate bar layers "
-            "inside a time-series visual goal; those values belong in answer text, chart annotations, or a separate supporting visual "
-            "only when the user explicitly requests a separate comparison. Use multiple grids only when the user explicitly asks for "
-            "independent panels or when the visual meanings cannot share an x-domain. "
-            "Do not create a graphical layer whose only purpose is to display a textual trend/direction label or another scalar conclusion. "
-            "A trend claim is inspected through its complete contextual series and, when grounded derived series exists, a real fitted or "
-            "smoothed trend series. Put a direction statement in the chart title/summary/legend, never in an artificial one-point scatter. "
-            "A line or area layer must have at least two grounded points after filtering; never encode a one-record scalar or boundary receipt as a line. "
-            "For a localized interval claim, preserve the complete source series and add interval_overlay against the same series. Set "
-            "enable_zoom=true and choose viewport_start/viewport_end from grounded timestamps so the initial viewport strictly contains "
-            "the highlighted interval and real surrounding context. The compiler keeps the complete series reachable and applies filterMode=filter. "
-            "A layer's role and label must be entailed by the field_semantics of its encoded columns. Never present a central estimate "
-            "as a lower bound, upper bound, interval, anomaly, or decision; styling, duplicate layers, and renamed roles do not create "
-            "missing semantics. If any user-required visual meaning is absent from the semantic views, return visual_goals=[] and one "
-            "complete required_data_request instead. Return exactly one branch, and include name plus insight_type in every "
-            "code_interpreter or SQL-owned atomic insight_request. Use anomaly for missing anomaly results, forecast for missing or invalidated prediction "
-            "outputs, and code_interpreter only for derived calculations over valid existing artifacts; code must never replace a "
-            "specialized forecast or anomaly owner. input_evidence must be one exact semantic source_ref from the inventory or null, never prose. "
-            "Text cards and tables are unsupported. "
-            "Do not weaken the requested purpose and do not invent a fallback chart.\n"
+            "organized existing values into views. Return one branch: non-empty visual_goals with required_data_request=null, or an empty "
+            "goal list with one complete owner request. Do not write renderer options, transforms, datasets, or series; select only semantic "
+            "layer intent and fields. Every schema field is required; use null, false, normal, solid, none, primary, or [] when inapplicable. "
+            "Allowed layer_type values are series, event_points, band, interval_overlay, comparison. series/event_points/comparison/interval_overlay "
+            "need x and y; band needs x/lower/upper. A line-like layer needs at least two points; event_points needs one. required_roles need "
+            "same-role layers. interval_overlay uses a multi-point context source and either one interval_source_ref with exact start/end fields, "
+            "or literal start/end values, never both; all interval fields are null for other types. "
+            "Use one cohesive shared plot for related time-aligned information. Preserve the full series for a localized interval, forecast, anomaly, "
+            "or trend claim; forecast additionally needs historical actuals when available. Do not turn scalar summaries or text labels into artificial "
+            "graphic layers, or claim semantics not present in field_semantics. If required meaning is absent, request its owning source instead. "
+            "Owners: sql_query for raw context, anomaly for anomaly outputs, forecast for predictions, and code_interpreter only for derived calculations "
+            "with non-empty insight_requests. input_evidence is an exact source_ref or null. Text cards and tables are unsupported. "
+            "The closed encoding field contract below is the complete executable vocabulary for every layer. Copy a field name "
+            "verbatim from the entry for its source_ref into encodings and interval boundary fields. Field names are identifiers, "
+            "not prose: never translate, paraphrase, or substitute an Insight name, statement, or label for a field identifier. "
+            "When Repair context reports a rejected field, choose a different field from that same contract or return a genuine "
+            "required_data_request; never repeat the rejected identifier. Do not weaken the requested purpose and do not invent a fallback chart.\n"
             f"Visualization request: {request.message}\n"
             f"Visual verification contract: {json.dumps(verification.model_dump(mode='json'), ensure_ascii=False)}\n"
             f"Target Key Insights: {json.dumps(target_insights, ensure_ascii=False)}\n"
             f"Authoritative visual contract: {json.dumps(_visual_contract(request_state), ensure_ascii=False)}\n"
             f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
             f"Repair context: {json.dumps(repair_context, ensure_ascii=False) if repair_context else 'none'}\n"
+            f"Closed encoding field contract: {json.dumps(field_contract, ensure_ascii=False)}\n"
             f"Semantic view inventory: {json.dumps(inventory, ensure_ascii=False)}"
         )
         messages = [("system", prompt), ("user", request.message)]
@@ -1259,11 +1205,18 @@ def _resolve_visualization_lineage_refs(
 
 
 def _verified_insight_inventory(request_state: RequestStateModel) -> list[dict]:
-    return [
-        _insight_prompt_view(insight)
-        for insight in request_state.insight_set.insights
-        if insight.status == "verified"
-    ]
+    # Verification selects semantic Insight identifiers, whereas later planning
+    # needs source refs to materialize their lineage. Keep those namespaces
+    # separate at the decision boundary so the model cannot mistake a
+    # presentation/source ref (``insight:<id>``) for an ``insight_id`` value.
+    inventory = []
+    for insight in request_state.insight_set.insights:
+        if insight.status != "verified":
+            continue
+        item = _insight_prompt_view(insight)
+        item.pop("source_ref", None)
+        inventory.append(item)
+    return inventory
 
 
 def _data_source_inventory(inventory: dict) -> dict:
@@ -1480,6 +1433,36 @@ def _default_source_paths(inventory: dict) -> dict[str, list[str]]:
         if ref and paths:
             result[ref] = paths
     return result
+
+
+def _closed_visual_field_contract(inventory: dict) -> dict[str, list[dict[str, str]]]:
+    """Return the executable chart-field vocabulary for each semantic view.
+
+    Semantic view field names are runtime identifiers, while Insight statements
+    and labels are natural language. Keeping this compact contract adjacent to
+    the IR request prevents a planner from treating descriptive text as a
+    column name without choosing a chart on the tool's behalf.
+    """
+
+    contract: dict[str, list[dict[str, str]]] = {}
+    for view in inventory.get("views", []) if isinstance(inventory.get("views"), list) else []:
+        if not isinstance(view, dict):
+            continue
+        ref = str(view.get("source_ref") or "").strip()
+        fields = view.get("schema_fields") if isinstance(view.get("schema_fields"), list) else []
+        semantics = view.get("field_semantics") if isinstance(view.get("field_semantics"), dict) else {}
+        entries = [
+            {
+                "name": str(field["name"]),
+                "data_type": str(field.get("data_type") or "unknown"),
+                "semantic_role": str(semantics.get(str(field["name"])) or ""),
+            }
+            for field in fields
+            if isinstance(field, dict) and str(field.get("name") or "").strip()
+        ]
+        if ref and entries:
+            contract[ref] = entries
+    return contract
 
 
 def _missing_evidence_required(requirement: VisualizationEvidenceRequest, inventory: dict) -> StructuredToolError:
