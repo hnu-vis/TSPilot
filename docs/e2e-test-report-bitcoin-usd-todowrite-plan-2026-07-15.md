@@ -168,7 +168,7 @@ Loaded 2679 rows across 1 series for query 'from(bucket: "bitcoin")
 
 查询快照：
 
-- [qry_influxdb2-bitcoin-sample_b7690376e354.json](/home/feilvvl/TSPilot-v0.2/cache_data/query_snapshots/qry_influxdb2-bitcoin-sample_b7690376e354.json)
+- [qry_influxdb2-bitcoin-sample_b7690376e354.json](../cache_data/query_snapshots/qry_influxdb2-bitcoin-sample_b7690376e354.json)
 
 ### 3. `insight`
 
@@ -217,7 +217,7 @@ Loaded 2679 rows across 1 series for query 'from(bucket: "bitcoin")
 
 分析快照：
 
-- [ins_evi_influxdb2-bitcoin-sample_from_bucket___bitcoin_____range_start__2023-01-_d336826bdaa2.json](/home/feilvvl/TSPilot-v0.2/cache_data/analysis_snapshots/ins_evi_influxdb2-bitcoin-sample_from_bucket___bitcoin_____range_start__2023-01-_d336826bdaa2.json)
+- [ins_evi_influxdb2-bitcoin-sample_from_bucket___bitcoin_____range_start__2023-01-_d336826bdaa2.json](../cache_data/analysis_snapshots/ins_evi_influxdb2-bitcoin-sample_from_bucket___bitcoin_____range_start__2023-01-_d336826bdaa2.json)
 
 ### 4. `format_answer`
 

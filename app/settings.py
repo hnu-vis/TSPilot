@@ -26,7 +26,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_title: str = "TSPilot v0.2 API"
+    app_title: str = "TSPilot v0.1 API"
     app_version: str = "0.1.0"
     docs_url: str = "/docs"
     redoc_url: str = "/redoc"

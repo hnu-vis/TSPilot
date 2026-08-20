@@ -2,7 +2,7 @@
 
 - Date: 2026-07-30
 - Time: 18:42 CST
-- Workspace: `/home/feilvvl/TSPilot-v0.2`
+- Workspace: `/home/feilvvl/TSPilot-v0.1`
 - Environment: `/home/feilvvl/TSPilot/tspilot_env`
 - Frontend build: not executed
 
@@ -78,7 +78,7 @@ Result:
 ```text
 ============================= test session starts ==============================
 platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0
-rootdir: /home/feilvvl/TSPilot-v0.2
+rootdir: /home/feilvvl/TSPilot-v0.1
 configfile: pyproject.toml
 plugins: anyio-4.13.0, asyncio-1.3.0, langsmith-0.7.36
 asyncio: mode=Mode.STRICT

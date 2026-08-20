@@ -1,6 +1,6 @@
-# TSPilot v0.2 File Specs
+# TSPilot v0.1 File Specs
 
-This document defines the planned code files for TSPilot v0.2 and points to the
+This document defines the planned code files for TSPilot v0.1 and points to the
 specification document for each file.
 
 For the hard architectural boundary between modules, see
@@ -9,7 +9,7 @@ For the hard architectural boundary between modules, see
 ## Planned file tree
 
 ```text
-TSPilot-v0.2/
+TSPilot-v0.1/
 ├── app/
 │   ├── server.py
 │   ├── deps.py

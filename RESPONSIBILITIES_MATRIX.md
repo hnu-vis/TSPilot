@@ -1,4 +1,4 @@
-# TSPilot v0.2 Responsibilities Matrix
+# TSPilot v0.1 Responsibilities Matrix
 
 ## Canonical rules
 

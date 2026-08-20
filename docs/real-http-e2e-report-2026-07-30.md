@@ -2,7 +2,7 @@
 
 - Date: 2026-07-30
 - Time window: 18:48-19:01 CST
-- Workspace: `/home/feilvvl/TSPilot-v0.2`
+- Workspace: `/home/feilvvl/TSPilot-v0.1`
 - Environment: `/home/feilvvl/TSPilot/tspilot_env`
 - Backend under test: real FastAPI service on `127.0.0.1:18081`
 - LLM path: real configured `ChatOpenAI` from project `.env`
@@ -42,7 +42,7 @@ Configuration checks:
 settings_OPENAI_API_KEY=True
 settings_OPENAI_API_BASE=True
 settings_OPENAI_MODEL=gpt-4o-mini
-database config dir=/home/feilvvl/TSPilot-v0.2/configs/databases
+database config dir=/home/feilvvl/TSPilot-v0.1/configs/databases
 InfluxDB localhost:18086 reachable=True
 ```
 

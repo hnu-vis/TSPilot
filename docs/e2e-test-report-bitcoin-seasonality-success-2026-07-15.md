@@ -1,7 +1,7 @@
 # Bitcoin USD 周期性端到端测试报告
 
 日期: 2026-07-15  
-项目: `TSPilot-v0.2`  
+项目: `TSPilot-v0.1`
 测试类型: 真实 HTTP 端到端测试  
 服务入口: `http://127.0.0.1:5680`
 
@@ -61,7 +61,7 @@ Content-Type: application/json
 
 本次成功完成的真实响应文件:
 
-- [cache_data/bitcoin_e2e_attempt_1.json](/home/feilvvl/TSPilot-v0.2/cache_data/bitcoin_e2e_attempt_1.json)
+- [cache_data/bitcoin_e2e_attempt_1.json](../cache_data/bitcoin_e2e_attempt_1.json)
 
 关键字段:
 
@@ -332,5 +332,5 @@ value 在该时间范围内没有明显周期性。异常检测发现 6 个异�
 
 ## 7. 附件
 
-- 成功响应原文: [cache_data/bitcoin_e2e_attempt_1.json](/home/feilvvl/TSPilot-v0.2/cache_data/bitcoin_e2e_attempt_1.json)
-- 之前失败样例: [cache_data/bitcoin_e2e_response_2026-07-15.json](/home/feilvvl/TSPilot-v0.2/cache_data/bitcoin_e2e_response_2026-07-15.json)
+- 成功响应原文: [cache_data/bitcoin_e2e_attempt_1.json](../cache_data/bitcoin_e2e_attempt_1.json)
+- 之前失败样例: [cache_data/bitcoin_e2e_response_2026-07-15.json](../cache_data/bitcoin_e2e_response_2026-07-15.json)

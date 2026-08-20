@@ -13,18 +13,18 @@
 
 运行环境：
 
-- 仓库：`TSPilot-v0.2`
+- 仓库：`TSPilot-v0.1`
 - 模型：`gpt-5.4-mini`
 - 配置来源：本仓库 `.env`
 
 接口入口：
 
-- [app/routes/chat.py](/home/feilvvl/TSPilot-v0.2/app/routes/chat.py)
+- [app/routes/chat.py](../app/routes/chat.py)
 
 执行编排：
 
-- [runtime/react_loop.py](/home/feilvvl/TSPilot-v0.2/runtime/react_loop.py)
-- [runtime/action_policy.py](/home/feilvvl/TSPilot-v0.2/runtime/action_policy.py)
+- [runtime/react_loop.py](../runtime/react_loop.py)
+- [runtime/action_policy.py](../runtime/action_policy.py)
 
 ## 2. 真实请求
 
@@ -352,4 +352,4 @@ Observation 关键输出：
 
 如果要看完整测试矩阵和 fake/real 的对照说明，可以看：
 
-- [react-e2e-test-report.md](/home/feilvvl/TSPilot-v0.2/docs/react-e2e-test-report.md)
+- [react-e2e-test-report.md](react-e2e-test-report.md)

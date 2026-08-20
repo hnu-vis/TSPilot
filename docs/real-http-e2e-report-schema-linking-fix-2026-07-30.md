@@ -1,7 +1,7 @@
 # Real HTTP E2E Report: Schema Linking Fix
 
 - Date: 2026-07-30
-- Workspace: `/home/feilvvl/TSPilot-v0.2`
+- Workspace: `/home/feilvvl/TSPilot-v0.1`
 - Environment: `/home/feilvvl/TSPilot/tspilot_env`
 - Backend: real FastAPI on `127.0.0.1:18081`
 - LLM: real configured `ChatOpenAI` from project `.env`

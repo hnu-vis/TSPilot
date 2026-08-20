@@ -2,7 +2,7 @@
 
 ## 1. 测试目标
 
-验证 `TSPilot-v0.2` 在真实服务进程、真实模型配置、真实外部 HTTP 请求下，是否能完成以下完整链路：
+验证 `TSPilot-v0.1` 在真实服务进程、真实模型配置、真实外部 HTTP 请求下，是否能完成以下完整链路：
 
 1. 接收用户问题
 2. 规划任务
@@ -362,7 +362,7 @@ appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -
 {
   "success": true,
   "summary": "appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。 appliances_energy_wh 的最高值为 430.00，最低值为 30.00。 异常检测发现 4 个异常点，典型异常包括 2016-01-11T19:00:00=430.0, 2016-01-11T22:30:00=390.0, 2016-01-12T01:00:00=380.0。 appliances_energy_wh 的短期预测共 12 个点，预测区间内整体下降，从 71.01 变化到 59.68。",
-  "title": "TSPilot v0.2 Analysis",
+  "title": "TSPilot v0.1 Analysis",
   "section_types": [
     "summary",
     "plan",

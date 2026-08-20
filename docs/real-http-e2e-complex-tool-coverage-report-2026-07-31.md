@@ -17,7 +17,7 @@
 
 ## 测试环境
 
-- 项目路径：`/home/feilvvl/TSPilot-v0.2`
+- 项目路径：`/home/feilvvl/TSPilot-v0.1`
 - Python 环境：`/home/feilvvl/TSPilot/tspilot_env`
 - 服务命令：`/home/feilvvl/TSPilot/tspilot_env/bin/python -m uvicorn app.server:app --host 127.0.0.1 --port 18084`
 - 请求方式：真实 HTTP POST `/api/v1/chat`，`stream=true`

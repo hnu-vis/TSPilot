@@ -45,7 +45,7 @@ POST /api/v1/chat
 
 完整响应已保存到：
 
-- [cache_data/bitcoin_e2e_rerun_2026-07-15.json](/home/feilvvl/TSPilot-v0.2/cache_data/bitcoin_e2e_rerun_2026-07-15.json)
+- [cache_data/bitcoin_e2e_rerun_2026-07-15.json](../cache_data/bitcoin_e2e_rerun_2026-07-15.json)
 
 ## 真实执行过程
 

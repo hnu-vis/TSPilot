@@ -1,6 +1,6 @@
-# TSPilot v0.2 Startup Guide
+# TSPilot v0.1 Startup Guide
 
-This repository contains the TSPilot v0.2 backend and React frontend.
+This repository contains the TSPilot v0.1 backend and React frontend.
 
 ## Prerequisites
 

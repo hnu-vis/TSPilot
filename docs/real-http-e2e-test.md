@@ -414,7 +414,7 @@ Observation Payload 关键字段：
 
 ```json
 {
-  "title": "TSPilot v0.2 Analysis",
+  "title": "TSPilot v0.1 Analysis",
   "summary": "appliances_energy_wh 在所选时间范围内整体下降，变化幅度约为 -33.33%。",
   "section_types": ["insights", "forecast", "anomaly"],
   "reference_types": ["query", "insight", "forecast", "anomaly"],
@@ -607,9 +607,9 @@ data: {"conversation_id":"conv_27aeb02530d3","request_id":"req_1fc41743dc8a","an
 如果要看：
 
 - fake 和真实混合的总测试说明：
-  - [react-e2e-test-report.md](/home/feilvvl/TSPilot-v0.2/docs/react-e2e-test-report.md)
+  - [react-e2e-test-report.md](react-e2e-test-report.md)
 - 仅真实模型请求记录：
-  - [real-e2e-request.md](/home/feilvvl/TSPilot-v0.2/docs/real-e2e-request.md)
+  - [real-e2e-request.md](real-e2e-request.md)
 
 这份文档的定位是：
 

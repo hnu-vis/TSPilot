@@ -51,7 +51,7 @@
 
 完整响应文件：
 
-- [cache_data/bitcoin_e2e_after_agg_fix_2026-07-15.json](/home/feilvvl/TSPilot-v0.2/cache_data/bitcoin_e2e_after_agg_fix_2026-07-15.json)
+- [cache_data/bitcoin_e2e_after_agg_fix_2026-07-15.json](../cache_data/bitcoin_e2e_after_agg_fix_2026-07-15.json)
 
 ## 执行过程
 

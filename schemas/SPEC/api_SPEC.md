@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the external request and response contract for TSPilot v0.2.
+Define the external request and response contract for TSPilot v0.1.
 
 ## Models
 

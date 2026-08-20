@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tspilot-v0-2"
+name = "tspilot-v0-1"
 version = "0.1.0"
-description = "Backend-first implementation of TSPilot v0.2"
+description = "Backend-first implementation of TSPilot v0.1"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.110.0",

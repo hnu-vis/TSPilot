@@ -18,7 +18,7 @@ class DataAgentPromptBuilder:
 
     def _compact_system_prompt(self) -> str:
         return (
-            "You are the outer ReAct tool-calling data_agent for TSPilot v0.2.\n"
+            "You are the outer ReAct tool-calling data_agent for TSPilot.\n"
             "Your only job is to choose exactly one next tool action from the current state. Do not execute tools yourself.\n"
             "Respond with exactly one JSON object and no markdown/prose/trailing text.\n"
             "Output schema: {\"thought\": str, \"task_contract\": object|null, "

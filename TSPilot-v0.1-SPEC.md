@@ -1,4 +1,4 @@
-# TSPilot v0.2 SPEC
+# TSPilot v0.1 SPEC
 
 ## Goal
 
@@ -96,7 +96,7 @@ The canonical file groups are:
 - evidence and analysis are separated from presentation
 - the final answer is traceable to evidence and verified facts
 
-## Non-goals for v0.2
+## Non-goals for v0.1
 
 - multi-agent orchestration
 - graph routing

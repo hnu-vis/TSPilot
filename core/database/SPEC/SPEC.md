@@ -12,7 +12,7 @@ Core/Database 是 TSPilot 的时序数据库抽象层，提供统一的数据库
 
 当前推荐的解耦查询架构见：
 
-- [query_architecture_SPEC.md](/home/feilvvl/TSPilot-v0.2/core/database/SPEC/query_architecture_SPEC.md)
+- [query_architecture_SPEC.md](query_architecture_SPEC.md)
 
 ## 2. 核心接口 / 关键类
 
