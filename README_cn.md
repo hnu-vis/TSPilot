@@ -183,20 +183,18 @@ TSPilot 支持统一接入和管理多种时序数据库。数据库可以直接
 
 不同数据库的连接方式和运行依赖可能有所差异，具体配置请参考对应的数据库说明。
 
-有关连接器接口和配置方式，请参阅：
-
-- [数据库配置规范](configs/databases/SPEC/SPEC.md)
-- [数据库模块规范](core/database/SPEC/SPEC.md)
+具体设置方式请参阅[数据库配置指南](docs/guides/database-configuration.md)。
 
 ## 📚 项目文档
 
 | | 目标 | 文档 |
 |:---:|---|---|
-| 🧭 | 了解系统设计与能力边界 | [系统规范](TSPilot-v0.1-SPEC.md) |
-| 📁 | 查看项目文件规范 | [文件规范](SPEC.md) |
-| 🧩 | 了解模块职责边界 | [职责矩阵](RESPONSIBILITIES_MATRIX.md) |
-| 🔗 | 查看 API 数据契约 | [API 规范](schemas/SPEC/api_SPEC.md) |
-| 🗄️ | 接入时序数据库 | [数据库配置规范](configs/databases/SPEC/SPEC.md) |
+| 🧭 | 了解系统设计与能力边界 | [系统架构](docs/architecture/system.md) |
+| 🔗 | 接入聊天 API | [聊天 API 契约](docs/contracts/api.md) |
+| 📈 | 了解折线图数据结构 | [可视化契约](docs/contracts/visualization.md) |
+| 🗄️ | 接入时序数据库 | [数据库配置指南](docs/guides/database-configuration.md) |
+
+全部公共文档请参阅[文档索引](docs/README.md)。
 
 ## 🤝 参与贡献
 

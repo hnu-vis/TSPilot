@@ -36,6 +36,7 @@ cache_data/
 notes/
 tmp/
 scratch/
+/develop_docs/
 
 
 .agents/

@@ -183,20 +183,18 @@ TSPilot provides unified access to multiple time-series databases. Databases can
 
 Connection methods and runtime dependencies vary across databases. Refer to the corresponding database documentation for details.
 
-For connector and configuration details, see:
-
-- [Database configuration specification](configs/databases/SPEC/SPEC.md)
-- [Database module specification](core/database/SPEC/SPEC.md)
+For setup details, see the [database configuration guide](docs/guides/database-configuration.md).
 
 ## 📚 Project documentation
 
 | | Goal | Document |
 |:---:|---|---|
-| 🧭 | Understand system design and capability boundaries | [System specification](TSPilot-v0.1-SPEC.md) |
-| 📁 | Review repository conventions | [File specification](SPEC.md) |
-| 🧩 | Understand module responsibilities | [Responsibility matrix](RESPONSIBILITIES_MATRIX.md) |
-| 🔗 | Review public API contracts | [API specification](schemas/SPEC/api_SPEC.md) |
-| 🗄️ | Connect a time-series database | [Database configuration specification](configs/databases/SPEC/SPEC.md) |
+| 🧭 | Understand system design and capability boundaries | [System architecture](docs/architecture/system.md) |
+| 🔗 | Integrate with the chat API | [Chat API contract](docs/contracts/api.md) |
+| 📈 | Understand the LineChart payload | [Visualization contract](docs/contracts/visualization.md) |
+| 🗄️ | Connect a time-series database | [Database configuration guide](docs/guides/database-configuration.md) |
+
+See the [documentation index](docs/README.md) for the complete public documentation set.
 
 ## 🤝 Contributing
 
