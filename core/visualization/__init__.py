@@ -4,18 +4,15 @@ from core.visualization.materializer import (
     IncompatibleVisualDomainError,
     InvalidPresentationLineageError,
     PresentationCatalog,
-    VisualizationMaterializer,
-    VisualizationSemanticValidator,
 )
+from core.visualization.linechart import LineChartCompiler, LineChartValidator
 from core.visualization.artifact_store import VisualizationArtifactStore
-from core.visualization.render_audit import PlaywrightEChartsRenderAuditor
 
 __all__ = [
     "InvalidPresentationLineageError",
     "IncompatibleVisualDomainError",
     "PresentationCatalog",
-    "VisualizationMaterializer",
-    "VisualizationSemanticValidator",
+    "LineChartCompiler",
+    "LineChartValidator",
     "VisualizationArtifactStore",
-    "PlaywrightEChartsRenderAuditor",
 ]

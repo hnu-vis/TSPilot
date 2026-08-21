@@ -10,34 +10,15 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from schemas.key_insight import KeyInsight, InsightItem
-from schemas.output import VisualGoal, VisualLayerPlan, VisualSemanticPlan
 from schemas.state import RequestStateModel
 from schemas.visual_verification import VisualizationVerification
 from schemas.visualization import (
     VisualizationAccessibility,
     VisualizationBinding,
-    ChartSemanticTarget,
-    IntervalSemanticTarget,
-    ReferenceSemanticTarget,
-    RelationSemanticTarget,
-    VisualizationChannelBinding,
-    VisualizationCoordinateSpace,
-    VisualizationDataMark,
     VisualizationDataView,
     VisualizationField,
-    VisualizationGuide,
-    VisualizationGuideEntry,
-    VisualizationGuideSection,
-    VisualizationLayout,
-    VisualizationLayoutCell,
-    VisualizationMetric,
     VisualizationPayload,
     VisualizationRecord,
-    VisualizationScale,
-    VisualizationSemantic,
-    VisualizationSemanticContent,
-    XSemanticTarget,
-    XYSemanticTarget,
 )
 
 

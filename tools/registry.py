@@ -21,7 +21,7 @@ from tools.sql_query import SqlQueryInput, SqlQueryTool
 from tools.terminate import TerminateInput, TerminateTool
 from tools.todowrite import TodoWriteInput, TodoWriteResult, TodoWriteTool
 from tools.visualization import VisualizationInput, VisualizationResult, VisualizationTool
-from core.visualization import PlaywrightEChartsRenderAuditor, VisualizationArtifactStore
+from core.visualization import VisualizationArtifactStore
 from runtime.timeout_policy import TimeoutPolicy, load_timeout_policy
 
 
@@ -213,13 +213,6 @@ def build_tool_registry(
                 llm=llm,
                 artifact_store=visualization_artifact_store,
                 llm_timeout_seconds=timeout_policy.tool("visualization").stage_seconds("llm_call_seconds"),
-                render_auditor=PlaywrightEChartsRenderAuditor(
-                    llm=llm,
-                    audit_url=settings.visualization_audit_url,
-                    llm_timeout_seconds=timeout_policy.tool("visualization").stage_seconds("llm_call_seconds"),
-                    navigation_timeout_seconds=timeout_policy.tool("visualization").stage_seconds("browser_navigation_seconds"),
-                    render_timeout_seconds=timeout_policy.tool("visualization").stage_seconds("browser_render_seconds"),
-                ),
             ),
             prompt_visible=True,
             runtime_access="request_state_read",

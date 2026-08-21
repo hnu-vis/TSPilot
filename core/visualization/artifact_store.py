@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import threading
 
+from pydantic import ValidationError
+
 from schemas.visualization import VisualizationPayload
 
 
@@ -48,10 +50,18 @@ class VisualizationArtifactStore:
         if not target.is_file():
             return None
         with self._lock:
-            payload = json.loads(target.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
             if not isinstance(payload, dict) or payload.get("schema_version") != "4":
                 return None
-            return VisualizationPayload.model_validate(payload)
+            try:
+                return VisualizationPayload.model_validate(payload)
+            except ValidationError:
+                # Old V3 and pre-LineChart V4 artifacts remain on disk but are
+                # intentionally not migrated or interpreted by the new runtime.
+                return None
 
     def descriptor(self, visualization: VisualizationPayload) -> VisualizationPayload:
         views = []

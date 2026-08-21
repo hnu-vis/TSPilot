@@ -970,23 +970,97 @@ def _evidence_refs_from_payload(payload: dict) -> list[str]:
     return refs
 
 
+def _prompt_json(text: str, marker: str):
+    if marker not in text:
+        return None
+    chunk = text.split(marker, 1)[1].lstrip()
+    try:
+        return json.JSONDecoder().raw_decode(chunk)[0]
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _fake_visual_content_plan(prompt_text: str) -> _FakeResponse:
+    inventory = _prompt_json(prompt_text, "Grounded source inventory:") or {}
+    target_ids = _prompt_json(prompt_text, "Requested target Insight ids:") or []
+    sources = [item for item in inventory.get("sources", []) if isinstance(item, dict)]
+    host = next((
+        item for item in sources
+        if item.get("kind") == "data_view"
+        and int(item.get("row_count") or 0) >= 2
+        and any(field.get("data_type") == "time" for field in item.get("schema_fields") or [])
+        and any(field.get("data_type") == "number" for field in item.get("schema_fields") or [])
+    ), None)
+    if host is None:
+        return _FakeResponse(json.dumps({
+            "visual_question": None, "interpretation": None, "target_insight_ids": [], "goals": [],
+            "required_data_request": {
+                "required_action": "sql_query", "purpose": "load a complete time series", "message": None,
+                "required_shape": "timeseries", "required_fields": ["timestamp", "value"],
+                "required_properties": ["at least two observations"], "input_evidence": None,
+                "input_source_refs": [], "insight_requests": [],
+            },
+        }, ensure_ascii=False))
+    source_ref = str(host["source_ref"])
+    return _FakeResponse(json.dumps({
+        "visual_question": "Does the complete series support the requested analytical conclusion?",
+        "interpretation": "Read the complete contextual line and its linked evidence.",
+        "target_insight_ids": target_ids,
+        "goals": [{
+            "goal_id": "primary", "purpose": "verify the requested conclusion", "title": "Observed series",
+            "summary": "Complete grounded context.", "priority": "primary", "host_source_ref": source_ref,
+            "content": [{
+                "content_id": "context", "source_ref": source_ref, "insight_ids": target_ids,
+                "purpose": "complete contextual series", "importance": "primary",
+            }],
+            "required_interactions": ["tooltip", "zoom", "evidence_link"],
+        }],
+        "required_data_request": None,
+    }, ensure_ascii=False))
+
+
+def _fake_linechart_plan(prompt_text: str) -> _FakeResponse:
+    content = _prompt_json(prompt_text, "Visual content plan:") or {}
+    inventory = _prompt_json(prompt_text, "Grounded source inventory:") or {}
+    sources = {
+        str(item.get("source_ref")): item
+        for item in inventory.get("sources", [])
+        if isinstance(item, dict) and item.get("source_ref")
+    }
+    charts = []
+    for goal in content.get("goals") or []:
+        source_ref = str(goal.get("host_source_ref") or "")
+        source = sources.get(source_ref, {})
+        fields = source.get("schema_fields") or []
+        x_field = next((str(item["name"]) for item in fields if item.get("data_type") == "time"), "timestamp")
+        y_field = next((str(item["name"]) for item in fields if item.get("data_type") == "number"), "value")
+        charts.append({
+            "goal_id": goal.get("goal_id"), "x_axis_type": "time", "x_axis_label": "Time",
+            "y_axes": [{"axis_id": "value", "label": y_field, "measure": y_field, "unit": None, "scale": "linear"}],
+            "host_line": {
+                "content_id": (goal.get("content") or [{}])[0].get("content_id"),
+                "role": "complete context", "importance": "primary",
+                "label": "Observed", "x_field": x_field, "y_field": y_field,
+                "y_axis_id": "value", "line_style": "solid", "symbol": "none",
+            },
+            "lines": [],
+            "points": [], "bands": [], "intervals": [], "reference_lines": [], "annotations": [],
+            "legend_visible": False, "legend_position": "top", "tooltip_mode": "axis",
+            "zoom_enabled": True, "zoom_start": None, "zoom_end": None,
+        })
+    return _FakeResponse(json.dumps({"charts": charts, "required_data_request": None}, ensure_ascii=False))
+
+
 def _query_generation_response(user_prompt: str, messages=None) -> _FakeResponse | None:
     prompt_text = "\n".join(
         str(message[1])
         for message in (messages or [])
         if isinstance(message, (tuple, list)) and len(message) > 1
     )
-    if "You are the visual verification planner inside" in prompt_text:
-        return _FakeResponse(json.dumps({"outcome": {
-                "decision": "not_visualizable",
-                "target_insight_ids": [],
-                "verification_question": None,
-                "interpretation": "The fake unit-test model cannot inspect a rendered visual relationship.",
-                "visual_relation": None,
-                "required_context": [],
-                "non_visual_insight_ids": [],
-                "required_data_request": None,
-            }}, ensure_ascii=False))
+    if "visual-content planner for a LineChart-first" in prompt_text:
+        return _fake_visual_content_plan(prompt_text)
+    if "compose complete grounded LineChart plans" in prompt_text:
+        return _fake_linechart_plan(prompt_text)
     try:
         internal_payload = json.loads(user_prompt)
     except (TypeError, json.JSONDecodeError):

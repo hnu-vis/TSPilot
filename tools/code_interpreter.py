@@ -134,6 +134,12 @@ class CodeInterpreterTool(BaseTool):
         if not sources and request_state is not None:
             evidence_ref = f"evidence:{evidence.evidence_id}"
             sources = resolve_artifact_sources(request_state, [evidence_ref])
+        elif (
+            sources
+            and request_state is not None
+            and _requires_anomaly_adjusted_series(validated_input)
+        ):
+            sources = _include_database_ancestor_source(request_state, sources, evidence)
         code = str(validated_input.code or "").strip()
         generated_code = not code
         response_language = getattr(request_state, "response_language", "en")
@@ -171,6 +177,8 @@ class CodeInterpreterTool(BaseTool):
             else None
         )
         context["input_insights"] = input_insights
+        context["analysis_constraints"] = dict(validated_input.constraints)
+        context["authoritative_anomaly_usage_required"] = _requires_anomaly_adjusted_series(validated_input)
         anomaly_context = _authoritative_anomaly_context(request_state, evidence.evidence_id)
         if anomaly_context:
             context["anomaly_context"] = anomaly_context
@@ -217,6 +225,14 @@ class CodeInterpreterTool(BaseTool):
                     requests=validated_input.insight_requests,
                     derived_name_map=derived_name_map,
                 )
+                anomaly_usage_error = _authoritative_anomaly_usage_error(
+                    code=code,
+                    computed=computed,
+                    context=context,
+                    input_source_refs=input_source_refs,
+                )
+                if anomaly_usage_error:
+                    raise AnalysisCodeError(anomaly_usage_error)
                 referenced_derived_ids = {
                     evidence_id
                     for insight in computed
@@ -294,8 +310,10 @@ class CodeInterpreterTool(BaseTool):
         system = (
             "Choose the one grounded artifact source that should back the canonical df for this calculation. "
             "Select by semantic ownership, not list order: calculations about an existing forecast should use the forecast artifact; "
-            "calculations about detected anomalies should use the anomaly artifact; raw evidence is primary only for calculations "
-            "whose requested values are owned by the observations themselves. Other sources remain available for composition. "
+            "calculations whose result is the anomaly set or anomaly scores should use the anomaly artifact. An anomaly artifact is "
+            "only an exclusion overlay when the goal asks for metrics over observations after removing detected anomalies; in that "
+            "case the complete observation Evidence must be primary and the anomaly artifact remains auxiliary. Raw evidence is "
+            "primary whenever the requested values are owned by the observations themselves. Other sources remain available for composition. "
             "Return exactly one source_ref copied verbatim from artifact_sources and a concise reason."
         )
         messages = [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
@@ -433,6 +451,11 @@ class CodeInterpreterTool(BaseTool):
             "Never duplicate, filter, or rename the selected raw Evidence as derived Evidence when its values are unchanged; consumers already have the complete source artifact. "
             "Never use DataFrame.shape or values.tolist() as artifact rows; use df.to_dict(orient='records'). Use exact authoritative anomaly_context points when present; do not run another detector. "
             "When anomaly_context is used, include its exact source_ref in every affected calculation_trace. "
+            "When the goal, analysis constraints, or Insight requirements request a cleaned/anomaly-excluded observation "
+            "series, an explicit anomaly artifact is authoritative: exclude its exact identities from the primary observations "
+            "and include that anomaly source_ref in every affected Insight trace. An anomaly artifact used only as unrelated "
+            "context does not alter calculations owned by another source. Merely citing an applicable anomaly artifact without "
+            "applying it is invalid. "
             "Convert numpy/pandas values and timestamps to JSON-native scalars and ISO strings. Never return NaN or Infinity."
         )
         payload = {
@@ -441,6 +464,7 @@ class CodeInterpreterTool(BaseTool):
             "canonical_inputs": _analysis_schema_contract(context),
             "primary_source": context.get("primary_source"),
             "input_insights": context.get("input_insights", []),
+            "analysis_constraints": context.get("analysis_constraints", {}),
             "anomaly_context": _anomaly_prompt_contract(context.get("anomaly_context")),
             "artifact_sources": source_prompt_manifest(context.get("sources", [])),
             "repair_context": repair_context,
@@ -632,6 +656,15 @@ def _resolve_database_evidence(value, request_state) -> DatabaseEvidence | None:
         raise ValueError(f"code_interpreter requires grounded database_evidence: {exc}") from exc
 
 
+def _include_database_ancestor_source(request_state, sources: list[dict], evidence: DatabaseEvidence) -> list[dict]:
+    """Expose a specialized artifact's complete database ancestor as an auxiliary source."""
+
+    evidence_ref = f"evidence:{evidence.evidence_id}"
+    if any(str(source.get("source_ref")) == evidence_ref for source in sources):
+        return sources
+    return [*sources, *resolve_artifact_sources(request_state, [evidence_ref])]
+
+
 def _analysis_inputs(evidence: DatabaseEvidence) -> tuple[list[dict], list[dict], list[str]]:
     data = evidence.data or {}
     rows = [dict(item) for item in data.get("rows", []) if isinstance(item, dict)]
@@ -732,6 +765,70 @@ def _preflight_analysis_code(
                 "hardcoded result literals are not accepted"
             )
     return None
+
+
+def _authoritative_anomaly_usage_error(
+    *,
+    code: str,
+    computed: list[ComputedInsight],
+    context: dict,
+    input_source_refs: list[str],
+) -> str | None:
+    """Require transparent use of an explicitly supplied anomaly artifact.
+
+    This is a semantic execution invariant, not an outlier detector: the LLM still
+    authors the cleaning calculation and repairs it when the invariant is missing.
+    """
+
+    anomaly = context.get("anomaly_context") if isinstance(context, dict) else None
+    if not isinstance(anomaly, dict) or not anomaly.get("anomaly_points"):
+        return None
+    if context.get("authoritative_anomaly_usage_required") is not True:
+        return None
+    explicit_refs = [str(ref) for ref in input_source_refs if str(ref).startswith("anomaly:")]
+    if not explicit_refs:
+        return None
+    source_ref = str(anomaly.get("source_ref") or explicit_refs[0])
+    loaded_names = prepare_analysis_code(code).loaded_names
+    if not loaded_names.intersection({"anomaly_context", "analysis_context", "source_by_ref", "sources"}):
+        return (
+            f"explicit anomaly source '{source_ref}' was not consumed. Rebuild the computation from the primary series "
+            "after excluding the exact authoritative anomaly identities; do not redetect anomalies."
+        )
+    missing_trace = [
+        item.insight_key
+        for item in computed
+        if source_ref not in _flatten_trace(item.calculation_trace)
+    ]
+    if missing_trace:
+        return (
+            f"explicit anomaly source '{source_ref}' is absent from calculation_trace for {missing_trace}. "
+            "Apply the authoritative anomaly exclusions and record the exact source_ref in every affected trace."
+        )
+    return None
+
+
+def _requires_anomaly_adjusted_series(value: CodeInterpreterInput) -> bool:
+    """Recognize an explicit semantic request to compute over an anomaly-adjusted series."""
+
+    contract = {
+        "goal": value.analysis_goal,
+        "constraints": value.constraints,
+        "requirements": [item.requirements for item in value.insight_requests],
+    }
+    text = json.dumps(contract, ensure_ascii=False, default=str).casefold()
+    return any(token in text for token in (
+        "exclude_anomal", "anomaly_exclusion", "anomaly-adjusted", "outlier_exclusion",
+        "exclude_outlier", "cleaned_series", "排除异常", "剔除异常", "排除离群", "剔除离群",
+    ))
+
+
+def _flatten_trace(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(f"{key} {_flatten_trace(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return " ".join(_flatten_trace(item) for item in value)
+    return str(value or "")
 
 
 def _llm_content(response) -> str:

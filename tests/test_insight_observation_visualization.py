@@ -5,13 +5,17 @@ import asyncio
 import pytest
 
 from core.key_insight.runtime import register_key_insights_from_payload
-from core.visualization import VisualizationMaterializer
+from core.visualization import LineChartCompiler, PresentationCatalog
 from runtime.request_state import build_request_state, public_final_answer
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightItem
 from schemas.database_context import DatabaseContext
-from schemas.output import AnswerClaim, FinalAnswer, FinalResponsePlan, PlannedAnswerSection, VisualGoal, VisualLayerPlan
+from schemas.output import AnswerClaim, FinalAnswer, FinalResponsePlan, PlannedAnswerSection
+from schemas.linechart_plan import (
+    LineChartGoalPlan, LineChartPlan, LineChartYAxisPlan, LinePlan,
+    VisualContentGoal, VisualContentItem, VisualContentPlan,
+)
 from schemas.state import RequestStateModel
 from schemas.tool import ToolCall
 from tools.anomaly import AnomalyInput
@@ -105,15 +109,30 @@ def test_collection_insight_preserves_item_identity_for_visualization():
     assert [item.item_id for item in insight.items] == ["day-1", "day-2", "day-3"]
     assert insight.evidence_refs
 
-    visualization = VisualizationMaterializer(request_state).materialize(VisualGoal(
-        purpose="show recent observations", title="Recent three days",
-        required_roles=["observations"],
-        layers=[VisualLayerPlan(
-            role="observations", source_ref=f"insight:{insight.insight_id}", mark="line",
-            encoding={"x": "timestamp", "y": "value"},
+    source_ref = f"insight:{insight.insight_id}"
+    content = VisualContentPlan(
+        visual_question="What are the recent observations?", interpretation="Read the complete line.",
+        target_insight_ids=[insight.insight_id],
+        goals=[VisualContentGoal(
+            goal_id="recent", purpose="show recent observations", title="Recent three days",
+            priority="primary", host_source_ref=source_ref,
+            content=[VisualContentItem(
+                content_id="observations", source_ref=source_ref, insight_ids=[insight.insight_id],
+                purpose="recent observations", importance="primary",
+            )],
         )],
-    ))
-    assert visualization.schema_version == "3"
+    )
+    plan = LineChartPlan(charts=[LineChartGoalPlan(
+        goal_id="recent", x_axis_type="time",
+        y_axes=[LineChartYAxisPlan(axis_id="value", measure="price")],
+        host_line=LinePlan(
+            content_id="observations", role="observations",
+            importance="primary", x_field="timestamp", y_field="value",
+            y_axis_id="value",
+        ),
+    )])
+    visualization = LineChartCompiler(PresentationCatalog(request_state)).compile(content, plan)[0]
+    assert visualization.schema_version == "4"
     assert len(visualization.bindings) == 3
     assert {binding.item_id for binding in visualization.bindings} == {"day-1", "day-2", "day-3"}
 

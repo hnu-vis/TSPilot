@@ -39,7 +39,6 @@ class _BinderLlm:
 
 class _NeedsForecastCalculationLlm:
     async def ainvoke(self, messages):
-        prompt = str(messages[0][1])
         requirement = {
             "required_action": "code_interpreter",
             "purpose": "Calculate forecast direction and percentage change",
@@ -55,23 +54,13 @@ class _NeedsForecastCalculationLlm:
                 "insight_type": "change",
             }],
         }
-        if "You define the presentation goal" in prompt:
-            payload = {
-                "decision": "needs_sources",
-                "target_insight_ids": [],
-                "verification_question": None,
-                "interpretation": None,
-                "visual_relation": "forecast_change",
-                "proof_obligations": [],
-                "required_context": ["forecast direction and percentage change"],
-                "non_visual_insight_ids": [],
-                "required_data_request": requirement,
-            }
-            payload = {"outcome": payload}
-        elif "semantic projection stage" in prompt:
-            payload = {"semantic_views": [], "required_data_request": requirement}
-        else:
-            payload = {"visual_goals": [], "required_data_request": requirement}
+        payload = {
+            "visual_question": None,
+            "interpretation": None,
+            "target_insight_ids": [],
+            "goals": [],
+            "required_data_request": requirement,
+        }
         return SimpleNamespace(content=json.dumps(payload), response_metadata={})
 
 

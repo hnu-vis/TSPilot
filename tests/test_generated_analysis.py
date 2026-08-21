@@ -20,7 +20,13 @@ from schemas.analysis import ComputedInsight
 from schemas.key_insight import KeyInsightRequest
 from schemas.timeseries import AnomalyResult
 from schemas.tool import ToolObservation
-from tools.code_interpreter import CodeInterpreterInput, CodeInterpreterTool, _preflight_analysis_code
+from tools.code_interpreter import (
+    CodeInterpreterInput,
+    CodeInterpreterTool,
+    _authoritative_anomaly_usage_error,
+    _include_database_ancestor_source,
+    _preflight_analysis_code,
+)
 
 
 class _AnalysisSpec:
@@ -378,6 +384,57 @@ def test_code_generation_prompt_references_authoritative_anomalies_without_copyi
         "runtime_variable": "anomaly_context",
     }
     assert "987654.321" not in llm.calls[0][1][1]
+
+
+def test_explicit_anomaly_source_requires_execution_and_trace_transparency():
+    context = {
+        "authoritative_anomaly_usage_required": True,
+        "anomaly_context": {
+            "source_ref": "anomaly:anomaly_generated",
+            "anomaly_points": [{"timestamp": "2023-01-01T01:00:00Z", "value": 15.0}],
+        }
+    }
+    computed = [ComputedInsight(
+        insight_key="period_change",
+        value=15.0,
+        calculation_trace={"formula": "last-first"},
+    )]
+    error = _authoritative_anomaly_usage_error(
+        code="result = {'computed_insights': [{'value': float(value.iloc[-1])}], 'derived_evidence': []}",
+        computed=computed,
+        context=context,
+        input_source_refs=["evidence:evi_generated", "anomaly:anomaly_generated"],
+    )
+    assert "was not consumed" in str(error)
+
+    computed[0].calculation_trace = {
+        "operation": "exclude exact authoritative anomaly identities before last-first",
+        "source_ref": "anomaly:anomaly_generated",
+    }
+    assert _authoritative_anomaly_usage_error(
+        code="clean = anomaly_context['anomaly_points']; result = {'computed_insights': [], 'derived_evidence': []}",
+        computed=computed,
+        context=context,
+        input_source_refs=["evidence:evi_generated", "anomaly:anomaly_generated"],
+    ) is None
+
+
+def test_specialized_source_exposes_complete_database_ancestor_for_llm_selection():
+    state = _state()
+    anomaly = AnomalyResult(
+        anomaly_id="anomaly_generated", detector_name="unit",
+        anomaly_points=[{"timestamp": "2023-01-01T01:00:00Z", "value": 15.0}],
+        diagnostics={"resolved_evidence_id": "evi_generated"},
+    )
+    state.anomaly_artifacts[anomaly.anomaly_id] = anomaly
+    from core.artifact_sources import resolve_artifact_sources
+
+    sources = resolve_artifact_sources(state, ["anomaly:anomaly_generated"])
+    expanded = _include_database_ancestor_source(state, sources, _evidence())
+    assert [item["source_ref"] for item in expanded] == [
+        "anomaly:anomaly_generated",
+        "evidence:evi_generated",
+    ]
 
 
 def test_generated_code_preflight_failure_is_repaired_by_llm_before_execution():

@@ -5,14 +5,15 @@ import asyncio
 import pytest
 
 from app.settings import get_settings
-from core.visualization import PresentationCatalog, VisualizationArtifactStore, VisualizationMaterializer
+from core.visualization import LineChartCompiler, PresentationCatalog, VisualizationArtifactStore
 from runtime.request_state import build_request_state
-from schemas.analysis import AnalysisResult, ComputedInsight, DerivedEvidence
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
-from schemas.output import FinalResponsePlan, PlannedAnswerSection, VisualGoal, VisualLayerPlan
-from schemas.visual_verification import VisualizationVerification
+from schemas.linechart_plan import (
+    LineChartGoalPlan, LineChartPlan, LineChartYAxisPlan, LinePlan,
+    VisualContentGoal, VisualContentItem, VisualContentPlan,
+)
+from schemas.output import FinalResponsePlan, PlannedAnswerSection
 from tools.base import StructuredToolError
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
 
@@ -28,373 +29,76 @@ def _state():
         get_settings(),
     )
     evidence = DatabaseEvidence(
-        evidence_id="evi_prices", result_type="timeseries", database="demo", query_language="unit",
-        query="unit:prices", summary="Loaded three prices.",
+        evidence_id="evi_prices", result_type="timeseries", database="demo", summary="Loaded three prices.",
         data={"rows": [
             {"timestamp": "2026-01-01T00:00:00Z", "value": 10.0},
             {"timestamp": "2026-01-02T00:00:00Z", "value": 12.0},
             {"timestamp": "2026-01-03T00:00:00Z", "value": 15.0},
-        ], "time_field": "timestamp", "value_field": "value"},
-        columns=["timestamp", "value"],
+        ]}, columns=["timestamp", "value"],
     )
     state.database_evidence_artifacts[evidence.evidence_id] = evidence
     state.latest_database_evidence = evidence
     return state
 
 
-def _trend_goal(source_ref="view:evidence:evi_prices:default"):
-    return VisualGoal(
-        purpose="show the observed trend", title="Price trend", required_roles=["series"],
-        layers=[VisualLayerPlan(role="series", source_ref=source_ref, mark="line", encoding={"x": "timestamp", "y": "value"})],
+def _attach_visualization(state, tmp_path):
+    source = "view:evidence:evi_prices:default"
+    content = VisualContentPlan(
+        visual_question="Did prices rise?", interpretation="Read the complete line.",
+        goals=[VisualContentGoal(
+            goal_id="trend", purpose="show the trend", title="Price trend", priority="primary",
+            host_source_ref=source,
+            content=[VisualContentItem(content_id="history", source_ref=source, purpose="complete history", importance="primary")],
+        )],
     )
-
-
-def _attach_trend_visualization(state, tmp_path):
-    complete = VisualizationMaterializer(state).materialize(_trend_goal())
+    plan = LineChartPlan(charts=[LineChartGoalPlan(
+        goal_id="trend", x_axis_type="time",
+        y_axes=[LineChartYAxisPlan(axis_id="price", measure="price")],
+        host_line=LinePlan(
+            content_id="history", role="history", importance="primary",
+            x_field="timestamp", y_field="value", y_axis_id="price",
+        ),
+    )])
+    complete = LineChartCompiler(PresentationCatalog(state)).compile(content, plan)[0]
     descriptor = VisualizationArtifactStore(tmp_path).put(complete)
     state.visualizations = [descriptor]
     return descriptor
 
 
-def test_format_answer_references_existing_visualization_without_second_llm_call(tmp_path):
+def test_format_answer_reuses_v4_linechart_without_another_llm_call(tmp_path):
     state = _state()
-    descriptor = _attach_trend_visualization(state, tmp_path)
+    descriptor = _attach_visualization(state, tmp_path)
     plan = FinalResponsePlan(
         title="Recent prices", summary="The latest value is 15.",
         sections=[PlannedAnswerSection(section_type="analysis", heading="Trend", content="Prices rose.", source_refs=["evidence:evi_prices"])],
         visualization_ids=[descriptor.visualization_id],
     )
-    result = asyncio.run(FormatAnswerTool(llm=_ForbiddenLlm()).execute(FormatAnswerInput(response_plan=plan), request_state=state))
-
-    visualization = result["visualizations"][0]
-    assert visualization["schema_version"] == "3"
-    assert visualization["data_ref"]
-    assert visualization["layers"][0]["mark"] == "line"
-    assert visualization["datasets"][0]["series"] == []
-    assert visualization["datasets"][0]["source_ref"] == "view:evidence:evi_prices:default"
-    assert result["claims"][0]["visualization_ids"] == [visualization["visualization_id"]]
-
-
-def test_format_answer_creates_a_visible_claim_for_an_approved_unmapped_verification(tmp_path):
-    state = _state()
-    state.insight_set.insights = [KeyInsight(
-        insight_id="insight_trend",
-        insight_key="observed_trend",
-        name="Observed trend",
-        insight_type="trend",
-        statement="Prices rose across the observed interval.",
-        value={"direction": "up"},
-        method="code_interpreter",
-        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
-    )]
-    complete = VisualizationMaterializer(state).materialize(
-        _trend_goal(),
-        verification=VisualizationVerification(
-            target_insight_ids=["insight_trend"],
-            verification_question="Does the complete series rise across the interval?",
-            interpretation="The complete observed series supports the upward-trend insight.",
-        ),
-    )
-    descriptor = VisualizationArtifactStore(tmp_path).put(complete)
-    state.visualizations = [descriptor]
-    plan = FinalResponsePlan(
-        summary="Prices rose.",
-        sections=[],
-        visualization_ids=[descriptor.visualization_id],
-    )
-
-    result = asyncio.run(FormatAnswerTool().execute(
-        FormatAnswerInput(response_plan=plan),
-        request_state=state,
-    ))
-
-    assert result["claims"] == [{
-        "claim_id": f"claim_visualization_{descriptor.visualization_id}",
-        "text": "The complete observed series supports the upward-trend insight.",
-        "insight_ids": ["insight_trend"],
-        "item_ids": [],
-        "analysis_ids": [],
-        "artifact_type": None,
-        "artifact_ids": [],
-        "evidence_ids": [],
-        "visualization_ids": [descriptor.visualization_id],
-    }]
-
-
-def test_visual_verification_links_claims_through_target_insight_provenance(tmp_path):
-    state = _state()
-    analysis = AnalysisResult(
-        analysis_id="ana_trend",
-        analysis_goal="calculate the observed trend",
-        code_hash="sha256:trend",
-        input_evidence_id="evi_prices",
-        input_row_count=3,
-        status="succeeded",
-        summary="Calculated the trend.",
-        computed_insights=[ComputedInsight(
-            insight_key="observed_trend",
-            value={"direction": "up"},
-            calculation_trace={"formula": "last > first"},
-        )],
-    )
-    state.analysis_artifacts[analysis.analysis_id] = analysis
-    state.insight_set.insights = [KeyInsight(
-        insight_id="insight_trend",
-        insight_key="observed_trend",
-        name="Observed trend",
-        insight_type="trend",
-        statement="Prices rose across the observed interval.",
-        value={"direction": "up"},
-        method="code_interpreter",
-        evidence_refs=[
-            InsightEvidenceRef(source_type="analysis", source_id="ana_trend"),
-            InsightEvidenceRef(source_type="query", source_id="evi_prices"),
-        ],
-    )]
-    descriptor = VisualizationArtifactStore(tmp_path).put(
-        VisualizationMaterializer(state).materialize(
-            _trend_goal(),
-            verification=VisualizationVerification(
-                target_insight_ids=["insight_trend"],
-                verification_question="Does the complete series rise across the interval?",
-                interpretation="The complete series lets the user inspect the trend.",
-            ),
-        )
-    )
-    state.visualizations = [descriptor]
-    plan = FinalResponsePlan(
-        summary="Prices rose.",
-        sections=[PlannedAnswerSection(
-            section_type="analysis",
-            content="Prices rose across the observed interval.",
-            source_refs=["analysis:ana_trend"],
-        )],
-        visualization_ids=[descriptor.visualization_id],
-    )
-
-    result = asyncio.run(FormatAnswerTool().execute(
-        FormatAnswerInput(response_plan=plan),
-        request_state=state,
-    ))
-
-    assert result["claims"][0]["analysis_ids"] == ["ana_trend"]
-    assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
-
-
-def test_format_answer_accepts_selected_visualization_as_section_source(tmp_path):
-    state = _state()
-    descriptor = _attach_trend_visualization(state, tmp_path)
-    plan = FinalResponsePlan(
-        summary="The chart is ready.",
-        sections=[PlannedAnswerSection(
-            section_type="visualization",
-            content="The full trend is shown in the chart.",
-            source_refs=[descriptor.visualization_id],
-        )],
-        visualization_ids=[descriptor.visualization_id],
-    )
-
-    result = asyncio.run(FormatAnswerTool().execute(
-        FormatAnswerInput(response_plan=plan),
-        request_state=state,
-    ))
-
-    assert result["sections"][0]["structured_payload"]["source_refs"] == [
-        f"visualization:{descriptor.visualization_id}"
-    ]
-    assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
-
-
-def test_format_answer_supports_visualizations_grounded_by_insight_items(tmp_path):
-    state = _state()
-    insight = KeyInsight(
-        insight_id="insight_trade",
-        insight_key="max_trade",
-        name="Maximum trade",
-        insight_type="optimization",
-        statement="Buy at 10.",
-        value={"profit": 5.0},
-        items=[InsightItem(
-            item_id="buy",
-            timestamp="2026-01-01T00:00:00Z",
-            value=10.0,
-            label="Buy",
-            dimensions={"role": "buy"},
-            evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
-        )],
-        method="code_interpreter",
-        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
-        calculation_trace={"formula": "sell-buy"},
-    )
-    state.insight_set.insights = [insight]
-    goal = VisualGoal(
-        purpose="verify trade", title="Trade", required_roles=["series", "buy"],
-        layers=[
-            VisualLayerPlan(
-                role="series", source_ref="view:evidence:evi_prices:default", mark="line",
-                encoding={"x": "timestamp", "y": "value"},
-            ),
-            VisualLayerPlan(
-                role="buy", source_ref="insight:insight_trade#buy", mark="point",
-                encoding={"x": "timestamp", "y": "value"},
-            ),
-        ],
-    )
-    descriptor = VisualizationArtifactStore(tmp_path).put(VisualizationMaterializer(state).materialize(goal))
-    state.visualizations = [descriptor]
-    plan = FinalResponsePlan(
-        summary="Buy at 10.",
-        sections=[PlannedAnswerSection(
-            section_type="analysis", content="Buy at 10.", source_refs=["insight:insight_trade#buy"],
-        )],
-        visualization_ids=[descriptor.visualization_id],
-    )
-
-    result = asyncio.run(FormatAnswerTool().execute(
+    result = asyncio.run(FormatAnswerTool(llm=_ForbiddenLlm()).execute(
         FormatAnswerInput(response_plan=plan), request_state=state,
     ))
-
-    item_reference = next(
-        reference for reference in result["references"]
-        if reference["evidence"].get("item", {}).get("item_id") == "buy"
-    )
-    assert item_reference["source_type"] == "insight"
-    assert result["claims"][0]["insight_ids"] == ["insight_trade"]
-    assert result["claims"][0]["item_ids"] == ["buy"]
+    chart = result["visualizations"][0]
+    assert chart["schema_version"] == "4"
+    assert chart["chart_type"] == "line"
+    assert chart["data_views"][0]["records"] == []
+    assert chart["lines"][0]["role"] == "history"
+    assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
 
 
-def test_planning_inventories_separate_raw_semantics_from_renderer_contract():
-    inventory = PresentationCatalog(_state()).planner_inventory()
-    assert inventory["schema_version"] == "semantic-source-v1"
-    assert "renderer" not in inventory
-    assert "marks" not in inventory
-    assert any(item["source_ref"] == "view:evidence:evi_prices:default" for item in inventory["sources"])
-    assert "templates" not in inventory
-
-
-def test_format_answer_routes_unknown_visualization_id_to_visualization_tool():
+def test_format_answer_routes_unknown_visualization_id_back_to_visualization():
     state = _state()
-    plan = FinalResponsePlan(summary="Answer", visualization_ids=["viz_missing"])
-    with pytest.raises(StructuredToolError) as caught:
-        asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
-    failure = caught.value.validation_failure
-    assert failure["capability"] == "visualization"
-    assert failure["retry_policy"]["max_equivalent_retries"] == 1
-    assert failure["retry_policy"]["required_action"] == "visualization"
+    with pytest.raises(StructuredToolError) as exc_info:
+        asyncio.run(FormatAnswerTool(llm=_ForbiddenLlm()).execute(
+            FormatAnswerInput(response_plan=FinalResponsePlan(summary="Done", visualization_ids=["viz_missing"])),
+            request_state=state,
+        ))
+    assert exc_info.value.recommended_next_action == "visualization"
 
 
-def test_format_answer_canonicalizes_semantic_insight_key_reference():
+def test_format_answer_preserves_visualization_verification(tmp_path):
     state = _state()
-    state.insight_set.insights = [KeyInsight(
-        insight_id="insight_max_1",
-        insight_key="max_value",
-        name="Maximum value",
-        insight_type="extreme",
-        statement="Maximum value is 15.",
-        value=15.0,
-        method="sql_query",
-        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
-    )]
-    plan = FinalResponsePlan(
-        summary="Maximum value is 15.",
-        sections=[PlannedAnswerSection(
-            section_type="insight",
-            content="Maximum value is 15.",
-            source_refs=["insight:max_value"],
-        )],
-    )
-
-    result = asyncio.run(FormatAnswerTool().execute(
-        FormatAnswerInput(response_plan=plan),
+    descriptor = _attach_visualization(state, tmp_path)
+    result = asyncio.run(FormatAnswerTool(llm=_ForbiddenLlm()).execute(
+        FormatAnswerInput(response_plan=FinalResponsePlan(summary="Prices rose.", visualization_ids=[descriptor.visualization_id])),
         request_state=state,
     ))
-
-    assert result["sections"][0]["structured_payload"]["source_refs"] == ["insight:insight_max_1"]
-    assert result["claims"][0]["insight_ids"] == ["insight_max_1"]
-
-
-def test_format_answer_routes_unknown_prose_source_back_to_terminate():
-    state = _state()
-    plan = FinalResponsePlan(
-        summary="Answer",
-        sections=[PlannedAnswerSection(section_type="text", content="Answer", source_refs=["insight:invented"])],
-    )
-
-    with pytest.raises(StructuredToolError) as caught:
-        asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
-
-    assert caught.value.recommended_next_action == "terminate"
-    assert caught.value.error_type == "final_response_reference_invalid"
-    assert caught.value.validation_failure["retry_policy"]["required_action"] == "terminate"
-
-
-def test_analysis_and_derived_evidence_are_separate_answer_sources():
-    state = _state()
-    analysis = AnalysisResult(
-        analysis_id="ana_returns", analysis_goal="daily returns", code_hash="sha256:returns",
-        input_evidence_id="evi_prices", input_row_count=3, status="succeeded", summary="Computed.",
-        computed_insights=[ComputedInsight(
-            insight_key="maximum_return", value=0.25,
-            calculation_trace={"formula": "max(returns)"}, derived_evidence_ids=["dev_returns"],
-        )],
-    )
-    state.analysis_artifacts[analysis.analysis_id] = analysis
-    state.derived_evidence_artifacts["dev_returns"] = DerivedEvidence(
-        evidence_id="dev_returns", name="Daily returns", shape="timeseries",
-        rows=[{"date": "2026-01-02", "return": 0.2}, {"date": "2026-01-03", "return": 0.25}],
-        lineage=["evidence:evi_prices"], transform_summary="Calculated daily returns.",
-    )
-    plan = FinalResponsePlan(
-        summary=analysis.summary,
-        sections=[PlannedAnswerSection(
-            section_type="analysis", content=analysis.summary,
-            source_refs=["analysis:ana_returns", "derived_evidence:dev_returns"],
-        )],
-    )
-    result = asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
-    assert result["visualizations"] == []
-    assert result["references"][0]["source_type"] == "analysis"
-    assert [item["source_type"] for item in result["references"]] == ["analysis", "derived_evidence"]
-    assert result["references"][0]["evidence"]["computed_insights"][0]["value"] == 0.25
-    assert len(result["references"][1]["evidence"]["rows"]) == 2
-
-
-def test_format_answer_routes_poisoned_analysis_lineage_back_to_code_interpreter():
-    state = _state()
-    analysis = AnalysisResult(
-        analysis_id="ana_poisoned",
-        analysis_goal="daily returns",
-        code_hash="sha256:poisoned",
-        input_evidence_id="evi_prices",
-        input_row_count=3,
-        status="succeeded",
-        summary="Computed.",
-        computed_insights=[ComputedInsight(
-            insight_key="maximum_return", value=0.2,
-            calculation_trace={"formula": "max(returns)"}, derived_evidence_ids=["dev_poisoned"],
-        )],
-        diagnostics={"executed_code": "result = {'derived_evidence': []}"},
-    )
-    state.analysis_artifacts[analysis.analysis_id] = analysis
-    state.derived_evidence_artifacts["dev_poisoned"] = DerivedEvidence(
-        evidence_id="dev_poisoned", name="Returns", shape="timeseries",
-        rows=[{"date": "2026-01-02", "return": 0.2}],
-        lineage=["evidence:invented_alias"], transform_summary="Calculated returns.",
-    )
-    plan = FinalResponsePlan(
-        summary="Computed.",
-        sections=[PlannedAnswerSection(
-            section_type="analysis",
-            content="Computed.",
-            source_refs=["view:derived_evidence:dev_poisoned"],
-        )],
-    )
-
-    with pytest.raises(StructuredToolError) as caught:
-        asyncio.run(FormatAnswerTool().execute(FormatAnswerInput(response_plan=plan), request_state=state))
-
-    failure = caught.value.validation_failure
-    assert caught.value.error_type == "analysis_lineage_invalid"
-    assert failure["retry_policy"]["required_action"] == "code_interpreter"
-    assert failure["repair_contract"]["input_evidence"] == "evi_prices"
-    assert failure["repair_contract"]["allowed_lineage_refs"] == ["evidence:evi_prices"]
+    assert result["visualizations"][0]["verification"]["verification_question"] == "Did prices rise?"

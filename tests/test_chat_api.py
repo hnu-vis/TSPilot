@@ -115,7 +115,7 @@ def test_chat_json_path_returns_final_answer():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "partial"
+    assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"][:2] == ["sql_query", "code_interpreter"]
     assert payload["answer"]["summary"]
@@ -212,7 +212,7 @@ def test_chat_json_path_uses_code_interpreter_tool(tmp_path):
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["status"] == "partial"
+        assert payload["status"] == "completed"
         assert payload["used_tools"] == ["sql_query", "code_interpreter", "visualization"]
 
         code_observation = next(
@@ -266,7 +266,7 @@ def test_code_required_metrics_execute_in_interpreter():
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "partial"
+    assert payload["status"] == "completed"
     assert payload["used_tools"].count("code_interpreter") == 1
     successful_code = [
         event["payload"]["payload_preview"]
@@ -437,7 +437,7 @@ def test_chat_json_path_persists_complete_trace_log(tmp_path):
         log_payload = json.loads(log_path.read_text(encoding="utf-8"))
         assert log_payload["schema_version"] == "conversation_trace_v1"
         assert log_payload["mode"] == "json"
-        assert log_payload["status"] == "partial"
+        assert log_payload["status"] == "completed"
         assert log_payload["request"]["message"] == "请分析 appliances_energy_wh 的趋势"
         assert [event["event_type"] for event in log_payload["trace"]["internal"]].count("action") == 4
         assert log_payload["summary"]["used_tools"] == ["sql_query", "code_interpreter", "visualization"]
@@ -762,7 +762,7 @@ def test_chat_json_path_supports_complex_multi_step_react():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "partial"
+    assert payload["status"] == "completed"
     assert payload["response_kind"] == "final_answer"
     assert payload["used_tools"] == [
         "todowrite",
@@ -851,7 +851,7 @@ def test_runtime_advances_plan_without_repeated_todowrite():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "partial"
+    assert payload["status"] == "completed"
     assert payload["used_tools"].count("todowrite") == 1
     assert "sql_query" in payload["used_tools"]
     assert "code_interpreter" in payload["used_tools"]
@@ -896,7 +896,7 @@ def test_tool_failure_returns_observation_and_model_can_recover():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "partial"
+    assert payload["status"] == "completed"
     assert payload["used_tools"] == [
         "todowrite", "forecast", "sql_query", "code_interpreter",
         "visualization", "anomaly", "visualization",
