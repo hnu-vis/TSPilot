@@ -70,26 +70,9 @@ export type VisualizationBinding = {
   locator?: Record<string, unknown>;
 };
 
-export type VisualizationPoint = {
-  x?: unknown;
-  y?: number | null;
-  lower?: number | null;
-  upper?: number | null;
-  label?: string | null;
-  binding_id?: string | null;
-  metadata?: Record<string, unknown>;
-};
-
-export type VisualizationSeries = {
-  series_id: string;
-  name: string;
-  role: string;
-  unit?: string | null;
-  points?: VisualizationPoint[];
-};
-
 export type Visualization = {
-  schema_version: '3';
+  schema_version: '4';
+  chart_type: 'line';
   visualization_id: string;
   data_ref?: string | null;
   purpose: string;
@@ -103,36 +86,59 @@ export type Visualization = {
   } | null;
   source_refs?: string[];
   required_roles?: string[];
-  datasets: Array<{
-    dataset_id: string;
+  data_views: Array<{
+    view_id: string;
     source_ref: string;
     data_ref?: string | null;
     row_count?: number | null;
     time_range?: { start?: unknown; end?: unknown } | null;
-    dimensions?: Array<{ name: string; data_type: string; role: string; unit?: string | null }>;
-    series?: VisualizationSeries[];
+    fields: Array<{ name: string; data_type: string; semantic_role: string; measure?: string | null; unit?: string | null }>;
+    records: Array<{ record_id: string; values: Record<string, unknown>; binding_id?: string | null }>;
   }>;
-  layers?: Array<{
-    layer_id: string;
-    mark: string;
-    role: string;
-    source_ref: string;
-    encoding?: Record<string, string | string[]>;
-    transform?: Array<{ type: 'filter'; field: string; operator: string; value?: unknown }>;
-    presentation?: Record<string, unknown>;
-    dataset_id: string;
-    series_id?: string | null;
-    points?: VisualizationPoint[];
-    label?: string | null;
+  x_axis: { axis_id: string; data_type: 'time' | 'category'; label?: string | null };
+  y_axes: Array<{ axis_id: string; label?: string | null; measure: string; unit?: string | null; scale: 'linear' | 'log' }>;
+  lines: Array<VisualizationXYComponent & { line_style: string; symbol: string }>;
+  points: Array<VisualizationXYComponent & { symbol: string; size: string }>;
+  bands: Array<VisualizationComponent & { x_field: string; lower_field: string; upper_field: string; y_axis_id: string }>;
+  intervals: Array<VisualizationComponent & { start_field: string; end_field: string }>;
+  reference_lines: Array<VisualizationComponent & { value_field: string; y_axis_id: string }>;
+  annotations: Array<VisualizationComponent & {
+    content_field: string;
+    target: {
+      target_type: 'chart' | 'x' | 'xy' | 'interval';
+      x_field?: string;
+      y_field?: string;
+      y_axis_id?: string;
+      start_field?: string;
+      end_field?: string;
+    };
   }>;
-  bindings?: VisualizationBinding[];
-  layout?: 'overlay' | 'facets';
-  presentation?: Record<string, unknown>;
+  legend: { visible: boolean; toggle_components: boolean; position: 'top' | 'bottom' };
+  tooltip: { mode: 'axis' | 'item' | 'none'; show_source: boolean };
+  zoom: { enabled: boolean; start?: unknown; end?: unknown };
+  bindings: VisualizationBinding[];
   accessibility: {
     description: string;
     table_columns?: string[];
     table_rows?: Array<Record<string, unknown>>;
   };
+};
+
+export type VisualizationComponent = {
+  component_id: string;
+  role: string;
+  importance: 'primary' | 'highlight' | 'support';
+  source_ref: string;
+  view_id: string;
+  label?: string | null;
+  binding_ids?: string[];
+  presentation?: Record<string, unknown>;
+};
+
+export type VisualizationXYComponent = VisualizationComponent & {
+  x_field: string;
+  y_field: string;
+  y_axis_id: string;
 };
 
 export type InsightStatus = 'verified' | 'unavailable' | 'rejected' | 'partial' | string;

@@ -12,6 +12,7 @@ import {
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 import type { AnswerClaim, FinalAnswer as FinalAnswerType, TokenUsage, Visualization } from '../types';
+import { containsInternalIdentifier, sanitizeEvidenceForDisplay, sanitizeUserFacingText } from '../lib/presentation';
 import { VisualizationGallery } from './VisualizationGallery';
 
 type AnswerSection = NonNullable<FinalAnswerType['sections']>[number];
@@ -120,7 +121,7 @@ export function FinalAnswer({
       <header className="answer-header">
         <div className="answer-header-title">
           <CheckCircle2 size={17} />
-          <span>{answer.title?.trim() || copy.answer}</span>
+          <span>{sanitizeUserFacingText(answer.title?.trim() || copy.answer)}</span>
         </div>
         <div className="answer-header-meta">
           {references.length > 0 && (
@@ -144,7 +145,7 @@ export function FinalAnswer({
         <div className="answer-sections">
           {sectionPresentations.map(({ section, sourceIndex, visualEvidence }) => (
             <section key={`${section.section_type}-${sourceIndex}`} className="answer-section">
-              <SectionHeading section={section} />
+              <SectionHeading section={section} locale={locale} />
               <StructuredSection section={section} summary={summary} />
               {visualEvidence.length > 0 && (
                 <div className="answer-section-visual-evidence" aria-label={locale === 'zh' ? '对应的视觉证据' : 'Related visual evidence'}>
@@ -168,7 +169,7 @@ export function FinalAnswer({
 
       {unplacedClaimEvidence.length > 0 && (
         <section className="answer-section answer-visualizations-section" aria-label="Visual evidence">
-          <ContentHeading icon={<Eye size={16} />} title={locale === 'zh' ? '结论与视觉证据' : 'Claims and visual evidence'} />
+          <ContentHeading icon={<Eye size={16} />} title={locale === 'zh' ? '视觉证据' : 'Visual evidence'} />
           <div className="answer-claim-evidence-list">
             {unplacedClaimEvidence.map(({ visualization, claims }) => (
               <ClaimEvidenceCard
@@ -245,7 +246,7 @@ function ClaimEvidenceCard({
     <article className={`answer-claim-evidence-card ${showClaims ? '' : 'section-linked'}`}>
       {showClaims && (
         <header className="answer-claim-evidence-header">
-          <span>{locale === 'zh' ? '关键结论' : 'Key claim'}</span>
+          <span>{locale === 'zh' ? '图表说明' : 'Chart context'}</span>
           <div className="answer-claim-evidence-claims">
             {claims.map((claim) => <MarkdownContent key={claim.claim_id} content={claim.text} />)}
           </div>
@@ -260,7 +261,7 @@ function ClaimEvidenceCard({
         <div className="answer-claim-evidence-reading">
           <div>
             <strong>{locale === 'zh' ? '如何阅读' : 'How to read it'}</strong>
-            <p>{verification.interpretation}</p>
+            <p>{sanitizeUserFacingText(verification.interpretation)}</p>
           </div>
         </div>
       )}
@@ -302,11 +303,13 @@ function ContentHeading({ icon, title }: { icon: ReactNode; title: string }) {
   );
 }
 
-function SectionHeading({ section }: { section: AnswerSection }) {
+function SectionHeading({ section, locale }: { section: AnswerSection; locale: AnswerLocale }) {
+  const title = section.heading || formatLabel(section.section_type);
+  if (isConclusionHeading(title, locale)) return null;
   return (
     <div className="answer-content-heading">
       <FileSearch size={16} />
-      <h3>{section.heading || formatLabel(section.section_type)}</h3>
+      <h3>{sanitizeUserFacingText(title)}</h3>
     </div>
   );
 }
@@ -353,7 +356,7 @@ function EvidenceItemsView({
           <article className="query-result-item" key={item.evidence_id || `${index}`}>
             <div className="query-result-heading">
               <span>{index + 1}</span>
-              <strong>{item.purpose || `${copy.queryResult} ${index + 1}`}</strong>
+              <strong>{sanitizeUserFacingText(item.purpose || `${copy.queryResult} ${index + 1}`)}</strong>
               {previewRows.length > 0 && (
                 <div className="query-result-preview">
                   <span>{copy.showingRows(Math.min(previewRows.length, 8), item.row_count)}</span>
@@ -423,32 +426,33 @@ function deduplicateReferences(references: AnswerReference[]): AnswerReference[]
 
 function ReferenceItem({ reference, index, copy }: { reference: AnswerReference; index: number; copy: AnswerCopy }) {
   const [open, setOpen] = useState(false);
+  const label = publicReferenceLabel(reference, index, copy);
   return (
     <details className="answer-reference-item" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <span className="answer-reference-icon"><FileSearch size={14} /></span>
         <span className="answer-reference-label">
-          <strong>{reference.label || `${copy.source} ${index + 1}`}</strong>
+          <strong>{label}</strong>
           <small>{formatLabel(reference.source_type)}</small>
         </span>
         <ChevronDown size={15} className="collapsible-chevron" />
       </summary>
-      {open && <ReferenceEvidence evidence={reference.evidence} sourceId={reference.source_id} />}
+      {open && <ReferenceEvidence evidence={reference.evidence} />}
     </details>
   );
 }
 
-function ReferenceEvidence({ evidence, sourceId }: { evidence: Record<string, unknown> | null | undefined; sourceId?: string | null }) {
+function ReferenceEvidence({ evidence }: { evidence: Record<string, unknown> | null | undefined }) {
   const record = asRecord(evidence);
   const summary = asString(record?.summary);
-  const details = Object.fromEntries(
+  const rawDetails = Object.fromEntries(
     Object.entries(record || {}).filter(([key, value]) => key !== 'summary' && value !== null && value !== undefined),
   );
+  const details = asRecord(sanitizeEvidenceForDisplay(rawDetails));
   return (
     <div className="answer-reference-body">
       {summary && <MarkdownContent content={summary} />}
-      {sourceId && <div className="answer-source-id">{sourceId}</div>}
-      {Object.keys(details).length > 0 && (
+      {details && Object.keys(details).length > 0 && (
         <pre>{JSON.stringify(details, null, 2)}</pre>
       )}
     </div>
@@ -489,7 +493,7 @@ function MetricGroups({ metrics }: { metrics: Array<Record<string, unknown>> }) 
         <dl className="answer-metric-grid" key={`${index}`}>
           {Object.entries(metricGroup).map(([key, value]) => (
             <div key={key}>
-              <dt>{formatLabel(key)}</dt>
+              <dt>{sanitizeUserFacingText(formatLabel(key))}</dt>
               <dd>{formatCell(value)}</dd>
             </div>
           ))}
@@ -516,18 +520,18 @@ export function MarkdownContent({
         if (block.type === 'bulletList') {
           return (
             <ul key={`bullets-${index}`}>
-              {block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{item}</li>)}
+              {block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{sanitizeUserFacingText(item)}</li>)}
             </ul>
           );
         }
         if (block.type === 'numberedList') {
           return (
             <ol key={`numbers-${index}`} start={block.start}>
-              {block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{item}</li>)}
+              {block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{sanitizeUserFacingText(item)}</li>)}
             </ol>
           );
         }
-        return <p key={`paragraph-${index}`}>{block.content}</p>;
+        return <p key={`paragraph-${index}`}>{sanitizeUserFacingText(block.content)}</p>;
       })}
     </div>
   );
@@ -854,8 +858,24 @@ function formatCell(value: unknown) {
   if (value === null || value === undefined) return '-';
   if (typeof value === 'number') return Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
   if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return containsInternalIdentifier(value) ? sanitizeUserFacingText(value) : value;
   return JSON.stringify(value);
+}
+
+function isConclusionHeading(title: string, locale: AnswerLocale) {
+  const normalized = comparableText(title);
+  const labels = locale === 'zh'
+    ? new Set(['结论', '主要结论', '核心结论'])
+    : new Set(['conclusion', 'main conclusion', 'key conclusion']);
+  return labels.has(normalized);
+}
+
+function publicReferenceLabel(reference: AnswerReference, index: number, copy: AnswerCopy) {
+  const evidence = asRecord(reference.evidence);
+  const candidates = [reference.label, asString(evidence?.name), asString(evidence?.insight_key)];
+  const candidate = candidates.find((value) => value && !containsInternalIdentifier(value));
+  if (!candidate) return `${copy.source} ${index + 1}`;
+  return sanitizeUserFacingText(candidate.includes('_') ? formatLabel(candidate) : candidate);
 }
 
 function queryLabel(language: string | undefined) {

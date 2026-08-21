@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
-import type { ECharts, EChartsOption } from 'echarts';
-import type { Visualization, VisualizationPoint, VisualizationSeries } from '../types';
+import type { ECharts, EChartsOption, SeriesOption } from 'echarts';
+import type { Visualization, VisualizationBinding, VisualizationComponent } from '../types';
 import { fetchVisualizationData } from '../services/api';
 import { useI18n, type UiLocale } from '../i18n';
 import { formatHumanTime, isIsoTimestamp } from '../lib/humanTime';
+import { sanitizeUserFacingText } from '../lib/presentation';
 
 type GalleryProps = {
   visualizations: Visualization[];
@@ -19,108 +20,58 @@ export function VisualizationGallery({ visualizations, activeBindingId, onSelect
 
   useEffect(() => {
     const controller = new AbortController();
-    visualizations.forEach((visualization) => {
-      if (!visualization.data_ref || loaded[visualization.visualization_id]) return;
+    for (const visualization of visualizations) {
+      if (!visualization.data_ref || loaded[visualization.visualization_id]) continue;
       void fetchVisualizationData(visualization.data_ref)
         .then((payload) => {
-          if (!controller.signal.aborted) {
-            setLoaded((current) => ({ ...current, [visualization.visualization_id]: payload }));
-          }
+          if (!controller.signal.aborted) setLoaded((value) => ({ ...value, [visualization.visualization_id]: payload }));
         })
         .catch((error) => {
           if (!controller.signal.aborted) {
-            setLoadErrors((current) => ({
-              ...current,
+            setLoadErrors((value) => ({
+              ...value,
               [visualization.visualization_id]: error instanceof Error ? error.message : t('Unable to load chart data.'),
             }));
           }
         });
-    });
+    }
     return () => controller.abort();
-  }, [visualizations, loaded]);
+  }, [visualizations, loaded, t]);
 
-  const hydrated = visualizations.map((visualization) => loaded[visualization.visualization_id] || visualization);
-  const pendingIds = new Set(visualizations
-    .filter((visualization) => visualization.data_ref && !loaded[visualization.visualization_id] && !loadErrors[visualization.visualization_id])
-    .map((visualization) => visualization.visualization_id));
-  const renderable = hydrated.filter((visualization) => !pendingIds.has(visualization.visualization_id) && isRenderableVisualization(visualization));
-  const rejectedCount = hydrated.filter((visualization) => !pendingIds.has(visualization.visualization_id) && !isRenderableVisualization(visualization)).length;
-  const ordered = [...renderable].sort((left, right) => (
-    Number(right.priority === 'primary') - Number(left.priority === 'primary')
-  ));
-  const activeBinding = ordered
-    .flatMap((visualization) => visualization.bindings || [])
-    .find((binding) => binding.binding_id === activeBindingId);
+  const hydrated = visualizations.map((item) => loaded[item.visualization_id] || item);
+  const pending = new Set(visualizations
+    .filter((item) => item.data_ref && !loaded[item.visualization_id] && !loadErrors[item.visualization_id])
+    .map((item) => item.visualization_id));
+  const renderable = hydrated.filter((item) => !pending.has(item.visualization_id) && isRenderableVisualization(item));
+  const rejected = hydrated.filter((item) => !pending.has(item.visualization_id) && !isRenderableVisualization(item)).length;
+  const activeBinding = renderable.flatMap((item) => item.bindings).find((item) => item.binding_id === activeBindingId);
 
   return (
     <div className="answer-visualization-gallery">
-      {rejectedCount > 0 && (
-        <div className="answer-visualization-unavailable" role="status">
-          {t('{count} saved visualizations cannot be displayed because the data schema is no longer supported.', { count: rejectedCount })}
-        </div>
-      )}
-      {Object.values(loadErrors).map((message) => (
-        <div className="answer-visualization-unavailable" role="status" key={message}>{message}</div>
-      ))}
-      {pendingIds.size > 0 && (
-        <div className="answer-visualization-unavailable" role="status">{t('Loading complete visualization data…')}</div>
-      )}
+      {rejected > 0 && <div className="answer-visualization-unavailable" role="status">
+        {t('{count} saved visualizations cannot be displayed because the data schema is no longer supported.', { count: rejected })}
+      </div>}
+      {Object.values(loadErrors).map((message) => <div className="answer-visualization-unavailable" role="status" key={message}>{message}</div>)}
+      {pending.size > 0 && <div className="answer-visualization-unavailable" role="status">{t('Loading complete visualization data…')}</div>}
       <div className="answer-visualization-grid">
-        {ordered.map((visualization) => (
-          <VisualizationCard
-            key={visualization.visualization_id}
-            visualization={visualization}
-            activeBindingId={activeBindingId}
-            onSelectBinding={onSelectBinding}
-          />
+        {[...renderable].sort((a, b) => Number(a.priority !== 'primary') - Number(b.priority !== 'primary')).map((item) => (
+          <VisualizationCard key={item.visualization_id} visualization={item} activeBindingId={activeBindingId} onSelectBinding={onSelectBinding} />
         ))}
       </div>
-      {activeBinding && (
-        <div className="visualization-link-detail" role="status">
-          <strong>{t('Linked evidence')}</strong>
-          <span>{activeBinding.source_type}</span>
-          {activeBinding.source_ref && <code>{activeBinding.source_ref}</code>}
-          {activeBinding.evidence_id && <code>{activeBinding.evidence_id}</code>}
-          {activeBinding.locator && Object.keys(activeBinding.locator).length > 0 && (
-            <code>{JSON.stringify(activeBinding.locator)}</code>
-          )}
-        </div>
-      )}
+      {activeBinding && <BindingDetail binding={activeBinding} label={t('Linked evidence')} />}
     </div>
   );
 }
 
 export function isRenderableVisualization(value: unknown): value is Visualization {
-  if (!isRecord(value) || value.schema_version !== '3') return false;
-  if (
-    typeof value.visualization_id !== 'string'
-    || typeof value.title !== 'string'
-    || !['primary', 'supporting'].includes(String(value.priority))
-    || !Array.isArray(value.datasets)
-    || !Array.isArray(value.layers)
-    || !Array.isArray(value.bindings)
-    || !isRecord(value.accessibility)
-    || typeof value.accessibility.description !== 'string'
-  ) return false;
-
-  const datasetsAreValid = value.datasets.every((dataset) => (
-    isRecord(dataset)
-    && typeof dataset.dataset_id === 'string'
-    && typeof dataset.source_ref === 'string'
-    && (dataset.series === undefined || Array.isArray(dataset.series))
-  ));
-  if (!datasetsAreValid) return false;
-
-  const datasetIds = new Set(value.datasets.map((dataset) => String(dataset.dataset_id)));
-  return value.layers.every((layer) => (
-    isRecord(layer)
-    && typeof layer.layer_id === 'string'
-    && typeof layer.mark === 'string'
-    && typeof layer.role === 'string'
-    && typeof layer.dataset_id === 'string'
-    && datasetIds.has(layer.dataset_id)
-    && (layer.points === undefined || Array.isArray(layer.points))
-  ));
+  if (!isRecord(value) || value.schema_version !== '4' || value.chart_type !== 'line') return false;
+  if (typeof value.visualization_id !== 'string' || typeof value.title !== 'string') return false;
+  if (!Array.isArray(value.data_views) || !Array.isArray(value.lines) || value.lines.length === 0) return false;
+  if (!Array.isArray(value.y_axes) || !isRecord(value.x_axis) || !Array.isArray(value.bindings)) return false;
+  if (!isRecord(value.accessibility) || typeof value.accessibility.description !== 'string') return false;
+  const views = new Set(value.data_views.flatMap((item) => isRecord(item) && typeof item.view_id === 'string' ? [item.view_id] : []));
+  return value.data_views.every((item) => isRecord(item) && Array.isArray(item.fields) && Array.isArray(item.records))
+    && value.lines.every((item) => isRecord(item) && typeof item.component_id === 'string' && views.has(String(item.view_id)));
 }
 
 function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: {
@@ -128,125 +79,54 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
 }) {
-  const { t, locale } = useI18n();
-  const marks = (visualization.layers || []).map((layer) => layer.mark);
-  return (
-    <article className={`answer-visualization-card is-${visualization.priority}`}>
-      <div className="answer-visualization-card-header">
-        <div>
-          <strong>{visualization.title}</strong>
-          {visualization.summary && <p>{visualization.summary}</p>}
-        </div>
-        <span>{Array.from(new Set(marks)).map(formatMarkLabel).join(' · ')}</span>
-      </div>
-      <EChartView
-        visualization={visualization}
-        activeBindingId={activeBindingId}
-        onSelectBinding={onSelectBinding}
-        locale={locale}
-      />
-      {(visualization.accessibility.table_rows?.length || 0) > 0 && (
-        <details className="visualization-data-details">
-          <summary>{t('View chart data')}</summary>
-          <AccessibleTable
-            visualization={visualization}
-            rows={visualization.accessibility.table_rows || []}
-            columns={visualization.accessibility.table_columns || []}
-            onSelectBinding={onSelectBinding}
-            locale={locale}
-          />
-        </details>
-      )}
-    </article>
-  );
+  return <article className={`answer-visualization-card is-${visualization.priority}`}>
+    <div className="answer-visualization-card-header">
+      <div><strong>{sanitizeUserFacingText(visualization.title)}</strong>{visualization.summary && <p>{sanitizeUserFacingText(visualization.summary)}</p>}</div>
+    </div>
+    <EChartView visualization={visualization} activeBindingId={activeBindingId} onSelectBinding={onSelectBinding} />
+    {(visualization.accessibility.table_rows?.length || 0) > 0 && <AccessibleTable visualization={visualization} onSelectBinding={onSelectBinding} />}
+  </article>;
 }
 
-function formatFieldLabel(value: string) {
-  return value.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function EChartView({ visualization, activeBindingId, onSelectBinding, locale }: {
+function EChartView({ visualization, activeBindingId, onSelectBinding }: {
   visualization: Visualization;
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
-  locale: UiLocale;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ECharts | null>(null);
-  const [renderError, setRenderError] = useState<string | null>(null);
-  const [compact, setCompact] = useState(false);
+  const [renderError, setRenderError] = useState(false);
+  const compact = false;
   const option = useMemo(
     () => buildVisualizationOption(visualization, activeBindingId, compact, locale),
-    [visualization, activeBindingId, compact, locale],
+    [visualization, activeBindingId, locale],
   );
 
   useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return undefined;
+    if (!hostRef.current) return undefined;
     let chart: ECharts;
     try {
-      chart = echarts.init(host, undefined, { renderer: 'canvas' });
-    } catch (error) {
-      console.error('Unable to initialize visualization.', error);
-      setRenderError(error instanceof Error ? error.message : t('Unable to render this visualization.'));
-      return undefined;
-    }
-    chartRef.current = chart;
-    const handleClick = (params: { data?: unknown }) => {
-      const data = isRecord(params.data) ? params.data : null;
-      const bindingId = data && typeof data.bindingId === 'string'
-        ? data.bindingId
-        : data && typeof data.__binding_id === 'string' ? data.__binding_id : null;
-      if (bindingId) onSelectBinding(bindingId);
-    };
-    chart.on('click', handleClick);
-    const resize = () => {
-      const nextCompact = host.clientWidth < 520;
-      setCompact((current) => current === nextCompact ? current : nextCompact);
-      chart.resize();
-    };
-    resize();
-    const observer = new ResizeObserver(resize);
-    observer.observe(host);
-    return () => {
-      observer.disconnect();
-      chart.off('click', handleClick);
-      chart.dispose();
-      chartRef.current = null;
-    };
-  }, [onSelectBinding, t]);
-
-  useEffect(() => {
-    try {
-      chartRef.current?.setOption(option, { notMerge: true, lazyUpdate: true });
-      setRenderError(null);
+      chart = echarts.init(hostRef.current, undefined, { renderer: 'canvas' });
+      chartRef.current = chart;
+      chart.setOption(option, { notMerge: true, lazyUpdate: false });
+      chart.on('click', (params) => {
+        const data: unknown = params.data;
+        if (isRecord(data) && typeof data.bindingId === 'string') onSelectBinding(data.bindingId);
+      });
+      setRenderError(false);
     } catch (error) {
       console.error('Unable to render visualization.', error);
-      setRenderError(error instanceof Error ? error.message : t('Unable to render this visualization.'));
+      setRenderError(true);
+      return undefined;
     }
-  }, [option, t]);
+    const observer = new ResizeObserver(() => chart.resize());
+    observer.observe(hostRef.current);
+    return () => { observer.disconnect(); chart.dispose(); chartRef.current = null; };
+  }, [option, onSelectBinding]);
 
-  if (renderError) {
-    return (
-      <div className="answer-visualization-unavailable" role="status">
-        {t('Unable to render this visualization.')}
-        <small>{renderError}</small>
-      </div>
-    );
-  }
-
-  const faceted = usesIndependentGrids(visualization);
-
-  return (
-    <div
-      ref={hostRef}
-      className={`answer-echart${faceted ? ' is-faceted' : ''}`}
-      style={{ height: faceted ? Math.max(360, Math.max(1, (visualization.layers || []).filter((layer) => layer.mark !== 'table').length) * 190 + 28) : 380 }}
-      role="img"
-      aria-label={visualization.accessibility.description || visualization.title}
-    />
-  );
+  if (renderError) return <div className="answer-visualization-unavailable" role="status">{t('Unable to render this visualization.')}</div>;
+  return <div ref={hostRef} className="answer-visualization-chart" style={{ height: 380 }} aria-label={sanitizeUserFacingText(visualization.accessibility.description)} />;
 }
 
 export function buildVisualizationOption(
@@ -255,818 +135,159 @@ export function buildVisualizationOption(
   compact = false,
   locale: UiLocale = 'en',
 ): EChartsOption {
-  const layers = visualization.layers || [];
-  const datasets = new Map(visualization.datasets.map((dataset) => [dataset.dataset_id, dataset]));
-  const faceted = usesIndependentGrids(visualization) && layers.length > 1;
-  const overlayYAxisCount = faceted ? 1 : Math.max(1, axisPresentationCount(visualization.presentation?.yAxis));
-  const primaryXAxisType = preferredSharedXAxisType(layers, datasets);
-  const grids = faceted
-    ? layers.map((_, index) => ({
-        left: compact ? 48 : 66,
-        right: compact ? 12 : 24,
-        top: (compact ? 54 : 34) + index * 190,
-        height: compact ? 122 : 130,
-      }))
-    : [{
-        left: compact ? 48 : 62,
-        right: compact ? 12 : 24,
-        top: compact ? 52 : 36,
-        bottom: compact ? 48 : 52,
-        containLabel: false,
-      }];
-  const xAxis = layers.map((layer, index) => ({
-    type: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type),
-    gridIndex: faceted ? index : 0,
-    axisLabel: {
-      hideOverlap: true,
-      color: '#667085',
-      fontSize: compact ? 9 : 11,
-      formatter: axisType(datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type) === 'time'
-        ? (value: unknown) => formatAxisTime(value, locale, compact)
-        : undefined,
-    },
-    axisLine: { lineStyle: { color: '#d0d5dd' } },
-    splitLine: { show: false },
-  }));
-  const yAxis = layers.map((layer, index) => ({
-    type: 'value',
-    gridIndex: faceted ? index : 0,
-    name: faceted ? layer.label || formatRoleLabel(layer.role) : undefined,
-    nameTextStyle: { color: '#667085', align: 'left', fontSize: compact ? 9 : 11 },
-    scale: true,
-    axisLabel: { color: '#667085', fontSize: compact ? 9 : 11, formatter: formatAxisNumber },
-    splitLine: { lineStyle: { color: '#eef1f4' } },
-  }));
-  const seriesOptions: any[] = [];
-  const scalarAnnotations: Array<{
-    label: string;
-    content?: string | null;
-    value: number | null;
-    unit?: string | null;
-  }> = [];
-  const positionedAnnotations: Array<{
-    x: unknown;
-    y: number | null;
-    label: string;
-    content?: string | null;
-    value: number | null;
-    unit?: string | null;
-    bindingId?: string | null;
-  }> = [];
-  const rendererDatasets: Array<{ id: string; source: Array<Record<string, unknown>> }> = [];
-  layers.forEach((layer, index) => {
-    const dataset = datasets.get(layer.dataset_id);
-    if (layer.mark === 'rule') return;
-    if (layer.mark === 'annotation') {
-      const points = layer.points?.length
-        ? layer.points
-        : (dataset?.series || []).flatMap((series) => series.points || []);
-      points.forEach((point) => {
-        const annotation = {
-          label: layer.label || formatRoleLabel(layer.role),
-          content: point.label,
-          value: point.y ?? null,
-          unit: dataset?.series?.[0]?.unit,
-        };
-        if (point.x !== undefined && point.x !== null) {
-          positionedAnnotations.push({
-            ...annotation,
-            x: point.x,
-            y: point.y ?? null,
-            bindingId: point.binding_id,
-          });
-        } else {
-          scalarAnnotations.push(annotation);
-        }
-      });
-      return;
+  const views = new Map(visualization.data_views.map((view) => [view.view_id, view]));
+  const axisIndex = new Map(visualization.y_axes.map((axis, index) => [axis.axis_id, index]));
+  const lines = visualization.lines.map((line) => {
+    const data = componentData(views.get(line.view_id)?.records || [], line.x_field, line.y_field, activeBindingId);
+    return {
+      id: line.component_id,
+      name: line.label || line.role,
+      type: 'line',
+      yAxisIndex: axisIndex.get(line.y_axis_id) || 0,
+      data,
+      showSymbol: line.symbol !== 'none',
+      symbol: line.symbol === 'none' ? 'circle' : line.symbol,
+      lineStyle: { type: line.line_style, width: line.importance === 'primary' ? 2.5 : 2 },
+      emphasis: { focus: 'series' },
+      ...(line.presentation || {}),
+    } as unknown as SeriesOption;
+  });
+  const points = visualization.points.map((point) => ({
+    id: point.component_id,
+    name: point.label || point.role,
+    type: 'scatter',
+    yAxisIndex: axisIndex.get(point.y_axis_id) || 0,
+    data: componentData(views.get(point.view_id)?.records || [], point.x_field, point.y_field, activeBindingId),
+    symbol: point.symbol,
+    symbolSize: point.size === 'large' ? 16 : point.size === 'small' ? 8 : 12,
+    ...(point.presentation || {}),
+  } as unknown as SeriesOption));
+  const bands = visualization.bands.flatMap((band) => bandSeries(band, views.get(band.view_id)?.records || [], axisIndex));
+  const guideHost = lines[0] as Record<string, unknown> | undefined;
+  if (guideHost) attachGuides(guideHost, visualization, views, axisIndex);
+  const annotations = chartAnnotations(visualization, views);
+  const dense = visualization.data_views.some((view) => (view.row_count || view.records.length) > 80);
+
+  return {
+    animation: !compact,
+    aria: { enabled: true, decal: { show: true }, description: visualization.accessibility.description },
+    grid: { left: compact ? 48 : 64, right: visualization.y_axes.length > 1 ? 72 : 28, top: visualization.legend.visible ? 64 : 28, bottom: visualization.zoom.enabled || dense ? 72 : 42 },
+    legend: { show: visualization.legend.visible, top: visualization.legend.position === 'top' ? 8 : undefined, bottom: visualization.legend.position === 'bottom' ? 8 : undefined, selectedMode: visualization.legend.toggle_components },
+    tooltip: visualization.tooltip.mode === 'none' ? { show: false } : { trigger: visualization.tooltip.mode, valueFormatter: (value: unknown) => formatValue(value, locale) },
+    xAxis: { type: visualization.x_axis.data_type, name: visualization.x_axis.label || undefined, axisLabel: { formatter: (value: unknown) => formatValue(value, locale) } },
+    yAxis: visualization.y_axes.map((axis, index) => ({ type: axis.scale === 'log' ? 'log' : 'value', name: axis.label || axis.measure, position: index === 0 ? 'left' : 'right', axisLabel: { formatter: (value: unknown) => `${formatValue(value, locale)}${axis.unit ? ` ${axis.unit}` : ''}` } })),
+    dataZoom: visualization.zoom.enabled || dense ? [
+      { type: 'inside', startValue: zoomValue(visualization.zoom.start), endValue: zoomValue(visualization.zoom.end) },
+      { type: 'slider', height: 20, bottom: 18, startValue: zoomValue(visualization.zoom.start), endValue: zoomValue(visualization.zoom.end) },
+    ] : [],
+    series: [...bands, ...lines, ...points],
+    graphic: annotations,
+  };
+}
+
+function componentData(records: Visualization['data_views'][number]['records'], xField: string, yField: string, active: string | null) {
+  return records.flatMap((record) => {
+    const x = record.values[xField];
+    const y = record.values[yField];
+    if (x === null || x === undefined || typeof y !== 'number') return [];
+    if (typeof x !== 'string' && typeof x !== 'number') return [];
+    return [{ value: [x, y], bindingId: record.binding_id, itemStyle: record.binding_id && record.binding_id === active ? { borderColor: '#111827', borderWidth: 3 } : undefined }];
+  });
+}
+
+function bandSeries(band: Visualization['bands'][number], records: Visualization['data_views'][number]['records'], axes: Map<string, number>): SeriesOption[] {
+  const base = records.flatMap((record) => {
+    const x = record.values[band.x_field]; const lower = record.values[band.lower_field];
+    return x != null && typeof lower === 'number' ? [[x, lower]] : [];
+  });
+  const range = records.flatMap((record) => {
+    const x = record.values[band.x_field]; const lower = record.values[band.lower_field]; const upper = record.values[band.upper_field];
+    return x != null && typeof lower === 'number' && typeof upper === 'number' ? [[x, upper - lower]] : [];
+  });
+  const stack = `band_${band.component_id}`;
+  return [
+    { id: `${band.component_id}_base`, name: band.label || band.role, type: 'line', stack, yAxisIndex: axes.get(band.y_axis_id) || 0, data: base, symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { opacity: 0 }, tooltip: { show: false } } as SeriesOption,
+    { id: band.component_id, name: band.label || band.role, type: 'line', stack, yAxisIndex: axes.get(band.y_axis_id) || 0, data: range, symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { opacity: 0.18 } } as SeriesOption,
+  ];
+}
+
+function attachGuides(host: Record<string, unknown>, visualization: Visualization, views: Map<string, Visualization['data_views'][number]>, axes: Map<string, number>) {
+  const markLines: Array<Record<string, unknown>> = visualization.reference_lines.flatMap((item) => {
+    const record = views.get(item.view_id)?.records[0]; const value = record?.values[item.value_field];
+    return typeof value === 'number' ? [{ name: item.label || item.role, yAxis: value, yAxisIndex: axes.get(item.y_axis_id) || 0 }] : [];
+  });
+  const markAreas: Array<Array<Record<string, unknown>>> = visualization.intervals.flatMap((item) => (
+    (views.get(item.view_id)?.records || []).flatMap((record) => {
+      const start = record.values[item.start_field]; const end = record.values[item.end_field];
+      return start != null && end != null ? [[{ name: item.label || item.role, xAxis: start }, { xAxis: end }]] : [];
+    })
+  ));
+  const markPoints: Array<Record<string, unknown>> = [];
+  for (const item of visualization.annotations) {
+    const records = (views.get(item.view_id)?.records || []).slice(0, 12);
+    for (const record of records) {
+      const content = record.values[item.content_field];
+      if (content == null) continue;
+      const label = { formatter: String(content) };
+      if (item.target.target_type === 'x' && item.target.x_field) {
+        const x = record.values[item.target.x_field];
+        if (x != null) markLines.push({ xAxis: x, label, bindingId: record.binding_id });
+      } else if (item.target.target_type === 'xy' && item.target.x_field && item.target.y_field) {
+        const x = record.values[item.target.x_field]; const y = record.values[item.target.y_field];
+        if (x != null && typeof y === 'number') markPoints.push({ coord: [x, y], label, bindingId: record.binding_id });
+      } else if (item.target.target_type === 'interval' && item.target.start_field && item.target.end_field) {
+        const start = record.values[item.target.start_field]; const end = record.values[item.target.end_field];
+        if (start != null && end != null) markAreas.push([{ name: String(content), xAxis: start }, { xAxis: end }]);
+      }
     }
-    const xAxisIndex = faceted ? index : 0;
-    const yAxisIndex = faceted ? index : requestedAxisIndex(layer.presentation?.yAxisIndex, overlayYAxisCount);
-    const sourceSeries = dataset?.series?.length
-      ? dataset.series
-      : [{ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points: layer.points || [] }];
-    sourceSeries.forEach((series) => {
-      if (layer.mark === 'band') {
-        seriesOptions.push(...confidenceBandSeries(series, index, xAxisIndex, yAxisIndex));
-        return;
-      }
-      if (!['line', 'area', 'bar', 'point', 'boxplot', 'rule', 'rect'].includes(layer.mark)) {
-        const rendererDatasetId = `${layer.layer_id}_${series.series_id}`;
-        rendererDatasets.push({
-          id: rendererDatasetId,
-          source: (series.points || []).map((point) => groundedPointRecord(point, layer.encoding)),
-        });
-        seriesOptions.push(buildRendererNativeSeriesOption(
-          { ...layer, label: series.name }, rendererDatasetId, xAxisIndex, yAxisIndex,
-        ));
-        return;
-      }
-      seriesOptions.push(buildLayerSeriesOption(
-        { ...layer, label: series.name }, series.points || [], index, xAxisIndex, yAxisIndex, activeBindingId,
-      ));
+  }
+  host.markLine = { silent: false, data: markLines };
+  host.markArea = { silent: false, data: markAreas };
+  host.markPoint = { data: markPoints };
+}
+
+function chartAnnotations(visualization: Visualization, views: Map<string, Visualization['data_views'][number]>) {
+  let index = 0;
+  const seen = new Set<string>();
+  return visualization.annotations.flatMap((item) => {
+    if (item.target.target_type !== 'chart') return [];
+    return (views.get(item.view_id)?.records || []).slice(0, 6).flatMap((record) => {
+      const content = record.values[item.content_field];
+      if (content == null) return [];
+      const text = sanitizeUserFacingText(String(content));
+      if (seen.has(text)) return [];
+      seen.add(text);
+      const top = 30 + index++ * 24;
+      return [{ type: 'text', right: 18, top, style: { text, fill: '#374151', fontSize: 12, backgroundColor: 'rgba(255,255,255,.88)', padding: [4, 6] } }];
     });
   });
-  const rulePoints = layers.flatMap((layer) => (
-    layer.mark === 'rule'
-      ? (layer.points || []).map((point) => ({ ...point, guideLabel: layer.label || point.label || '' }))
-      : []
-  ));
-  const xOnlyAnnotations = positionedAnnotations.filter((annotation) => annotation.y == null);
-  if ((rulePoints.length > 0 || xOnlyAnnotations.length > 0) && seriesOptions.length > 0) {
-    const first = seriesOptions[0] as Record<string, unknown>;
-    first.markLine = {
-      symbol: 'none',
-      label: { color: '#475467', formatter: '{b}' },
-      lineStyle: { color: '#98a2b3', type: 'dashed' },
-      data: [
-        ...rulePoints.map((point) => ({
-          name: point.guideLabel,
-          xAxis: point.x,
-          yAxis: point.x == null ? point.y : undefined,
-          bindingId: point.binding_id,
-        })),
-        ...xOnlyAnnotations.map((annotation) => ({
-          name: formatAnnotationText(annotation),
-          xAxis: annotation.x,
-          bindingId: annotation.bindingId,
-        })),
-      ],
-    };
-  }
-  const pointAnnotations = positionedAnnotations.filter((annotation) => annotation.y != null);
-  if (pointAnnotations.length > 0 && seriesOptions.length > 0) {
-    const first = seriesOptions[0] as Record<string, unknown>;
-    first.markPoint = {
-      symbol: 'pin',
-      symbolSize: compact ? 34 : 42,
-      itemStyle: { color: '#6941c6' },
-      label: {
-        show: true,
-        position: 'top',
-        color: '#475467',
-        fontSize: compact ? 9 : 11,
-        formatter: '{b}',
-      },
-      data: pointAnnotations.map((annotation) => ({
-        name: formatAnnotationText(annotation),
-        coord: [annotation.x, annotation.y],
-        value: annotation.value,
-        bindingId: annotation.bindingId,
-      })),
-    };
-  }
-  const intervalPoints = layers.flatMap((layer) => layer.mark === 'rect' ? layer.points || [] : []);
-  if (intervalPoints.length >= 2 && seriesOptions.length > 0) {
-    const first = seriesOptions[0] as Record<string, unknown>;
-    first.markArea = {
-      itemStyle: { color: 'rgba(220, 104, 3, 0.10)' },
-      label: { color: '#7a2e0e' },
-      data: [[{ name: intervalPoints[0].label || 'Interval', xAxis: intervalPoints[0].x }, { xAxis: intervalPoints[1].x }]],
-    };
-  }
-
-  const hostLayerIndex = layers.findIndex((layer) => !['rule', 'annotation'].includes(layer.mark));
-  const generatedXAxis = faceted
-    ? xAxis
-    : [xAxis[Math.max(0, hostLayerIndex)] || xAxis[0]];
-  const renderedOverlayYAxisCount = faceted
-    ? 1
-    : Math.max(1, ...seriesOptions.map((series) => Number(series.yAxisIndex) + 1).filter(Number.isFinite));
-  const generatedYAxis = faceted
-    ? yAxis
-    : Array.from({ length: renderedOverlayYAxisCount }, (_, index) => ({
-        ...yAxis[0],
-        gridIndex: 0,
-        position: index === 0 ? 'left' : 'right',
-        offset: index > 1 ? (index - 1) * 48 : 0,
-      }));
-  const hasDenseSeries = layers.some(
-    (layer) => (datasets.get(layer.dataset_id)?.series?.[0]?.points?.length || 0) > 80,
-  );
-  const option: Record<string, unknown> = {
-    animationDuration: 260,
-    aria: { enabled: true, decal: { show: true }, description: visualization.accessibility.description },
-    color: ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'],
-    grid: grids,
-    tooltip: {
-      trigger: layers.some((layer) => layer.mark === 'point') ? 'item' : 'axis',
-      confine: true,
-      valueFormatter: formatAxisNumber,
-      formatter: primaryXAxisType === 'time'
-        ? (params: unknown) => formatTimeSeriesTooltip(params, locale)
-        : undefined,
-      textStyle: { fontSize: compact ? 10 : 12 },
-    },
-    legend: {
-      type: 'scroll',
-      top: 2,
-      left: compact ? 8 : 'center',
-      right: compact ? 8 : undefined,
-      itemWidth: compact ? 12 : 25,
-      itemHeight: compact ? 8 : 14,
-      itemGap: compact ? 8 : 10,
-      textStyle: { color: '#475467', fontSize: compact ? 9 : 12 },
-      formatter: compact ? compactLegendLabel : undefined,
-    },
-    xAxis: generatedXAxis,
-    yAxis: generatedYAxis,
-    dataZoom: resolveDataZoom(hasDenseSeries, undefined, compact),
-    dataset: rendererDatasets,
-    series: seriesOptions,
-    graphic: scalarAnnotationGraphic(scalarAnnotations, compact),
-  };
-  const presented = deepMerge(option, visualization.presentation || {});
-  // These are the immutable structural binding boundary. Presentation may
-  // style generated axes but cannot change their cardinality or grid binding.
-  presented.grid = grids;
-  presented.xAxis = responsiveAxes(
-    mergeAxisPresentation(generatedXAxis, visualization.presentation?.xAxis, faceted),
-    compact,
-    'x',
-    locale,
-  );
-  presented.yAxis = responsiveAxes(
-    mergeAxisPresentation(generatedYAxis, visualization.presentation?.yAxis, faceted),
-    compact,
-    'y',
-  );
-  presented.dataset = rendererDatasets;
-  presented.series = compact ? seriesOptions.map(compactSeriesOption) : seriesOptions;
-  presented.graphic = scalarAnnotationGraphic(scalarAnnotations, compact);
-  presented.dataZoom = resolveDataZoom(
-    hasDenseSeries,
-    visualization.presentation?.dataZoom,
-    compact,
-  );
-  if (compact) {
-    // Card headings already carry title and summary. Renderer-owned compact
-    // layout keeps the plot's semantic encodings legible at audit/mobile width.
-    presented.title = { show: false };
-    presented.toolbox = { show: false };
-    presented.legend = option.legend;
-  }
-  return presented as EChartsOption;
 }
 
-function resolveDataZoom(
-  hasDenseSeries: boolean,
-  plannedDataZoom: unknown,
-  compact: boolean,
-): Array<Record<string, unknown>> {
-  const planned = (Array.isArray(plannedDataZoom)
-    ? plannedDataZoom.filter(isRecord)
-    : isRecord(plannedDataZoom) ? [plannedDataZoom] : [])
-    .map((item) => ({ ...item }));
-  if (!hasDenseSeries) return planned;
-
-  const hasViewport = (item: Record<string, unknown>) => (
-    ['start', 'end', 'startValue', 'endValue'].some((key) => Object.prototype.hasOwnProperty.call(item, key))
-  );
-  const viewportSource = planned.find(hasViewport) || {};
-  const viewport = Object.fromEntries(
-    [
-      'start', 'end', 'startValue', 'endValue', 'minSpan', 'maxSpan',
-      'minValueSpan', 'maxValueSpan', 'rangeMode', 'zoomLock',
-    ]
-      .filter((key) => Object.prototype.hasOwnProperty.call(viewportSource, key))
-      .map((key) => [key, viewportSource[key]]),
-  );
-  const inside = planned.find((item) => item.type === 'inside') || {};
-  const slider = planned.find((item) => item.type === 'slider') || {};
-  return [
-    { ...inside, ...viewport, type: 'inside', filterMode: 'filter' },
-    {
-      height: compact ? 16 : 18,
-      bottom: compact ? 2 : 4,
-      ...slider,
-      ...viewport,
-      type: 'slider',
-      filterMode: 'filter',
-    },
-  ];
+function AccessibleTable({ visualization, onSelectBinding }: { visualization: Visualization; onSelectBinding: (id: string) => void }) {
+  const rows = visualization.accessibility.table_rows || [];
+  const columns = visualization.accessibility.table_columns || [];
+  return <details className="visualization-data-details"><summary>Data</summary><div className="answer-visualization-table-wrap"><table className="answer-data-table answer-visualization-table"><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={index} onClick={() => typeof row.binding_id === 'string' && onSelectBinding(row.binding_id)}>{columns.map((column) => <td key={column}>{formatValue(row[column], 'en')}</td>)}</tr>)}</tbody></table></div></details>;
 }
 
-function responsiveAxes(
-  axes: Array<Record<string, unknown>>,
-  compact: boolean,
-  dimension: 'x' | 'y',
-  locale: UiLocale,
-): Array<Record<string, unknown>> {
-  if (!compact) return axes;
-  return axes.map((axis) => {
-    const axisLabel = isRecord(axis.axisLabel) ? axis.axisLabel : {};
-    return {
-      ...axis,
-      nameGap: 8,
-      nameTextStyle: { ...(isRecord(axis.nameTextStyle) ? axis.nameTextStyle : {}), fontSize: 9 },
-      axisLabel: {
-        ...axisLabel,
-        fontSize: 9,
-        hideOverlap: true,
-        formatter: dimension === 'x' && axis.type === 'time'
-          ? (value: unknown) => formatAxisTime(value, locale, true)
-          : axisLabel.formatter,
-      },
-    };
-  });
+function BindingDetail({ binding, label }: { binding: VisualizationBinding; label: string }) {
+  return <div className="visualization-link-detail" role="status"><strong>{label}</strong><span>{formatBindingType(binding.source_type)}</span></div>;
 }
 
-function compactSeriesOption(series: Record<string, unknown>): Record<string, unknown> {
-  const label = isRecord(series.label) ? series.label : null;
-  if (!label) return series;
-  return {
-    ...series,
-    label: {
-      ...label,
-      fontSize: 9,
-      width: 96,
-      overflow: 'truncate',
-    },
-    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' },
-  };
+function formatBindingType(value: string) {
+  return value.replace(/[_-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function mergeAxisPresentation(
-  generated: Array<Record<string, unknown>>,
-  presentation: unknown,
-  faceted: boolean,
-): Array<Record<string, unknown>> {
-  const shared = isRecord(presentation) ? presentation : null;
-  const perAxis = Array.isArray(presentation) ? presentation : [];
-  return generated.map((axis, index) => {
-    const overlay = shared || (isRecord(perAxis[index]) ? perAxis[index] : null);
-    const merged = overlay ? deepMerge(axis, overlay) : axis;
-    return { ...merged, gridIndex: faceted ? index : 0 };
-  });
+function formatValue(value: unknown, locale: UiLocale): string {
+  if (typeof value === 'number') return new Intl.NumberFormat(locale === 'zh-CN' ? 'zh-CN' : 'en-US', { maximumFractionDigits: 4 }).format(value);
+  if (typeof value === 'string' && isIsoTimestamp(value)) return formatHumanTime(value, locale);
+  if (typeof value === 'string') return sanitizeUserFacingText(value);
+  return value == null ? '—' : String(value);
 }
 
-function usesIndependentGrids(visualization: Visualization): boolean {
-  if (visualization.layout !== 'facets') return false;
-  const requestedXAxisIndices = (visualization.layers || [])
-    .map((layer) => layer.presentation?.xAxisIndex)
-    .filter((value): value is number => typeof value === 'number' && Number.isInteger(value));
-  return requestedXAxisIndices.length === 0 || requestedXAxisIndices.some((index) => index !== 0);
-}
-
-function axisPresentationCount(value: unknown): number {
-  if (Array.isArray(value)) return value.filter(isRecord).length;
-  return isRecord(value) ? 1 : 0;
-}
-
-function requestedAxisIndex(value: unknown, axisCount: number): number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < axisCount ? value : 0;
-}
-
-function preferredSharedXAxisType(
-  layers: NonNullable<Visualization['layers']>,
-  datasets: Map<string, Visualization['datasets'][number]>,
-) {
-  const types = layers.map((layer) => axisType(
-    datasets.get(layer.dataset_id)?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type,
-  ));
-  return types.includes('time') ? 'time' : types[0] || 'category';
-}
-
-function scalarAnnotationGraphic(
-  annotations: Array<{
-    label: string;
-    content?: string | null;
-    value: number | null;
-    unit?: string | null;
-  }>,
-  compact = false,
-) {
-  if (annotations.length === 0) return [];
-  const text = annotations.map(formatAnnotationText).join('\n');
-  return [{
-    type: 'text',
-    left: compact ? 48 : 76,
-    top: compact ? 48 : 58,
-    z: 100,
-    silent: true,
-    style: {
-      text,
-      fill: '#475467',
-      font: compact ? '9px sans-serif' : '11px sans-serif',
-      lineHeight: compact ? 14 : 18,
-      backgroundColor: 'rgba(255, 255, 255, 0.9)',
-      borderColor: '#e4e7ec',
-      borderWidth: 1,
-      borderRadius: 6,
-      padding: [6, 8],
-    },
-  }];
-}
-
-function formatAnnotationText(annotation: {
-  label: string;
-  content?: string | null;
-  value: number | null;
-  unit?: string | null;
-}) {
-  const heading = annotation.content
-    ? `${annotation.label}: ${annotation.content}`
-    : annotation.label;
-  if (annotation.value == null) return heading;
-  return `${heading}: ${formatAxisNumber(annotation.value)}${annotation.unit ? ` ${annotation.unit}` : ''}`;
-}
-
-function deepMerge(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
-  const merged: Record<string, unknown> = { ...base };
-  Object.entries(overlay).forEach(([key, value]) => {
-    const current = merged[key];
-    merged[key] = isRecord(current) && isRecord(value)
-      ? deepMerge(current, value)
-      : value;
-  });
-  return merged;
-}
-
-function buildLayerSeriesOption(
-  layer: NonNullable<Visualization['layers']>[number],
-  points: VisualizationPoint[],
-  index: number,
-  xAxisIndex: number,
-  yAxisIndex: number,
-  activeBindingId: string | null,
-): any {
-  const name = layer.label || formatRoleLabel(layer.role);
-  if (layer.mark === 'boxplot') {
-    return {
-      ...(layer.presentation || {}),
-      name,
-      type: 'boxplot',
-      xAxisIndex,
-      yAxisIndex,
-      data: points.map((point) => [
-        point.lower,
-        numberFrom(point.metadata?.q1),
-        numberFrom(point.metadata?.median) ?? point.y,
-        numberFrom(point.metadata?.q3),
-        point.upper,
-      ]),
-    };
-  }
-  if (layer.mark === 'bar') {
-    return {
-      ...(layer.presentation || {}),
-      name,
-      type: 'bar',
-      xAxisIndex,
-      yAxisIndex,
-      barMaxWidth: 34,
-      itemStyle: { borderRadius: [5, 5, 0, 0] },
-      emphasis: { focus: 'series' },
-      data: points.map((point) => toEChartsPoint(point)),
-    };
-  }
-  if (layer.mark === 'point') {
-    const colorField = encodingField(layer.encoding?.color);
-    const shapeField = encodingField(layer.encoding?.shape);
-    const sizeField = encodingField(layer.encoding?.size);
-    const opacityField = encodingField(layer.encoding?.opacity);
-    return {
-      ...(layer.presentation || {}),
-      name,
-      type: 'scatter',
-      xAxisIndex,
-      yAxisIndex,
-      symbol: (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index),
-      symbolSize: (_value: unknown, params: { data?: unknown }) => isRecord(params.data) && params.data.bindingId === activeBindingId
-        ? 15
-        : sizeForEncoding(params.data, sizeField),
-      itemStyle: {
-        color: (params: { data?: unknown }) => colorForEncoding(params.data, colorField, index),
-        borderColor: '#fff',
-        borderWidth: 2,
-      },
-      label: { show: true, position: 'top', color: '#475467', formatter: (params: { data?: unknown }) => isRecord(params.data) ? String(params.data.semanticLabel || '') : '' },
-      large: points.length > 1200,
-      data: points.map((point) => toEChartsPoint(point, layer, index, opacityField)),
-      z: 10,
-    };
-  }
-  const linePresentation = layer.presentation || {};
-  const presentedLineStyle = isRecord(linePresentation.lineStyle) ? linePresentation.lineStyle : {};
-  const presentedAreaStyle = isRecord(linePresentation.areaStyle) ? linePresentation.areaStyle : {};
-  const presentedEmphasis = isRecord(linePresentation.emphasis) ? linePresentation.emphasis : {};
-  const presentedLabel = isRecord(linePresentation.label) ? linePresentation.label : null;
-  const colorField = encodingField(layer.encoding?.color);
-  const shapeField = encodingField(layer.encoding?.shape);
-  const sizeField = encodingField(layer.encoding?.size);
-  const opacityField = encodingField(layer.encoding?.opacity);
-  return {
-    ...linePresentation,
-    name,
-    type: 'line',
-    xAxisIndex,
-    yAxisIndex,
-    showSymbol: linePresentation.showSymbol ?? (points.length <= 40 || points.some((point) => point.binding_id)),
-    symbol: shapeField
-      ? (_value: unknown, params: { data?: unknown }) => symbolForEncoding(params.data, shapeField, index)
-      : linePresentation.symbol,
-    symbolSize: (value: unknown, params: { data?: unknown }) => (
-      isRecord(params.data) && params.data.bindingId === activeBindingId ? 10 : 5
-    ),
-    smooth: linePresentation.smooth ?? false,
-    connectNulls: linePresentation.connectNulls ?? false,
-    lineStyle: {
-      ...presentedLineStyle,
-      color: colorField
-        ? colorForEncoding({ metadata: points[0]?.metadata || {} }, colorField, index)
-        : presentedLineStyle.color,
-      width: sizeField
-        ? lineWidthForEncoding({ metadata: points[0]?.metadata || {} }, sizeField)
-        : presentedLineStyle.width ?? 2,
-      opacity: opacityField
-        ? opacityForEncoding({ metadata: points[0]?.metadata || {} }, opacityField)
-        : presentedLineStyle.opacity ?? 1,
-    },
-    areaStyle: layer.mark === 'area' ? { opacity: 0.16, ...presentedAreaStyle } : undefined,
-    label: presentedLabel
-      ? {
-          ...presentedLabel,
-          formatter: presentedLabel.formatter ?? (() => points[0]?.label || name),
-        }
-      : undefined,
-    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' },
-    data: points.map((point) => toEChartsPoint(point, layer, index, opacityField)),
-    emphasis: { focus: 'series', ...presentedEmphasis },
-    z: linePresentation.z ?? 3 + index,
-  };
-}
-
-function buildRendererNativeSeriesOption(
-  layer: NonNullable<Visualization['layers']>[number],
-  datasetId: string,
-  xAxisIndex: number,
-  yAxisIndex: number,
-): Record<string, unknown> {
-  // Presentation is merged first. Grounded binding properties below always win,
-  // so renderer freedom cannot replace the dataset or its field encodings.
-  return {
-    ...(layer.presentation || {}),
-    name: layer.label || formatRoleLabel(layer.role),
-    type: layer.mark,
-    datasetId,
-    encode: layer.encoding || {},
-    xAxisIndex,
-    yAxisIndex,
-  };
-}
-
-function groundedPointRecord(
-  point: VisualizationPoint,
-  encoding: Record<string, string | string[]> | undefined,
-): Record<string, unknown> {
-  const record: Record<string, unknown> = { ...(point.metadata || {}) };
-  const xField = encodingField(encoding?.x);
-  const yFields = encodingFields(encoding?.y || encoding?.value);
-  if (xField && record[xField] === undefined) record[xField] = point.x;
-  if (yFields.length === 1 && record[yFields[0]] === undefined) record[yFields[0]] = point.y;
-  record.__binding_id = point.binding_id;
-  record.__semantic_label = point.label;
-  return record;
-}
-
-function encodingFields(value: string | string[] | undefined): string[] {
-  return Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
-}
-
-function encodingField(value: string | string[] | undefined): string | undefined {
-  return encodingFields(value)[0];
-}
-
-function confidenceBandSeries(
-  series: VisualizationSeries,
-  index: number,
-  xAxisIndex: number,
-  yAxisIndex: number,
-): any[] {
-  const bounded = (series.points || []).filter((point) => point.lower != null && point.upper != null);
-  if (bounded.length === 0) return [];
-  return [
-    {
-      name: `${series.name} lower`,
-      type: 'line',
-      xAxisIndex,
-      yAxisIndex,
-      stack: `confidence_${index}`,
-      symbol: 'none',
-      lineStyle: { opacity: 0 },
-      areaStyle: { opacity: 0 },
-      tooltip: { show: false },
-      data: bounded.map((point) => [point.x, point.lower]),
-      silent: true,
-    },
-    {
-      name: `${series.name} interval`,
-      type: 'line',
-      xAxisIndex,
-      yAxisIndex,
-      stack: `confidence_${index}`,
-      symbol: 'none',
-      lineStyle: { opacity: 0 },
-      areaStyle: { color: 'rgba(105, 65, 198, 0.20)' },
-      tooltip: { show: false },
-      data: bounded.map((point) => [point.x, Number(point.upper) - Number(point.lower)]),
-      silent: true,
-    },
-  ];
-}
-
-function AccessibleTable({ visualization, rows, columns, onSelectBinding, locale }: {
-  visualization: Visualization;
-  rows: Array<Record<string, unknown>>;
-  columns: string[];
-  onSelectBinding: (bindingId: string) => void;
-  locale: UiLocale;
-}) {
-  const bindingById = new Map((visualization.bindings || []).map((binding) => [binding.binding_id, binding]));
-  const temporalColumns = new Set(visualization.datasets.flatMap((dataset) => (
-    (dataset.dimensions || [])
-      .filter((dimension) => dimension.data_type === 'time')
-      .map((dimension) => dimension.name)
-  )));
-  return (
-    <div className="answer-visualization-table-wrap">
-      <table className="answer-data-table answer-visualization-table">
-        <thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
-        <tbody>
-          {rows.map((row, rowIndex) => {
-            const bindingId = typeof row.binding_id === 'string' ? row.binding_id : null;
-            const binding = bindingId ? bindingById.get(bindingId) : undefined;
-            return (
-              <tr
-                key={String(row.item_id || rowIndex)}
-                onClick={() => binding && onSelectBinding(binding.binding_id)}
-                onKeyDown={(event) => {
-                  if ((event.key === 'Enter' || event.key === ' ') && binding) onSelectBinding(binding.binding_id);
-                }}
-                tabIndex={binding ? 0 : undefined}
-              >
-                {columns.map((column) => (
-                  <td key={column}>{formatCell(row[column], locale, temporalColumns.has(column))}</td>
-                ))}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function toEChartsPoint(
-  point: VisualizationPoint,
-  layer?: NonNullable<Visualization['layers']>[number],
-  layerIndex = 0,
-  opacityField?: string,
-) {
-  const metadata = point.metadata || {};
-  const colorField = encodingField(layer?.encoding?.color);
-  return {
-    value: [chartValue(point.x), point.y],
-    bindingId: point.binding_id,
-    semanticLabel: point.label,
-    metadata,
-    itemStyle: {
-      color: colorForEncoding({ metadata }, colorField, layerIndex),
-      opacity: opacityForEncoding({ metadata }, opacityField),
-      borderWidth: point.binding_id ? 2 : undefined,
-      borderColor: point.binding_id ? '#fff' : undefined,
-    },
-  };
-}
-
-function chartValue(value: unknown): string | number | null {
-  if (typeof value === 'number' || typeof value === 'string') return value;
-  return value == null ? null : String(value);
-}
-
-function formatAxisTime(value: unknown, locale: UiLocale = 'en', compact = false): string {
-  return formatHumanTime(value, locale, compact ? 'axis-compact' : 'axis');
-}
-
-function compactLegendLabel(value: string): string {
-  return value.length > 18 ? `${value.slice(0, 17)}…` : value;
-}
-
-function formatAxisNumber(value: unknown): string {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return '—';
-  return new Intl.NumberFormat(undefined, {
-    notation: Math.abs(numeric) >= 1_000_000 ? 'compact' : 'standard',
-    maximumFractionDigits: 3,
-  }).format(numeric);
-}
-
-function formatMarkLabel(mark: string) {
-  return mark[0]?.toUpperCase() + mark.slice(1);
-}
-
-function formatRoleLabel(role: string) {
-  return role.replace(/[._-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function axisType(dataType?: string): 'time' | 'value' | 'category' {
-  if (dataType === 'time') return 'time';
-  if (dataType === 'number') return 'value';
-  return 'category';
-}
-
-const VISUAL_COLORS = ['#087f5b', '#6941c6', '#175cd3', '#dc6803', '#b42318'];
-const VISUAL_SYMBOLS = ['circle', 'triangle', 'diamond', 'rect', 'roundRect'];
-
-function encodedValue(data: unknown, field?: string): unknown {
-  return field && isRecord(data) && isRecord(data.metadata) ? data.metadata[field] : undefined;
-}
-
-function stableIndex(value: unknown, modulo: number, fallback: number): number {
-  if (value === undefined || value === null) return fallback % modulo;
-  const text = String(value);
-  let hash = 0;
-  for (let index = 0; index < text.length; index += 1) hash = ((hash * 31) + text.charCodeAt(index)) >>> 0;
-  return hash % modulo;
-}
-
-function colorForEncoding(data: unknown, field: string | undefined, fallback: number): string {
-  return VISUAL_COLORS[stableIndex(encodedValue(data, field), VISUAL_COLORS.length, fallback)];
-}
-
-function symbolForEncoding(data: unknown, field: string | undefined, fallback: number): string {
-  return VISUAL_SYMBOLS[stableIndex(encodedValue(data, field), VISUAL_SYMBOLS.length, fallback)];
-}
-
-function sizeForEncoding(data: unknown, field?: string): number {
-  const value = Number(encodedValue(data, field));
-  return Number.isFinite(value) ? Math.max(6, Math.min(24, Math.abs(value))) : 10;
-}
-
-function lineWidthForEncoding(data: unknown, field?: string): number {
-  const value = Number(encodedValue(data, field));
-  return Number.isFinite(value) ? Math.max(1, Math.min(8, Math.abs(value))) : 2;
-}
-
-function opacityForEncoding(data: unknown, field?: string): number {
-  const value = Number(encodedValue(data, field));
-  return Number.isFinite(value) ? Math.max(0.15, Math.min(1, value)) : 1;
-}
-
-function formatCell(value: unknown, locale: UiLocale, temporal = false): string {
-  if (value === null || value === undefined || value === '') return '—';
-  if (temporal || isIsoTimestamp(value)) return formatHumanTime(value, locale, 'long');
-  if (typeof value === 'number') return formatAxisNumber(value);
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
-}
-
-function formatTimeSeriesTooltip(value: unknown, locale: UiLocale): string {
-  const params = (Array.isArray(value) ? value : [value]).filter(isRecord);
-  if (params.length === 0) return '';
-  const first = params[0];
-  const timestamp = first.axisValue ?? firstAxisValue(first.value) ?? firstAxisValue(first.data);
-  const heading = escapeTooltipText(formatHumanTime(timestamp, locale, 'long'));
-  const rows = params.map((param) => {
-    const marker = typeof param.marker === 'string' ? param.marker : '';
-    const name = escapeTooltipText(String(param.seriesName || param.name || ''));
-    const renderedValue = escapeTooltipText(formatTooltipValue(param.value));
-    return `${marker}${name}${name ? ': ' : ''}${renderedValue}`;
-  });
-  return [heading, ...rows].filter(Boolean).join('<br/>');
-}
-
-function firstAxisValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value[0];
-  if (isRecord(value)) return firstAxisValue(value.value);
-  return undefined;
-}
-
-function formatTooltipValue(value: unknown): string {
-  if (Array.isArray(value)) {
-    const measures = value.slice(1).filter((item) => item !== null && item !== undefined);
-    return measures.map((item) => typeof item === 'number' ? formatAxisNumber(item) : String(item)).join(' · ');
-  }
-  if (typeof value === 'number') return formatAxisNumber(value);
-  if (isRecord(value)) return formatTooltipValue(value.value);
-  return value === null || value === undefined ? '—' : String(value);
-}
-
-function escapeTooltipText(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function numberFrom(value: unknown): number | null {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
+function zoomValue(value: unknown): string | number | Date | undefined {
+  return typeof value === 'string' || typeof value === 'number' || value instanceof Date ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
