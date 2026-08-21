@@ -22,7 +22,6 @@ cache_data/
 
 .env
 .env.*
-!.env.example
 
 # Runtime model connections can contain API credentials. Version only the
 # credential-free templates under configs/models/templates/.
