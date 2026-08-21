@@ -1,6 +1,6 @@
 <h1 align="center">TSPilot: Agentic AI-native Time Series Data Interaction System</h1>
 
-<p align="center"><b>An AI-native agent system for interacting with and analyzing time-series data</b></p>
+<p align="center"><b>Connect, query, analyze, and understand time-series data through natural language</b></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Version-0.1.0-6C63FF?style=flat-square" alt="TSPilot 0.1.0">
@@ -23,7 +23,6 @@
 
 <p align="center">
   <a href="#-updates">Updates</a>&nbsp;&nbsp;•&nbsp;&nbsp;
-  <a href="#-why-tspilot">Why TSPilot</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-product-interface">Product interface</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-core-capabilities">Core capabilities</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-quick-start">Quick start</a>&nbsp;&nbsp;•&nbsp;&nbsp;
@@ -39,11 +38,11 @@
 
 ## 🧭 Why TSPilot
 
-Time-series analysis involves much more than writing a database query. Users often need to understand data structure, time ranges, aggregation choices, and data quality, then move repeatedly between querying, analysis, and visualization tools before reaching a reliable conclusion.
+Time-series analysis involves much more than writing a database query. Users often need to understand **data structure, time ranges, aggregation choices, and data quality**, then move repeatedly between querying, analysis, and visualization tools before reaching a reliable conclusion.
 
-TSPilot connects natural-language interaction with time-series querying, analysis, and visualization. It helps users explore data, detect anomalies, forecast future values, discover patterns, and produce conclusions grounded in real evidence.
+TSPilot connects **natural-language interaction** with **time-series querying, analysis, and visualization**. It helps users explore data, detect anomalies, forecast future values, discover patterns, and produce **conclusions grounded in real evidence**.
 
-The artifacts and insights created during one analysis can be reused in later questions, allowing an investigation to continue naturally instead of starting from scratch.
+The artifacts and insights created during one analysis can be **reused in later questions**, allowing an investigation to continue naturally instead of starting from scratch.
 
 ## 🖥️ Product interface
 
@@ -62,13 +61,21 @@ The artifacts and insights created during one analysis can be reused in later qu
 
 ## ✨ Core capabilities
 
-| Capability | Description |
-|---|---|
-| 💬 **Natural-language data interaction** | Query, explore, and analyze time-series data using ordinary language. |
-| 🗄️ **Multiple time-series databases** | Connect and manage different time-series databases through one consistent experience. |
-| 📊 **Full-result analysis** | Perform statistical analysis, forecasting, anomaly detection, and pattern discovery over complete query results. |
-| ♻️ **Reusable analytical artifacts** | Preserve query results, insights, and visualizations for follow-up questions and continued analysis. |
-| 📈 **Visual verification** | Combine complete time series, forecast intervals, anomaly points, and key windows in interactive line charts. |
+<table>
+  <thead>
+    <tr>
+      <th width="32%">Capability</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>💬 <b>Natural-language data interaction</b></td><td>Query, explore, and analyze time-series data using ordinary language.</td></tr>
+    <tr><td>🗄️ <b>Multiple time-series databases</b></td><td>Connect and manage different time-series databases through one consistent experience.</td></tr>
+    <tr><td>📊 <b>Full-result analysis</b></td><td>Perform statistical analysis, forecasting, anomaly detection, and pattern discovery over complete query results.</td></tr>
+    <tr><td>♻️ <b>Reusable analytical artifacts</b></td><td>Preserve query results, insights, and visualizations for follow-up questions and continued analysis.</td></tr>
+    <tr><td>📈 <b>Visual verification</b></td><td>Combine complete time series, forecast intervals, anomaly points, and key windows in interactive line charts.</td></tr>
+  </tbody>
+</table>
 
 ## 🚀 Quick start
 
