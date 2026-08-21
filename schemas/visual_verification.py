@@ -1,7 +1,15 @@
 """Semantic contract shared by visualization planning and presentation."""
 from __future__ import annotations
 
+from typing import Annotated, Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+VisualProofObligationId = Annotated[
+    str,
+    Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$"),
+]
 
 
 class VisualProofObligation(BaseModel):
@@ -9,9 +17,9 @@ class VisualProofObligation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    obligation_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
-    description: str = Field(min_length=1)
-    required: bool
+    obligation_id: VisualProofObligationId
+    description: str = Field(min_length=1, max_length=800)
+    required: Literal[True]
 
 
 class VisualizationVerification(BaseModel):
@@ -20,9 +28,9 @@ class VisualizationVerification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_insight_ids: list[str] = Field(default_factory=list)
-    verification_question: str = Field(min_length=1)
-    interpretation: str = Field(min_length=1)
-    proof_obligations: list[VisualProofObligation] = Field(default_factory=list)
+    verification_question: str = Field(min_length=1, max_length=1200)
+    interpretation: str = Field(min_length=1, max_length=1200)
+    proof_obligations: list[VisualProofObligation] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def unique_targets(self):

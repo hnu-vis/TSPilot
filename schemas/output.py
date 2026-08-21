@@ -74,6 +74,7 @@ class VisualLayerPlan(BaseModel):
     encoding: dict[str, str | VisualFieldEncoding | list[str | VisualFieldEncoding]] = Field(default_factory=dict)
     transform: list[VisualFilterTransform] = Field(default_factory=list)
     presentation: dict[str, Any] = Field(default_factory=dict)
+    provenance_source_refs: list[str] = Field(default_factory=list)
     label: str | None = None
 
     @model_validator(mode="after")
@@ -84,6 +85,61 @@ class VisualLayerPlan(BaseModel):
         if mark.casefold() in {"text", "table"}:
             raise ValueError(f"'{mark}' is content, not a graphical visualization mark")
         return self
+
+
+class VisualSemanticPlan(BaseModel):
+    """One grounded semantic object with separate target and content bindings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    semantic_id: str = Field(min_length=1)
+    semantic_type: Literal["fact", "event", "observation", "interval", "relation", "reference"]
+    role: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    target_encoding: dict[str, str] = Field(default_factory=dict)
+    description_field: str | None = None
+    metric_fields: list[str] = Field(default_factory=list)
+    related_semantic_ids: list[str] = Field(default_factory=list)
+    importance: Literal["primary", "highlight", "support"] = "support"
+    line_style: Literal["solid", "dashed", "dotted"] = "solid"
+    symbol: Literal["none", "circle", "diamond", "triangle", "pin"] = "none"
+    presentation: dict[str, Any] = Field(default_factory=dict)
+    provenance_source_refs: list[str] = Field(default_factory=list)
+    label: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_semantic_shape(self):
+        required = {
+            "fact": set(),
+            "event": {"x"},
+            "observation": {"x", "y"},
+            "interval": {"start", "end"},
+            "relation": set(),
+            "reference": {"value"},
+        }[self.semantic_type]
+        actual = set(self.target_encoding)
+        if actual != required:
+            raise ValueError(
+                f"semantic '{self.semantic_id}' type '{self.semantic_type}' requires target fields "
+                f"{sorted(required)}, got {sorted(actual)}"
+            )
+        if self.semantic_type == "relation":
+            if len(self.related_semantic_ids) < 2:
+                raise ValueError("relation semantic requires at least two related semantic ids")
+        elif self.related_semantic_ids:
+            raise ValueError("only relation semantics may contain related_semantic_ids")
+        if not self.description_field and not self.metric_fields and self.semantic_type == "fact":
+            raise ValueError("fact semantic requires grounded description or metric content")
+        return self
+
+
+class VisualGuideSectionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    section_id: str = Field(min_length=1)
+    section_type: Literal["data", "semantics"]
+    label: str = Field(min_length=1)
+    target_ids: list[str] = Field(min_length=1)
 
 
 class VisualGoal(BaseModel):
@@ -98,10 +154,15 @@ class VisualGoal(BaseModel):
     required_roles: list[str] = Field(default_factory=list)
     presentation: dict[str, Any] = Field(default_factory=dict)
     layers: list[VisualLayerPlan] = Field(default_factory=list)
+    semantics: list[VisualSemanticPlan] = Field(default_factory=list)
+    guides: list[VisualGuideSectionPlan] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def require_role_layer_bijection(self):
-        layer_roles = {layer.role.strip().casefold() for layer in self.layers}
+    def require_role_coverage(self):
+        layer_roles = {
+            item.role.strip().casefold()
+            for item in [*self.layers, *self.semantics]
+        }
         missing = [
             role for role in self.required_roles
             if role.strip().casefold() not in layer_roles
@@ -110,6 +171,27 @@ class VisualGoal(BaseModel):
             raise ValueError(
                 f"every required visual role must have a same-role layer; missing={missing}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_scene_refs(self):
+        semantic_ids = {item.semantic_id for item in self.semantics}
+        if len(semantic_ids) != len(self.semantics):
+            raise ValueError("visual semantic ids must be unique")
+        for semantic in self.semantics:
+            unknown = set(semantic.related_semantic_ids) - semantic_ids
+            if unknown:
+                raise ValueError(
+                    f"relation semantic '{semantic.semantic_id}' references unknown semantics: {sorted(unknown)}"
+                )
+        mark_ids = {f"mark_{index}" for index, _ in enumerate(self.layers)}
+        for section in self.guides:
+            allowed = mark_ids if section.section_type == "data" else semantic_ids
+            unknown = set(section.target_ids) - allowed
+            if unknown:
+                raise ValueError(
+                    f"guide section '{section.section_id}' references unknown targets: {sorted(unknown)}"
+                )
         return self
 
 
@@ -122,20 +204,57 @@ class VisualEncodingIR(BaseModel):
     field: str = Field(min_length=1)
 
 
-class VisualLayerIR(BaseModel):
-    """Renderer-independent, closed layer intent compiled into a VisualLayerPlan."""
+class VisualSemanticIR(BaseModel):
+    """Closed LLM-authored semantic intent before deterministic compilation."""
 
     model_config = ConfigDict(extra="forbid")
 
-    layer_type: Literal["series", "event_points", "band", "interval_overlay", "comparison"]
+    semantic_id: str = Field(min_length=1)
+    semantic_type: Literal["fact", "event", "observation", "interval", "relation", "reference"]
+    role: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    target_encodings: list[VisualEncodingIR] = Field(default_factory=list)
+    description_field: str | None = None
+    metric_fields: list[str] = Field(default_factory=list)
+    related_semantic_ids: list[str] = Field(default_factory=list)
+    importance: Literal["primary", "highlight", "support"]
+    line_style: Literal["solid", "dashed", "dotted"]
+    symbol: Literal["none", "circle", "diamond", "triangle", "pin"]
+    label: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_semantic_contract(self):
+        channels = [encoding.channel for encoding in self.target_encodings]
+        if len(channels) != len(set(channels)):
+            raise ValueError(f"semantic IR '{self.semantic_id}' contains duplicate target channels")
+        required = {
+            "fact": set(),
+            "event": {"x"},
+            "observation": {"x", "y"},
+            "interval": {"lower", "upper"},
+            "relation": set(),
+            "reference": {"value"},
+        }[self.semantic_type]
+        if set(channels) != required:
+            raise ValueError(
+                f"semantic IR '{self.semantic_id}' type '{self.semantic_type}' requires "
+                f"target channels {sorted(required)}, got {sorted(channels)}"
+            )
+        if self.semantic_type == "relation" and len(self.related_semantic_ids) < 2:
+            raise ValueError("relation semantic IR requires at least two related semantic ids")
+        if self.semantic_type != "relation" and self.related_semantic_ids:
+            raise ValueError("only relation semantic IR may reference related semantics")
+        return self
+
+
+class _VisualLayerIRBase(BaseModel):
+    """Fields shared by every renderer-independent layer intent."""
+
+    model_config = ConfigDict(extra="forbid")
+
     role: str = Field(min_length=1)
     source_ref: str = Field(min_length=1)
     encodings: list[VisualEncodingIR]
-    interval_source_ref: str | None
-    interval_start_field: str | None
-    interval_end_field: str | None
-    interval_start_value: str | int | float | None
-    interval_end_value: str | int | float | None
     emphasis: Literal["normal", "subtle", "strong"]
     line_style: Literal["solid", "dashed", "dotted"]
     symbol: Literal["none", "circle", "diamond", "triangle", "pin"]
@@ -150,12 +269,81 @@ class VisualLayerIR(BaseModel):
         channel_set = set(channels)
         if self.layer_type == "band":
             required = {"x", "lower", "upper"}
+        elif self.layer_type == "reference_line":
+            required = {"value"}
+        elif self.layer_type == "annotation":
+            required = {"label"}
         else:
             required = {"x", "y"}
         missing = required - channel_set
         if missing:
             raise ValueError(f"visual IR layer '{self.role}' is missing channels {sorted(missing)}")
         return self
+
+
+class SeriesVisualLayerIR(_VisualLayerIRBase):
+    layer_type: Literal["series"]
+
+
+class EventPointsVisualLayerIR(_VisualLayerIRBase):
+    layer_type: Literal["event_points"]
+
+
+class BandVisualLayerIR(_VisualLayerIRBase):
+    layer_type: Literal["band"]
+
+
+class ComparisonVisualLayerIR(_VisualLayerIRBase):
+    layer_type: Literal["comparison"]
+
+
+class ReferenceLineVisualLayerIR(_VisualLayerIRBase):
+    """A grounded scalar guide spanning the host plot's x domain."""
+
+    layer_type: Literal["reference_line"]
+
+
+class AnnotationVisualLayerIR(_VisualLayerIRBase):
+    """Grounded content attached to a host, optionally at a real x position.
+
+    An annotation may bind ``x`` when its source is a located event or
+    observation. Omitting ``x`` keeps scalar/global content as a chart-level
+    callout. In either form the annotation borrows the host coordinate system
+    and never creates an axis domain of its own.
+    """
+
+    layer_type: Literal["annotation"]
+
+
+class IntervalSourceVisualLayerIR(_VisualLayerIRBase):
+    """An interval overlay whose one boundary pair comes from another view."""
+
+    layer_type: Literal["interval_overlay"]
+    interval_source_ref: str = Field(min_length=1)
+    interval_start_field: str = Field(min_length=1)
+    interval_end_field: str = Field(min_length=1)
+
+
+class IntervalLiteralVisualLayerIR(_VisualLayerIRBase):
+    """An interval overlay whose boundary pair is explicitly grounded in the IR."""
+
+    layer_type: Literal["interval_overlay"]
+    interval_start_value: str | int | float
+    interval_end_value: str | int | float
+
+
+# A plain union emits provider-compatible JSON Schema ``anyOf`` while each
+# branch makes irrelevant interval properties impossible to emit.
+VisualLayerIR = (
+    SeriesVisualLayerIR
+    | EventPointsVisualLayerIR
+    | BandVisualLayerIR
+    | ComparisonVisualLayerIR
+    | ReferenceLineVisualLayerIR
+    | AnnotationVisualLayerIR
+    | IntervalSourceVisualLayerIR
+    | IntervalLiteralVisualLayerIR
+)
 
 
 class VisualGoalIR(BaseModel):
@@ -175,10 +363,15 @@ class VisualGoalIR(BaseModel):
     viewport_end: str | int | float | None
     y_scale: Literal["linear", "log"]
     layers: list[VisualLayerIR] = Field(min_length=1)
+    semantics: list[VisualSemanticIR] = Field(default_factory=list)
+    guides: list[VisualGuideSectionPlan] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def require_role_layer_bijection(self):
-        layer_roles = {layer.role.strip().casefold() for layer in self.layers}
+    def require_role_coverage(self):
+        layer_roles = {
+            item.role.strip().casefold()
+            for item in [*self.layers, *self.semantics]
+        }
         missing = [
             role for role in self.required_roles
             if role.strip().casefold() not in layer_roles

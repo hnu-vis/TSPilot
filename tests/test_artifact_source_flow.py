@@ -43,6 +43,7 @@ class _NeedsForecastCalculationLlm:
         requirement = {
             "required_action": "code_interpreter",
             "purpose": "Calculate forecast direction and percentage change",
+            "message": None,
             "required_shape": "scalar",
             "required_fields": ["direction", "change_pct"],
             "required_properties": ["derived from forecast endpoints"],
@@ -54,17 +55,19 @@ class _NeedsForecastCalculationLlm:
                 "insight_type": "change",
             }],
         }
-        if "You are the visual verification planner inside" in prompt:
+        if "You define the presentation goal" in prompt:
             payload = {
                 "decision": "needs_sources",
                 "target_insight_ids": [],
                 "verification_question": None,
                 "interpretation": None,
                 "visual_relation": "forecast_change",
+                "proof_obligations": [],
                 "required_context": ["forecast direction and percentage change"],
                 "non_visual_insight_ids": [],
                 "required_data_request": requirement,
             }
+            payload = {"outcome": payload}
         elif "semantic projection stage" in prompt:
             payload = {"semantic_views": [], "required_data_request": requirement}
         else:
@@ -269,6 +272,26 @@ def test_visualization_runtime_injects_presentation_budget_without_outer_reasoni
     }
 
 
+def test_visualization_runtime_separates_repair_control_from_semantic_constraints():
+    executor = ToolExecutor.__new__(ToolExecutor)
+
+    normalized = executor._normalize_action_input(
+        "visualization",
+        {
+            "message": "Repair the visual.",
+            "constraints": {
+                "theme": "dark",
+                "mode": "repair",
+                "repair_contract": {"execution_error": "rejected candidate payload"},
+                "_validation_failure": {"message": "internal diagnostic"},
+            },
+        },
+        _state(),
+    )
+
+    assert normalized["constraints"] == {"theme": "dark"}
+
+
 @pytest.mark.asyncio
 async def test_code_interpreter_calculates_directly_from_forecast_source():
     result = await CodeInterpreterTool(llm=_BinderLlm()).execute(
@@ -333,6 +356,28 @@ def test_presentation_catalog_publishes_all_specialized_views():
     assert "view:anomaly:anomaly_evi_demo:points" in refs
     assert "view:anomaly:anomaly_evi_demo:spans" in refs
     assert "view:anomaly:anomaly_evi_demo:scores" in refs
+
+
+def test_planner_inventory_exposes_bounded_grounded_facts_for_small_specialized_views():
+    inventory = PresentationCatalog(_state()).planner_inventory()
+    by_ref = {item["source_ref"]: item for item in inventory["sources"]}
+
+    assert by_ref["view:anomaly:anomaly_evi_demo:points"]["grounded_preview"] == [{
+        "timestamp": "2026-01-02T00:00:00Z",
+        "value": 110.0,
+    }]
+    assert by_ref["view:anomaly:anomaly_evi_demo:points"]["semantic_contract"] == {
+        "data_role": "anomaly_detection_output",
+        "materializes_input_transformation": False,
+        "operation_description": "Detected anomaly points, scores, spans, or detector status.",
+        "supported_visual_uses": ["anomaly_markers", "exclusion_markers", "anomaly_scores"],
+        "limitations": [
+            "Does not contain the retained/cleaned input records after exclusions.",
+            "Does not apply anomaly exclusions to the input series.",
+        ],
+    }
+    assert by_ref["view:evidence:evi_demo:default"]["semantic_contract"]["data_role"] == "raw_observations"
+    assert "grounded_preview" not in by_ref["view:evidence:evi_demo:default"]
 
 
 def test_planner_inventory_does_not_expand_every_insight_item_into_a_source():

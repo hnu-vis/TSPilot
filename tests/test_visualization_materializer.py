@@ -53,6 +53,13 @@ def test_catalog_exposes_typed_reference_contracts_without_data_rows():
     assert "rows" not in view
     assert "examples" not in str(view["data_structure"])
     assert view["projection_root"]["record_path_candidates"] == ["$.records"]
+    assert view["projection_root"]["executable_path_contracts"] == {
+        "default_source_paths": ["$.timestamp", "$.value"],
+        "record_paths": [{
+            "record_path": "$.records",
+            "source_paths": ["$.timestamp", "$.value"],
+        }],
+    }
 
 
 def test_semantic_projection_supports_sparse_fields_in_heterogeneous_records():
@@ -91,6 +98,37 @@ def test_semantic_projection_supports_sparse_fields_in_heterogeneous_records():
     assert rows == [
         {"time": "2026-01-01", "lower": None, "upper": None},
         {"time": "2026-01-02", "lower": 9.0, "upper": 13.0},
+    ]
+
+
+def test_semantic_projection_exposes_scalar_views_only_as_explicit_guides():
+    state = _state([{"timestamp": "2026-01-01", "value": 10.0}])
+    state.derived_evidence_artifacts["dev_status"] = DerivedEvidence(
+        evidence_id="dev_status",
+        name="Processing status",
+        shape="scalar",
+        scalar={"detected_count": 2},
+        lineage=["evidence:evi_series"],
+        transform_summary="Counted status records.",
+    )
+    catalog = PresentationCatalog(state)
+
+    refs = catalog.materialize_semantic_views([SimpleNamespace(
+        view_id="status_only",
+        name="Status only",
+        grain="status",
+        source_ref="view:derived_evidence:dev_status",
+        record_path=None,
+        fields=[SimpleNamespace(
+            name="detected_count",
+            semantic_role="status_count",
+            source_path="$.detected_count",
+        )],
+    )])
+
+    view = catalog.semantic_inventory(refs)["views"][0]
+    assert view["render_contract"]["allowed_layer_types"] == [
+        "reference_line", "annotation",
     ]
 
 
@@ -136,6 +174,12 @@ def test_semantic_projection_flattens_an_llm_selected_nested_record_grain():
         if source["source_ref"] == "insight:ins_turns"
     )
     assert "$.items[*].items" in insight_inventory["projection_root"]["record_path_candidates"]
+    nested_contract = next(
+        item
+        for item in insight_inventory["projection_root"]["executable_path_contracts"]["record_paths"]
+        if item["record_path"] == "$.items[*].items"
+    )
+    assert nested_contract["source_paths"] == ["$.role", "$.timestamp", "$.value"]
 
     refs = catalog.materialize_semantic_views([SimpleNamespace(
         view_id="turning_boundaries",
@@ -501,6 +545,101 @@ def test_verified_return_rate_scalar_is_losslessly_projected_as_a_bar():
     assert point.x == "Return rate"
     assert point.y == 44.3196
     assert state.insight_set.insights[0].value == 44.3196
+
+
+def test_scalar_guides_attach_to_a_time_host_without_creating_an_x_domain():
+    state = _state([
+        {"timestamp": "2026-01-01", "value": 1.0},
+        {"timestamp": "2026-01-02", "value": 3.0},
+    ])
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_summary",
+        insight_key="observed_summary",
+        name="Observed summary",
+        insight_type="point_value",
+        statement="The mean is 2 and the judgment is low.",
+        value={"mean": 2.0, "judgment": "low"},
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_series")],
+        calculation_trace={"formula": "mean(value)"},
+    )]
+
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(
+            role="observations",
+            source_ref="view:evidence:evi_series:default",
+            mark="line",
+            encoding={"x": "timestamp", "y": "value"},
+        ),
+        VisualLayerPlan(
+            role="summary",
+            source_ref="insight:insight_summary",
+            mark="rule",
+            encoding={"value": "mean"},
+            label="Mean",
+        ),
+        VisualLayerPlan(
+            role="summary",
+            source_ref="insight:insight_summary",
+            mark="annotation",
+            encoding={"label": "judgment"},
+            label="Judgment",
+        ),
+        required_roles=["observations", "summary"],
+    ))
+
+    assert [layer.mark for layer in result.layers] == ["line", "rule", "annotation"]
+    assert result.layers[1].points[0].y == 2.0
+    assert result.layers[2].points[0].label == "low"
+    assert result.layers[2].points[0].x is None
+    assert result.datasets[0].dimensions[0].data_type == "time"
+
+
+def test_code_insight_annotation_preserves_an_optional_grounded_x_coordinate():
+    state = _state([
+        {"timestamp": "2026-01-01T00:00:00Z", "value": 1.0},
+        {"timestamp": "2026-01-02T00:00:00Z", "value": 3.0},
+    ])
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_decision",
+        insight_key="decision_point",
+        name="Decision point",
+        insight_type="decision_point",
+        statement="The code-derived decision occurs at the second observation.",
+        value={"count": 1},
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_series")],
+        calculation_trace={"method": "optimized grounded objective"},
+        items=[InsightItem(
+            item_id="decision_1",
+            timestamp="2026-01-02T00:00:00Z",
+            value=3.0,
+            label="Decision",
+            dimensions={"role": "selected_decision"},
+        )],
+    )]
+
+    result = VisualizationMaterializer(state).materialize(_goal(
+        VisualLayerPlan(
+            role="observations",
+            source_ref="view:evidence:evi_series:default",
+            mark="line",
+            encoding={"x": "timestamp", "y": "value"},
+        ),
+        VisualLayerPlan(
+            role="decision",
+            source_ref="insight:insight_decision",
+            mark="annotation",
+            encoding={"x": "timestamp", "value": "value", "label": "label"},
+            label="Code result",
+        ),
+    ))
+
+    annotation = result.layers[1].points[0]
+    assert annotation.x == "2026-01-02T00:00:00Z"
+    assert annotation.y == 3.0
+    assert annotation.label == "Decision"
+    assert result.datasets[1].dimensions[0].data_type == "time"
 
 
 def test_line_segment_highlight_preserves_full_context_and_upstream_values():

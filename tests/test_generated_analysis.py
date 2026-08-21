@@ -300,6 +300,7 @@ def test_code_generation_and_binding_are_separate_llm_calls():
     ))
     assert len(llm.calls) == 2
     assert "Do not produce statements" in llm.calls[0][0][1]
+    assert "Do not discard that relationship after reducing it to a scalar" in llm.calls[0][0][1]
     assert "Do not calculate" in llm.calls[1][0][1]
     assert result["computed_insights"][0]["value"] == 15.0
 

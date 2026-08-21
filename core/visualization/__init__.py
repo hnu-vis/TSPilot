@@ -1,6 +1,7 @@
 """Grounded presentation-source inventory and template materialization."""
 
 from core.visualization.materializer import (
+    IncompatibleVisualDomainError,
     InvalidPresentationLineageError,
     PresentationCatalog,
     VisualizationMaterializer,
@@ -11,6 +12,7 @@ from core.visualization.render_audit import PlaywrightEChartsRenderAuditor
 
 __all__ = [
     "InvalidPresentationLineageError",
+    "IncompatibleVisualDomainError",
     "PresentationCatalog",
     "VisualizationMaterializer",
     "VisualizationSemanticValidator",

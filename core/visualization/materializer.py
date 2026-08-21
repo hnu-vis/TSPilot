@@ -10,18 +10,34 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from schemas.key_insight import KeyInsight, InsightItem
-from schemas.output import VisualGoal, VisualLayerPlan
+from schemas.output import VisualGoal, VisualLayerPlan, VisualSemanticPlan
 from schemas.state import RequestStateModel
 from schemas.visual_verification import VisualizationVerification
 from schemas.visualization import (
     VisualizationAccessibility,
     VisualizationBinding,
-    VisualizationDataset,
-    VisualizationDimension,
-    VisualizationLayer,
+    ChartSemanticTarget,
+    IntervalSemanticTarget,
+    ReferenceSemanticTarget,
+    RelationSemanticTarget,
+    VisualizationChannelBinding,
+    VisualizationCoordinateSpace,
+    VisualizationDataMark,
+    VisualizationDataView,
+    VisualizationField,
+    VisualizationGuide,
+    VisualizationGuideEntry,
+    VisualizationGuideSection,
+    VisualizationLayout,
+    VisualizationLayoutCell,
+    VisualizationMetric,
     VisualizationPayload,
-    VisualizationPoint,
-    VisualizationSeries,
+    VisualizationRecord,
+    VisualizationScale,
+    VisualizationSemantic,
+    VisualizationSemanticContent,
+    XSemanticTarget,
+    XYSemanticTarget,
 )
 
 
@@ -65,6 +81,10 @@ class InvalidPresentationLineageError(ValueError):
         self.view_ref = view_ref
         self.lineage_ref = lineage_ref
         super().__init__(f"data view '{view_ref}' contains unknown lineage source '{lineage_ref}'")
+
+
+class IncompatibleVisualDomainError(ValueError):
+    """The fixed composition cannot share one coordinate system."""
 
 
 class PresentationCatalog:
@@ -543,12 +563,20 @@ class PresentationCatalog:
                             except ValueError:
                                 values.append(None)
                         if resolved_count == 0:
-                            structures = [_structure_outline([record]) for record in records[:4]]
+                            path_contracts = _projection_path_contracts(source)
+                            selected_paths = next(
+                                (
+                                    item["source_paths"]
+                                    for item in path_contracts["record_paths"]
+                                    if item["record_path"] == record_path
+                                ),
+                                path_contracts["default_source_paths"],
+                            )
                             raise ValueError(
                                 f"semantic source path '{path}' is unavailable in every record within "
-                                f"record_path {record_path!r}; available record paths: "
-                                f"{_record_path_candidates(_projection_root(source))}; "
-                                f"representative record structures: {structures}"
+                                f"record_path {record_path!r}; source_path is relative to each selected "
+                                f"record. Valid source paths for this record_path: {selected_paths}. "
+                                f"Executable projection path contracts: {path_contracts}"
                             )
                         projected_columns[name] = values
                         field_semantics[name] = str(getattr(mapping, "semantic_role", "") or name)
@@ -578,6 +606,13 @@ class PresentationCatalog:
                     bindings=bindings,
                 )
                 refs.append(ref)
+                render_contract = _render_contract(self.resolve(ref).value)
+                if not render_contract["allowed_layer_types"]:
+                    raise ValueError(
+                        f"semantic view '{view_id}' has no executable visual consumer; its materialized "
+                        f"contract is {render_contract}. Request a grounded source exposing data-layer fields, "
+                        "interval boundaries, or scalar/text content suitable for an explicit guide"
+                    )
         except Exception:
             for ref in refs:
                 self._sources.pop(ref, None)
@@ -604,12 +639,30 @@ class PresentationCatalog:
                     for item in lineage_sources
                     if (context := _query_context(item)) is not None
                 ],
+                "semantic_contract": _source_semantic_contract(lineage_sources),
             }
             result["data_structure"] = _structure_outline(records)
+            # Small grounded sources (for example anomaly points or interval
+            # boundaries) carry semantic facts that a structure-only outline
+            # cannot express.  Keep the preview strictly bounded; full series
+            # remain reference-backed and are resolved only at materialization.
+            preview_eligible = any(
+                item.kind in {"anomaly", "forecast", "derived_evidence"}
+                for item in lineage_sources
+            )
+            if preview_eligible:
+                if value.scalar is not None:
+                    result["grounded_preview"] = _bounded_row(value.scalar)
+                elif 0 < len(value.rows) <= 12:
+                    result["grounded_preview"] = [
+                        _bounded_row(row)
+                        for row in value.rows
+                    ]
             full_projection_root = _projection_root(source)
             result["projection_root"] = {
                 "data_structure": _structure_outline([full_projection_root]),
                 "record_path_candidates": _record_path_candidates(full_projection_root),
+                "executable_path_contracts": _projection_path_contracts(source),
             }
             if value.field_semantics:
                 result["field_semantics"] = value.field_semantics
@@ -641,11 +694,18 @@ class PresentationCatalog:
                 "locator": _bounded_row(locator_row) if locator_row else None,
                 "render_capabilities": _render_capabilities(fields, scalar=not bool(insight.items or locator_row)),
                 "data_structure": _structure_outline(records),
+                "semantic_contract": {
+                    "data_role": "key_insight_claim",
+                    "materializes_input_transformation": False,
+                    "operation_description": insight.calculation_trace,
+                    "supported_visual_uses": ["target_claim", "annotation", "interval_boundaries"],
+                },
             }
             full_projection_root = _projection_root(source)
             result["projection_root"] = {
                 "data_structure": _structure_outline([full_projection_root]),
                 "record_path_candidates": _record_path_candidates(full_projection_root),
+                "executable_path_contracts": _projection_path_contracts(source),
             }
             return result
         if source.kind == "insight_item":
@@ -659,11 +719,18 @@ class PresentationCatalog:
                 "schema_fields": fields,
                 "render_capabilities": _render_capabilities(fields, scalar=False),
                 "data_structure": _structure_outline([_insight_item_row(item)]),
+                "semantic_contract": {
+                    "data_role": "key_insight_item",
+                    "materializes_input_transformation": False,
+                    "operation_description": insight.calculation_trace,
+                    "supported_visual_uses": ["target_point", "annotation"],
+                },
             }
             full_projection_root = _projection_root(source)
             result["projection_root"] = {
                 "data_structure": _structure_outline([full_projection_root]),
                 "record_path_candidates": _record_path_candidates(full_projection_root),
+                "executable_path_contracts": _projection_path_contracts(source),
             }
             return result
         value = source.value
@@ -707,7 +774,7 @@ class PresentationCatalog:
 
 
 class VisualizationMaterializer:
-    """Compile LLM-planned semantic views into grounded V3 renderer payloads."""
+    """Compile LLM-planned semantic views into a grounded V4 scene."""
 
     def __init__(
         self,
@@ -744,23 +811,121 @@ class VisualizationMaterializer:
         verification: VisualizationVerification | None = None,
     ) -> VisualizationPayload:
         if not goal.layers:
-            raise ValueError(f"visual goal '{goal.purpose}' requires at least one layer")
-        datasets: list[VisualizationDataset] = []
-        layers: list[VisualizationLayer] = []
+            raise ValueError(f"visual goal '{goal.purpose}' requires at least one data mark")
+        data_views: list[VisualizationDataView] = []
+        marks: list[VisualizationDataMark] = []
+        semantics: list[VisualizationSemantic] = []
         bindings: dict[str, VisualizationBinding] = {}
         source_refs: list[str] = []
+        scales: dict[str, VisualizationScale] = {}
+        space_id = "space_0"
+
         for layer_index, plan in enumerate(goal.layers):
             source = self.catalog.resolve(plan.source_ref)
-            dataset, layer, layer_bindings = self._materialize_layer(plan, source, layer_index)
-            datasets.append(dataset)
-            layers.append(layer)
-            if source.ref.startswith("semantic:") and source.kind == "view":
-                source_refs.extend(source.value.lineage)
-            else:
-                source_refs.append(source.ref)
+            view, layer_bindings = self._materialize_view(
+                source,
+                view_id=f"view_{layer_index}",
+                transforms=plan.transform,
+            )
+            encoding = _encoding_fields(plan.encoding)
+            _validate_layer_encoding(plan.mark, encoding, source)
+            x_field = _first_encoding_field(encoding.get("x"))
+            y_field = _first_encoding_field(encoding.get("y"))
+            if not x_field or not y_field:
+                raise ValueError(f"data mark '{plan.role}' requires explicit x and y fields")
+            x_scale_id = "scale_x_0"
+            y_axis_index = _requested_y_axis_index(plan.presentation)
+            y_scale_id = f"scale_y_{y_axis_index}"
+            self._merge_scale(
+                scales,
+                _scale_for_field(
+                    view,
+                    x_field,
+                    scale_id=x_scale_id,
+                    channel="x",
+                    scale_type="time" if _field_type(view, x_field) == "time" else "category",
+                ),
+            )
+            self._merge_scale(
+                scales,
+                _scale_for_field(
+                    view,
+                    y_field,
+                    scale_id=y_scale_id,
+                    channel="y",
+                    scale_type=_goal_y_scale_type(goal, y_axis_index),
+                ),
+            )
+            marks.append(VisualizationDataMark(
+                mark_id=f"mark_{layer_index}",
+                mark=plan.mark,
+                role=plan.role,
+                source_ref=source.ref,
+                data_view_id=view.view_id,
+                space_id=space_id,
+                encoding={
+                    channel: VisualizationChannelBinding(
+                        fields=value if isinstance(value, list) else [value],
+                        scale_id=(
+                            x_scale_id if channel == "x"
+                            else y_scale_id if channel in {"y", "lower", "upper"}
+                            else None
+                        ),
+                    )
+                    for channel, value in encoding.items()
+                },
+                transform=[item.model_dump(mode="json") for item in plan.transform],
+                presentation=_presentation_options(plan.presentation),
+                label=plan.label,
+            ))
+            data_views.append(view)
+            for provenance_ref in [source.ref, *plan.provenance_source_refs]:
+                source_refs.extend(self._public_source_refs(provenance_ref))
             for binding in layer_bindings:
                 bindings[binding.binding_id] = binding
-        _require_compatible_shared_x_domain(goal, datasets)
+
+        semantic_materializations = []
+        for semantic_index, plan in enumerate(goal.semantics):
+            source = self.catalog.resolve(plan.source_ref)
+            view, semantic_bindings = self._materialize_view(
+                source,
+                view_id=f"semantic_view_{semantic_index}",
+            )
+            _validate_semantic_plan(plan, view)
+            data_views.append(view)
+            semantic_materializations.append((plan, view))
+            source_refs.extend(self._public_source_refs(source.ref))
+            for provenance_ref in plan.provenance_source_refs:
+                source_refs.extend(self._public_source_refs(provenance_ref))
+            for binding in semantic_bindings:
+                bindings[binding.binding_id] = binding
+
+        for plan, view in semantic_materializations:
+            if plan.semantic_type == "relation":
+                continue
+            semantics.extend(self._materialize_semantic_group(
+                plan,
+                view,
+                scales=scales,
+                space_id=space_id,
+            ))
+        for plan, view in semantic_materializations:
+            if plan.semantic_type != "relation":
+                continue
+            semantics.extend(self._materialize_relation_group(
+                plan,
+                view,
+                semantics=semantics,
+                bindings=bindings,
+            ))
+
+        y_scale_ids = [scale.scale_id for scale in scales.values() if scale.channel == "y"]
+        coordinate_spaces = [VisualizationCoordinateSpace(
+            space_id=space_id,
+            x_scale_id="scale_x_0",
+            y_scale_ids=y_scale_ids,
+        )]
+        guides = _materialize_guides(goal, marks, semantics)
         identity = {
             "goal": goal.model_dump(mode="json"),
             "source_refs": source_refs,
@@ -773,56 +938,171 @@ class VisualizationMaterializer:
             visualization_id=f"viz_{digest}_{index}", purpose=goal.purpose, priority=goal.priority,
             title=goal.title, summary=goal.summary, verification=verification,
             source_refs=list(dict.fromkeys(source_refs)),
-            required_roles=list(dict.fromkeys(goal.required_roles)), datasets=datasets, layers=layers,
-            bindings=list(bindings.values()), layout=_layout_from_chart_plan(goal),
+            required_roles=list(dict.fromkeys(goal.required_roles)),
+            data_views=data_views,
+            scales=list(scales.values()),
+            coordinate_spaces=coordinate_spaces,
+            marks=marks,
+            semantics=semantics,
+            guides=guides,
+            layout=VisualizationLayout(
+                mode=_layout_from_chart_plan(goal),
+                cells=[VisualizationLayoutCell(cell_id="cell_0", space_ids=[space_id])],
+            ),
+            bindings=list(bindings.values()),
             presentation=_presentation_options(goal.presentation),
-            accessibility=_accessibility(goal, datasets),
+            accessibility=_accessibility_v4(goal, data_views, semantics),
         )
         return payload
 
-    def _materialize_layer(
-        self, plan: VisualLayerPlan, source: PresentationSource, index: int,
-    ) -> tuple[VisualizationDataset, VisualizationLayer, list[VisualizationBinding]]:
+    def _materialize_view(
+        self,
+        source: PresentationSource,
+        *,
+        view_id: str,
+        transforms=(),
+    ) -> tuple[VisualizationDataView, list[VisualizationBinding]]:
         rows, scalar = _source_data(source)
-        encoding = _encoding_fields(plan.encoding)
-        _validate_layer_encoding(plan.mark, encoding, source)
-        presentation = _presentation_options(plan.presentation)
-        rows = _apply_presentation_transforms(rows, plan.transform, source)
-        if plan.transform:
+        rows = _apply_presentation_transforms(rows, transforms, source)
+        if transforms:
             scalar = None
-        points, bindings, x_field, y_field = _points_for_source(source, rows, scalar, encoding)
-        if not points:
-            raise ValueError(f"layer role '{plan.role}' produced no renderable points from {source.ref}")
-        dataset_id = f"dataset_{index}"
-        group_field = _first_encoding_field(encoding.get("series"))
-        grouped_points: dict[str, list[VisualizationPoint]] = {}
-        if group_field:
-            for point in points:
-                group = str(point.metadata.get(group_field, ""))
-                grouped_points.setdefault(group, []).append(point)
-        else:
-            grouped_points[""] = points
-        series = [
-            VisualizationSeries(
-                series_id=f"series_{index}_{group_index}",
-                name=(f"{plan.label or plan.role}: {group}" if group else plan.label or plan.role),
-                role=(f"{plan.role}:{group}" if group else plan.role),
-                points=group_points,
+        records, bindings = _records_for_source(source, rows, scalar, view_id=view_id)
+        if not records:
+            raise ValueError(f"visual source '{source.ref}' produced no grounded records")
+        fields = _visualization_fields(source, records)
+        allowed_fields = {field.name for field in fields}
+        normalized_records = [record.model_copy(update={
+            "values": {
+                key: value
+                for key, value in record.values.items()
+                if key in allowed_fields
+            },
+        }) for record in records]
+        return VisualizationDataView(
+            view_id=view_id,
+            source_ref=source.ref,
+            fields=fields,
+            records=normalized_records,
+        ), bindings
+
+    def _merge_scale(
+        self,
+        scales: dict[str, VisualizationScale],
+        candidate: VisualizationScale,
+    ) -> None:
+        current = scales.get(candidate.scale_id)
+        if current is None:
+            scales[candidate.scale_id] = candidate
+            return
+        current_type = "category" if current.data_type in {"category", "string"} else current.data_type
+        candidate_type = "category" if candidate.data_type in {"category", "string"} else candidate.data_type
+        if current_type != candidate_type:
+            raise IncompatibleVisualDomainError(
+                f"scale '{candidate.scale_id}' mixes incompatible data types "
+                f"{current.data_type!r} and {candidate.data_type!r}"
             )
-            for group_index, (group, group_points) in enumerate(grouped_points.items())
-        ]
-        dataset = VisualizationDataset(
-            dataset_id=dataset_id, source_ref=source.ref,
-            dimensions=_dimensions(x_field, y_field, rows, scalar), series=series,
-        )
-        layer = VisualizationLayer(
-            layer_id=f"layer_{index}", mark=plan.mark, role=plan.role, source_ref=source.ref,
-            encoding=encoding, transform=[item.model_dump(mode="json") for item in plan.transform],
-            presentation=presentation,
-            dataset_id=dataset_id, series_id=series[0].series_id if len(series) == 1 else None,
-            points=points if plan.mark in {"point", "rule", "rect"} else [], label=plan.label,
-        )
-        return dataset, layer, bindings
+        if current.unit and candidate.unit and current.unit != candidate.unit:
+            raise IncompatibleVisualDomainError(
+                f"scale '{candidate.scale_id}' mixes incompatible units {current.unit!r} and {candidate.unit!r}"
+            )
+
+    def _materialize_semantic_group(
+        self,
+        plan: VisualSemanticPlan,
+        view: VisualizationDataView,
+        *,
+        scales: dict[str, VisualizationScale],
+        space_id: str,
+    ) -> list[VisualizationSemantic]:
+        result = []
+        for index, record in enumerate(view.records):
+            semantic_id = plan.semantic_id if len(view.records) == 1 else f"{plan.semantic_id}:{record.record_id}"
+            target = _semantic_target(
+                plan,
+                record,
+                scales=scales,
+                space_id=space_id,
+            )
+            result.append(VisualizationSemantic(
+                semantic_id=semantic_id,
+                group_id=plan.semantic_id,
+                semantic_type=plan.semantic_type,
+                role=plan.role,
+                source_ref=plan.source_ref,
+                target=target,
+                content=_semantic_content(plan, view, record),
+                importance=plan.importance,
+                line_style=plan.line_style,
+                symbol=plan.symbol,
+                presentation=_presentation_options(plan.presentation),
+                binding_id=record.binding_id,
+            ))
+        return result
+
+    def _materialize_relation_group(
+        self,
+        plan: VisualSemanticPlan,
+        view: VisualizationDataView,
+        *,
+        semantics: list[VisualizationSemantic],
+        bindings: dict[str, VisualizationBinding],
+    ) -> list[VisualizationSemantic]:
+        by_group: dict[str, list[VisualizationSemantic]] = {}
+        for semantic in semantics:
+            by_group.setdefault(semantic.group_id, []).append(semantic)
+        members = []
+        for related_id in plan.related_semantic_ids:
+            candidates = by_group.get(related_id, [])
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"relation '{plan.semantic_id}' requires exactly one grounded member for "
+                    f"semantic group '{related_id}', got {len(candidates)}"
+                )
+            if candidates[0].semantic_type not in {"event", "observation"}:
+                raise ValueError("relation members must be grounded event or observation semantics")
+            members.append(candidates[0])
+        member_item_ids = {
+            binding.item_id
+            for member in members
+            if member.binding_id
+            if (binding := bindings.get(member.binding_id)) is not None and binding.item_id
+        }
+        if len(member_item_ids) != len(members):
+            raise ValueError(f"relation '{plan.semantic_id}' members require stable Insight item ids")
+
+        result = []
+        for index, record in enumerate(view.records):
+            relation_binding = bindings.get(record.binding_id or "")
+            related_item_ids = set(relation_binding.related_item_ids) if relation_binding else set()
+            if related_item_ids != member_item_ids:
+                raise ValueError(
+                    f"relation '{plan.semantic_id}' provenance does not match its selected members; "
+                    f"expected={sorted(member_item_ids)}, actual={sorted(related_item_ids)}"
+                )
+            semantic_id = plan.semantic_id if len(view.records) == 1 else f"{plan.semantic_id}:{record.record_id}"
+            result.append(VisualizationSemantic(
+                semantic_id=semantic_id,
+                group_id=plan.semantic_id,
+                semantic_type="relation",
+                role=plan.role,
+                source_ref=plan.source_ref,
+                target=RelationSemanticTarget(
+                    semantic_ids=[member.semantic_id for member in members],
+                ),
+                content=_semantic_content(plan, view, record),
+                importance=plan.importance,
+                line_style=plan.line_style,
+                symbol=plan.symbol,
+                presentation=_presentation_options(plan.presentation),
+                binding_id=record.binding_id,
+            ))
+        return result
+
+    def _public_source_refs(self, ref: str) -> list[str]:
+        source = self.catalog.resolve(ref)
+        if source.ref.startswith("semantic:") and source.kind == "view":
+            return list(source.value.lineage)
+        return [source.ref]
 
 
 class VisualizationSemanticValidator:
@@ -833,7 +1113,10 @@ class VisualizationSemanticValidator:
         self.required_located_roles = required_located_roles or set()
 
     def validate(self, goal: VisualGoal, payload: VisualizationPayload) -> None:
-        materialized_roles = {layer.role.strip().casefold() for layer in payload.layers}
+        materialized_roles = {
+            item.role.strip().casefold()
+            for item in [*payload.marks, *payload.semantics]
+        }
         missing_roles = [
             role for role in goal.required_roles
             if role.strip().casefold() not in materialized_roles
@@ -851,23 +1134,18 @@ class VisualizationSemanticValidator:
                 raise ValueError(
                     f"visual verification targets are not verified Key Insights: {sorted(unknown)}"
                 )
-        for layer in payload.layers:
-            source = self.catalog.resolve(layer.source_ref)
-            _validate_layer_encoding(layer.mark, layer.encoding, source)
-            if layer.mark.strip().casefold() in {"line", "area"}:
-                dataset = next(
-                    (item for item in payload.datasets if item.dataset_id == layer.dataset_id),
-                    None,
+        views = {view.view_id: view for view in payload.data_views}
+        for mark in payload.marks:
+            source = self.catalog.resolve(mark.source_ref)
+            encoding = {
+                channel: binding.fields if len(binding.fields) > 1 else binding.fields[0]
+                for channel, binding in mark.encoding.items()
+            }
+            _validate_layer_encoding(mark.mark, encoding, source)
+            if mark.mark.strip().casefold() in {"line", "area"} and len(views[mark.data_view_id].records) < 2:
+                raise ValueError(
+                    f"{mark.mark} mark '{mark.role}' requires at least two grounded records"
                 )
-                plotted_series = (
-                    [item for item in dataset.series if item.series_id == layer.series_id]
-                    if dataset is not None and layer.series_id
-                    else list(dataset.series) if dataset is not None else []
-                )
-                if not plotted_series or any(len(series.points) < 2 for series in plotted_series):
-                    raise ValueError(
-                        f"{layer.mark} layer '{layer.role}' requires at least two grounded points per series"
-                    )
 
 
 def _constraint_role_candidates(constraints: dict) -> set[str]:
@@ -950,6 +1228,355 @@ def _ordered_filter_value(value: Any) -> tuple[int, Any]:
         if parsed is not None:
             return 2, parsed.timestamp()
     return 3, str(value)
+
+
+def _records_for_source(
+    source: PresentationSource,
+    rows: list[dict],
+    scalar: dict | None,
+    *,
+    view_id: str,
+) -> tuple[list[VisualizationRecord], list[VisualizationBinding]]:
+    source_bindings = _projection_bindings(source)
+    bindings_by_id = {
+        binding.binding_id: binding
+        for binding in source_bindings.values()
+    }
+    records = list(rows)
+    if scalar is not None and not records:
+        records = [dict(scalar)]
+    output: list[VisualizationRecord] = []
+    used_bindings: dict[str, VisualizationBinding] = {}
+    for index, row in enumerate(records):
+        item_id = str(row.get("item_id") or "")
+        explicit_binding_id = str(row.get("__binding_id") or "")
+        binding = (
+            bindings_by_id.get(explicit_binding_id)
+            or source_bindings.get(item_id)
+            or source_bindings.get("")
+        )
+        if binding is not None:
+            used_bindings[binding.binding_id] = binding
+        record_id = item_id or f"{view_id}:{index}"
+        output.append(VisualizationRecord(
+            record_id=record_id,
+            values={
+                str(key): value
+                for key, value in row.items()
+                if not str(key).startswith("__")
+            },
+            binding_id=binding.binding_id if binding else None,
+        ))
+    return output, list(used_bindings.values())
+
+
+def _visualization_fields(
+    source: PresentationSource,
+    records: list[VisualizationRecord],
+) -> list[VisualizationField]:
+    schema = {
+        str(item.get("name")): str(item.get("data_type") or "string")
+        for item in _source_schema(source)
+        if isinstance(item, dict) and item.get("name")
+    }
+    semantics = source.value.field_semantics if source.kind == "view" else {}
+    supported = {"time", "number", "category", "string", "boolean"}
+    present = {key for record in records for key in record.values}
+    result = []
+    for name, data_type in schema.items():
+        if name not in present or data_type not in supported:
+            continue
+        result.append(VisualizationField(
+            name=name,
+            data_type=data_type,
+            semantic_role=str(semantics.get(name) or name),
+            unit=_source_field_unit(source),
+        ))
+    return result
+
+
+def _source_field_unit(source: PresentationSource) -> str | None:
+    if source.kind == "insight":
+        return source.value.unit
+    if source.kind == "insight_item":
+        return source.value[0].unit
+    return None
+
+
+def _field(view: VisualizationDataView, name: str) -> VisualizationField:
+    candidate = next((field for field in view.fields if field.name == name), None)
+    if candidate is None:
+        raise ValueError(
+            f"visual data view '{view.view_id}' does not expose field '{name}'; "
+            f"available={sorted(field.name for field in view.fields)}"
+        )
+    return candidate
+
+
+def _field_type(view: VisualizationDataView, name: str) -> str:
+    return _field(view, name).data_type
+
+
+def _scale_for_field(
+    view: VisualizationDataView,
+    field_name: str,
+    *,
+    scale_id: str,
+    channel: str,
+    scale_type: str,
+) -> VisualizationScale:
+    field = _field(view, field_name)
+    data_type = field.data_type
+    if data_type == "boolean":
+        data_type = "category"
+    return VisualizationScale(
+        scale_id=scale_id,
+        channel=channel,
+        data_type=data_type,
+        semantic_role=field.semantic_role,
+        unit=field.unit,
+        scale_type=scale_type,
+    )
+
+
+def _requested_y_axis_index(presentation: dict | None) -> int:
+    value = (presentation or {}).get("yAxisIndex")
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _goal_y_scale_type(goal: VisualGoal, index: int) -> str:
+    y_axis = goal.presentation.get("yAxis") if isinstance(goal.presentation, dict) else None
+    entries = y_axis if isinstance(y_axis, list) else [y_axis] if isinstance(y_axis, dict) else []
+    entry = entries[index] if index < len(entries) and isinstance(entries[index], dict) else {}
+    return "log" if entry.get("type") == "log" else "linear"
+
+
+def _validate_semantic_plan(plan: VisualSemanticPlan, view: VisualizationDataView) -> None:
+    fields = {field.name for field in view.fields}
+    referenced = {
+        *plan.target_encoding.values(),
+        *plan.metric_fields,
+        *([plan.description_field] if plan.description_field else []),
+    }
+    unknown = referenced - fields
+    if unknown:
+        raise ValueError(
+            f"semantic '{plan.semantic_id}' references unavailable fields {sorted(unknown)} "
+            f"from '{plan.source_ref}'"
+        )
+    if plan.semantic_type in {"observation", "reference"}:
+        numeric_field = plan.target_encoding["y" if plan.semantic_type == "observation" else "value"]
+        if _field_type(view, numeric_field) != "number":
+            raise ValueError(f"semantic '{plan.semantic_id}' requires a numeric y target")
+    if plan.semantic_type == "event" and _field_type(view, plan.target_encoding["x"]) not in {
+        "time", "category", "string", "boolean",
+    }:
+        raise ValueError(f"event semantic '{plan.semantic_id}' requires a time or category x target")
+    if plan.semantic_type == "observation" and _field_type(view, plan.target_encoding["x"]) not in {
+        "time", "category", "string", "boolean",
+    }:
+        raise ValueError(f"observation semantic '{plan.semantic_id}' requires a compatible x target")
+    if plan.semantic_type == "interval":
+        start_type = _field_type(view, plan.target_encoding["start"])
+        end_type = _field_type(view, plan.target_encoding["end"])
+        if start_type != end_type or start_type not in {"time", "number", "category", "string"}:
+            raise ValueError(f"interval semantic '{plan.semantic_id}' requires compatible boundaries")
+
+
+def _semantic_target(
+    plan: VisualSemanticPlan,
+    record: VisualizationRecord,
+    *,
+    scales: dict[str, VisualizationScale],
+    space_id: str,
+):
+    values = record.values
+    x_scale = scales["scale_x_0"]
+    y_scale_id = f"scale_y_{_requested_y_axis_index(plan.presentation)}"
+    if plan.semantic_type == "fact":
+        return ChartSemanticTarget()
+    if plan.semantic_type == "event":
+        x = values.get(plan.target_encoding["x"])
+        _require_value(x, semantic_id=plan.semantic_id, channel="x")
+        _require_target_type(plan.semantic_id, _python_visual_type(x), x_scale.data_type, channel="x")
+        return XSemanticTarget(
+            space_id=space_id,
+            scale_id=x_scale.scale_id,
+            record_id=record.record_id,
+            x=x,
+        )
+    if plan.semantic_type == "observation":
+        x = values.get(plan.target_encoding["x"])
+        y = _number(values.get(plan.target_encoding["y"]))
+        _require_value(x, semantic_id=plan.semantic_id, channel="x")
+        _require_value(y, semantic_id=plan.semantic_id, channel="y")
+        y_scale = scales.get(y_scale_id)
+        if y_scale is None:
+            raise ValueError(f"semantic '{plan.semantic_id}' targets unavailable y scale '{y_scale_id}'")
+        _require_target_type(plan.semantic_id, _python_visual_type(x), x_scale.data_type, channel="x")
+        return XYSemanticTarget(
+            space_id=space_id,
+            x_scale_id=x_scale.scale_id,
+            y_scale_id=y_scale.scale_id,
+            record_id=record.record_id,
+            x=x,
+            y=y,
+        )
+    if plan.semantic_type == "interval":
+        start = values.get(plan.target_encoding["start"])
+        end = values.get(plan.target_encoding["end"])
+        _require_value(start, semantic_id=plan.semantic_id, channel="start")
+        _require_value(end, semantic_id=plan.semantic_id, channel="end")
+        if _ordered_filter_value(start) > _ordered_filter_value(end):
+            raise ValueError(f"interval semantic '{plan.semantic_id}' has reversed boundaries")
+        _require_target_type(plan.semantic_id, _python_visual_type(start), x_scale.data_type, channel="interval")
+        return IntervalSemanticTarget(
+            space_id=space_id,
+            scale_id=x_scale.scale_id,
+            axis="x",
+            record_id=record.record_id,
+            start=start,
+            end=end,
+        )
+    if plan.semantic_type == "reference":
+        value = _number(values.get(plan.target_encoding["value"]))
+        _require_value(value, semantic_id=plan.semantic_id, channel="value")
+        y_scale = scales.get(y_scale_id)
+        if y_scale is None:
+            raise ValueError(f"semantic '{plan.semantic_id}' targets unavailable y scale '{y_scale_id}'")
+        return ReferenceSemanticTarget(
+            space_id=space_id,
+            scale_id=y_scale.scale_id,
+            axis="y",
+            record_id=record.record_id,
+            value=value,
+        )
+    raise ValueError("relation targets are resolved only after their member semantics")
+
+
+def _require_value(value: Any, *, semantic_id: str, channel: str) -> None:
+    if value is None:
+        raise ValueError(f"semantic '{semantic_id}' has null target channel '{channel}'")
+
+
+def _python_visual_type(value: Any) -> str:
+    if _time_value(value) is not None:
+        return "time"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    return "category"
+
+
+def _require_target_type(semantic_id: str, actual: str, expected: str, *, channel: str) -> None:
+    normalized_expected = "category" if expected in {"category", "string"} else expected
+    normalized_actual = "category" if actual in {"category", "string"} else actual
+    if normalized_actual != normalized_expected:
+        raise IncompatibleVisualDomainError(
+            f"semantic '{semantic_id}' {channel} target type '{actual}' is incompatible "
+            f"with host scale type '{expected}'"
+        )
+
+
+def _semantic_content(
+    plan: VisualSemanticPlan,
+    view: VisualizationDataView,
+    record: VisualizationRecord,
+) -> VisualizationSemanticContent:
+    description = None
+    if plan.description_field:
+        raw_description = record.values.get(plan.description_field)
+        description = str(raw_description) if raw_description is not None else None
+    metrics = []
+    for metric_field in plan.metric_fields:
+        field = _field(view, metric_field)
+        value = record.values.get(metric_field)
+        if value is None:
+            continue
+        metrics.append(VisualizationMetric(
+            label=field.semantic_role,
+            value=value,
+            data_type=field.data_type,
+            unit=field.unit,
+        ))
+    return VisualizationSemanticContent(
+        title=plan.label,
+        description=description,
+        metrics=metrics,
+    )
+
+
+def _materialize_guides(
+    goal: VisualGoal,
+    marks: list[VisualizationDataMark],
+    semantics: list[VisualizationSemantic],
+) -> list[VisualizationGuide]:
+    if not goal.guides:
+        return []
+    marks_by_id = {mark.mark_id: mark for mark in marks}
+    semantics_by_group: dict[str, list[VisualizationSemantic]] = {}
+    for semantic in semantics:
+        semantics_by_group.setdefault(semantic.group_id, []).append(semantic)
+    sections = []
+    for section in goal.guides:
+        entries = []
+        for target_id in section.target_ids:
+            if section.section_type == "data":
+                mark = marks_by_id[target_id]
+                entries.append(VisualizationGuideEntry(
+                    entry_id=f"guide:{section.section_id}:{target_id}",
+                    label=mark.label or mark.role,
+                    target_type="mark",
+                    target_id=target_id,
+                    interaction="toggle",
+                    swatch=_mark_swatch(mark.mark),
+                ))
+                continue
+            group = semantics_by_group[target_id]
+            binding_ids = {semantic.binding_id for semantic in group if semantic.binding_id}
+            entries.append(VisualizationGuideEntry(
+                entry_id=f"guide:{section.section_id}:{target_id}",
+                label=group[0].content.title,
+                target_type="semantic",
+                target_id=target_id,
+                interaction="select" if len(binding_ids) == 1 else "none",
+                swatch=group[0].semantic_type,
+                binding_id=next(iter(binding_ids)) if len(binding_ids) == 1 else None,
+            ))
+        sections.append(VisualizationGuideSection(
+            section_id=section.section_id,
+            section_type=section.section_type,
+            label=section.label,
+            entries=entries,
+        ))
+    return [VisualizationGuide(guide_id="legend_0", sections=sections)]
+
+
+def _mark_swatch(mark: str) -> str:
+    normalized = str(mark or "").strip().casefold()
+    return normalized if normalized in {"line", "point", "bar", "area", "band"} else "mark"
+
+
+def _accessibility_v4(
+    goal: VisualGoal,
+    data_views: list[VisualizationDataView],
+    semantics: list[VisualizationSemantic],
+) -> VisualizationAccessibility:
+    rows = [
+        {"view": view.view_id, **record.values}
+        for view in data_views
+        for record in view.records[:12]
+    ]
+    rows.extend({
+        "semantic_type": semantic.semantic_type,
+        "role": semantic.role,
+        "title": semantic.content.title,
+        "metrics": [metric.model_dump(mode="json") for metric in semantic.content.metrics],
+    } for semantic in semantics[:12])
+    return VisualizationAccessibility(
+        description=goal.summary or goal.purpose,
+        table_columns=_row_fields(rows),
+        table_rows=rows[:24],
+    )
 
 
 def _source_data(source: PresentationSource) -> tuple[list[dict], dict | None]:
@@ -1093,6 +1720,9 @@ def _validate_layer_encoding(
     elif normalized_mark in {"rule", "rect"}:
         if not x_field and not y_field:
             raise ValueError(f"{mark} layer requires an explicit x or y/value encoding")
+    elif normalized_mark == "annotation":
+        if not _first_encoding_field(encoding.get("label")) and not y_field:
+            raise ValueError("annotation layer requires an explicit label or value encoding")
     elif not referenced:
         raise ValueError(f"renderer-native mark '{mark}' requires at least one grounded field encoding")
 
@@ -1127,7 +1757,7 @@ def _points_for_source(source, rows, scalar, encoding):
         upper = _number(row.get(upper_field)) if upper_field else None
         item_id = str(row.get("item_id") or "")
         point = VisualizationPoint(
-            x=row.get(x_field) if x_field else row.get("label") or row.get("name"), y=y,
+            x=row.get(x_field) if x_field else None, y=y,
             lower=lower, upper=upper,
             label=str(row.get(label_field) or row.get("label") or row.get("type") or "") or None,
             binding_id=str(row.get("__binding_id") or binding_by_item.get(item_id) or "") or None,
@@ -1135,19 +1765,26 @@ def _points_for_source(source, rows, scalar, encoding):
             # encodings can address shapes beyond the normalized x/y pair.
             metadata=dict(row),
         )
-        if point.x is not None or point.y is not None or point.lower is not None or point.upper is not None:
+        if (
+            point.x is not None
+            or point.y is not None
+            or point.lower is not None
+            or point.upper is not None
+            or point.label is not None
+        ):
             points.append(point)
     if scalar and not points:
         y_key = y_field
         x_key = x_field
         binding_id = bindings[0].binding_id if bindings else None
         point = VisualizationPoint(
-            x=scalar.get(x_key) if x_key else scalar.get("label"),
+            x=scalar.get(x_key) if x_key else None,
             y=_number(scalar.get(y_key)) if y_key else None,
-            label=str(scalar.get("label") or "") or None, binding_id=binding_id,
+            label=str(scalar.get(label_field) or scalar.get("label") or "") or None,
+            binding_id=binding_id,
             metadata=dict(scalar),
         )
-        if point.x is not None or point.y is not None:
+        if point.x is not None or point.y is not None or point.label is not None:
             points.append(point)
         x_field = x_key or "label"
         y_field = y_key or "value"
@@ -1166,6 +1803,7 @@ def _insight_item_binding(ref: str, insight: KeyInsight, item: InsightItem) -> V
     evidence_id = next((e.source_id for e in item.evidence_refs or insight.evidence_refs if e.source_type in {"query", "database_evidence"}), None)
     return VisualizationBinding(
         binding_id=ref, source_type="insight_item", insight_id=insight.insight_id, item_id=item.item_id,
+        related_item_ids=list(item.source_item_ids),
         evidence_id=evidence_id, source_ref=ref, locator=item.locator,
     )
 
@@ -1245,18 +1883,41 @@ def _layout_from_chart_plan(goal):
 def _require_compatible_shared_x_domain(goal, datasets):
     if _layout_from_chart_plan(goal) != "overlay":
         return
+    axis_dataset_ids = {
+        dataset.dataset_id
+        for plan, dataset in zip(goal.layers, datasets, strict=True)
+        if plan.mark.strip().casefold() not in {"rule", "annotation"}
+    }
     domain_types = {
         dimension.data_type
         for dataset in datasets
+        if dataset.dataset_id in axis_dataset_ids
         for dimension in dataset.dimensions
         if dimension.role == "x"
     }
     normalized = {"category" if item in {"category", "string"} else item for item in domain_types}
     if len(normalized) > 1:
-        raise ValueError(
+        raise IncompatibleVisualDomainError(
             "one shared chart requires compatible x-domain semantics across all layers; "
             "keep time-aligned layers in the primary visual goal and leave scalar summaries in answer text "
             "or an explicitly requested supporting chart"
+        )
+    annotation_domain_types = {
+        dimension.data_type
+        for plan, dataset in zip(goal.layers, datasets, strict=True)
+        if plan.mark.strip().casefold() == "annotation"
+        and _first_encoding_field(_encoding_fields(plan.encoding).get("x"))
+        for dimension in dataset.dimensions
+        if dimension.role == "x"
+    }
+    normalized_annotations = {
+        "category" if item in {"category", "string"} else item
+        for item in annotation_domain_types
+    }
+    if normalized_annotations and normalized_annotations != normalized:
+        raise IncompatibleVisualDomainError(
+            "a positioned annotation must use the same x-domain semantics as its host layer; "
+            f"host={sorted(normalized)}, annotation={sorted(normalized_annotations)}"
         )
 
 
@@ -1304,6 +1965,74 @@ def _full_fidelity_status(sources: list[PresentationSource]) -> bool | None:
     return all(values)
 
 
+def _source_semantic_contract(sources: list[PresentationSource]) -> dict:
+    """Describe what an artifact-backed view has actually materialized.
+
+    Lineage alone says where values came from, but not whether an operation was
+    applied to the input. Downstream LLMs must not infer that anomaly detections
+    are an exclusion-applied dataset or that raw evidence is a derived result.
+    """
+
+    by_kind: dict[str, PresentationSource] = {}
+    for source in sources:
+        by_kind.setdefault(source.kind, source)
+    if "insight" in by_kind or "insight_item" in by_kind:
+        source = by_kind.get("insight") or by_kind["insight_item"]
+        value = source.value[0] if source.kind == "insight_item" else source.value
+        return {
+            "data_role": "key_insight_claim",
+            "materializes_input_transformation": False,
+            "operation_description": getattr(value, "calculation_trace", None),
+            "supported_visual_uses": ["target_claim", "reference_guide", "annotation"],
+            "limitations": [
+                "A scalar claim does not materialize the contextual series used to calculate it."
+            ],
+        }
+    if "derived_evidence" in by_kind:
+        artifact = by_kind["derived_evidence"].value
+        return {
+            "data_role": "derived_transformation_result",
+            "materializes_input_transformation": True,
+            "operation_description": getattr(artifact, "transform_summary", None),
+            "supported_visual_uses": ["transformed_context", "derived_series", "derived_markers"],
+            "limitations": [],
+        }
+    if "forecast" in by_kind:
+        return {
+            "data_role": "forecast_output",
+            "materializes_input_transformation": True,
+            "operation_description": "Model-produced forecast values or intervals.",
+            "supported_visual_uses": ["forecast_series", "forecast_interval"],
+            "limitations": ["Does not represent cleaned or exclusion-applied historical observations."],
+        }
+    if "anomaly" in by_kind:
+        return {
+            "data_role": "anomaly_detection_output",
+            "materializes_input_transformation": False,
+            "operation_description": "Detected anomaly points, scores, spans, or detector status.",
+            "supported_visual_uses": ["anomaly_markers", "exclusion_markers", "anomaly_scores"],
+            "limitations": [
+                "Does not contain the retained/cleaned input records after exclusions.",
+                "Does not apply anomaly exclusions to the input series.",
+            ],
+        }
+    if "evidence" in by_kind:
+        return {
+            "data_role": "raw_observations",
+            "materializes_input_transformation": False,
+            "operation_description": "Database observations materialized from the executed query.",
+            "supported_visual_uses": ["complete_context", "raw_series", "comparison_baseline"],
+            "limitations": ["Does not materialize downstream analysis transformations."],
+        }
+    return {
+        "data_role": "unclassified_grounded_view",
+        "materializes_input_transformation": False,
+        "operation_description": None,
+        "supported_visual_uses": [],
+        "limitations": ["No transformation result is declared by lineage."],
+    }
+
+
 def _render_capabilities(schema_fields: list[dict], *, scalar: bool) -> dict:
     data_types = {str(item.get("data_type") or "") for item in schema_fields if isinstance(item, dict)}
     timestamped_numeric = "time" in data_types and "number" in data_types
@@ -1335,17 +2064,38 @@ def _render_contract(value: DataViewValue) -> dict:
         for field in fields_by_type.get(data_type, [])
         if field
     ]
+    semantic_roles = {
+        str(field): str(value.field_semantics.get(field) or "").strip().casefold()
+        for field in number_fields
+    }
+    lower_fields = [
+        field
+        for field, role in semantic_roles.items()
+        if role == "lower_bound" or role.startswith("lower_") or role.endswith("_lower")
+    ]
+    upper_fields = [
+        field
+        for field, role in semantic_roles.items()
+        if role == "upper_bound" or role.startswith("upper_") or role.endswith("_upper")
+    ]
     allowed: list[str] = []
     if point_count >= 1 and time_fields and number_fields:
         allowed.append("event_points")
     if point_count >= 2 and time_fields and number_fields:
         allowed.append("series")
-    if point_count >= 2 and time_fields and len(number_fields) >= 2:
+    # Two arbitrary numeric columns do not constitute an uncertainty band.
+    # The semantic projection LLM must explicitly identify complementary
+    # lower/upper roles before the chart planner may consume them as a band.
+    if point_count >= 2 and time_fields and lower_fields and upper_fields:
         allowed.append("band")
     if point_count >= 1 and category_fields and number_fields:
         allowed.append("comparison")
     if point_count >= 1 and len(time_fields) >= 2:
         allowed.append("interval_bounds")
+    if point_count >= 1 and number_fields:
+        allowed.append("reference_line")
+    if point_count >= 1 and any(fields_by_type.values()):
+        allowed.append("annotation")
     return {
         "data_shape": value.shape,
         "point_count": point_count,
@@ -1353,6 +2103,8 @@ def _render_contract(value: DataViewValue) -> dict:
         "time_fields": time_fields,
         "number_fields": number_fields,
         "category_fields": category_fields,
+        "lower_fields": lower_fields,
+        "upper_fields": upper_fields,
     }
 
 
@@ -1440,7 +2192,8 @@ def _rows_from_evidence(evidence) -> list[dict]:
 def _insight_item_row(item: InsightItem) -> dict:
     row = {
         "item_id": item.item_id, "value": item.value, "label": item.label, "rank": item.rank,
-        "timestamp": item.timestamp, **item.dimensions, **item.locator,
+        "timestamp": item.timestamp, "source_item_ids": list(item.source_item_ids),
+        **item.dimensions, **item.locator,
     }
     return {key: value for key, value in row.items() if value is not None}
 
@@ -1650,6 +2403,67 @@ def _record_path_candidates(root: dict, *, max_depth: int = 6) -> list[str]:
 
     visit(root, "$", 0)
     return list(dict.fromkeys(candidates))
+
+
+def _projection_path_contracts(source: PresentationSource) -> dict:
+    """Describe the two executable path namespaces used by semantic projection.
+
+    With ``record_path=null`` the materializer reads the source's normalized
+    presentation rows.  With a selected record path it reads records from the
+    nested projection document and every source path becomes relative to one
+    such record.  Publishing both namespaces prevents an LLM from combining a
+    container path from the latter with a field path from the former.
+    """
+
+    rows, scalar = _source_data(source)
+    default_records = rows or ([dict(scalar)] if scalar else [])
+    root = _projection_root(source)
+    record_contracts = []
+    for record_path in _record_path_candidates(root):
+        try:
+            selected = _records_at_path(root, record_path)
+        except ValueError:
+            continue
+        record_contracts.append({
+            "record_path": record_path,
+            "source_paths": _relative_leaf_paths(selected),
+        })
+    return {
+        "default_source_paths": _relative_leaf_paths(default_records),
+        "record_paths": record_contracts,
+    }
+
+
+def _relative_leaf_paths(records: list[dict], *, max_depth: int = 6) -> list[str]:
+    """Return bounded scalar leaf paths relative to one selected record."""
+
+    paths: list[str] = []
+
+    def child_path(path: str, key: Any) -> str:
+        name = str(key)
+        if re.fullmatch(r"[^.\[\]]+", name):
+            return f"{path}.{name}"
+        escaped = name.replace("'", "\\'")
+        return f"{path}['{escaped}']"
+
+    def visit(value: Any, path: str, depth: int) -> None:
+        if len(paths) >= 128 or depth > max_depth:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                visit(nested, child_path(path, key), depth + 1)
+            return
+        # Arrays define another record grain.  A field source path selects one
+        # scalar value and therefore never crosses an array boundary.
+        if isinstance(value, (list, tuple)):
+            return
+        if path != "$" and path not in paths:
+            paths.append(path)
+
+    for record in records[:4]:
+        if isinstance(record, dict):
+            visit(record, "$", 0)
+    return paths
 
 
 def _structure_outline(records: list[dict]) -> dict:

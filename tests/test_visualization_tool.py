@@ -21,10 +21,18 @@ from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightEvidenceRef, InsightItem
 from schemas.task_contract import TaskContract, TaskContractOutput
+from schemas.timeseries import AnomalyResult
 from schemas.visualization import VisualizationPayload
 from schemas.tool import ToolObservation
 from tools.base import StructuredToolError
-from tools.visualization import VisualizationInput, VisualizationTool, _expand_source_preferences, _semantic_error
+from tools.visualization import (
+    VisualCompositionGoal,
+    VisualCompositionLayer,
+    VisualizationInput,
+    VisualizationTool,
+    _expand_source_preferences,
+    _semantic_error,
+)
 from tools.registry import build_tool_registry
 
 
@@ -49,6 +57,8 @@ class _PlannerLlm:
     async def ainvoke(self, _messages):
         if _is_verification_prompt(_messages):
             return SimpleNamespace(content=_verification_payload(_messages), response_metadata={})
+        if _is_evidence_consumption_prompt(_messages):
+            return SimpleNamespace(content=_evidence_consumption_payload(_messages), response_metadata={})
         if _is_projection_prompt(_messages):
             self.projection_prompts.append(_messages)
             return SimpleNamespace(
@@ -57,6 +67,8 @@ class _PlannerLlm:
                 ),
                 response_metadata={},
             )
+        if _is_composition_prompt(_messages):
+            return SimpleNamespace(content=_composition_payload(self.payload), response_metadata={})
         self.calls += 1
         if "independently audit" in str(_messages[0][1]):
             self.audit_prompts.append(_messages)
@@ -64,23 +76,30 @@ class _PlannerLlm:
                 content=self.audit_payloads[min(len(self.audit_prompts) - 1, len(self.audit_payloads) - 1)],
                 response_metadata={},
             )
-        return SimpleNamespace(content=_chart_ir_payload(self.payload), response_metadata={})
+        return SimpleNamespace(content=_encoding_payload(self.payload), response_metadata={})
 
 
 class _SequencePlannerLlm:
     def __init__(self, payloads: list[str]):
         self.payloads = list(payloads)
         self.calls = 0
+        self.composition_calls = 0
         self.chart_prompts = []
 
     async def ainvoke(self, _messages):
         if _is_verification_prompt(_messages):
             return SimpleNamespace(content=_verification_payload(_messages), response_metadata={})
+        if _is_evidence_consumption_prompt(_messages):
+            return SimpleNamespace(content=_evidence_consumption_payload(_messages), response_metadata={})
         if _is_projection_prompt(_messages):
             return SimpleNamespace(
                 content=_projection_ir_payload(_projection_for_chart_payload(self.payloads[-1])),
                 response_metadata={},
             )
+        if _is_composition_prompt(_messages):
+            payload = self.payloads[min(self.composition_calls, len(self.payloads) - 1)]
+            self.composition_calls += 1
+            return SimpleNamespace(content=_composition_payload(payload), response_metadata={})
         if "independently audit" in str(_messages[0][1]):
             self.calls += 1
             return SimpleNamespace(
@@ -90,19 +109,50 @@ class _SequencePlannerLlm:
         self.chart_prompts.append(_messages)
         payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
         self.calls += 1
-        return SimpleNamespace(content=_chart_ir_payload(payload), response_metadata={})
+        return SimpleNamespace(content=_encoding_payload(payload), response_metadata={})
 
 
 def _is_projection_prompt(messages) -> bool:
     return "You are the semantic projection stage" in str(messages[0][1])
 
 
+def _is_composition_prompt(messages) -> bool:
+    return "You design the semantic composition" in str(messages[0][1])
+
+
+def _is_encoding_prompt(messages) -> bool:
+    return "You bind exact semantic fields" in str(messages[0][1])
+
+
 def _is_verification_prompt(messages) -> bool:
-    return "You are the visual verification planner inside" in str(messages[0][1])
+    return "You define the presentation goal" in str(messages[0][1])
+
+
+def _is_evidence_consumption_prompt(messages) -> bool:
+    prompt = str(messages[0][1])
+    return (
+        "You bind a fixed visualization goal" in prompt
+        or "You resolve only the primary axis-bearing data relationship" in prompt
+    )
 
 
 def _is_chart_prompt(messages) -> bool:
-    return "You produce a closed, renderer-independent Visual IR" in str(messages[0][1])
+    return _is_encoding_prompt(messages)
+
+
+def _evidence_consumption_payload(messages) -> str:
+    prompt = str(messages[0][1])
+    match = re.search(r"Allowed lineage source refs: (\[[^\n]*\])", prompt)
+    refs = json.loads(match.group(1)) if match else []
+    return json.dumps({
+        "decision": "ready",
+        "rationale": "The selected test lineage supplies the fixed visual goal.",
+        "source_uses": [
+            {"source_ref": ref, "purpose": "Supply grounded test evidence."}
+            for ref in refs
+        ],
+        "required_data_request": None,
+    })
 
 
 def _strict_dependency_payload(value: dict | None) -> dict | None:
@@ -135,18 +185,15 @@ def _projection_ir_payload(payload: str | dict) -> str:
         view.setdefault("mode", "records")
         if view["mode"] == "events":
             view["mode"] = "wide_events"
-        view.setdefault("fields", [])
-        view.setdefault("events", [])
         views.append(view)
     return json.dumps({
         "semantic_views": views,
-        "evidence_bindings": decoded.get("evidence_bindings", []),
         "required_data_request": _strict_dependency_payload(decoded.get("required_data_request")),
     })
 
 
 def _chart_ir_payload(payload: str | dict) -> str:
-    decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    decoded = json.loads(payload) if isinstance(payload, str) else json.loads(json.dumps(payload))
     requirement = _strict_dependency_payload(decoded.get("required_data_request"))
     if requirement is not None:
         return json.dumps({"visual_goals": [], "required_data_request": requirement})
@@ -158,6 +205,24 @@ def _chart_ir_payload(payload: str | dict) -> str:
         for goal in decoded.get("visual_goals", []):
             for layer in goal.get("layers", []):
                 layer.pop("mark", None)
+                layer["source_ref"] = _test_semantic_source_ref(layer["source_ref"])
+                if layer.get("interval_source_ref"):
+                    layer["interval_source_ref"] = _test_semantic_source_ref(
+                        layer["interval_source_ref"]
+                    )
+                if layer.get("layer_type") != "interval_overlay":
+                    for key in (
+                        "interval_source_ref", "interval_start_field", "interval_end_field",
+                        "interval_start_value", "interval_end_value",
+                    ):
+                        layer.pop(key, None)
+                elif layer.get("interval_source_ref") is not None:
+                    layer.pop("interval_start_value", None)
+                    layer.pop("interval_end_value", None)
+                else:
+                    layer.pop("interval_source_ref", None)
+                    layer.pop("interval_start_field", None)
+                    layer.pop("interval_end_field", None)
         return json.dumps(decoded)
     goals = []
     for raw_goal in decoded.get("visual_goals", []):
@@ -200,22 +265,21 @@ def _chart_ir_payload(payload: str | dict) -> str:
             symbol = str(layer_presentation.get("symbol") or raw_layer.get("symbol") or "none")
             if symbol not in {"none", "circle", "diamond", "triangle", "pin"}:
                 symbol = "circle"
-            layers.append({
+            layer = {
                 "layer_type": layer_type,
                 "role": raw_layer["role"],
-                "source_ref": raw_layer["source_ref"],
+                "source_ref": _test_semantic_source_ref(raw_layer["source_ref"]),
                 "encodings": encoding_items,
-                "interval_source_ref": None,
-                "interval_start_field": None,
-                "interval_end_field": None,
-                "interval_start_value": between["value"][0] if between else None,
-                "interval_end_value": between["value"][1] if between else None,
                 "emphasis": "strong" if width >= 3 else "subtle" if width <= 1.5 else "normal",
                 "line_style": line_style.get("type", "solid"),
                 "symbol": symbol,
                 "axis": "secondary" if layer_presentation.get("yAxisIndex") == 1 else "primary",
                 "label": raw_layer.get("label"),
-            })
+            }
+            if between:
+                layer["interval_start_value"] = between["value"][0]
+                layer["interval_end_value"] = between["value"][1]
+            layers.append(layer)
         legend = chart_presentation.get("legend") or {}
         tooltip = chart_presentation.get("tooltip") or {}
         goals.append({
@@ -235,6 +299,83 @@ def _chart_ir_payload(payload: str | dict) -> str:
     return json.dumps({"visual_goals": goals, "required_data_request": None})
 
 
+def _composition_payload(payload: str | dict) -> str:
+    chart = json.loads(_chart_ir_payload(payload))
+    if chart.get("required_data_request") is not None:
+        return json.dumps({"visual_goals": [], "required_data_request": chart["required_data_request"]})
+    goals = []
+    for goal_index, raw_goal in enumerate(chart.get("visual_goals", [])):
+        layers = []
+        for layer_index, raw_layer in enumerate(raw_goal.get("layers", [])):
+            layer_type = raw_layer["layer_type"]
+            layers.append({
+                "layer_id": f"layer_{goal_index}_{layer_index}",
+                "family": (
+                    "primary"
+                    if layer_index == 0
+                    else "highlight" if layer_type == "interval_overlay" else "support"
+                ),
+                "layer_type": layer_type,
+                "role": raw_layer["role"],
+                "purpose": f"Render the fixed {raw_layer['role']} evidence role.",
+                "source_ref": raw_layer["source_ref"],
+                "interval_source_ref": raw_layer.get("interval_source_ref"),
+                "label": raw_layer.get("label"),
+            })
+        goals.append({
+            key: raw_goal.get(key)
+            for key in (
+                "purpose", "title", "priority", "summary", "show_legend", "tooltip",
+                "enable_zoom", "viewport_start", "viewport_end", "y_scale",
+            )
+        } | {"layers": layers})
+    return json.dumps({"visual_goals": goals, "required_data_request": None})
+
+
+def _encoding_payload(payload: str | dict) -> str:
+    chart = json.loads(_chart_ir_payload(payload))
+    if chart.get("required_data_request") is not None:
+        return json.dumps({"layers": [], "required_data_request": chart["required_data_request"]})
+    layers = []
+    for goal_index, goal in enumerate(chart.get("visual_goals", [])):
+        for layer_index, raw_layer in enumerate(goal.get("layers", [])):
+            channels = {
+                item["channel"]: item["field"]
+                for item in raw_layer["encodings"]
+            }
+            layer = {
+                "layer_id": f"layer_{goal_index}_{layer_index}",
+                "emphasis": raw_layer["emphasis"],
+                "line_style": raw_layer["line_style"],
+                "symbol": raw_layer["symbol"],
+                "axis": raw_layer["axis"],
+            }
+            if raw_layer["layer_type"] == "reference_line":
+                layer["value_field"] = channels["value"]
+                layer["label_field"] = channels.get("label")
+            elif raw_layer["layer_type"] == "annotation":
+                layer["content_field"] = channels["label"]
+                layer["value_field"] = channels.get("value")
+                layer["x_field"] = channels.get("x")
+            else:
+                layer["x_field"] = channels["x"]
+                layer["series_field"] = channels.get("series")
+                layer["label_field"] = channels.get("label")
+            if raw_layer["layer_type"] == "band":
+                layer["lower_field"] = channels["lower"]
+                layer["upper_field"] = channels["upper"]
+            elif raw_layer["layer_type"] not in {"reference_line", "annotation"}:
+                layer["y_field"] = channels["y"]
+            if raw_layer.get("interval_source_ref") is not None:
+                layer["interval_start_field"] = raw_layer["interval_start_field"]
+                layer["interval_end_field"] = raw_layer["interval_end_field"]
+            elif raw_layer["layer_type"] == "interval_overlay":
+                layer["interval_start_value"] = raw_layer["interval_start_value"]
+                layer["interval_end_value"] = raw_layer["interval_end_value"]
+            layers.append(layer)
+    return json.dumps({"layers": layers, "required_data_request": None})
+
+
 def _strict_test_payload(payload: str | dict, messages) -> str:
     if _is_verification_prompt(messages):
         decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
@@ -246,10 +387,21 @@ def _strict_test_payload(payload: str | dict, messages) -> str:
             outcome.get("required_data_request")
         )
         return json.dumps(decoded)
+    if "independently audit" in str(messages[0][1]) and "assessments" in str(messages[0][1]):
+        decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        if "outcome" not in decoded:
+            decoded = {"outcome": decoded}
+        outcome = decoded["outcome"]
+        outcome["required_data_request"] = _strict_dependency_payload(
+            outcome.get("required_data_request")
+        )
+        return json.dumps(decoded)
     if _is_projection_prompt(messages):
         return _projection_ir_payload(payload)
-    if _is_chart_prompt(messages):
-        return _chart_ir_payload(payload)
+    if _is_composition_prompt(messages):
+        return _composition_payload(payload)
+    if _is_encoding_prompt(messages):
+        return _encoding_payload(payload)
     decoded = json.loads(payload) if isinstance(payload, str) else dict(payload)
     if "required_data_request" in decoded:
         decoded["required_data_request"] = _strict_dependency_payload(decoded.get("required_data_request"))
@@ -282,36 +434,50 @@ def _projection_for_chart_payload(payload: str) -> str:
         for goal in decoded.get("visual_goals", [])
         for layer in goal.get("layers", [])
     ]
-    source_ref = next(
-        (layer.get("source_ref") for layer in layers if layer.get("source_ref")),
-        "view:evidence:evi_full:default",
-    )
-    fields = []
-    seen = set()
-    for layer in layers:
-        if layer.get("source_ref") != source_ref:
-            continue
-        for value in (layer.get("encoding") or {}).values():
-            values = value if isinstance(value, list) else [value]
-            for item in values:
-                field_name = item if isinstance(item, str) else item.get("field") if isinstance(item, dict) else None
-                if field_name and field_name not in seen:
-                    seen.add(field_name)
-                    fields.append({"name": field_name, "semantic_role": field_name, "source_path": f"$.{field_name}"})
-    if not fields:
-        fields = [{"name": "value", "semantic_role": "measure", "source_path": "$.value"}]
-    view_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source_ref))
-    return json.dumps({
-        "semantic_views": [{
-            "view_id": f"test_{view_id}",
+    source_refs = list(dict.fromkeys(
+        str(layer.get("source_ref"))
+        for layer in layers
+        if layer.get("source_ref")
+    )) or ["view:evidence:evi_full:default"]
+    views = []
+    for source_ref in source_refs:
+        fields = []
+        seen = set()
+        for layer in layers:
+            if layer.get("source_ref") != source_ref:
+                continue
+            for value in (layer.get("encoding") or {}).values():
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    field_name = item if isinstance(item, str) else item.get("field") if isinstance(item, dict) else None
+                    if field_name and field_name not in seen:
+                        seen.add(field_name)
+                        fields.append({"name": field_name, "semantic_role": field_name, "source_path": f"$.{field_name}"})
+        if not fields:
+            fields = [{"name": "value", "semantic_role": "measure", "source_path": "$.value"}]
+        view_id = _test_semantic_view_id(source_ref)
+        views.append({
+            "view_id": view_id,
             "name": "Test semantic view",
             "purpose": "Support the chart plan under test",
             "grain": "records",
             "source_ref": source_ref,
             "fields": fields,
-        }],
+        })
+    return json.dumps({
+        "semantic_views": views,
         "required_data_request": None,
     })
+
+
+def _test_semantic_view_id(source_ref: str) -> str:
+    return f"test_{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(source_ref))}"
+
+
+def _test_semantic_source_ref(source_ref: str) -> str:
+    if source_ref.startswith("semantic:"):
+        return source_ref
+    return f"semantic:{_test_semantic_view_id(source_ref)}"
 
 
 class _WorkflowPlannerLlm:
@@ -324,6 +490,10 @@ class _WorkflowPlannerLlm:
     async def ainvoke(self, messages):
         if _is_verification_prompt(messages):
             payload = _verification_payload(messages)
+        elif _is_evidence_consumption_prompt(messages):
+            payload = _evidence_consumption_payload(messages)
+        elif _is_composition_prompt(messages):
+            payload = self.plans[min(self.plan_calls, len(self.plans) - 1)]
         elif "independently audit" in str(messages[0][1]):
             payload = self.audits[min(self.audit_calls, len(self.audits) - 1)]
             self.audit_calls += 1
@@ -348,6 +518,8 @@ class _TwoStagePlannerLlm:
         if _is_verification_prompt(messages):
             self.verification_prompts.append(messages)
             return SimpleNamespace(content=_verification_payload(messages), response_metadata={})
+        if _is_evidence_consumption_prompt(messages):
+            return SimpleNamespace(content=_evidence_consumption_payload(messages), response_metadata={})
         if "independently audit" in str(messages[0][1]):
             self.audit_prompts.append(messages)
             return SimpleNamespace(
@@ -358,6 +530,8 @@ class _TwoStagePlannerLlm:
             self.projection_calls += 1
             self.projection_prompts.append(messages)
             payload = self.projection
+        elif _is_composition_prompt(messages):
+            payload = self.chart
         else:
             self.chart_calls += 1
             self.chart_prompts.append(messages)
@@ -371,10 +545,13 @@ class _RepairingTwoStagePlannerLlm:
         self.charts = chart if isinstance(chart, list) else [chart]
         self.projection_prompts = []
         self.chart_calls = 0
+        self.composition_calls = 0
 
     async def ainvoke(self, messages):
         if _is_verification_prompt(messages):
             return SimpleNamespace(content=_verification_payload(messages), response_metadata={})
+        if _is_evidence_consumption_prompt(messages):
+            return SimpleNamespace(content=_evidence_consumption_payload(messages), response_metadata={})
         if "independently audit" in str(messages[0][1]):
             return SimpleNamespace(
                 content='{"decision":"approve","issues":[],"required_data_request":null}',
@@ -384,6 +561,16 @@ class _RepairingTwoStagePlannerLlm:
             index = min(len(self.projection_prompts), len(self.projections) - 1)
             self.projection_prompts.append(messages)
             payload = self.projections[index]
+        elif _is_composition_prompt(messages):
+            dependency_sequence = all(
+                item.get("required_data_request") is not None
+                for item in self.charts
+            )
+            payload = self.charts[
+                min(self.composition_calls, len(self.charts) - 1)
+                if dependency_sequence else -1
+            ]
+            self.composition_calls += 1
         else:
             payload = self.charts[min(self.chart_calls, len(self.charts) - 1)]
             self.chart_calls += 1
@@ -414,10 +601,22 @@ class _StrictPlannerLlm:
             async def ainvoke(self, messages):
                 if _is_verification_prompt(messages):
                     content = _verification_payload(messages)
+                elif _is_evidence_consumption_prompt(messages):
+                    content = _evidence_consumption_payload(messages)
                 elif _is_projection_prompt(messages):
                     content = _projection_ir_payload(owner.projection)
+                elif _is_composition_prompt(messages):
+                    content = _composition_payload(owner.chart)
+                elif _is_encoding_prompt(messages):
+                    content = _encoding_payload(owner.chart)
+                elif "independently audit" in str(messages[0][1]):
+                    content = json.dumps({
+                        "decision": "approve",
+                        "issues": [],
+                        "required_data_request": None,
+                    })
                 else:
-                    content = _chart_ir_payload(owner.chart)
+                    raise AssertionError("unexpected visualization LLM stage")
                 payload = json.loads(content)
                 return {
                     "raw": SimpleNamespace(content=content, response_metadata={}),
@@ -589,6 +788,93 @@ def test_verified_numeric_scalar_inventory_supports_only_lossless_graphical_mark
     assert source["render_capabilities"]["renderer_series_type"] == "open"
 
 
+def test_visual_composition_allows_one_semantic_role_to_use_distinct_guides():
+    goal = VisualCompositionGoal(
+        purpose="Inspect observations against their summary",
+        title="Observed measure",
+        priority="primary",
+        summary=None,
+        show_legend=True,
+        tooltip="axis",
+        enable_zoom=False,
+        viewport_start=None,
+        viewport_end=None,
+        y_scale="linear",
+        layers=[
+            VisualCompositionLayer(
+                layer_id="host",
+                family="primary",
+                layer_type="series",
+                role="summary_evidence",
+                purpose="Show the complete host series",
+                source_ref="semantic:series",
+                interval_source_ref=None,
+                label=None,
+            ),
+            VisualCompositionLayer(
+                layer_id="mean",
+                family="support",
+                layer_type="reference_line",
+                role="summary_evidence",
+                purpose="Show the grounded mean guide",
+                source_ref="semantic:summary",
+                interval_source_ref=None,
+                label="Mean",
+            ),
+            VisualCompositionLayer(
+                layer_id="judgment",
+                family="support",
+                layer_type="annotation",
+                role="summary_evidence",
+                purpose="Show the grounded judgment",
+                source_ref="semantic:summary",
+                interval_source_ref=None,
+                label="Judgment",
+            ),
+        ],
+    )
+
+    assert [layer.role for layer in goal.layers] == ["summary_evidence"] * 3
+
+
+def test_visual_composition_rejects_mixed_host_coordinate_domains():
+    common = {
+        "purpose": "Compare incompatible hosts",
+        "title": "Mixed hosts",
+        "priority": "primary",
+        "summary": None,
+        "show_legend": True,
+        "tooltip": "axis",
+        "enable_zoom": False,
+        "viewport_start": None,
+        "viewport_end": None,
+        "y_scale": "linear",
+    }
+    with pytest.raises(ValueError, match="cannot mix temporal and categorical axis domains"):
+        VisualCompositionGoal(**common, layers=[
+            VisualCompositionLayer(
+                layer_id="series",
+                family="primary",
+                layer_type="series",
+                role="history",
+                purpose="Show history",
+                source_ref="semantic:history",
+                interval_source_ref=None,
+                label=None,
+            ),
+            VisualCompositionLayer(
+                layer_id="bars",
+                family="support",
+                layer_type="comparison",
+                role="summary",
+                purpose="Show categorical summary",
+                source_ref="semantic:summary",
+                interval_source_ref=None,
+                label=None,
+            ),
+        ])
+
+
 @pytest.mark.asyncio
 async def test_visualization_uses_provider_strict_schema_for_every_active_planning_stage(tmp_path):
     projection = {
@@ -604,7 +890,6 @@ async def test_visualization_uses_provider_strict_schema_for_every_active_planni
                 {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
                 {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
             ],
-            "events": [],
         }],
         "required_data_request": None,
     }
@@ -652,7 +937,7 @@ async def test_visualization_uses_provider_strict_schema_for_every_active_planni
     ).execute(VisualizationInput(message="Show the observed series."), request_state=_state(5))
 
     assert result["status"] == "created"
-    assert len(llm.structured_calls) == 3
+    assert len(llm.structured_calls) == 5
     assert all(call["method"] == "json_schema" for call in llm.structured_calls)
     assert all(call["strict"] is True for call in llm.structured_calls)
     assert all(call["include_raw"] is True for call in llm.structured_calls)
@@ -672,6 +957,7 @@ async def test_visualization_uses_provider_strict_schema_for_every_active_planni
         provider_schema = convert_to_openai_tool(
             call["schema"], strict=True,
         )["function"]["parameters"]
+        assert "oneOf" not in json.dumps(provider_schema)
         assert_closed_required_objects(provider_schema)
 
 
@@ -712,7 +998,7 @@ async def test_temporal_context_is_preferred_over_isolated_scalar_layer(tmp_path
     )
 
     visualization = result["visualizations"][0]
-    assert llm.calls == 1  # chart planning publishes after grounded materialization
+    assert llm.calls == 2  # chart planning plus independent semantic audit
     assert [layer["mark"] for layer in visualization["layers"]] == ["line"]
     complete = store.get(visualization["visualization_id"])
     assert complete is not None
@@ -1098,8 +1384,236 @@ async def test_semantic_projection_repairs_from_path_execution_feedback_without_
 
     assert len(llm.projection_prompts) == 2
     assert "semantic source path '$.missing.measure' is unavailable in every record" in llm.projection_prompts[1][0][1]
+    assert "Valid source paths for this record_path: ['$.timestamp', '$.value']" in llm.projection_prompts[1][0][1]
+    assert "executable_path_contracts" in llm.projection_prompts[0][0][1]
     assert llm.chart_calls == 1
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_semantic_projection_keeps_scalar_evidence_as_an_explicit_guide(tmp_path):
+    state = _state(5)
+    state.derived_evidence_artifacts["dev_status"] = DerivedEvidence(
+        evidence_id="dev_status",
+        name="Observed summary",
+        shape="scalar",
+        scalar={"mean_measure": 2.0, "judgment": "low"},
+        lineage=["evidence:evi_full"],
+        transform_summary="Counted status records.",
+    )
+    projection = {
+        "semantic_views": [{
+            "view_id": "status_only",
+            "name": "Observed summary",
+            "purpose": "Expose grounded mean and judgment guides",
+            "grain": "status",
+            "source_ref": "view:derived_evidence:dev_status",
+            "record_path": None,
+            "mode": "records",
+            "fields": [
+                {
+                    "name": "mean_measure",
+                    "semantic_role": "observed_measure_average",
+                    "source_path": "$.mean_measure",
+                },
+                {
+                    "name": "judgment",
+                    "semantic_role": "observed_measure_judgment",
+                    "source_path": "$.judgment",
+                },
+            ],
+        }, {
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose the grounded time relationship",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": "$.records",
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Show the observed series",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["observed_series", "summary_guide"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": False,
+            "viewport_start": None,
+            "viewport_end": None,
+            "y_scale": "linear",
+            "layers": [{
+                "layer_type": "series",
+                "role": "observed_series",
+                "source_ref": "semantic:observations",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "y", "field": "measure"},
+                ],
+                "emphasis": "normal",
+                "line_style": "solid",
+                "symbol": "none",
+                "axis": "primary",
+                "label": None,
+            }, {
+                "layer_type": "reference_line",
+                "role": "summary_guide",
+                "source_ref": "semantic:status_only",
+                "encodings": [{"channel": "value", "field": "mean_measure"}],
+                "emphasis": "strong",
+                "line_style": "dashed",
+                "symbol": "none",
+                "axis": "primary",
+                "label": "Mean measure",
+            }, {
+                "layer_type": "annotation",
+                "role": "summary_guide",
+                "source_ref": "semantic:status_only",
+                "encodings": [{"channel": "label", "field": "judgment"}],
+                "emphasis": "normal",
+                "line_style": "solid",
+                "symbol": "none",
+                "axis": "primary",
+                "label": "Judgment",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _RepairingTwoStagePlannerLlm(
+        projections=[projection], chart=chart,
+    )
+
+    result = await VisualizationTool(
+        llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(VisualizationInput(message="Show the observed relationship."), request_state=state)
+
+    assert result["status"] == "created"
+    assert len(llm.projection_prompts) == 1
+    assert llm.chart_calls == 1
+    assert [layer["mark"] for layer in result["visualizations"][0]["layers"]] == [
+        "line", "rule", "annotation",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_visualization_tool_preserves_code_insight_x_in_annotation(tmp_path):
+    state = _state(5)
+    state.insight_set.insights = [KeyInsight(
+        insight_id="insight_code_decision",
+        insight_key="code_decision",
+        name="Code-derived decision",
+        insight_type="decision_point",
+        statement="The selected decision occurs at the third observation.",
+        value={"count": 1},
+        method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
+        calculation_trace={"method": "optimized grounded objective"},
+        items=[InsightItem(
+            item_id="decision_1",
+            timestamp="2026-01-01T02:00:00Z",
+            value=2.0,
+            label="Selected decision",
+            dimensions={"role": "decision"},
+        )],
+    )]
+    projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose the complete host series",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": None,
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+        }, {
+            "view_id": "decision",
+            "name": "Code-derived decision",
+            "purpose": "Preserve the located code result as an annotation",
+            "grain": "decision",
+            "source_ref": "insight:insight_code_decision",
+            "record_path": None,
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "decision_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "decision_value", "source_path": "$.value"},
+                {"name": "role", "semantic_role": "decision_role", "source_path": "$.role"},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Locate the code-derived decision in context",
+            "title": "Observed series and decision",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["observations", "decision"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": False,
+            "viewport_start": None,
+            "viewport_end": None,
+            "y_scale": "linear",
+            "layers": [{
+                "layer_type": "series",
+                "role": "observations",
+                "source_ref": "semantic:observations",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "y", "field": "measure"},
+                ],
+                "emphasis": "normal",
+                "line_style": "solid",
+                "symbol": "none",
+                "axis": "primary",
+                "label": "Observed",
+            }, {
+                "layer_type": "annotation",
+                "role": "decision",
+                "source_ref": "semantic:decision",
+                "encodings": [
+                    {"channel": "x", "field": "time"},
+                    {"channel": "value", "field": "measure"},
+                    {"channel": "label", "field": "role"},
+                ],
+                "emphasis": "strong",
+                "line_style": "solid",
+                "symbol": "pin",
+                "axis": "primary",
+                "label": "Code result",
+            }],
+        }],
+        "required_data_request": None,
+    }
+    llm = _RepairingTwoStagePlannerLlm(projections=[projection], chart=chart)
+    store = VisualizationArtifactStore(tmp_path)
+
+    result = await VisualizationTool(llm=llm, artifact_store=store).execute(
+        VisualizationInput(message="Show the code-derived decision on the series."),
+        request_state=state,
+    )
+
+    assert result["status"] == "created"
+    visualization = store.get(result["visualization_ids"][0])
+    assert visualization is not None
+    annotation = visualization.layers[1]
+    assert annotation.mark == "annotation"
+    assert annotation.encoding == {"label": "role", "y": "measure", "x": "time"}
+    assert annotation.points[0].x == "2026-01-01T02:00:00Z"
+    assert annotation.points[0].y == 2.0
+    assert annotation.points[0].label == "decision"
 
 
 @pytest.mark.asyncio
@@ -1127,8 +1641,9 @@ async def test_semantic_projection_repairs_mutually_exclusive_records_and_events
     repaired_projection = {
         **invalid_projection,
         "semantic_views": [{
-            **invalid_projection["semantic_views"][0],
-            "events": [],
+            key: value
+            for key, value in invalid_projection["semantic_views"][0].items()
+            if key != "events"
         }],
     }
     chart = {
@@ -1156,8 +1671,114 @@ async def test_semantic_projection_repairs_mutually_exclusive_records_and_events
     ).execute(VisualizationInput(message="Show the observed series."), request_state=_state(5))
 
     assert len(llm.projection_prompts) == 2
-    assert "records semantic view cannot include event mappings" in str(llm.projection_prompts[1][0][1])
+    assert "Extra inputs are not permitted" in str(llm.projection_prompts[1][0][1])
     assert result["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_visualization_repairs_degenerate_proof_id_without_reinjecting_outer_error(tmp_path):
+    long_id = "complete_context_" + ("bitcoin_timeseries_context_" * 20)
+    projection = {
+        "semantic_views": [{
+            "view_id": "observations",
+            "name": "Observed series",
+            "purpose": "Expose the complete observed context",
+            "grain": "observation",
+            "source_ref": "view:evidence:evi_full:default",
+            "record_path": "$.records",
+            "mode": "records",
+            "fields": [
+                {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
+            ],
+        }],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "Show the observed context",
+            "title": "Observed series",
+            "priority": "primary",
+            "summary": None,
+            "required_roles": ["complete_context"],
+            "layers": [{
+                "role": "complete_context",
+                "source_ref": "semantic:observations",
+                "mark": "line",
+                "encoding": {"x": "time", "y": "measure"},
+            }],
+        }],
+        "required_data_request": None,
+    }
+
+    class DegenerateProofPlannerLlm:
+        def __init__(self):
+            self.verification_prompts = []
+            self.all_prompts = []
+
+        async def ainvoke(self, messages):
+            self.all_prompts.append(messages)
+            if _is_verification_prompt(messages):
+                index = len(self.verification_prompts)
+                self.verification_prompts.append(messages)
+                obligation_id = long_id if index == 0 else "complete_context"
+                payload = {
+                    "decision": "visualize",
+                    "target_insight_ids": [],
+                    "verification_question": "Does the complete series show the requested relationship?",
+                    "interpretation": "Inspect the complete observed context.",
+                    "visual_relation": "observed time-series relationship",
+                    "proof_obligations": [{
+                        "obligation_id": obligation_id,
+                        "description": "Complete observed context.",
+                        "required": True,
+                    }],
+                    "required_context": ["complete observed context"],
+                    "non_visual_insight_ids": [],
+                    "required_data_request": None,
+                }
+            elif _is_projection_prompt(messages):
+                payload = projection
+            elif "independently audit" in str(messages[0][1]):
+                payload = {
+                    "assessments": [{
+                        "obligation_id": "complete_context",
+                        "status": "directly_materialized",
+                        "missing_evidence_kind": None,
+                        "view_ids": ["observations"],
+                        "rationale": "The complete observed view directly covers the obligation.",
+                    }],
+                    "decision": "approve",
+                    "issues": [],
+                    "required_data_request": None,
+                }
+            else:
+                payload = chart
+            return SimpleNamespace(
+                content=_strict_test_payload(payload, messages),
+                response_metadata={},
+            )
+
+    llm = DegenerateProofPlannerLlm()
+    result = await VisualizationTool(
+        llm=llm,
+        artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(
+        VisualizationInput(
+            message="Show the observed series.",
+            constraints={
+                "repair_contract": {"execution_error": "OUTER_ERROR_SHOULD_NOT_REENTER"},
+                "mode": "repair",
+            },
+        ),
+        request_state=_state(5),
+    )
+
+    assert result["status"] == "created"
+    assert len(llm.verification_prompts) == 2
+    assert "at most 32 characters" in str(llm.verification_prompts[1])
+    assert all("OUTER_ERROR_SHOULD_NOT_REENTER" not in str(prompt) for prompt in llm.all_prompts)
+    assert result["visualizations"][0]["verification"]["proof_obligations"][0]["obligation_id"] == "complete_context"
 
 
 @pytest.mark.asyncio
@@ -1200,7 +1821,8 @@ async def test_chart_requirement_repairs_ungrounded_input_evidence_with_llm(tmp_
         llm=llm, artifact_store=VisualizationArtifactStore(tmp_path),
     ).execute(VisualizationInput(message="Show a real interval."), request_state=_state(5))
 
-    assert llm.chart_calls == 2
+    assert llm.composition_calls == 2
+    assert llm.chart_calls == 0
     assert result["status"] == "needs_sources"
     assert result["required_data_request"]["required_action"] == "code_interpreter"
     assert result["required_data_request"]["input_source_refs"] == ["evidence:evi_full"]
@@ -1273,13 +1895,17 @@ async def test_visualization_tool_repairs_invalid_llm_plan_inside_tool_boundary(
         artifact_store=VisualizationArtifactStore(tmp_path),
     ).execute(VisualizationInput(message="Show the complete series."), request_state=_state(25))
 
-    assert llm.calls == 2  # invalid materialization plus repaired chart plan
+    assert llm.calls == 3  # invalid materialization, repaired plan, and semantic audit
     assert result["visualizations"][0]["datasets"][0]["row_count"] == 25
     repaired_prompt = str(llm.chart_prompts[1][0][1])
     assert "Closed encoding field contract" in repaired_prompt
     assert '"name": "timestamp"' in repaired_prompt
     assert '"name": "value"' in repaired_prompt
-    assert "missing_timestamp" in repaired_prompt
+    assert '"allowed_consumers": ["event_points", "series", "reference_line", "annotation"]' in repaired_prompt
+    assert "missing_timestamp" not in repaired_prompt
+    assert "validation error(s)" in repaired_prompt
+    assert '"semantic:test_view_evidence_evi_full_default"' in repaired_prompt
+    assert "Delete or completely rebuild every rejected layer" in repaired_prompt
 
 
 @pytest.mark.asyncio
@@ -1326,7 +1952,7 @@ async def test_incompatible_chart_domains_are_replanned_inside_the_tool_boundary
         request_state=state,
     )
 
-    assert llm.calls == 2  # incompatible domains plus repaired chart plan
+    assert llm.calls == 2  # fixed-composition field encoding and semantic audit
     assert result["visualizations"][0]["required_roles"] == ["base_series", "endpoints"]
 
 
@@ -1698,11 +2324,6 @@ async def test_line_visualization_closes_proof_obligation_through_semantic_evide
                 {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
                 {"name": "measure", "semantic_role": "observed_measure", "source_path": "$.value"},
             ],
-            "events": [],
-        }],
-        "evidence_bindings": [{
-            "obligation_id": "complete_context",
-            "view_id": "observations",
         }],
         "required_data_request": None,
     }
@@ -1765,6 +2386,23 @@ async def test_line_visualization_closes_proof_obligation_through_semantic_evide
                 }, messages), response_metadata={})
             if _is_projection_prompt(messages):
                 return SimpleNamespace(content=_strict_test_payload(projection, messages), response_metadata={})
+            if "independently audit" in str(messages[0][1]):
+                payload = {
+                    "assessments": [{
+                        "obligation_id": "complete_context",
+                        "status": "directly_materialized",
+                        "missing_evidence_kind": None,
+                        "view_ids": ["observations"],
+                        "rationale": "The complete observed view directly covers the obligation.",
+                    }],
+                    "decision": "approve",
+                    "issues": [],
+                    "required_data_request": None,
+                }
+                return SimpleNamespace(
+                    content=json.dumps({"outcome": payload}),
+                    response_metadata={},
+                )
             self.chart_prompts.append(messages)
             return SimpleNamespace(content=_strict_test_payload(chart, messages), response_metadata={})
 
@@ -1833,9 +2471,24 @@ async def test_visualization_repairs_invalid_insight_reference_with_llm_replanni
                     "non_visual_insight_ids": [],
                     "required_data_request": None,
                 }}), response_metadata={})
+            if _is_evidence_consumption_prompt(messages):
+                return SimpleNamespace(
+                    content=_evidence_consumption_payload(messages),
+                    response_metadata={},
+                )
             if _is_projection_prompt(messages):
                 return SimpleNamespace(content=_projection_ir_payload(_projection_for_chart_payload(json.dumps(chart))), response_metadata={})
-            return SimpleNamespace(content=_chart_ir_payload(chart), response_metadata={})
+            if _is_composition_prompt(messages):
+                return SimpleNamespace(content=_composition_payload(chart), response_metadata={})
+            if _is_encoding_prompt(messages):
+                return SimpleNamespace(content=_encoding_payload(chart), response_metadata={})
+            if "independently audit" in str(messages[0][1]):
+                return SimpleNamespace(content=json.dumps({
+                    "decision": "approve",
+                    "issues": [],
+                    "required_data_request": None,
+                }), response_metadata={})
+            raise AssertionError("unexpected visualization LLM stage")
 
     llm = RepairingVerificationLlm()
     result = await VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path)).execute(
@@ -1851,6 +2504,103 @@ async def test_visualization_repairs_invalid_insight_reference_with_llm_replanni
 
 
 @pytest.mark.asyncio
+async def test_explicit_cleaned_trajectory_is_requested_after_goal_and_before_projection(tmp_path):
+    state = _state(25)
+    anomaly_id = "anomaly_evi_full"
+    timestamp = "2026-01-01T05:00:00Z"
+    state.anomaly_artifacts[anomaly_id] = AnomalyResult(
+        anomaly_id=anomaly_id,
+        detector_name="test_detector",
+        anomaly_points=[{"timestamp": timestamp, "value": 999.0, "score": 12.0}],
+        diagnostics={"detected_count": 1},
+    )
+    state.insight_set.insights = [KeyInsight(
+        insight_id="ins_filtered_target",
+        insight_key="filtered_target",
+        name="Filtered target",
+        insight_type="interval",
+        statement="After excluding anomalies, the selected target starts at the excluded point.",
+        value={"start_time": timestamp, "start_value": 999.0},
+        method="code_interpreter",
+        evidence_refs=[
+            InsightEvidenceRef(source_type="query", source_id="evi_full"),
+            InsightEvidenceRef(source_type="anomaly", source_id=anomaly_id),
+        ],
+        calculation_trace="Excluded anomaly points, then selected the same remaining point.",
+    )]
+
+    class ConsumptionPlannerLlm:
+        def __init__(self):
+            self.goal_prompts = []
+            self.consumption_prompts = []
+
+        async def ainvoke(self, messages):
+            if _is_verification_prompt(messages):
+                self.goal_prompts.append(messages)
+                return SimpleNamespace(content=_strict_test_payload({
+                    "decision": "visualize",
+                    "target_insight_ids": ["ins_filtered_target"],
+                    "verification_question": "Can the target be inspected on a cleaned-only trajectory?",
+                    "interpretation": "Show only the exclusion-applied trajectory around the target.",
+                    "visual_relation": "target in cleaned-only temporal context",
+                    "proof_obligations": [{
+                        "obligation_id": "filtered_context",
+                        "description": "The transformed context after exclusions.",
+                        "required": True,
+                    }],
+                    "required_context": ["transformed context", "excluded points"],
+                    "non_visual_insight_ids": [],
+                    "required_data_request": None,
+                }, messages), response_metadata={})
+            if _is_evidence_consumption_prompt(messages):
+                self.consumption_prompts.append(messages)
+                return SimpleNamespace(content=json.dumps({
+                    "decision": "needs_sources",
+                    "rationale": "The explicitly requested cleaned-only trajectory is not materialized.",
+                    "source_uses": [],
+                    "required_data_request": {
+                        "required_action": "code_interpreter",
+                        "purpose": "Materialize the exclusion-applied series requested by the presentation goal.",
+                        "message": "Produce the cleaned-only transformed context.",
+                        "required_shape": "timeseries",
+                        "required_fields": ["timestamp", "value", "exclusion_status"],
+                        "required_properties": ["anomaly exclusions applied"],
+                        "input_evidence": "evi_full",
+                        "input_source_refs": ["evidence:evi_full", f"anomaly:{anomaly_id}"],
+                        "insight_requests": [{
+                            "name": "Cleaned trajectory context",
+                            "insight_type": "timeseries_context",
+                            "insight_key": "cleaned_context",
+                        }],
+                    },
+                }), response_metadata={})
+            raise AssertionError("semantic projection must not run before missing upstream evidence is resolved")
+
+    llm = ConsumptionPlannerLlm()
+    result = await VisualizationTool(
+        llm=llm,
+        artifact_store=VisualizationArtifactStore(tmp_path),
+    ).execute(
+        VisualizationInput(
+            message="Show the filtered target on the cleaned-only exclusion-applied trajectory.",
+            source_refs=["insight:filtered_target"],
+        ),
+        request_state=state,
+    )
+
+    assert result["status"] == "needs_sources"
+    assert result["required_data_request"]["required_action"] == "code_interpreter"
+    assert result["required_data_request"]["insight_requests"]
+    assert len(llm.goal_prompts) == 1
+    assert len(llm.consumption_prompts) == 1
+    assert "projection_root" not in str(llm.goal_prompts[0])
+    consumption_prompt = str(llm.consumption_prompts[0])
+    assert "Excluded anomaly points, then selected the same remaining point." in consumption_prompt
+    assert timestamp in consumption_prompt
+    assert '"value": 999.0' in consumption_prompt
+
+
+@pytest.mark.asyncio
 async def test_visualization_preserves_full_series_and_highlights_interval_inside_broader_viewport(tmp_path):
     state = _state(100)
     state.insight_set.insights = [KeyInsight(
@@ -1859,28 +2609,80 @@ async def test_visualization_preserves_full_series_and_highlights_interval_insid
         name="Reversal interval",
         insight_type="interval",
         statement="The series falls and then rises inside the located interval.",
+        value={
+            "start_time": "2026-01-02T12:00:00Z",
+            "end_time": "2026-01-03T12:00:00Z",
+            "start_value": 36.0,
+            "end_value": 60.0,
+        },
         method="code_interpreter",
         evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_full")],
-        items=[
-            InsightItem(item_id="start", timestamp="2026-01-02T12:00:00Z", value=36.0, label="Start"),
-            InsightItem(item_id="end", timestamp="2026-01-03T12:00:00Z", value=60.0, label="End"),
-        ],
     )]
-    llm = _PlannerLlm(
-        '{"visual_goals":[{"purpose":"verify the located reversal interval",'
-        '"title":"Reversal in monthly context","priority":"primary",'
-        '"summary":"The full series remains scrollable while the located interval is emphasized.",'
-        '"required_roles":["complete_series","highlighted_interval"],'
-        '"presentation":{"dataZoom":[{"type":"inside",'
-        '"startValue":"2026-01-02T00:00:00Z","endValue":"2026-01-04T00:00:00Z"}]},'
-        '"layers":[{"role":"complete_series","source_ref":"view:evidence:evi_full:default",'
-        '"mark":"line","encoding":{"x":"timestamp","y":"value"}},'
-        '{"role":"highlighted_interval","source_ref":"view:evidence:evi_full:default",'
-        '"mark":"line","encoding":{"x":"timestamp","y":"value"},'
-        '"transform":[{"type":"filter","field":"timestamp","operator":"between",'
-        '"value":["2026-01-02T12:00:00Z","2026-01-03T12:00:00Z"]}],'
-        '"presentation":{"lineStyle":{"width":5}}}]}],"required_data_request":null}'
-    )
+    projection = {
+        "semantic_views": [
+            {
+                "view_id": "full_series",
+                "name": "Complete observed series",
+                "purpose": "Preserve the complete temporal context",
+                "grain": "observation",
+                "source_ref": "view:evidence:evi_full:default",
+                "record_path": None,
+                "mode": "records",
+                "fields": [
+                    {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
+                    {"name": "measure", "semantic_role": "observed_value", "source_path": "$.value"},
+                ],
+            },
+            {
+                "view_id": "target_bounds",
+                "name": "Authoritative target boundaries",
+                "purpose": "Keep the located Key Insight as the interval boundary source",
+                "grain": "target interval",
+                "source_ref": "insight:insight_reversal",
+                "record_path": None,
+                "mode": "records",
+                "fields": [
+                    {"name": "start", "semantic_role": "interval_start", "source_path": "$.start_time"},
+                    {"name": "end", "semantic_role": "interval_end", "source_path": "$.end_time"},
+                ],
+            },
+        ],
+        "required_data_request": None,
+    }
+    chart = {
+        "visual_goals": [{
+            "purpose": "verify the located reversal interval",
+            "title": "Reversal in monthly context",
+            "priority": "primary",
+            "summary": "The full series remains scrollable while the located interval is emphasized.",
+            "required_roles": ["complete_series", "highlighted_interval"],
+            "show_legend": True,
+            "tooltip": "axis",
+            "enable_zoom": True,
+            "viewport_start": "2026-01-02T00:00:00Z",
+            "viewport_end": "2026-01-04T00:00:00Z",
+            "y_scale": "linear",
+            "layers": [
+                {
+                    "layer_type": "series", "role": "complete_series", "source_ref": "semantic:full_series",
+                    "encodings": [{"channel": "x", "field": "time"}, {"channel": "y", "field": "measure"}],
+                    "emphasis": "subtle", "line_style": "solid", "symbol": "none", "axis": "primary",
+                    "label": "Observed value",
+                },
+                {
+                    "layer_type": "interval_overlay", "role": "highlighted_interval", "source_ref": "semantic:full_series",
+                    "encodings": [{"channel": "x", "field": "time"}, {"channel": "y", "field": "measure"}],
+                    "interval_source_ref": "semantic:target_bounds",
+                    "interval_start_field": "start",
+                    "interval_end_field": "end",
+                    "emphasis": "strong", "line_style": "solid", "symbol": "none", "axis": "primary",
+                    "label": "Located reversal interval",
+                },
+            ],
+        }],
+        "required_data_request": None,
+    }
+    llm = _TwoStagePlannerLlm(projection=projection, chart=chart)
 
     store = VisualizationArtifactStore(tmp_path)
     result = await VisualizationTool(
@@ -1898,6 +2700,7 @@ async def test_visualization_preserves_full_series_and_highlights_interval_insid
     assert visualization is not None
     assert len(visualization.datasets[0].series[0].points) == 100
     assert len(visualization.datasets[1].series[0].points) == 25
+    assert "insight:insight_reversal" in visualization.source_refs
     assert visualization.presentation["dataZoom"][0] == {
         "type": "inside",
         "filterMode": "filter",
@@ -1940,7 +2743,6 @@ async def test_visualization_expands_wide_turning_record_and_compiles_interval_o
                     {"name": "time", "semantic_role": "observation_time", "source_path": "$.timestamp"},
                     {"name": "price", "semantic_role": "observed_price", "source_path": "$.value"},
                 ],
-                "events": [],
             },
             {
                 "view_id": "turning_bounds",
@@ -1954,7 +2756,6 @@ async def test_visualization_expands_wide_turning_record_and_compiles_interval_o
                     {"name": "start", "semantic_role": "interval_start", "source_path": "$.start_time"},
                     {"name": "end", "semantic_role": "interval_end", "source_path": "$.end_time"},
                 ],
-                "events": [],
             },
             {
                 "view_id": "turning_events",
@@ -1964,7 +2765,6 @@ async def test_visualization_expands_wide_turning_record_and_compiles_interval_o
                 "source_ref": "insight:insight_turning_window",
                 "record_path": "$.value",
                 "mode": "events",
-                "fields": [],
                 "events": [
                     {"event_role": "start", "timestamp_path": "$.start_time", "value_path": "$.start_price"},
                     {"event_role": "peak", "timestamp_path": "$.peak_time", "value_path": "$.peak_price"},
@@ -2052,7 +2852,6 @@ async def test_long_event_table_stays_row_preserving_and_compiles_to_point_mark(
             "source_ref": "view:derived_evidence:dev_endpoints",
             "record_path": "$.records",
             "mode": "wide_events",
-            "fields": [],
             "events": [{
                 "event_role": "located_event",
                 "timestamp_path": "$.timestamp",
@@ -2075,7 +2874,6 @@ async def test_long_event_table_stays_row_preserving_and_compiles_to_point_mark(
                 {"name": "time", "semantic_role": "event_time", "source_path": "$.timestamp"},
                 {"name": "value", "semantic_role": "event_value", "source_path": "$.value"},
             ],
-            "events": [],
         }],
         "required_data_request": None,
     }
@@ -2245,7 +3043,7 @@ async def test_disabled_render_audit_does_not_block_candidate_publication(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_disabled_candidate_semantic_audit_is_not_invoked(tmp_path):
+async def test_candidate_semantic_audit_can_block_publication(tmp_path):
     llm = _PlannerLlm(
         '{"visual_goals":[{"purpose":"trend","title":"Observed trend","priority":"primary",'
         '"summary":null,"required_roles":["series"],"layers":[{"role":"series",'
@@ -2262,5 +3060,7 @@ async def test_disabled_candidate_semantic_audit_is_not_invoked(tmp_path):
         artifact_store=VisualizationArtifactStore(tmp_path),
     ).execute(VisualizationInput(message="Show the observed trend."), request_state=_state(25))
 
-    assert result["status"] == "created"
-    assert llm.audit_prompts == []
+    assert result["status"] == "unavailable"
+    assert len(llm.audit_prompts) == 1
+    assert result["visualizations"] == []
+    assert list(tmp_path.glob("*.json")) == []

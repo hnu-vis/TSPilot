@@ -248,7 +248,7 @@ describe('buildVisualizationOption', () => {
     expect(option.series.some((series: Record<string, number>) => series.yAxisIndex === 1)).toBe(true);
   });
 
-  it('keeps incompatible single-value summaries inside the chart as annotations', () => {
+  it('renders an explicitly planned scalar annotation without creating another axis domain', () => {
     const option = buildVisualizationOption(visualization({
       layout: 'facets',
       presentation: {
@@ -268,7 +268,10 @@ describe('buildVisualizationOption', () => {
       ],
       layers: [
         { layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history', dataset_id: 'history', presentation: { xAxisIndex: 0, yAxisIndex: 0 } },
-        { layer_id: 'summary', mark: 'bar', role: 'summary', source_ref: 'summary', dataset_id: 'summary', presentation: { xAxisIndex: 0, yAxisIndex: 1 } },
+        {
+          layer_id: 'summary', mark: 'annotation', role: 'summary', source_ref: 'summary',
+          dataset_id: 'summary', label: 'Change', points: [{ y: 12.5 }], presentation: {},
+        },
       ],
     })) as Record<string, any>;
 
@@ -276,7 +279,79 @@ describe('buildVisualizationOption', () => {
     expect(option.series).toHaveLength(1);
     expect(option.series[0].name).toBe('History');
     expect(option.yAxis).toHaveLength(1);
-    expect(option.graphic[0].style.text).toContain('Change: 12.5 %');
+    expect(option.graphic[0].style.text).toContain('Change: 12.5');
+  });
+
+  it('renders a code-derived annotation at its grounded x coordinate', () => {
+    const option = buildVisualizationOption(visualization({
+      datasets: [
+        {
+          dataset_id: 'history', source_ref: 'history', dimensions,
+          series: [{ series_id: 'history', name: 'History', role: 'history', points: [
+            { x: '2026-01-01T00:00:00Z', y: 10 },
+            { x: '2026-01-02T00:00:00Z', y: 12 },
+          ] }],
+        },
+        {
+          dataset_id: 'decision', source_ref: 'insight:decision', dimensions,
+          series: [{ series_id: 'decision', name: 'Decision', role: 'decision', points: [{
+            x: '2026-01-02T00:00:00Z', y: 12, label: 'Selected by code', binding_id: 'decision:1',
+          }] }],
+        },
+      ],
+      layers: [
+        { layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history', dataset_id: 'history' },
+        {
+          layer_id: 'decision', mark: 'annotation', role: 'decision', source_ref: 'insight:decision',
+          dataset_id: 'decision', label: 'Decision',
+          encoding: { x: 'timestamp', value: 'value', label: 'role' },
+          points: [{
+            x: '2026-01-02T00:00:00Z', y: 12, label: 'Selected by code', binding_id: 'decision:1',
+          }],
+        },
+      ],
+      bindings: [{ binding_id: 'decision:1', source_type: 'insight_item' }],
+    })) as Record<string, any>;
+
+    expect(option.series).toHaveLength(1);
+    expect(option.series[0].markPoint.data[0]).toMatchObject({
+      name: 'Decision: Selected by code: 12',
+      coord: ['2026-01-02T00:00:00Z', 12],
+      bindingId: 'decision:1',
+    });
+    expect(option.graphic).toEqual([]);
+    expect(option.xAxis).toHaveLength(1);
+  });
+
+  it('renders an x-only annotation as a located event guide', () => {
+    const option = buildVisualizationOption(visualization({
+      datasets: [{
+        dataset_id: 'history', source_ref: 'history', dimensions,
+        series: [{ series_id: 'history', name: 'History', role: 'history', points: [
+          { x: '2026-01-01T00:00:00Z', y: 10 },
+          { x: '2026-01-02T00:00:00Z', y: 12 },
+        ] }],
+      }, {
+        dataset_id: 'event', source_ref: 'event',
+        dimensions: [{ name: 'timestamp', data_type: 'time', role: 'x' }, { name: 'value', data_type: 'number', role: 'y' }],
+        series: [{ series_id: 'event', name: 'Event', role: 'event', points: [{
+          x: '2026-01-02T00:00:00Z', label: 'Regime changed',
+        }] }],
+      }],
+      layers: [
+        { layer_id: 'history', mark: 'line', role: 'history', source_ref: 'history', dataset_id: 'history' },
+        {
+          layer_id: 'event', mark: 'annotation', role: 'event', source_ref: 'event', dataset_id: 'event',
+          label: 'Event', points: [{ x: '2026-01-02T00:00:00Z', label: 'Regime changed' }],
+        },
+      ],
+    })) as Record<string, any>;
+
+    expect(option.series[0].markLine.data[0]).toMatchObject({
+      name: 'Event: Regime changed',
+      xAxis: '2026-01-02T00:00:00Z',
+    });
+    expect(option.graphic).toEqual([]);
   });
 
   it('passes renderer-native marks, multi-field encodings, and presentation through grounded datasets', () => {

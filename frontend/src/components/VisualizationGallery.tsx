@@ -298,25 +298,55 @@ export function buildVisualizationOption(
     splitLine: { lineStyle: { color: '#eef1f4' } },
   }));
   const seriesOptions: any[] = [];
-  const scalarAnnotations: Array<{ label: string; value: number | null; unit?: string | null }> = [];
+  const scalarAnnotations: Array<{
+    label: string;
+    content?: string | null;
+    value: number | null;
+    unit?: string | null;
+  }> = [];
+  const positionedAnnotations: Array<{
+    x: unknown;
+    y: number | null;
+    label: string;
+    content?: string | null;
+    value: number | null;
+    unit?: string | null;
+    bindingId?: string | null;
+  }> = [];
   const rendererDatasets: Array<{ id: string; source: Array<Record<string, unknown>> }> = [];
   layers.forEach((layer, index) => {
     const dataset = datasets.get(layer.dataset_id);
     if (layer.mark === 'rule') return;
+    if (layer.mark === 'annotation') {
+      const points = layer.points?.length
+        ? layer.points
+        : (dataset?.series || []).flatMap((series) => series.points || []);
+      points.forEach((point) => {
+        const annotation = {
+          label: layer.label || formatRoleLabel(layer.role),
+          content: point.label,
+          value: point.y ?? null,
+          unit: dataset?.series?.[0]?.unit,
+        };
+        if (point.x !== undefined && point.x !== null) {
+          positionedAnnotations.push({
+            ...annotation,
+            x: point.x,
+            y: point.y ?? null,
+            bindingId: point.binding_id,
+          });
+        } else {
+          scalarAnnotations.push(annotation);
+        }
+      });
+      return;
+    }
     const xAxisIndex = faceted ? index : 0;
     const yAxisIndex = faceted ? index : requestedAxisIndex(layer.presentation?.yAxisIndex, overlayYAxisCount);
     const sourceSeries = dataset?.series?.length
       ? dataset.series
       : [{ series_id: layer.layer_id, name: layer.label || formatRoleLabel(layer.role), role: layer.role, points: layer.points || [] }];
     sourceSeries.forEach((series) => {
-      if (!faceted && isScalarAnnotationLayer(dataset, series, primaryXAxisType)) {
-        scalarAnnotations.push({
-          label: series.name || layer.label || formatRoleLabel(layer.role),
-          value: series.points?.[0]?.y ?? null,
-          unit: series.unit,
-        });
-        return;
-      }
       if (layer.mark === 'band') {
         seriesOptions.push(...confidenceBandSeries(series, index, xAxisIndex, yAxisIndex));
         return;
@@ -337,14 +367,53 @@ export function buildVisualizationOption(
       ));
     });
   });
-  const rulePoints = layers.flatMap((layer) => layer.mark === 'rule' ? layer.points || [] : []);
-  if (rulePoints.length > 0 && seriesOptions.length > 0) {
+  const rulePoints = layers.flatMap((layer) => (
+    layer.mark === 'rule'
+      ? (layer.points || []).map((point) => ({ ...point, guideLabel: layer.label || point.label || '' }))
+      : []
+  ));
+  const xOnlyAnnotations = positionedAnnotations.filter((annotation) => annotation.y == null);
+  if ((rulePoints.length > 0 || xOnlyAnnotations.length > 0) && seriesOptions.length > 0) {
     const first = seriesOptions[0] as Record<string, unknown>;
     first.markLine = {
       symbol: 'none',
       label: { color: '#475467', formatter: '{b}' },
       lineStyle: { color: '#98a2b3', type: 'dashed' },
-      data: rulePoints.map((point) => ({ name: point.label || '', xAxis: point.x, yAxis: point.x == null ? point.y : undefined })),
+      data: [
+        ...rulePoints.map((point) => ({
+          name: point.guideLabel,
+          xAxis: point.x,
+          yAxis: point.x == null ? point.y : undefined,
+          bindingId: point.binding_id,
+        })),
+        ...xOnlyAnnotations.map((annotation) => ({
+          name: formatAnnotationText(annotation),
+          xAxis: annotation.x,
+          bindingId: annotation.bindingId,
+        })),
+      ],
+    };
+  }
+  const pointAnnotations = positionedAnnotations.filter((annotation) => annotation.y != null);
+  if (pointAnnotations.length > 0 && seriesOptions.length > 0) {
+    const first = seriesOptions[0] as Record<string, unknown>;
+    first.markPoint = {
+      symbol: 'pin',
+      symbolSize: compact ? 34 : 42,
+      itemStyle: { color: '#6941c6' },
+      label: {
+        show: true,
+        position: 'top',
+        color: '#475467',
+        fontSize: compact ? 9 : 11,
+        formatter: '{b}',
+      },
+      data: pointAnnotations.map((annotation) => ({
+        name: formatAnnotationText(annotation),
+        coord: [annotation.x, annotation.y],
+        value: annotation.value,
+        bindingId: annotation.bindingId,
+      })),
     };
   }
   const intervalPoints = layers.flatMap((layer) => layer.mark === 'rect' ? layer.points || [] : []);
@@ -357,7 +426,10 @@ export function buildVisualizationOption(
     };
   }
 
-  const generatedXAxis = faceted ? xAxis : xAxis.slice(0, 1);
+  const hostLayerIndex = layers.findIndex((layer) => !['rule', 'annotation'].includes(layer.mark));
+  const generatedXAxis = faceted
+    ? xAxis
+    : [xAxis[Math.max(0, hostLayerIndex)] || xAxis[0]];
   const renderedOverlayYAxisCount = faceted
     ? 1
     : Math.max(1, ...seriesOptions.map((series) => Number(series.yAxisIndex) + 1).filter(Number.isFinite));
@@ -556,24 +628,17 @@ function preferredSharedXAxisType(
   return types.includes('time') ? 'time' : types[0] || 'category';
 }
 
-function isScalarAnnotationLayer(
-  dataset: Visualization['datasets'][number] | undefined,
-  series: VisualizationSeries,
-  primaryXAxisType: 'time' | 'value' | 'category',
-) {
-  const layerXAxisType = axisType(dataset?.dimensions?.find((dimension) => dimension.role === 'x')?.data_type);
-  return layerXAxisType !== primaryXAxisType && (series.points?.length || 0) <= 1;
-}
-
 function scalarAnnotationGraphic(
-  annotations: Array<{ label: string; value: number | null; unit?: string | null }>,
+  annotations: Array<{
+    label: string;
+    content?: string | null;
+    value: number | null;
+    unit?: string | null;
+  }>,
   compact = false,
 ) {
   if (annotations.length === 0) return [];
-  const text = annotations.map((annotation) => {
-    const value = annotation.value == null ? '—' : formatAxisNumber(annotation.value);
-    return `${annotation.label}: ${value}${annotation.unit ? ` ${annotation.unit}` : ''}`;
-  }).join('\n');
+  const text = annotations.map(formatAnnotationText).join('\n');
   return [{
     type: 'text',
     left: compact ? 48 : 76,
@@ -592,6 +657,19 @@ function scalarAnnotationGraphic(
       padding: [6, 8],
     },
   }];
+}
+
+function formatAnnotationText(annotation: {
+  label: string;
+  content?: string | null;
+  value: number | null;
+  unit?: string | null;
+}) {
+  const heading = annotation.content
+    ? `${annotation.label}: ${annotation.content}`
+    : annotation.label;
+  if (annotation.value == null) return heading;
+  return `${heading}: ${formatAxisNumber(annotation.value)}${annotation.unit ? ` ${annotation.unit}` : ''}`;
 }
 
 function deepMerge(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {

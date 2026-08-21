@@ -65,6 +65,8 @@ def test_prompt_keeps_insight_content_atomic_and_visual_refs_explicit():
     assert "Put only visually inspectable conclusion Insights in source_refs" in system_prompt
     assert "prefer insight:<exact insight_key>" in system_prompt
     assert "never reconstruct or abbreviate an opaque identifier" in system_prompt
+    assert "unavailable_outputs and unavailable_reason are status metadata" in system_prompt
+    assert "availability states are not refs" in system_prompt
 
 
 def test_prompt_context_keeps_runtime_decision_state_out_of_model_context():

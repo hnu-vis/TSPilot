@@ -252,10 +252,14 @@ class ToolExecutor:
                 if not isinstance(item, dict) or item.get("action") != "visualization":
                     continue
                 guidance = item.get("input_guidance") if isinstance(item.get("input_guidance"), dict) else {}
-                if isinstance(guidance.get("repair_contract"), dict):
-                    constraints = {**constraints, "repair_contract": guidance["repair_contract"]}
                 if isinstance(guidance.get("constraints"), dict):
                     constraints = {**constraints, **guidance["constraints"]}
+            constraints = {
+                key: value
+                for key, value in constraints.items()
+                if key not in {"mode", "repair_contract", "validation_failure"}
+                and not str(key).startswith("_")
+            }
             normalized["constraints"] = constraints
             return {
                 key: value

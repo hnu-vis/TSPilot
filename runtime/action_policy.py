@@ -502,7 +502,9 @@ def runtime_action_constraints(request_state: RequestStateModel) -> dict:
         ).strip()
         reason = (
             "Visual verification is resolved as unavailable for the current source state. "
-            "Finalize from the available grounded evidence and disclose why no chart was published."
+            "Finalize from the available grounded evidence and disclose why no chart was published. "
+            "Keep visualization_ids empty; availability labels belong only in unavailable_outputs/unavailable_reason "
+            "and must never be used as section source_refs."
         )
         return {
             "required_actions": [{

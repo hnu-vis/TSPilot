@@ -22,17 +22,16 @@ class VisualizationArtifactStore:
     def put(self, visualization: VisualizationPayload) -> VisualizationPayload:
         artifact_id = self._validate_id(visualization.visualization_id)
         data_ref = f"/api/v1/visualizations/{artifact_id}/data"
-        complete_datasets = []
-        for dataset in visualization.datasets:
-            row_count = sum(len(series.points) for series in dataset.series)
-            complete_datasets.append(dataset.model_copy(update={
+        complete_views = []
+        for view in visualization.data_views:
+            complete_views.append(view.model_copy(update={
                 "data_ref": data_ref,
-                "row_count": row_count,
-                "time_range": _dataset_time_range(dataset),
+                "row_count": len(view.records),
+                "time_range": _view_time_range(view),
             }, deep=True))
         complete = visualization.model_copy(update={
             "data_ref": data_ref,
-            "datasets": complete_datasets,
+            "data_views": complete_views,
         }, deep=True)
         payload = complete.model_dump(mode="json")
         with self._lock:
@@ -49,22 +48,22 @@ class VisualizationArtifactStore:
         if not target.is_file():
             return None
         with self._lock:
-            return VisualizationPayload.model_validate_json(target.read_text(encoding="utf-8"))
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != "4":
+                return None
+            return VisualizationPayload.model_validate(payload)
 
     def descriptor(self, visualization: VisualizationPayload) -> VisualizationPayload:
-        datasets = []
-        for dataset in visualization.datasets:
-            row_count = sum(len(series.points) for series in dataset.series)
-            datasets.append(dataset.model_copy(update={
+        views = []
+        for view in visualization.data_views:
+            views.append(view.model_copy(update={
                 "data_ref": visualization.data_ref,
-                "row_count": row_count,
-                "time_range": _dataset_time_range(dataset),
-                "series": [],
+                "row_count": len(view.records),
+                "time_range": _view_time_range(view),
+                "records": [],
             }, deep=True))
-        layers = [layer.model_copy(update={"points": []}, deep=True) for layer in visualization.layers]
         return visualization.model_copy(update={
-            "datasets": datasets,
-            "layers": layers,
+            "data_views": views,
             "accessibility": visualization.accessibility.model_copy(update={"table_rows": []}),
         }, deep=True)
 
@@ -75,10 +74,14 @@ class VisualizationArtifactStore:
         return value
 
 
-def _dataset_time_range(dataset) -> dict | None:
-    values = []
-    for series in dataset.series:
-        values.extend(point.x for point in series.points if point.x not in (None, ""))
+def _view_time_range(view) -> dict | None:
+    time_fields = {field.name for field in view.fields if field.data_type == "time"}
+    values = [
+        record.values.get(field)
+        for record in view.records
+        for field in time_fields
+        if record.values.get(field) not in (None, "")
+    ]
     if not values:
         return None
     ordered = sorted(values, key=str)
