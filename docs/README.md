@@ -10,7 +10,7 @@ current architecture, integration contracts, and setup guidance.
 ## Contracts
 
 - [Chat API contract](contracts/api.md) — stable chat request and response boundary.
-- [LineChart Visualization V4 contract](contracts/visualization.md) — visualization payload, semantic validation, persistence, and hydration.
+- [Native ECharts Visualization V5 contract](contracts/visualization-v5.md) — grounded option validation, persistence, and direct rendering.
 
 ## Guides
 

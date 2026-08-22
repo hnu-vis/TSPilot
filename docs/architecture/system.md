@@ -27,7 +27,7 @@ the appropriate owner tool and retries visualization with the new observation.
 - `sql_query` discovers schemas, generates read-only queries, and returns database evidence.
 - `code_interpreter` calculates derived analytical results over existing evidence.
 - `forecast` and `anomaly` produce specialized time-series artifacts.
-- `visualization` creates grounded LineChart V4 artifacts.
+- `visualization` creates grounded native ECharts V5 artifacts.
 - `rag` and `skill` provide additional context when required.
 - `format_answer` assembles the terminal response from verified state.
 
@@ -46,10 +46,9 @@ responsible for producing it; visualization does not invent missing data.
 
 ### Presentation
 
-Final answers and visualizations reference authoritative artifacts. The
-LineChart-first visualization flow plans the intended content, composes chart
-components, validates their source bindings, and persists the full payload for
-frontend hydration.
+Final answers and visualizations reference authoritative artifacts. Native
+ECharts visualization planning composes options, validates their source
+bindings, and persists the full payload for frontend hydration.
 
 ## Core rules
 
@@ -75,6 +74,7 @@ frontend hydration.
 
 ## Current scope
 
-TSPilot v0.1 uses one outer data agent. Visualization is LineChart-first and
-supports primary and, only when necessary, supporting charts. Model and database
-connections are managed from the Web interface or local workspace configuration.
+TSPilot v0.1 uses one outer data agent. Visualization uses grounded native
+ECharts options and supports primary and, only when necessary, supporting
+charts. Model and database connections are managed from the Web interface or
+local workspace configuration.

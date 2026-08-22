@@ -980,75 +980,74 @@ def _prompt_json(text: str, marker: str):
         return None
 
 
-def _fake_visual_content_plan(prompt_text: str) -> _FakeResponse:
-    inventory = _prompt_json(prompt_text, "Grounded source inventory:") or {}
+def _fake_echarts_plan(prompt_text: str) -> _FakeResponse:
+    inventory = _prompt_json(prompt_text, "Grounded Source Inventory:") or {}
     target_ids = _prompt_json(prompt_text, "Requested target Insight ids:") or []
     sources = [item for item in inventory.get("sources", []) if isinstance(item, dict)]
-    host = next((
-        item for item in sources
-        if item.get("kind") == "data_view"
-        and int(item.get("row_count") or 0) >= 2
-        and any(field.get("data_type") == "time" for field in item.get("schema_fields") or [])
-        and any(field.get("data_type") == "number" for field in item.get("schema_fields") or [])
-    ), None)
+    host = next((item for item in sources if item.get("kind") == "data_view" and any(
+        field.get("data_type") == "time" for field in item.get("schema_fields", [])
+    ) and any(field.get("data_type") == "number" for field in item.get("schema_fields", []))), None)
     if host is None:
         return _FakeResponse(json.dumps({
-            "visual_question": None, "interpretation": None, "target_insight_ids": [], "goals": [],
+            "visual_question": None, "interpretation": None, "target_insight_ids": [], "charts": [],
             "required_data_request": {
-                "required_action": "sql_query", "purpose": "load a complete time series", "message": None,
+                "required_action": "sql_query", "purpose": "load a chartable time series", "message": None,
                 "required_shape": "timeseries", "required_fields": ["timestamp", "value"],
                 "required_properties": ["at least two observations"], "input_evidence": None,
                 "input_source_refs": [], "insight_requests": [],
             },
         }, ensure_ascii=False))
-    source_ref = str(host["source_ref"])
+    fields = host.get("schema_fields") or []
+    x_field = next(str(item["name"]) for item in fields if item.get("data_type") == "time")
+    y_field = next(str(item["name"]) for item in fields if item.get("data_type") == "number")
+    mark_points, mark_lines = [], []
+    for target_id in target_ids:
+        source = next((item for item in sources if item.get("source_ref") == f"insight:{target_id}"), None)
+        if source is None:
+            continue
+        target_fields = source.get("schema_fields") or []
+        time_field = next((str(item["name"]) for item in target_fields if item.get("data_type") == "time"), None)
+        number_field = next((str(item["name"]) for item in target_fields if item.get("data_type") == "number"), None)
+        if time_field and number_field:
+            mark_points.append({
+                "name": source.get("name") or "Insight",
+                "coord": [
+                    {"$value": {"source_ref": source["source_ref"], "field": time_field}},
+                    {"$value": {"source_ref": source["source_ref"], "field": number_field}},
+                ],
+            })
+        elif number_field:
+            mark_lines.append({
+                "name": source.get("name") or "Insight",
+                "yAxis": {"$value": {"source_ref": source["source_ref"], "field": number_field}},
+            })
+    series = {
+        "name": "Observed", "type": "line", "datasetId": "context",
+        "encode": {"x": x_field, "y": y_field}, "showSymbol": False,
+    }
+    if mark_points:
+        series["markPoint"] = {"data": mark_points}
+    if mark_lines:
+        series["markLine"] = {"data": mark_lines}
+    option = {
+        "useUTC": True,
+        "dataset": [{"id": "context", "source": {"$dataset": host["source_ref"]}}],
+        "xAxis": [{"type": "time"}], "yAxis": [{"type": "value"}],
+        "tooltip": {"trigger": "axis"}, "series": [series],
+    }
     return _FakeResponse(json.dumps({
         "visual_question": "Does the complete series support the requested analytical conclusion?",
-        "interpretation": "Read the complete contextual line and its linked evidence.",
+        "interpretation": "Read the complete context and grounded marks.",
         "target_insight_ids": target_ids,
-        "goals": [{
-            "goal_id": "primary", "purpose": "verify the requested conclusion", "title": "Observed series",
-            "summary": "Complete grounded context.", "priority": "primary", "host_source_ref": source_ref,
-            "content": [{
-                "content_id": "context", "source_ref": source_ref, "insight_ids": target_ids,
-                "purpose": "complete contextual series", "importance": "primary",
-            }],
-            "required_interactions": ["tooltip", "zoom", "evidence_link"],
+        "charts": [{
+            "chart_id": "primary", "purpose": "verify the requested conclusion", "priority": "primary",
+            "title": "Observed series", "summary": "Complete grounded context.",
+            "accessibility_description": "Observed values and grounded conclusions.",
+            "accessibility_table_columns": [x_field, y_field],
+            "option_json": json.dumps(option, ensure_ascii=False),
         }],
         "required_data_request": None,
     }, ensure_ascii=False))
-
-
-def _fake_linechart_plan(prompt_text: str) -> _FakeResponse:
-    content = _prompt_json(prompt_text, "Visual content plan:") or {}
-    inventory = _prompt_json(prompt_text, "Grounded source inventory:") or {}
-    sources = {
-        str(item.get("source_ref")): item
-        for item in inventory.get("sources", [])
-        if isinstance(item, dict) and item.get("source_ref")
-    }
-    charts = []
-    for goal in content.get("goals") or []:
-        source_ref = str(goal.get("host_source_ref") or "")
-        source = sources.get(source_ref, {})
-        fields = source.get("schema_fields") or []
-        x_field = next((str(item["name"]) for item in fields if item.get("data_type") == "time"), "timestamp")
-        y_field = next((str(item["name"]) for item in fields if item.get("data_type") == "number"), "value")
-        charts.append({
-            "goal_id": goal.get("goal_id"), "x_axis_type": "time", "x_axis_label": "Time",
-            "y_axes": [{"axis_id": "value", "label": y_field, "measure": y_field, "unit": None, "scale": "linear"}],
-            "host_line": {
-                "content_id": (goal.get("content") or [{}])[0].get("content_id"),
-                "role": "complete context", "importance": "primary",
-                "label": "Observed", "x_field": x_field, "y_field": y_field,
-                "y_axis_id": "value", "line_style": "solid", "symbol": "none",
-            },
-            "lines": [],
-            "points": [], "bands": [], "intervals": [], "reference_lines": [], "annotations": [],
-            "legend_visible": False, "legend_position": "top", "tooltip_mode": "axis",
-            "zoom_enabled": True, "zoom_start": None, "zoom_end": None,
-        })
-    return _FakeResponse(json.dumps({"charts": charts, "required_data_request": None}, ensure_ascii=False))
 
 
 def _query_generation_response(user_prompt: str, messages=None) -> _FakeResponse | None:
@@ -1057,10 +1056,8 @@ def _query_generation_response(user_prompt: str, messages=None) -> _FakeResponse
         for message in (messages or [])
         if isinstance(message, (tuple, list)) and len(message) > 1
     )
-    if "visual-content planner for a LineChart-first" in prompt_text:
-        return _fake_visual_content_plan(prompt_text)
-    if "compose complete grounded LineChart plans" in prompt_text:
-        return _fake_linechart_plan(prompt_text)
+    if "complete native Apache ECharts 5 option JSON" in prompt_text:
+        return _fake_echarts_plan(prompt_text)
     try:
         internal_payload = json.loads(user_prompt)
     except (TypeError, json.JSONDecodeError):

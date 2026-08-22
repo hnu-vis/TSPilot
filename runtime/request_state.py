@@ -675,37 +675,19 @@ def _visualization_verification_receipts(visualizations) -> list[dict]:
     for item in visualizations if isinstance(visualizations, list) else []:
         if not isinstance(item, dict):
             continue
-        data_views = item.get("data_views") if isinstance(item.get("data_views"), list) else []
-        components = [
-            component
-            for key in ("lines", "points", "bands", "intervals", "reference_lines", "annotations")
-            for component in (item.get(key) if isinstance(item.get(key), list) else [])
-            if isinstance(component, dict)
-        ]
-        view_receipts = []
-        for view in data_views:
-            if not isinstance(view, dict):
-                continue
-            view_receipts.append({
-                "grounded_by": _outer_grounding_refs([view.get("source_ref")]),
-                "row_count": view.get("row_count"),
-                "time_range": view.get("time_range"),
-            })
+        option = item.get("option") if isinstance(item.get("option"), dict) else {}
+        series = option.get("series")
+        series = series if isinstance(series, list) else ([series] if isinstance(series, dict) else [])
         receipts.append({
             "visualization_id": item.get("visualization_id"),
             "verification": item.get("verification"),
-            "full_fidelity": bool(item.get("data_ref")) and bool(data_views) and all(
-                isinstance(view.get("row_count"), int)
-                for view in data_views
-                if isinstance(view, dict)
-            ),
-            "required_roles": item.get("required_roles", []),
-            "materialized_roles": list(dict.fromkeys(
-                str(component.get("role"))
-                for component in components
-                if component.get("role")
+            "full_fidelity": bool(item.get("data_ref")),
+            "grounded_by": _outer_grounding_refs(item.get("source_refs", [])),
+            "series_types": list(dict.fromkeys(
+                str(component.get("type"))
+                for component in series
+                if isinstance(component, dict) and component.get("type")
             )),
-            "data_views": view_receipts,
         })
     return receipts
 

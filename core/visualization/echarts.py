@@ -22,6 +22,7 @@ ALLOWED_SERIES = {"line", "scatter", "bar"}
 MARK_KEYS = {"markPoint", "markLine", "markArea"}
 FORBIDDEN_KEYS = {"transform", "renderItem", "javascript", "script", "html", "dom"}
 URL_PATTERN = re.compile(r"(?:https?|ftp|data|javascript):", re.IGNORECASE)
+EXECUTABLE_PATTERN = re.compile(r"(?:\bfunction\s*\(|=>|<\s*script\b|\b(?:window|document)\s*\.)", re.IGNORECASE)
 
 
 class EChartsValidationError(ValueError):
@@ -122,6 +123,7 @@ class EChartsCompiler:
         table_rows: list[dict[str, Any]] = []
         resolved_datasets: list[dict[str, Any]] = []
         dataset_fields: list[set[str]] = []
+        dataset_row_counts: list[int] = []
         dataset_ids: dict[str, int] = {}
         for index, dataset in enumerate(datasets):
             path = f"/dataset/{index}"
@@ -152,6 +154,7 @@ class EChartsCompiler:
                 output_rows.append(output)
             fields = {str(item["name"]) for item in _schema_fields(output_rows)} | {"bindingId"}
             dataset_fields.append(fields)
+            dataset_row_counts.append(len(output_rows))
             dataset_id = dataset.get("id")
             if dataset_id is not None:
                 if not isinstance(dataset_id, str) or not dataset_id:
@@ -165,6 +168,7 @@ class EChartsCompiler:
             table_rows.extend({"source": source.ref, **row} for row in output_rows[:12])
 
         geometries: set[str] = set()
+        has_comparison_series = False
         resolved_series = []
         for index, item in enumerate(series):
             path = f"/series/{index}"
@@ -182,6 +186,7 @@ class EChartsCompiler:
             if not isinstance(encode, dict) or not encode:
                 raise EChartsValidationError(path + "/encode", "dataset-backed series requires encode")
             _validate_encode(encode, dataset_fields[dataset_index], path + "/encode")
+            has_comparison_series = has_comparison_series or dataset_row_counts[dataset_index] >= 2
             signature = json.dumps(
                 [series_type, dataset_index, encode, item.get("xAxisIndex", 0), item.get("yAxisIndex", 0)],
                 sort_keys=True,
@@ -200,6 +205,9 @@ class EChartsCompiler:
                     target_ids.update(mark_targets)
             resolved_series.append(resolved_item)
 
+        if not has_comparison_series:
+            raise EChartsValidationError("/series", "at least one continuous or comparison series requires two grounded records")
+
         resolved = dict(option)
         resolved["dataset"] = resolved_datasets if isinstance(option.get("dataset"), list) else resolved_datasets[0]
         resolved["series"] = resolved_series if isinstance(option.get("series"), list) else resolved_series[0]
@@ -216,6 +224,7 @@ class EChartsCompiler:
         targets: set[str] = set()
         resolved_data = []
         for index, item in enumerate(data):
+            _validate_mark_data_grounding(item, f"{path}/data/{index}")
             resolved, item_refs, item_bindings, item_targets = self._resolve_values(item, f"{path}/data/{index}")
             if item_bindings and isinstance(resolved, dict):
                 binding_ids = list(item_bindings)
@@ -271,15 +280,22 @@ class EChartsCompiler:
 
     def _resolve_source(self, ref: str, pointer: str):
         try:
-            return self.catalog.resolve(ref)
+            source = self.catalog.resolve(ref)
         except ValueError as exc:
             raise EChartsValidationError(pointer, str(exc)) from exc
+        if source.ref not in set(self.catalog.projection_refs()):
+            raise EChartsValidationError(pointer, f"source '{ref}' is not exposed by the Grounded Source Inventory")
+        return source
 
 
 def _validate_tree(value: Any, path: str, depth: int) -> None:
     if depth > MAX_DEPTH:
         raise EChartsValidationError(path, f"option nesting exceeds {MAX_DEPTH}")
     if isinstance(value, dict):
+        if "$dataset" in value and not _is_dataset_placeholder(value):
+            raise EChartsValidationError(path, "malformed $dataset placeholder")
+        if "$value" in value and not _is_value_placeholder(value):
+            raise EChartsValidationError(path, "malformed $value placeholder")
         for key, child in value.items():
             pointer = path + "/" + _escape(key)
             if str(key).casefold() in FORBIDDEN_KEYS:
@@ -288,8 +304,8 @@ def _validate_tree(value: Any, path: str, depth: int) -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _validate_tree(child, f"{path}/{index}", depth + 1)
-    elif isinstance(value, str) and URL_PATTERN.search(value):
-        raise EChartsValidationError(path, "URLs and executable schemes are forbidden")
+    elif isinstance(value, str) and (URL_PATTERN.search(value) or EXECUTABLE_PATTERN.search(value)):
+        raise EChartsValidationError(path, "URLs and executable content are forbidden")
     elif not isinstance(value, (str, int, float, bool, type(None))):
         raise EChartsValidationError(path, f"unsupported JSON value type '{type(value).__name__}'")
 
@@ -316,7 +332,14 @@ def _series_dataset_index(item: dict, ids: dict[str, int], count: int, path: str
         dataset_id = item["datasetId"]
         if dataset_id not in ids:
             raise EChartsValidationError(path + "/datasetId", f"unknown dataset id '{dataset_id}'")
-        return ids[dataset_id]
+        resolved = ids[dataset_id]
+        if "datasetIndex" in item:
+            index = item["datasetIndex"]
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= count:
+                raise EChartsValidationError(path + "/datasetIndex", f"dataset index must be between 0 and {count - 1}")
+            if index != resolved:
+                raise EChartsValidationError(path + "/datasetIndex", "datasetId and datasetIndex resolve to different datasets")
+        return resolved
     index = item.get("datasetIndex", 0)
     if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= count:
         raise EChartsValidationError(path + "/datasetIndex", f"dataset index must be between 0 and {count - 1}")
@@ -339,10 +362,53 @@ def _validate_encode(encode: dict, fields: set[str], path: str) -> None:
                     suffix = f"/{_escape(channel)}/{index}" if isinstance(value, list) else f"/{_escape(channel)}"
                     raise EChartsValidationError(path + suffix, f"unknown encoded field '{field}'")
                 selected.append(field)
-            elif not isinstance(field, int) or isinstance(field, bool):
-                raise EChartsValidationError(path + f"/{_escape(channel)}", "encode values must be field names or indexes")
-    if not selected and not any(isinstance(v, int) for v in encode.values()):
+            else:
+                raise EChartsValidationError(path + f"/{_escape(channel)}", "encode values must be grounded field names")
+    if not selected:
         raise EChartsValidationError(path, "encode must select grounded fields")
+
+
+def _validate_mark_data_grounding(value: Any, path: str) -> None:
+    if not _contains_value_placeholder(value):
+        raise EChartsValidationError(path, "mark data must contain at least one grounded $value placeholder")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = path + "/" + _escape(key)
+            if key in {"xAxis", "yAxis", "value"} and not _contains_value_placeholder(child):
+                raise EChartsValidationError(child_path, f"mark {key} data must use a $value placeholder")
+            if key == "coord":
+                if not isinstance(child, list) or not child or any(not _contains_value_placeholder(item) for item in child):
+                    raise EChartsValidationError(child_path, "every mark coordinate must use a $value placeholder")
+            _validate_nested_mark_coordinates(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_nested_mark_coordinates(child, f"{path}/{index}")
+
+
+def _validate_nested_mark_coordinates(value: Any, path: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = path + "/" + _escape(key)
+            if key in {"xAxis", "yAxis", "value"} and not _contains_value_placeholder(child):
+                raise EChartsValidationError(child_path, f"mark {key} data must use a $value placeholder")
+            if key == "coord" and (
+                not isinstance(child, list) or not child or any(not _contains_value_placeholder(item) for item in child)
+            ):
+                raise EChartsValidationError(child_path, "every mark coordinate must use a $value placeholder")
+            _validate_nested_mark_coordinates(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_nested_mark_coordinates(child, f"{path}/{index}")
+
+
+def _contains_value_placeholder(value: Any) -> bool:
+    if _is_value_placeholder(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_value_placeholder(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_value_placeholder(child) for child in value)
+    return False
 
 
 def _generic_binding(binding_id: str, source_ref: str, source_type: str, row_index: int) -> VisualizationBinding:

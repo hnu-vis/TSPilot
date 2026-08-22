@@ -58,7 +58,7 @@ class _NeedsForecastCalculationLlm:
             "visual_question": None,
             "interpretation": None,
             "target_insight_ids": [],
-            "goals": [],
+            "charts": [],
             "required_data_request": requirement,
         }
         return SimpleNamespace(content=json.dumps(payload), response_metadata={})

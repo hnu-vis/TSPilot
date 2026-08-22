@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.visualization import EChartsCompiler, PresentationCatalog, VisualizationArtifactStore
 from runtime.llm_trace import llm_trace_span
-from runtime.prompt_locale import prompt_locale_instruction
+from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
 from schemas.echarts_plan import EChartsPlan, StructuredEChartsPlan, VisualizationEvidenceRequest
@@ -71,7 +71,11 @@ class VisualizationTool(BaseTool):
                 descriptors = [self._artifact_store.put(item) for item in payloads]
                 refs = list(dict.fromkeys(ref for item in descriptors for ref in item.source_refs))
                 return VisualizationResult(
-                    summary=f"Created {len(descriptors)} grounded native ECharts artifact(s).",
+                    summary=localized_payload_label(
+                        request_state.response_language,
+                        zh=f"已创建 {len(descriptors)} 个有证据绑定的原生 ECharts 图表。",
+                        en=f"Created {len(descriptors)} grounded native ECharts artifact(s).",
+                    ),
                     visualization_ids=[item.visualization_id for item in descriptors],
                     visualizations=descriptors,
                     source_refs=refs,
@@ -80,7 +84,8 @@ class VisualizationTool(BaseTool):
                 repair = _repair_context(attempt, exc)
         return _unavailable_result(
             "Native ECharts composition remained invalid after two LLM repair attempts: "
-            + str((repair or {}).get("error") or "unknown validation error")
+            + str((repair or {}).get("error") or "unknown validation error"),
+            request_state.response_language,
         )
 
     async def _plan(self, request, inventory, target_ids, request_state, repair) -> EChartsPlan:
@@ -115,8 +120,16 @@ class VisualizationTool(BaseTool):
             StructuredEChartsPlan,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
-            trace_title="Native ECharts Planning",
-            trace_summary="生成并校验原生 ECharts option",
+            trace_title=localized_payload_label(
+                request_state.response_language,
+                zh="原生 ECharts 规划",
+                en="Native ECharts Planning",
+            ),
+            trace_summary=localized_payload_label(
+                request_state.response_language,
+                zh="生成并校验原生 ECharts option",
+                en="Generate and validate a native ECharts option",
+            ),
         )
         record_llm_token_usage(
             request_state,
@@ -205,11 +218,18 @@ def _dependency_result(requirement: VisualizationEvidenceRequest, request_state:
         payload = observation.payload if isinstance(observation.payload, dict) else {}
         previous = payload.get("required_data_request")
         if isinstance(previous, dict) and _dependency_signature(previous) == signature:
-            return _unavailable_result("The required visual source remained unavailable after its owner action completed.")
+            return _unavailable_result(
+                "The required visual source remained unavailable after its owner action completed.",
+                request_state.response_language,
+            )
         break
     return VisualizationResult(
         status="needs_sources",
-        summary="Visualization requires an additional grounded source before native ECharts composition.",
+        summary=localized_payload_label(
+            request_state.response_language,
+            zh="原生 ECharts 规划前还需要一个有证据依据的数据源。",
+            en="Visualization requires an additional grounded source before native ECharts composition.",
+        ),
         required_data_request=requirement,
     ).model_dump(mode="json")
 
@@ -226,10 +246,14 @@ def _dependency_signature(payload: dict) -> str:
     return json.dumps(stable, sort_keys=True, default=str)
 
 
-def _unavailable_result(reason: str) -> dict:
+def _unavailable_result(reason: str, language: str | None = None) -> dict:
     return VisualizationResult(
         status="unavailable",
-        summary="No chart was published because grounded native ECharts composition did not pass.",
+        summary=localized_payload_label(
+            language,
+            zh="由于有证据约束的原生 ECharts 组装未通过，因此未发布图表。",
+            en="No chart was published because grounded native ECharts composition did not pass.",
+        ),
         unavailable_reason=str(reason),
     ).model_dump(mode="json")
 

@@ -9,17 +9,14 @@ function answer(overrides: Partial<FinalAnswerType> = {}): FinalAnswerType {
 
 function visualization(overrides: Partial<Visualization> = {}): Visualization {
   return {
-    schema_version: '4', chart_type: 'line', visualization_id: 'viz', purpose: 'verify trend',
-    priority: 'primary', title: 'Price trend', data_views: [{
-      view_id: 'history', source_ref: 'evidence:evi',
-      fields: [{ name: 'time', data_type: 'time', semantic_role: 'time' }, { name: 'value', data_type: 'number', semantic_role: 'price' }],
-      records: [{ record_id: 'r1', values: { time: '2026-01-01', value: 10 } }, { record_id: 'r2', values: { time: '2026-01-02', value: 12 } }],
-    }],
-    x_axis: { axis_id: 'x', data_type: 'time' }, y_axes: [{ axis_id: 'y', measure: 'price', scale: 'linear' }],
-    lines: [{ component_id: 'history', role: 'history', importance: 'primary', source_ref: 'evidence:evi', view_id: 'history', x_field: 'time', y_field: 'value', y_axis_id: 'y', line_style: 'solid', symbol: 'none' }],
-    points: [], bands: [], intervals: [], reference_lines: [], annotations: [],
-    legend: { visible: false, toggle_components: false, position: 'top' },
-    tooltip: { mode: 'axis', show_source: true }, zoom: { enabled: false }, bindings: [],
+    schema_version: '5', chart_type: 'echarts', visualization_id: 'viz', purpose: 'verify trend',
+    priority: 'primary', title: 'Price trend',
+    option: {
+      dataset: { source: [{ time: '2026-01-01', value: 10 }, { time: '2026-01-02', value: 12 }] },
+      xAxis: { type: 'time' }, yAxis: { type: 'value' },
+      series: { type: 'line', encode: { x: 'time', y: 'value' } },
+    },
+    bindings: [],
     accessibility: { description: 'Price trend.' },
     ...overrides,
   };
@@ -37,7 +34,7 @@ describe('FinalAnswer', () => {
     expect(markup).not.toContain('answer-query-details" open');
   });
 
-  it('renders a V4 LineChart as linked claim evidence', () => {
+  it('renders a V5 native ECharts chart as linked claim evidence', () => {
     const chart = visualization({
       visualization_id: 'viz_trend',
       verification: {

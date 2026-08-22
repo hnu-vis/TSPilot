@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from app.settings import get_settings
-from core.visualization import LineChartCompiler, PresentationCatalog, VisualizationArtifactStore
+from core.visualization import EChartsCompiler, PresentationCatalog, VisualizationArtifactStore
 from runtime.request_state import build_request_state
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
-from schemas.linechart_plan import (
-    LineChartGoalPlan, LineChartPlan, LineChartYAxisPlan, LinePlan,
-    VisualContentGoal, VisualContentItem, VisualContentPlan,
-)
+from schemas.echarts_plan import EChartsChartPlan, EChartsPlan
 from schemas.output import FinalResponsePlan, PlannedAnswerSection
 from tools.base import StructuredToolError
 from tools.format_answer import FormatAnswerInput, FormatAnswerTool
@@ -43,29 +41,25 @@ def _state():
 
 def _attach_visualization(state, tmp_path):
     source = "view:evidence:evi_prices:default"
-    content = VisualContentPlan(
+    plan = EChartsPlan(
         visual_question="Did prices rise?", interpretation="Read the complete line.",
-        goals=[VisualContentGoal(
-            goal_id="trend", purpose="show the trend", title="Price trend", priority="primary",
-            host_source_ref=source,
-            content=[VisualContentItem(content_id="history", source_ref=source, purpose="complete history", importance="primary")],
+        charts=[EChartsChartPlan(
+            chart_id="trend", purpose="show the trend", title="Price trend", priority="primary",
+            accessibility_description="Three daily prices.",
+            option_json=json.dumps({
+                "dataset": {"source": {"$dataset": source}},
+                "xAxis": {"type": "time"}, "yAxis": {"type": "value"},
+                "series": {"type": "line", "encode": {"x": "timestamp", "y": "value"}},
+            }),
         )],
     )
-    plan = LineChartPlan(charts=[LineChartGoalPlan(
-        goal_id="trend", x_axis_type="time",
-        y_axes=[LineChartYAxisPlan(axis_id="price", measure="price")],
-        host_line=LinePlan(
-            content_id="history", role="history", importance="primary",
-            x_field="timestamp", y_field="value", y_axis_id="price",
-        ),
-    )])
-    complete = LineChartCompiler(PresentationCatalog(state)).compile(content, plan)[0]
+    complete = EChartsCompiler(PresentationCatalog(state)).compile(plan)[0]
     descriptor = VisualizationArtifactStore(tmp_path).put(complete)
     state.visualizations = [descriptor]
     return descriptor
 
 
-def test_format_answer_reuses_v4_linechart_without_another_llm_call(tmp_path):
+def test_format_answer_reuses_v5_echarts_without_another_llm_call(tmp_path):
     state = _state()
     descriptor = _attach_visualization(state, tmp_path)
     plan = FinalResponsePlan(
@@ -77,10 +71,9 @@ def test_format_answer_reuses_v4_linechart_without_another_llm_call(tmp_path):
         FormatAnswerInput(response_plan=plan), request_state=state,
     ))
     chart = result["visualizations"][0]
-    assert chart["schema_version"] == "4"
-    assert chart["chart_type"] == "line"
-    assert chart["data_views"][0]["records"] == []
-    assert chart["lines"][0]["role"] == "history"
+    assert chart["schema_version"] == "5"
+    assert chart["chart_type"] == "echarts"
+    assert chart["option"]["dataset"]["source"] == []
     assert result["claims"][0]["visualization_ids"] == [descriptor.visualization_id]
 
 

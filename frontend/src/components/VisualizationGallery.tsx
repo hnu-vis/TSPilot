@@ -105,8 +105,8 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
       chartRef.current = chart;
       chart.setOption(withTrustedDisplaySettings(visualization), { notMerge: true, lazyUpdate: false });
       chart.on('click', (params) => {
-        const data: unknown = params.data;
-        if (isRecord(data) && typeof data.bindingId === 'string') onSelectBinding(data.bindingId);
+        const bindingId = bindingIdFromClickData(params.data);
+        if (bindingId) onSelectBinding(bindingId);
       });
       setRenderError(false);
     } catch (error) {
@@ -144,7 +144,7 @@ export function withTrustedDisplaySettings(visualization: Visualization): EChart
   } as EChartsOption;
 }
 
-function bindingLocations(option: Record<string, unknown>, bindingId: string | null) {
+export function bindingLocations(option: Record<string, unknown>, bindingId: string | null) {
   if (!bindingId) return [];
   const datasets = asArray(option.dataset);
   const datasetIds = new Map(datasets.flatMap((dataset, index) => (
@@ -164,6 +164,10 @@ function bindingLocations(option: Record<string, unknown>, bindingId: string | n
       : (typeof series.datasetIndex === 'number' ? series.datasetIndex : 0);
     return datasetIndex === undefined ? [] : (matches.get(datasetIndex) || []).map((dataIndex) => ({ seriesIndex, dataIndex }));
   });
+}
+
+export function bindingIdFromClickData(data: unknown): string | null {
+  return isRecord(data) && typeof data.bindingId === 'string' ? data.bindingId : null;
 }
 
 function AccessibleTable({ visualization, onSelectBinding }: { visualization: Visualization; onSelectBinding: (id: string) => void }) {

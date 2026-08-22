@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from core.key_insight.runtime import register_key_insights_from_payload
-from core.visualization import LineChartCompiler, PresentationCatalog
+from core.visualization import EChartsCompiler, PresentationCatalog
 from runtime.request_state import build_request_state, public_final_answer
 from schemas.api import ChatRequest
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import KeyInsight, InsightItem
 from schemas.database_context import DatabaseContext
 from schemas.output import AnswerClaim, FinalAnswer, FinalResponsePlan, PlannedAnswerSection
-from schemas.linechart_plan import (
-    LineChartGoalPlan, LineChartPlan, LineChartYAxisPlan, LinePlan,
-    VisualContentGoal, VisualContentItem, VisualContentPlan,
-)
+from schemas.echarts_plan import EChartsChartPlan, EChartsPlan
 from schemas.state import RequestStateModel
 from schemas.tool import ToolCall
 from tools.anomaly import AnomalyInput
@@ -110,29 +108,21 @@ def test_collection_insight_preserves_item_identity_for_visualization():
     assert insight.evidence_refs
 
     source_ref = f"insight:{insight.insight_id}"
-    content = VisualContentPlan(
+    plan = EChartsPlan(
         visual_question="What are the recent observations?", interpretation="Read the complete line.",
         target_insight_ids=[insight.insight_id],
-        goals=[VisualContentGoal(
-            goal_id="recent", purpose="show recent observations", title="Recent three days",
-            priority="primary", host_source_ref=source_ref,
-            content=[VisualContentItem(
-                content_id="observations", source_ref=source_ref, insight_ids=[insight.insight_id],
-                purpose="recent observations", importance="primary",
-            )],
+        charts=[EChartsChartPlan(
+            chart_id="recent", purpose="show recent observations", title="Recent three days", priority="primary",
+            accessibility_description="Three recent daily observations.",
+            option_json=json.dumps({
+                "dataset": {"source": {"$dataset": source_ref}},
+                "xAxis": {"type": "time"}, "yAxis": {"type": "value"},
+                "series": {"type": "line", "encode": {"x": "timestamp", "y": "value"}},
+            }),
         )],
     )
-    plan = LineChartPlan(charts=[LineChartGoalPlan(
-        goal_id="recent", x_axis_type="time",
-        y_axes=[LineChartYAxisPlan(axis_id="value", measure="price")],
-        host_line=LinePlan(
-            content_id="observations", role="observations",
-            importance="primary", x_field="timestamp", y_field="value",
-            y_axis_id="value",
-        ),
-    )])
-    visualization = LineChartCompiler(PresentationCatalog(request_state)).compile(content, plan)[0]
-    assert visualization.schema_version == "4"
+    visualization = EChartsCompiler(PresentationCatalog(request_state)).compile(plan)[0]
+    assert visualization.schema_version == "5"
     assert len(visualization.bindings) == 3
     assert {binding.item_id for binding in visualization.bindings} == {"day-1", "day-2", "day-3"}
 
