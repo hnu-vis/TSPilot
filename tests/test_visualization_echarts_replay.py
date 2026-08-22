@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from core.visualization import VisualizationArtifactStore
-from schemas.echarts_plan import EChartsChartPlan, EChartsPlan
 from schemas.state import RequestStateModel
 from tools.visualization import VisualizationInput, VisualizationTool
 
@@ -24,48 +23,48 @@ PEAK_ID = "ins_ana_f502f7e9ce7dbd7d_rebound_peak_point_4db54b022117"
 class _HistoricalReplayLlm:
     async def ainvoke(self, _messages):
         low_ref, peak_ref, amount_ref = f"insight:{LOW_ID}", f"insight:{PEAK_ID}", f"insight:{AMOUNT_ID}"
-        option = {
-            "useUTC": True,
-            "legend": {"show": True},
-            "tooltip": {"trigger": "axis"},
-            "dataset": [{
-                "id": "prices",
-                "source": {"$dataset": "view:evidence:evi_influxdb2-bitcoin-sample_timeseries_d73eaf462ca6:default"},
+        payload = {
+            "visual_question": "What was the largest rebound from the monthly low after excluding outliers?",
+            "interpretation": "Read one complete price line, the two endpoints, and the highlighted interval.",
+            "target_insight_ids": [],
+            "charts": [{
+                "chart_id": "monthly_rebound",
+                "purpose": "verify rebound",
+                "priority": "primary",
+                "title": "USD price rebound from the monthly low",
+                "summary": f"The grounded rebound amount is provided by {amount_ref}.",
+                "accessibility_description": "One USD price line with the monthly low, subsequent peak, and rebound interval.",
+                "accessibility_table_columns": ["timestamp", "value"],
+                "series": [{
+                    "series_id": "prices",
+                    "name": "USD price",
+                    "source_ref": "view:evidence:evi_influxdb2-bitcoin-sample_timeseries_d73eaf462ca6:default",
+                    "x_field": "timestamp",
+                    "y_field": "value",
+                }],
+                "point_annotations": [
+                    {
+                        "series_id": "prices", "name": "Monthly low",
+                        "time": {"source_ref": low_ref, "value_id": "time_1"},
+                        "value": {"source_ref": low_ref, "value_id": "number_1"},
+                    },
+                    {
+                        "series_id": "prices", "name": "Subsequent peak",
+                        "time": {"source_ref": peak_ref, "value_id": "time_1"},
+                        "value": {"source_ref": peak_ref, "value_id": "number_1"},
+                    },
+                ],
+                "interval_annotations": [{
+                    "series_id": "prices", "name": "Rebound interval",
+                    "start": {"source_ref": low_ref, "value_id": "time_1"},
+                    "end": {"source_ref": peak_ref, "value_id": "time_1"},
+                }],
+                "reference_lines": [],
+                "y_axis_name": "USD",
             }],
-            "xAxis": [{"type": "time", "name": "Time (UTC)"}],
-            "yAxis": [{"type": "value", "name": "USD", "scale": True}],
-            "series": [{
-                "name": "USD price", "type": "line", "datasetId": "prices",
-                "encode": {"x": "timestamp", "y": "value"}, "showSymbol": False,
-                "markPoint": {"symbol": "circle", "symbolSize": 10, "label": {"show": False}, "data": [
-                    {"name": "Monthly low", "coord": [
-                        {"$value": {"source_ref": low_ref, "field": "timestamp"}},
-                        {"$value": {"source_ref": low_ref, "field": "value"}},
-                    ]},
-                    {"name": "Subsequent peak", "coord": [
-                        {"$value": {"source_ref": peak_ref, "field": "timestamp"}},
-                        {"$value": {"source_ref": peak_ref, "field": "value"}},
-                    ], "value": {"$value": {"source_ref": amount_ref, "field": "value"}}},
-                ]},
-                "markArea": {"data": [[
-                    {"name": "Rebound interval", "xAxis": {"$value": {"source_ref": low_ref, "field": "timestamp"}}},
-                    {"xAxis": {"$value": {"source_ref": peak_ref, "field": "timestamp"}}},
-                ]]},
-            }],
+            "required_data_request": None,
         }
-        plan = EChartsPlan(
-            visual_question="What was the largest rebound from the monthly low after excluding outliers?",
-            interpretation="Read one complete price line, the two endpoints, and the highlighted interval.",
-            target_insight_ids=[AMOUNT_ID, LOW_ID, PEAK_ID],
-            charts=[EChartsChartPlan(
-                chart_id="monthly_rebound", purpose="verify rebound", priority="primary",
-                title="USD price rebound from the monthly low",
-                summary="The rebound amount is attached to the peak mark, not plotted as a price series.",
-                accessibility_description="One USD price line with the monthly low, subsequent peak, and rebound interval.",
-                option_json=json.dumps(option),
-            )],
-        )
-        return SimpleNamespace(content=plan.model_dump_json(), response_metadata={})
+        return SimpleNamespace(content=json.dumps(payload), response_metadata={})
 
 
 @pytest.mark.asyncio
@@ -86,6 +85,5 @@ async def test_historical_monthly_rebound_tool_replay_publishes_clean_native_opt
     assert option["series"][0]["type"] == "line"
     assert len(option["series"][0]["markPoint"]["data"]) == 2
     assert len(option["series"][0]["markArea"]["data"]) == 1
-    assert len(option["yAxis"]) == 1
-    assert option["series"][0]["markPoint"]["data"][1]["value"] == pytest.approx(1285.1743)
+    assert option["yAxis"] == {"type": "value", "scale": True, "name": "USD"}
     assert len(option["dataset"][0]["source"]) == 258

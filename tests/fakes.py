@@ -1001,16 +1001,16 @@ def _fake_echarts_plan(prompt_text: str) -> _FakeResponse:
                 "input_source_refs": [], "insight_requests": [],
             },
         }, ensure_ascii=False))
-    fields = host.get("schema_fields") or []
-    x_field = (
-        str((host.get("time_fields") or [{}])[0].get("field") or "")
-        if line_sources
-        else next(str(item["name"]) for item in fields if item.get("data_type") == "time")
+    fields = host.get("fields") or host.get("schema_fields") or []
+    x_field = next(
+        str(item["name"])
+        for item in fields
+        if item.get("role") == "time_coordinate" or item.get("data_type") == "time"
     )
-    y_field = (
-        str((host.get("numeric_fields") or [{}])[0].get("field") or "")
-        if line_sources
-        else next(str(item["name"]) for item in fields if item.get("data_type") == "number")
+    y_field = next(
+        str(item["name"])
+        for item in fields
+        if item.get("role") == "numeric_measure" or item.get("data_type") == "number"
     )
     mark_points, mark_lines = [], []
     for target_id in target_ids:

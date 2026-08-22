@@ -104,11 +104,42 @@ def _assert_provider_objects_are_closed(node, path="$"):
             _assert_provider_objects_are_closed(value, f"{path}[{index}]")
 
 
-def test_structured_plan_is_closed_while_option_is_a_string():
+def test_structured_plan_is_closed_and_does_not_expose_native_option_json():
     schema = StructuredEChartsPlan.model_json_schema()
     _assert_provider_objects_are_closed(schema)
-    option_property = schema["$defs"]["EChartsChartPlan"]["properties"]["option_json"]
-    assert option_property["type"] == "string"
+    assert "option_json" not in json.dumps(schema)
+    chart = schema["$defs"]["StructuredEChartsChartPlan"]["properties"]
+    assert {"series", "point_annotations", "interval_annotations", "reference_lines"} <= set(chart)
+    time_ref = schema["$defs"]["EChartsGroundedTimeRef"]["properties"]
+    number_ref = schema["$defs"]["EChartsGroundedNumberRef"]["properties"]
+    assert "value_id" in time_ref and "field" not in time_ref
+    assert "value_id" in number_ref and "field" not in number_ref
+
+
+def test_typed_annotations_reject_values_from_different_coordinate_groups():
+    state = _state()
+    state.insight_set.insights[0].items.append(InsightItem(
+        item_id="other", label="other", timestamp="2026-01-02T00:00:00Z", value=13.0,
+    ))
+    chart = EChartsChartPlan.model_validate({
+        "chart_id": "peak", "purpose": "verify peak", "priority": "primary",
+        "title": "Peak", "accessibility_description": "Peak on complete price line.",
+        "series": [{
+            "series_id": "prices", "name": "Price",
+            "source_ref": "view:evidence:evi_prices:default",
+            "x_field": "timestamp", "y_field": "value",
+        }],
+        "point_annotations": [{
+            "series_id": "prices", "name": "Peak",
+            "time": {"source_ref": "insight:insight_peak", "value_id": "time_1"},
+            "value": {"source_ref": "insight:insight_peak", "value_id": "number_4"},
+        }],
+    })
+    plan = EChartsPlan(
+        visual_question="Where is the peak?", interpretation="Read the marked point.", charts=[chart],
+    )
+    with pytest.raises(EChartsValidationError, match="coordinate_group"):
+        EChartsCompiler(PresentationCatalog(state)).compile(plan)
 
 
 def test_prompt_inventory_separates_renderable_data_from_full_insight_content():
@@ -135,13 +166,64 @@ def test_line_chart_grounded_input_exposes_executable_sources_and_calculation_re
     assert len(package["eligible_line_sources"]) == 1
     line = package["eligible_line_sources"][0]
     assert line["source_ref"] == "view:evidence:evi_prices:default"
-    assert line["time_fields"] == [{"field": "timestamp", "meaning": None}]
-    assert line["numeric_fields"] == [{"field": "value", "meaning": None}]
+    assert package["reference_contract"]["data_source_ref"].startswith("Copy an eligible source_ref")
+    assert line["purpose"] == {
+        "name": "Complete prices.",
+        "data_role": "raw_observations",
+        "description": "Database observations materialized from the executed query.",
+        "materializes_transformation": False,
+        "visual_uses": ["complete_context", "raw_series", "comparison_baseline"],
+        "limitations": ["Does not materialize downstream analysis transformations."],
+    }
+    assert line["scope"]["record_count"] == 3
+    assert line["fields"] == [
+        {"name": "timestamp", "role": "time_coordinate", "meaning": None, "meaning_status": "not_declared"},
+        {"name": "value", "role": "numeric_measure", "meaning": None, "meaning_status": "not_declared"},
+    ]
+    assert line["example_data"] == {
+        "sample_only": True,
+        "origin": "materialized_source",
+        "selection": "all_available_records",
+        "rows": [
+            {"timestamp": "2026-01-01T00:00:00Z", "value": 10.0},
+            {"timestamp": "2026-01-02T00:00:00Z", "value": 12.0},
+            {"timestamp": "2026-01-03T00:00:00Z", "value": 15.0},
+        ],
+    }
     assert line["supports_insight_refs"] == ["insight:insight_peak"]
     insight = package["insights"][0]
-    assert insight["supporting_line_sources"] == ["view:evidence:evi_prices:default"]
-    assert insight["calculation"]["trace"]["formula"] == "max(value)"
-    assert insight["calculation"]["grounding_document"]["items"][0]["timestamp"] == "2026-01-03T00:00:00Z"
+    assert insight["content"]["statement"] == "The maximum is 15."
+    assert insight["content"]["result"] == 15.0
+    assert insight["content"]["unit"] == "USD"
+    assert insight["content"]["calculation_trace"]["formula"] == "max(value)"
+    assert insight["content"]["grounding_document"]["items"][0]["timestamp"] == "2026-01-03T00:00:00Z"
+    annotation_values = insight["content"]["available_annotation_values"]
+    assert all("field" not in item for item in annotation_values)
+    assert {(item["value_id"], item["value_type"], item["description"]) for item in annotation_values} >= {
+        ("number_1", "number", "value"),
+        ("time_1", "time", "calculation_trace.operands.peak.timestamp"),
+        ("number_2", "number", "calculation_trace.operands.peak.value"),
+        ("time_2", "time", "items.0.timestamp"),
+        ("number_3", "number", "items.0.value"),
+    }
+    assert insight["visual_support"]["line_sources"] == [
+        "view:evidence:evi_prices:default"
+    ]
+
+
+def test_line_chart_grounded_input_bounds_large_source_examples():
+    state = _state()
+    state.database_evidence_artifacts["evi_prices"].data["rows"] = [
+        {"timestamp": f"2026-01-{day:02d}T00:00:00Z", "value": float(day)}
+        for day in range(1, 7)
+    ]
+    catalog = PresentationCatalog(state)
+    preferred, _ = catalog.expand_preferences(["insight:insight_peak"])
+    package = _line_chart_grounded_input(catalog.targeted_planner_inventory(preferred), catalog=catalog)
+    sample = package["eligible_line_sources"][0]["example_data"]
+    assert sample["sample_only"] is True
+    assert sample["selection"] == "first_2_and_last_2_records"
+    assert [row["value"] for row in sample["rows"]] == [1.0, 2.0, 5.0, 6.0]
 
 
 def test_lineage_coverage_requires_each_distinct_renderable_derived_timeseries():
@@ -151,7 +233,7 @@ def test_lineage_coverage_requires_each_distinct_renderable_derived_timeseries()
             evidence_id=suffix, name=f"{suffix} interval", shape="timeseries",
             rows=[
                 {"timestamp": f"2026-01-{day + offset:02d}T00:00:00Z", "value": float(day)}
-                for day in (1, 2)
+                for day in (1, 2, 3)
             ], lineage=["evidence:evi_prices"], transform_summary=f"{suffix} interval records",
         )
         state.insight_set.insights.append(KeyInsight(
@@ -178,6 +260,31 @@ def test_lineage_coverage_requires_each_distinct_renderable_derived_timeseries()
     })
     payloads = EChartsCompiler(catalog).compile(_plan(option).model_copy(update={"target_insight_ids": []}))
     _validate_lineage_coverage(payloads, ["insight_first", "insight_second"], inventory, catalog)
+
+
+def test_lineage_coverage_does_not_require_sparse_endpoint_sources_as_lines():
+    state = _state()
+    for suffix, values in (("endpoints", (10.0, 15.0)), ("window", (10.0, 12.0, 15.0))):
+        state.derived_evidence_artifacts[suffix] = DerivedEvidence(
+            evidence_id=suffix, name=suffix, shape="timeseries",
+            rows=[
+                {"timestamp": f"2026-01-0{index}T00:00:00Z", "value": value}
+                for index, value in enumerate(values, start=1)
+            ], lineage=["evidence:evi_prices"], transform_summary=f"{suffix} records",
+        )
+        state.insight_set.insights.append(KeyInsight(
+            insight_id=f"insight_{suffix}", insight_key=suffix, name=suffix,
+            insight_type="interval", statement=suffix, value=list(values), method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="derived_evidence", source_id=suffix)],
+        ))
+    catalog = PresentationCatalog(state)
+    preferred, _ = catalog.expand_preferences(["insight:insight_endpoints", "insight:insight_window"])
+    inventory = catalog.targeted_planner_inventory(preferred)
+    option = _option()
+    option["dataset"][0]["source"] = {"$dataset": "view:derived_evidence:window"}
+    option["series"][0].pop("markPoint")
+    payloads = EChartsCompiler(catalog).compile(_plan(option).model_copy(update={"target_insight_ids": []}))
+    _validate_lineage_coverage(payloads, ["insight_endpoints", "insight_window"], inventory, catalog)
 
 
 def test_compiler_injects_complete_records_and_propagates_bindings():
@@ -403,24 +510,66 @@ class _RepairingLlm:
     async def ainvoke(self, messages):
         prompt = str(messages[0][1])
         self.calls.append(prompt)
-        option = _option()
-        if len(self.calls) == 1:
-            option["series"][0]["yAxisIndex"] = 3
-        payload = _plan(option).model_dump(mode="json")
-        payload["required_data_request"] = None
+        payload = {
+            "visual_question": "Does the complete series support the peak?",
+            "interpretation": "Read the line and highlighted peak.",
+            "target_insight_ids": [],
+            "charts": [{
+                "chart_id": "peak",
+                "purpose": "verify peak",
+                "priority": "primary",
+                "title": "Price and peak",
+                "summary": "Complete price context with its peak.",
+                "accessibility_description": "A complete price line with its peak.",
+                "accessibility_table_columns": ["timestamp", "value"],
+                "series": [{
+                    "series_id": "prices",
+                    "name": "Price",
+                    "source_ref": "view:evidence:evi_prices:default",
+                    "x_field": "timestamp",
+                    "y_field": "missing" if len(self.calls) == 1 else "value",
+                }],
+                "point_annotations": [{
+                    "series_id": "prices",
+                    "name": "Peak",
+                    "time": {"source_ref": "insight:insight_peak", "value_id": "time_2"},
+                    "value": {"source_ref": "insight:insight_peak", "value_id": "number_3"},
+                }],
+                "interval_annotations": [],
+                "reference_lines": [],
+                "y_axis_name": "USD",
+            }],
+            "required_data_request": None,
+        }
         return SimpleNamespace(content=json.dumps(payload), response_metadata={})
 
 
 @pytest.mark.asyncio
-async def test_tool_repairs_unknown_axis_using_precise_pointer_and_publishes(tmp_path):
+async def test_tool_repairs_unknown_typed_field_using_precise_pointer_and_publishes(tmp_path):
     llm = _RepairingLlm()
     result = await VisualizationTool(llm=llm, artifact_store=VisualizationArtifactStore(tmp_path)).execute(
         VisualizationInput(message="Show the price trend and peak.", source_refs=["insight:insight_peak"]),
         request_state=_state(),
     )
     assert result["status"] == "created" and len(llm.calls) == 2
-    assert "/series/0/yAxisIndex" in llm.calls[1]
+    assert "/series/0/encode/y" in llm.calls[1]
     assert "Line Chart Grounded Input" in llm.calls[1]
-    assert "regenerate a complete" in llm.calls[1]
+    assert "GROUNDED INPUT GUIDE" in llm.calls[1]
+    assert '"reference_contract"' in llm.calls[1]
+    assert '"example_data"' in llm.calls[1]
+    assert '"semantic_description"' not in llm.calls[1]
+    assert '"meaning_status": "not_declared"' in llm.calls[1]
+    assert '"available_annotation_values"' in llm.calls[1]
+    assert "never output a JSON path" in llm.calls[1]
+    assert "point_annotations" in llm.calls[1]
+    assert "regenerate a complete" in llm.calls[1] and "typed plan" in llm.calls[1]
     complete = VisualizationArtifactStore(tmp_path).get(result["visualization_ids"][0])
-    assert complete is not None and len(complete.option["yAxis"]) == 1
+    assert complete is not None and complete.option["yAxis"] == {"type": "value", "scale": True, "name": "USD"}
+    assert "title" not in complete.option
+    assert complete.option["legend"] == {"show": True, "top": 4, "data": ["Price"]}
+    assert complete.option["tooltip"] == {"show": True, "trigger": "axis"}
+    assert complete.option["dataZoom"] == [
+        {"type": "inside", "xAxisIndex": 0},
+        {"type": "slider", "show": True, "xAxisIndex": 0, "bottom": 12, "height": 22},
+    ]
+    assert complete.option["grid"]["bottom"] == 84

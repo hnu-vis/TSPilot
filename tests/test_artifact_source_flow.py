@@ -9,6 +9,7 @@ from core.artifact_sources import primary_analysis_input, resolve_artifact_sourc
 from core.harness import build_action_space, build_observation_frame
 from core.completion import apply_previous_observation_assessment
 from core.visualization import PresentationCatalog, VisualizationArtifactStore
+from schemas.analysis import DerivedEvidence
 from schemas.database import DatabaseEvidence
 from schemas.key_insight import InsightEvidenceRef, InsightItem, KeyInsight, KeyInsightRequest
 from schemas.agent_turn import PreviousObservationAssessment
@@ -367,6 +368,28 @@ def test_planner_inventory_exposes_bounded_grounded_facts_for_small_specialized_
     }
     assert by_ref["view:evidence:evi_demo:default"]["semantic_contract"]["data_role"] == "raw_observations"
     assert "grounded_preview" not in by_ref["view:evidence:evi_demo:default"]
+
+
+def test_derived_view_keeps_transformation_semantics_when_lineage_also_contains_insight():
+    state = _state()
+    state.insight_set.insights = [KeyInsight(
+        insight_id="ins_filter", insight_key="filter", name="Filtered result", insight_type="change",
+        statement="Filtered result is verified.", value=1.0, method="code_interpreter",
+        evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_demo")],
+    )]
+    state.derived_evidence_artifacts["cleaned"] = DerivedEvidence(
+        evidence_id="cleaned", name="Cleaned series", shape="timeseries",
+        rows=[
+            {"timestamp": "2026-01-01T00:00:00Z", "value": 100.0},
+            {"timestamp": "2026-01-02T00:00:00Z", "value": 110.0},
+        ],
+        lineage=["evidence:evi_demo", "insight:ins_filter"],
+        transform_summary="Excluded detected anomalies from the input series.",
+    )
+    inventory = PresentationCatalog(state).planner_inventory()
+    cleaned = next(item for item in inventory["sources"] if item["source_ref"] == "view:derived_evidence:cleaned")
+    assert cleaned["semantic_contract"]["data_role"] == "derived_transformation_result"
+    assert cleaned["semantic_contract"]["materializes_input_transformation"] is True
 
 
 def test_planner_inventory_does_not_expand_every_insight_item_into_a_source():
