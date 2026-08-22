@@ -31,6 +31,50 @@ class VisualizationEvidenceRequest(BaseModel):
         return self
 
 
+class EChartsGroundedTimeRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_ref: str = Field(min_length=1)
+    value_id: str = Field(min_length=1, pattern=r"^time_[1-9][0-9]*$")
+
+
+class EChartsGroundedNumberRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_ref: str = Field(min_length=1)
+    value_id: str = Field(min_length=1, pattern=r"^number_[1-9][0-9]*$")
+
+
+class EChartsLineSeriesPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    series_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    x_field: str = Field(min_length=1)
+    y_field: str = Field(min_length=1)
+
+
+class EChartsPointAnnotationPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    series_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    time: EChartsGroundedTimeRef
+    value: EChartsGroundedNumberRef
+
+
+class EChartsIntervalAnnotationPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    series_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    start: EChartsGroundedTimeRef
+    end: EChartsGroundedTimeRef
+
+
+class EChartsReferenceLinePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    series_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    value: EChartsGroundedNumberRef
+
+
 class EChartsChartPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chart_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -40,7 +84,20 @@ class EChartsChartPlan(BaseModel):
     summary: str | None = None
     accessibility_description: str = Field(min_length=1)
     accessibility_table_columns: list[str] = Field(default_factory=list)
-    option_json: str = Field(min_length=2, max_length=131072)
+    series: list[EChartsLineSeriesPlan] = Field(default_factory=list, max_length=2)
+    point_annotations: list[EChartsPointAnnotationPlan] = Field(default_factory=list, max_length=12)
+    interval_annotations: list[EChartsIntervalAnnotationPlan] = Field(default_factory=list, max_length=6)
+    reference_lines: list[EChartsReferenceLinePlan] = Field(default_factory=list, max_length=6)
+    y_axis_name: str | None = None
+    option_json: str | None = Field(default=None, min_length=2, max_length=131072, exclude=True)
+
+    @model_validator(mode="after")
+    def require_typed_or_legacy_option(self):
+        if self.option_json is not None and self.series:
+            raise ValueError("chart cannot contain both typed series and legacy option_json")
+        if self.option_json is None and not self.series:
+            raise ValueError("chart requires typed series")
+        return self
 
 
 class EChartsPlan(BaseModel):
@@ -95,12 +152,31 @@ class StructuredVisualizationEvidenceRequest(BaseModel):
         )
 
 
+class StructuredEChartsChartPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chart_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
+    purpose: str = Field(min_length=1)
+    priority: Literal["primary", "supporting"]
+    title: str = Field(min_length=1)
+    summary: str | None = None
+    accessibility_description: str = Field(min_length=1)
+    accessibility_table_columns: list[str] = Field(default_factory=list)
+    series: list[EChartsLineSeriesPlan] = Field(min_length=1, max_length=2)
+    point_annotations: list[EChartsPointAnnotationPlan] = Field(default_factory=list, max_length=12)
+    interval_annotations: list[EChartsIntervalAnnotationPlan] = Field(default_factory=list, max_length=6)
+    reference_lines: list[EChartsReferenceLinePlan] = Field(default_factory=list, max_length=6)
+    y_axis_name: str | None = None
+
+    def to_runtime(self) -> EChartsChartPlan:
+        return EChartsChartPlan(**self.model_dump())
+
+
 class StructuredEChartsPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     visual_question: str | None = None
     interpretation: str | None = None
     target_insight_ids: list[str] = Field(default_factory=list)
-    charts: list[EChartsChartPlan] = Field(default_factory=list, max_length=4)
+    charts: list[StructuredEChartsChartPlan] = Field(default_factory=list, max_length=1)
     required_data_request: StructuredVisualizationEvidenceRequest | None = None
 
     def to_runtime(self) -> EChartsPlan:
@@ -108,6 +184,17 @@ class StructuredEChartsPlan(BaseModel):
             visual_question=self.visual_question,
             interpretation=self.interpretation,
             target_insight_ids=self.target_insight_ids,
-            charts=self.charts,
+            charts=[chart.to_runtime() for chart in self.charts],
             required_data_request=(self.required_data_request.to_runtime() if self.required_data_request else None),
         )
+
+
+class StructuredEChartsChartPlanWithoutTimeAnnotations(StructuredEChartsChartPlan):
+    """Provider schema used when no selected Insight exposes a grounded time value."""
+
+    point_annotations: list[EChartsPointAnnotationPlan] = Field(default_factory=list, max_length=0)
+    interval_annotations: list[EChartsIntervalAnnotationPlan] = Field(default_factory=list, max_length=0)
+
+
+class StructuredEChartsPlanWithoutTimeAnnotations(StructuredEChartsPlan):
+    charts: list[StructuredEChartsChartPlanWithoutTimeAnnotations] = Field(default_factory=list, max_length=1)

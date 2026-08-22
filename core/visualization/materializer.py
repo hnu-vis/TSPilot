@@ -1071,6 +1071,15 @@ def _source_semantic_contract(sources: list[PresentationSource]) -> dict:
     by_kind: dict[str, PresentationSource] = {}
     for source in sources:
         by_kind.setdefault(source.kind, source)
+    if "derived_evidence" in by_kind:
+        artifact = by_kind["derived_evidence"].value
+        return {
+            "data_role": "derived_transformation_result",
+            "materializes_input_transformation": True,
+            "operation_description": getattr(artifact, "transform_summary", None),
+            "supported_visual_uses": ["transformed_context", "derived_series", "derived_markers"],
+            "limitations": [],
+        }
     if "insight" in by_kind or "insight_item" in by_kind:
         source = by_kind.get("insight") or by_kind["insight_item"]
         value = source.value[0] if source.kind == "insight_item" else source.value
@@ -1082,15 +1091,6 @@ def _source_semantic_contract(sources: list[PresentationSource]) -> dict:
             "limitations": [
                 "A scalar claim does not materialize the contextual series used to calculate it."
             ],
-        }
-    if "derived_evidence" in by_kind:
-        artifact = by_kind["derived_evidence"].value
-        return {
-            "data_role": "derived_transformation_result",
-            "materializes_input_transformation": True,
-            "operation_description": getattr(artifact, "transform_summary", None),
-            "supported_visual_uses": ["transformed_context", "derived_series", "derived_markers"],
-            "limitations": [],
         }
     if "forecast" in by_kind:
         return {

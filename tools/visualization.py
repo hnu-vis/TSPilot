@@ -9,12 +9,17 @@ from typing import Literal
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.visualization import EChartsCompiler, PresentationCatalog, VisualizationArtifactStore
+from core.visualization import EChartsCompiler, PresentationCatalog, VisualizationArtifactStore, grounded_annotation_fields
 from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import localized_payload_label, prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
-from schemas.echarts_plan import EChartsPlan, StructuredEChartsPlan, VisualizationEvidenceRequest
+from schemas.echarts_plan import (
+    EChartsPlan,
+    StructuredEChartsPlan,
+    StructuredEChartsPlanWithoutTimeAnnotations,
+    VisualizationEvidenceRequest,
+)
 from schemas.state import RequestStateModel
 from schemas.visualization import VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
@@ -38,7 +43,7 @@ class VisualizationResult(BaseModel):
 
 
 class VisualizationTool(BaseTool):
-    """Ask the LLM for native option JSON, then ground and validate it."""
+    """Ask the LLM for a semantic chart plan, then compile and validate it."""
 
     def __init__(self, *, llm, artifact_store: VisualizationArtifactStore, llm_timeout_seconds: float | None = None, **_ignored):
         self._llm = llm
@@ -74,6 +79,7 @@ class VisualizationTool(BaseTool):
                 _validate_plan_targets(plan, target_ids)
                 payloads = EChartsCompiler(catalog).compile(plan)
                 _validate_lineage_coverage(payloads, target_ids, inventory, catalog)
+                _validate_trajectory_context(payloads, inventory)
                 descriptors = [self._artifact_store.put(item) for item in payloads]
                 refs = list(dict.fromkeys(ref for item in descriptors for ref in item.source_refs))
                 return VisualizationResult(
@@ -97,37 +103,61 @@ class VisualizationTool(BaseTool):
 
     async def _plan(self, request, inventory, target_ids, request_state, repair) -> EChartsPlan:
         grounded_input = _line_chart_grounded_input(inventory, catalog=PresentationCatalog(request_state))
+        plan_schema = (
+            StructuredEChartsPlan
+            if _grounded_input_has_annotation_type(grounded_input, "time")
+            else StructuredEChartsPlanWithoutTimeAnnotations
+        )
         prompt = prompt_locale_instruction(request_state.response_language) + (
             "Create one native Apache ECharts 5 line chart that answers the user's question from Line Chart Grounded Input. "
             "Make the analytical conclusion visually verifiable; do not display unrelated sources merely because they exist.\n\n"
+            "GROUNDED INPUT GUIDE\n"
+            "reference_contract explains how refs bind grounded data and Insight values. Each eligible source then states only its purpose, "
+            "scope, fields, bounded example_data, lineage, and supported Insights. Each Insight states its content once and identifies its "
+            "visual support. Example rows illustrate the source but dataset.source.$dataset resolves the complete materialized source. "
+            "A field meaning_status=not_declared means its business meaning is unknown; preserve its name and do not guess a metric, unit, "
+            "transformation, or observation grain. Shape labels alone do not prove intermediate observations exist: use scope.record_count, "
+            "purpose, example_data, and limitations together.\n\n"
             "SOURCE AND INSIGHT USE\n"
-            "Choose the smallest set of eligible_line_sources needed for the answer. Each source already states its exact time fields, "
-            "numeric fields, transformation semantics, and the Insights it supports. Use an Insight's supporting_line_sources as the "
-            "visual evidence for that computed claim. The calculation object contains the grounded result, calculation trace, operands, "
-            "and locators; do not recalculate or invent any value. Prefer one time axis, one value axis, and one primary line. Add another "
+            "Choose the smallest set of eligible_line_sources that still preserves the observed trajectory needed to verify the answer. "
+            "When a related multi-observation series exists, use it as the primary line; never connect only two calculated endpoints and "
+            "present that straight segment as a price trend, rebound path, stability interval, or other observed trajectory. Treat endpoint-only "
+            "sources as calculation evidence and express their values through grounded marks on the complete related line. Each source states its exact time fields, "
+            "numeric fields, purpose, scope, and the Insights it supports. Use an Insight's visual_support.line_sources as the visual "
+            "evidence for that computed claim. The content object contains the grounded result, calculation trace, operands, and grounding "
+            "document; do not recalculate or invent any value. Prefer one time axis, one value axis, and one primary line. Add another "
             "line only when a comparison requires a distinct compatible time series, and cover every compared operand. Put scalar results "
             "in the chart title, summary, tooltip, or grounded annotations. A scalar with a different unit from the line stays in text and "
             "must not become a y-axis value.\n\n"
-            "ECHARTS OUTPUT CONTRACT\n"
-            "Return one closed EChartsPlan with one primary chart and compact valid option_json. Only series.type=\"line\" is allowed. "
-            "For every line, set dataset.source exactly to {\"$dataset\":\"EXACT_SOURCE_REF\"}, bind exact exposed field names in encode, "
-            "use xAxis.type=\"time\", yAxis.type=\"value\", yAxis.scale=true, series.showSymbol=false, and useUTC=true. Omit legend.data "
-            "for one line; with multiple lines, names must be concise, distinct, and exactly match legend entries. Never emit dataset source "
-            "arrays, series.data, transforms, functions, executable content, HTML, DOM, URLs, external assets, or invented source refs.\n"
-            "Minimal shape: {\"dataset\":{\"source\":{\"$dataset\":\"VIEW_REF\"}},\"xAxis\":{\"type\":\"time\"},"
-            "\"yAxis\":{\"type\":\"value\",\"scale\":true},\"series\":{\"name\":\"LABEL\",\"type\":\"line\","
-            "\"showSymbol\":false,\"encode\":{\"x\":\"TIME_FIELD\",\"y\":\"NUMBER_FIELD\"}}}.\n\n"
+            "For collection Insights, available_annotation_values may intentionally expose only bounded first/last examples. Do not call a "
+            "selected item longest, largest, first, last, or otherwise ranked unless the Insight statement, selection, rank, or calculation "
+            "trace explicitly establishes that property. Otherwise describe it only as the grounded interval or point that it is.\n\n"
+            "TYPED CHART CONTRACT\n"
+            "Return one closed EChartsPlan with exactly one primary chart. Do not write option_json or any renderer-native ECharts JSON; "
+            "the compiler owns datasets, axes, series styling, legends, tooltips, marks, and JSON serialization. In each chart, declare 1-2 "
+            "typed line series using series_id, name, exact source_ref, x_field, and y_field. Copy x_field from a source field with "
+            "role=time_coordinate and y_field from one with role=numeric_measure. Use multiple series only for a necessary compatible "
+            "comparison. Keep series_id unique and reference it from annotations. Optional y_axis_name is a concise grounded unit label.\n"
+            "Minimal chart fields: chart_id, purpose, priority, title, summary, accessibility_description, accessibility_table_columns, "
+            "series, point_annotations, interval_annotations, reference_lines, y_axis_name.\n\n"
             "GROUNDED ANNOTATIONS\n"
-            "Annotations are optional. Add them only when the Insight exposes every exact coordinate. Every semantic mark coordinate or "
-            "value must use {\"$value\":{\"source_ref\":\"INSIGHT_REF\",\"field\":\"FIELD_OR_JSON_POINTER\"}}. A field beginning with / "
-            "is a JSON Pointer into the Insight grounding document shown in calculation.grounding_document. Existing item_id and "
-            "record_id=\"scalar\" selectors may be used for flat records. For markPoint use symbol=\"circle\", symbolSize 8-16, and "
-            "label.show=false. If exact coordinates are unavailable, omit the mark and retain the valid supporting line.\n\n"
+            "Use point_annotations for visually important located points. Each point must pair one available_annotation_values entry "
+            "with value_type=time and one with value_type=number from the same source_ref and coordinate_group; copy only source_ref and "
+            "value_id. Use interval_annotations only when exact start and end time values share the same coordinate_group; their source_refs "
+            "may differ when the endpoints are separate Insights for the same kind of located value. "
+            "Use reference_lines for a scalar number compatible with the target series y unit. "
+            "A reference line must be a level, threshold, or average in the same quantity as the y field; never use a delta, duration, count, "
+            "percentage, or another calculation result as an axis level. Add only annotations required to locate or verify the requested "
+            "conclusion: do not add unrelated extrema, and do not duplicate a point value as a horizontal reference line. "
+            "value_id is an opaque grounded selector: never invent or alter it, and never output a JSON path. If a compatible annotation is "
+            "unavailable, omit it and retain the valid supporting line. In particular, if the chosen Insight lists no value_type=time entry, "
+            "it cannot support a point or interval annotation even when it has a numeric result; leave those annotation lists empty. "
+            "Annotation source_ref must be an Insight listed under insights, never an eligible_line_sources data view.\n\n"
             "DEPENDENCY AND RETRY\n"
             "Set target_insight_ids=[]. If no eligible source can visually support the requested calculation, return required_data_request "
             "for code_interpreter to materialize a multi-record time+number derived series from the stated lineage. With a chart, "
-            "required_data_request must be null. On retry, regenerate the complete option from the grounded input and validation findings; "
-            "do not mechanically patch the previous JSON. Keep all visible text in the requested response language.\n"
+            "required_data_request must be null. On retry, regenerate the complete typed plan from the grounded input and validation findings. "
+            "Keep all visible text in the requested response language.\n"
             f"User visualization request: {request.message}\n"
             f"Original task: {request_state.message}\n"
             f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
@@ -138,7 +168,7 @@ class VisualizationTool(BaseTool):
         messages = [("system", prompt), ("user", request.message)]
         response, content, parsed, error = await _invoke_structured(
             self._llm,
-            StructuredEChartsPlan,
+            plan_schema,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
             trace_title=localized_payload_label(
@@ -163,6 +193,14 @@ class VisualizationTool(BaseTool):
         if error is not None or parsed is None:
             raise _tool_error(f"Native ECharts Planning returned an invalid structured plan: {error}", stage="echarts_planning")
         return parsed.to_runtime()
+
+
+def _grounded_input_has_annotation_type(grounded_input: dict, value_type: str) -> bool:
+    return any(
+        candidate.get("value_type") == value_type
+        for insight in grounded_input.get("insights") or []
+        for candidate in (insight.get("content") or {}).get("available_annotation_values") or []
+    )
 
 
 async def _invoke_structured(llm, schema, messages, *, timeout_seconds, trace_title, trace_summary=None):
@@ -204,7 +242,7 @@ def _requested_insight_ids(refs: list[str], catalog: PresentationCatalog) -> lis
     return list(dict.fromkeys(result))
 
 
-def _line_chart_grounded_input(inventory: dict, *, catalog: PresentationCatalog) -> dict[str, list[dict] | str]:
+def _line_chart_grounded_input(inventory: dict, *, catalog: PresentationCatalog) -> dict[str, object]:
     """Build a question-facing line-source package instead of exposing a flat catalog.
 
     The package does not decide chart semantics. It makes already-grounded
@@ -227,23 +265,34 @@ def _line_chart_grounded_input(inventory: dict, *, catalog: PresentationCatalog)
         field_semantics = source.get("field_semantics") if isinstance(source.get("field_semantics"), dict) else {}
         source_ref = str(source.get("source_ref") or "")
         eligible_refs.add(source_ref)
-        eligible.append({
+        semantic_contract = source.get("semantic_contract") if isinstance(source.get("semantic_contract"), dict) else {}
+        eligible_source = {
             "source_ref": source_ref,
-            "name": source.get("name"),
-            "shape": source.get("shape"),
-            "row_count": source.get("row_count"),
-            "time_fields": [
-                {"field": field, "meaning": field_semantics.get(field)} for field in time_fields
+            "purpose": {
+                "name": source.get("name"),
+                "data_role": semantic_contract.get("data_role"),
+                "description": semantic_contract.get("operation_description"),
+                "materializes_transformation": semantic_contract.get("materializes_input_transformation"),
+                "visual_uses": list(semantic_contract.get("supported_visual_uses") or []),
+                "limitations": list(semantic_contract.get("limitations") or []),
+            },
+            "scope": {
+                "shape": source.get("shape"),
+                "record_count": source.get("row_count"),
+                "time_range": source.get("time_range"),
+            },
+            "fields": [
+                _field_description(field, "time_coordinate", field_semantics)
+                for field in time_fields
+            ] + [
+                _field_description(field, "numeric_measure", field_semantics)
+                for field in number_fields
             ],
-            "numeric_fields": [
-                {"field": field, "meaning": field_semantics.get(field)} for field in number_fields
-            ],
-            "time_range": source.get("time_range"),
-            "transformation": source.get("semantic_contract"),
+            "example_data": _source_example_data(catalog, source_ref, source.get("grounded_preview")),
             "lineage": source.get("lineage") or [],
-            "grounded_preview": source.get("grounded_preview"),
             "supports_insight_refs": [],
-        })
+        }
+        eligible.append(eligible_source)
 
     insights: list[dict] = []
     supported_by_source: dict[str, list[str]] = {ref: [] for ref in eligible_refs}
@@ -264,15 +313,15 @@ def _line_chart_grounded_input(inventory: dict, *, catalog: PresentationCatalog)
             )
             if source.get(key) is not None
         }
-        insights.append({
+        insight_description = {
             "source_ref": insight_ref,
-            "kind": source.get("kind"),
-            "name": source.get("name") or source.get("insight_name"),
-            "statement": source.get("statement"),
-            "calculation": {
+            "content": {
+                "kind": source.get("kind"),
+                "name": source.get("name") or source.get("insight_name"),
+                "statement": source.get("statement"),
                 "result": source.get("value"),
                 "unit": source.get("unit"),
-                "trace": source.get("calculation_trace")
+                "calculation_trace": source.get("calculation_trace")
                 if source.get("calculation_trace") is not None
                 else (source.get("semantic_contract") or {}).get("operation_description"),
                 "operands": {
@@ -281,19 +330,91 @@ def _line_chart_grounded_input(inventory: dict, *, catalog: PresentationCatalog)
                     if source.get(key) is not None
                 },
                 "grounding_document": grounding_document,
+                "available_annotation_values": [
+                    {key: value for key, value in item.items() if key not in {"field", "compatible_groups"}}
+                    for item in grounded_annotation_fields(catalog.resolve(insight_ref))
+                ],
             },
-            "supporting_line_sources": supporting_refs,
-            "evidence_refs": source.get("evidence_refs") or [],
-            "derived_from": source.get("derived_from") or [],
-        })
+            "visual_support": {
+                "line_sources": supporting_refs,
+                "evidence_refs": source.get("evidence_refs") or [],
+                "derived_from": source.get("derived_from") or [],
+            },
+        }
+        insights.append(insight_description)
 
     for source in eligible:
         source["supports_insight_refs"] = supported_by_source[source["source_ref"]]
     return {
         "chart_scope": "line_chart",
+        "reference_contract": {
+            "data_source_ref": (
+                "Copy an eligible source_ref exactly into dataset.source.$dataset; it resolves the complete materialized source, "
+                "not only example_data."
+            ),
+            "insight_ref": (
+                "For an annotation, copy an Insight source_ref and value_id exactly from content.available_annotation_values. "
+                "The compiler resolves that opaque ID to the grounded value; never output an internal path."
+            ),
+        },
         "eligible_line_sources": eligible,
         "insights": insights,
     }
+
+
+def _field_description(field: str, structural_role: str, field_semantics: dict) -> dict:
+    declared = field_semantics.get(field)
+    has_declared_meaning = declared is not None and bool(str(declared).strip())
+    return {
+        "name": field,
+        "role": structural_role,
+        "meaning": declared if has_declared_meaning else None,
+        "meaning_status": "declared" if has_declared_meaning else "not_declared",
+    }
+
+
+def _source_example_data(catalog: PresentationCatalog, source_ref: str, preview) -> dict:
+    """Return a bounded, labelled sample while refs retain full-data fidelity."""
+
+    if isinstance(preview, list):
+        rows = [dict(row) for row in preview if isinstance(row, dict)]
+        origin = "grounded_preview"
+    else:
+        source = catalog.resolve(source_ref)
+        rows = [dict(row) for row in (getattr(source.value, "rows", None) or []) if isinstance(row, dict)]
+        origin = "materialized_source"
+    if len(rows) <= 4:
+        selected = rows
+        selection = "all_available_records"
+    else:
+        selected = [*rows[:2], *rows[-2:]]
+        selection = "first_2_and_last_2_records"
+    return {
+        "sample_only": True,
+        "origin": origin,
+        "selection": selection,
+        "rows": [_compact_sample_row(row) for row in selected],
+    }
+
+
+def _compact_sample_row(row: dict) -> dict:
+    visible = [(key, value) for key, value in row.items() if not str(key).startswith("__")]
+    return {str(key): _compact_sample_value(value) for key, value in visible[:12]}
+
+
+def _compact_sample_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_compact_sample_value(item) for item in value[:8]]
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_sample_value(item)
+            for key, item in list(value.items())[:8]
+        }
+    return str(value)
 
 
 def _echarts_prompt_inventory(inventory: dict) -> dict[str, list[dict]]:
@@ -341,10 +462,13 @@ def _validate_lineage_coverage(payloads, insight_ids: list[str], inventory: dict
     """Require every distinct renderable derived lineage needed by selected claims to enter a line chart."""
 
     data_sources = [source for source in inventory.get("sources") or [] if source.get("kind") == "data_view"]
+    source_map = {str(source.get("source_ref")): source for source in data_sources}
     candidates_by_lineage: dict[str, set[str]] = {}
     for source in data_sources:
         contract = source.get("render_contract") if isinstance(source.get("render_contract"), dict) else {}
         if int(contract.get("point_count") or 0) < 2 or not contract.get("time_fields") or not contract.get("number_fields"):
+            continue
+        if _trajectory_alternatives(str(source.get("source_ref")), source, source_map):
             continue
         for lineage_ref in source.get("lineage") or []:
             if str(lineage_ref).startswith("derived_evidence:"):
@@ -379,6 +503,59 @@ def _validate_lineage_coverage(payloads, insight_ids: list[str], inventory: dict
         )
 
 
+def _validate_trajectory_context(payloads, inventory: dict) -> None:
+    """Reject endpoint-only lines when a related observation-level trajectory exists."""
+
+    data_sources = {
+        str(source.get("source_ref")): source
+        for source in inventory.get("sources") or []
+        if isinstance(source, dict) and source.get("kind") == "data_view"
+    }
+    selected_refs = {
+        ref
+        for payload in payloads
+        for ref in payload.source_refs
+        if ref in data_sources
+    }
+    for selected_ref in selected_refs:
+        selected = data_sources[selected_ref]
+        if int(selected.get("row_count") or 0) > 2:
+            continue
+        alternatives = _trajectory_alternatives(selected_ref, selected, data_sources)
+        if alternatives:
+            raise _tool_error(
+                f"/series: endpoint-only source '{selected_ref}' cannot represent an observed trajectory; "
+                f"use a related multi-observation line source {sorted(alternatives)} and encode endpoints as grounded marks",
+                stage="echarts_validation",
+            )
+
+
+def _trajectory_alternatives(selected_ref: str, selected: dict, data_sources: dict[str, dict]) -> list[str]:
+    """Find observation-level lines that make a sparse endpoint line semantically misleading."""
+
+    if int(selected.get("row_count") or 0) > 2:
+        return []
+    contract = selected.get("render_contract") if isinstance(selected.get("render_contract"), dict) else {}
+    selected_times = set(contract.get("time_fields") or [])
+    selected_numbers = set(contract.get("number_fields") or [])
+    selected_lineage = {str(ref) for ref in selected.get("lineage") or [] if str(ref).startswith("evidence:")}
+    if not selected_times or not selected_numbers or not selected_lineage:
+        return []
+    alternatives = []
+    for candidate_ref, candidate in data_sources.items():
+        candidate_contract = candidate.get("render_contract") if isinstance(candidate.get("render_contract"), dict) else {}
+        candidate_lineage = {str(ref) for ref in candidate.get("lineage") or [] if str(ref).startswith("evidence:")}
+        if (
+            candidate_ref != selected_ref
+            and int(candidate.get("row_count") or 0) > 2
+            and selected_lineage & candidate_lineage
+            and selected_times & set(candidate_contract.get("time_fields") or [])
+            and selected_numbers & set(candidate_contract.get("number_fields") or [])
+        ):
+            alternatives.append(candidate_ref)
+    return alternatives
+
+
 def _repair_context(attempt: int, exc: Exception, language: str | None, previous: list[dict]) -> dict:
     pointer = getattr(exc, "pointer", None)
     error = str(exc)
@@ -408,7 +585,13 @@ def _repair_context(attempt: int, exc: Exception, language: str | None, previous
     elif "/source_coverage" in error:
         repair_zh = "当前图漏掉了 Insight lineage 中另一条可渲染时序。按错误列出的精确 view ref 新增 dataset 和兼容量纲的 line，放在同一 time/value 坐标轴；不要删除已有一侧。"
         repair_en = "The chart omits another renderable Insight lineage. Add a dataset and compatible line using each exact view ref listed by the error on the same time/value axes; keep the existing side."
-    elif "incompatible visual scales" in error or "main range unreadable" in error or "visually compatible" in error:
+    elif "endpoint-only source" in error:
+        repair_zh = "不要把两个计算端点连接成趋势线。使用错误中列出的多观测时序作为主线，并通过 Insight grounding document 的精确坐标把端点画成 markPoint；必要时用 markArea 高亮两点之间的区间。"
+        repair_en = "Do not connect two calculated endpoints as a trend line. Use a listed multi-observation source as the primary line and place the endpoints as markPoints from exact Insight grounding-document coordinates; use markArea for the interval when useful."
+    elif "main range unreadable" in error:
+        repair_zh = "改用 Grounded Input 中已物化过滤或清洗操作的 eligible line source；若 Insight 点与新主线量纲兼容，保留并重新绑定这些标注。"
+        repair_en = "Use the eligible line source that materializes the required filtering or cleaning. Preserve and rebind grounded Insight marks when their coordinates remain scale-compatible with the new main line."
+    elif "incompatible visual scales" in error or "visually compatible" in error:
         repair_zh = "回到 source-first：保留必需且量纲兼容的 line，删除不同量纲的 series/mark。"
         repair_en = "Return to source-first composition: keep required scale-compatible lines and remove series or marks with another scale."
     elif "duplicate geometry" in error:
@@ -420,20 +603,36 @@ def _repair_context(attempt: int, exc: Exception, language: str | None, previous
     elif "unknown presentation source" in error:
         repair_zh = "不要改写 source_ref。只从库存逐字复制一个可渲染 data_view 的完整 source_ref，并先生成无 mark 的有效主 series。"
         repair_en = "Do not rewrite source refs. Copy one renderable data_view ref verbatim from inventory and first produce a valid unmarked main series."
-    else:
+    elif "typed annotations require an Insight source_ref" in error:
+        repair_zh = "annotation 只能引用 insights 中列出的 Insight；不得从 line source 按行号取值。若 Insight 没有完整坐标，删除整个 annotation。"
+        repair_en = "Annotations may reference only listed Insights, never line-source rows by position. Remove the entire annotation when no Insight provides its complete coordinate."
+    elif "/encode/" in error or "unknown encoded field" in error:
+        repair_zh = "从对应 source 的 fields 中逐字复制 x_field 和 y_field；x 必须是 time_coordinate，y 必须是 numeric_measure。"
+        repair_en = (
+            "Copy x_field and y_field verbatim from the selected source fields; x must be time_coordinate and y must be numeric_measure."
+        )
+    elif "value_id" in error:
         repair_zh = (
-            "从头重建一个更小的完整 option，并修正 JSON Pointer 指向的问题。删除所有不必要的 mark；"
-            "mark 数据中的时间和数值只能来自 $value，不能复制预览值。确保 option_json 本身是无注释、无尾随逗号的合法紧凑 JSON。"
+            "从对应 Insight 的 available_annotation_values 逐字复制 value_id；time 位置只能使用 time_*，number 位置只能使用 number_*。"
+            "若错误中的对应类型 available value_ids=[]，删除包含它的整个 point/interval/reference annotation，不得改用虚构 ID。"
         )
         repair_en = (
-            "Rebuild a smaller complete option from scratch and correct the cited JSON Pointer. Remove unnecessary marks; "
-            "every time or number in mark data must come from $value, never copied preview values. Ensure option_json is "
-            "compact valid JSON without comments or trailing commas."
+            "Copy value_id verbatim from the Insight's available_annotation_values; time slots require time_* and numeric slots require number_*. "
+            "When the error reports available value_ids=[], remove the entire containing point/interval/reference annotation; do not substitute an invented ID."
         )
-    regenerate_zh = "不要对上一版 JSON 做局部打补丁；请重新读取 Line Chart Grounded Input，并从头生成一个完整、较小且语义一致的 option。"
+    else:
+        repair_zh = (
+            "从头重建一个更小的 typed chart plan，并修正错误指向的问题。删除不必要的 annotation；"
+            "series 字段和 annotation value_id 只能从 Grounded Input 逐字复制。不要输出 option_json。"
+        )
+        repair_en = (
+            "Rebuild a smaller typed chart plan from scratch and correct the cited field. Remove unnecessary annotations; "
+            "copy every series field and annotation value_id verbatim from Grounded Input. Do not output option_json."
+        )
+    regenerate_zh = "不要对上一版输出做局部打补丁；请重新读取 Line Chart Grounded Input，并从头生成一个完整、较小且语义一致的 typed plan。"
     regenerate_en = (
-        "Do not patch the previous JSON locally. Re-read Line Chart Grounded Input and regenerate a complete, smaller, "
-        "semantically aligned option from scratch."
+        "Do not patch the previous output locally. Re-read Line Chart Grounded Input and regenerate a complete, smaller, "
+        "semantically aligned typed plan from scratch."
     )
     return {
         "stage": "echarts_compilation",

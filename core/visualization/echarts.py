@@ -73,7 +73,7 @@ class EChartsCompiler:
         target_ids: list[str],
         verification: VisualizationVerification,
     ) -> VisualizationPayload:
-        option = self._parse(chart.option_json)
+        option = self._parse(chart.option_json) if chart.option_json is not None else self._compose_typed_option(chart)
         resolution = self._validate_and_resolve(option)
         visualization_id = _visualization_id(chart, option)
         columns = chart.accessibility_table_columns or _columns(resolution.table_rows)
@@ -93,6 +93,127 @@ class EChartsCompiler:
                 table_rows=resolution.table_rows[:24],
             ),
         )
+
+    def _compose_typed_option(self, chart: EChartsChartPlan) -> dict[str, Any]:
+        """Compile a closed semantic chart plan into renderer-native option data."""
+
+        series_ids: dict[str, dict[str, Any]] = {}
+        datasets: list[dict[str, Any]] = []
+        dataset_ids: dict[str, str] = {}
+        rendered_series: list[dict[str, Any]] = []
+        series_names: set[str] = set()
+        for index, item in enumerate(chart.series):
+            if item.series_id in series_ids:
+                raise EChartsValidationError(f"/series/{index}/series_id", f"duplicate series id '{item.series_id}'")
+            if item.name in series_names:
+                raise EChartsValidationError(f"/series/{index}/name", f"duplicate legend name '{item.name}'")
+            series_names.add(item.name)
+            dataset_id = dataset_ids.get(item.source_ref)
+            if dataset_id is None:
+                dataset_id = f"source_{len(dataset_ids)}"
+                dataset_ids[item.source_ref] = dataset_id
+                datasets.append({"id": dataset_id, "source": {"$dataset": item.source_ref}})
+            rendered = {
+                "name": item.name,
+                "type": "line",
+                "datasetId": dataset_id,
+                "showSymbol": False,
+                "encode": {"x": item.x_field, "y": item.y_field},
+            }
+            series_ids[item.series_id] = rendered
+            rendered_series.append(rendered)
+
+        def target(series_id: str, pointer: str) -> dict[str, Any]:
+            item = series_ids.get(series_id)
+            if item is None:
+                raise EChartsValidationError(pointer, f"unknown annotation series_id '{series_id}'")
+            return item
+
+        for index, annotation in enumerate(chart.point_annotations):
+            item = target(annotation.series_id, f"/point_annotations/{index}/series_id")
+            time_value, time_candidate = self._typed_value_placeholder(annotation.time)
+            number_value, number_candidate = self._typed_value_placeholder(annotation.value)
+            _validate_coordinate_pair(
+                annotation.time.source_ref,
+                time_candidate,
+                annotation.value.source_ref,
+                number_candidate,
+                f"/point_annotations/{index}",
+            )
+            mark = item.setdefault("markPoint", {
+                "symbol": "circle", "symbolSize": 12, "label": {"show": False}, "data": [],
+            })
+            mark["data"].append({
+                "name": annotation.name,
+                "coord": [time_value, number_value],
+            })
+        for index, annotation in enumerate(chart.interval_annotations):
+            item = target(annotation.series_id, f"/interval_annotations/{index}/series_id")
+            start_value, start_candidate = self._typed_value_placeholder(annotation.start)
+            end_value, end_candidate = self._typed_value_placeholder(annotation.end)
+            _validate_coordinate_pair(
+                annotation.start.source_ref,
+                start_candidate,
+                annotation.end.source_ref,
+                end_candidate,
+                f"/interval_annotations/{index}",
+                require_same_source=False,
+            )
+            mark = item.setdefault("markArea", {"label": {"show": False}, "data": []})
+            mark["data"].append([
+                {"name": annotation.name, "xAxis": start_value},
+                {"xAxis": end_value},
+            ])
+        for index, annotation in enumerate(chart.reference_lines):
+            item = target(annotation.series_id, f"/reference_lines/{index}/series_id")
+            mark = item.setdefault("markLine", {
+                "symbol": "none", "label": {"position": "insideEndTop"}, "data": [],
+            })
+            resolved_value, _candidate = self._typed_value_placeholder(annotation.value)
+            mark["data"].append({"name": annotation.name, "yAxis": resolved_value})
+
+        option: dict[str, Any] = {
+            "useUTC": True,
+            "color": ["#5470c6", "#91cc75"],
+            "legend": {"show": True, "top": 4, "data": [item["name"] for item in rendered_series]},
+            "tooltip": {"show": True, "trigger": "axis"},
+            "grid": {"left": 64, "right": 28, "top": 44, "bottom": 84},
+            "dataZoom": [
+                {"type": "inside", "xAxisIndex": 0},
+                {"type": "slider", "show": True, "xAxisIndex": 0, "bottom": 12, "height": 22},
+            ],
+            "dataset": datasets,
+            "xAxis": {"type": "time"},
+            "yAxis": {
+                "type": "value",
+                "scale": True,
+                **({"name": chart.y_axis_name} if chart.y_axis_name else {}),
+            },
+            "series": rendered_series,
+        }
+        return option
+
+    def _typed_value_placeholder(self, value_ref) -> dict[str, Any]:
+        source = self._resolve_source(value_ref.source_ref, "/annotations/source_ref")
+        if source.kind not in {"insight", "insight_item"}:
+            raise EChartsValidationError(
+                "/annotations/source_ref",
+                f"typed annotations require an Insight source_ref, got '{source.ref}'; "
+                "dataset rows cannot be addressed by positional value_id",
+            )
+        candidates = {item["value_id"]: item for item in grounded_annotation_fields(source)}
+        candidate = candidates.get(value_ref.value_id)
+        if candidate is None:
+            value_type = "time" if value_ref.value_id.startswith("time_") else "number"
+            available = sorted(
+                item["value_id"] for item in candidates.values() if item.get("value_type") == value_type
+            )
+            raise EChartsValidationError(
+                "/annotations/value_id",
+                f"unknown grounded value_id '{value_ref.value_id}' for source '{source.ref}'; "
+                f"available {value_type} value_ids={available}",
+            )
+        return {"$value": {"source_ref": source.ref, "field": candidate["field"]}}, candidate
 
     @staticmethod
     def _parse(option_json: str) -> dict[str, Any]:
@@ -526,6 +647,76 @@ def _value_grounding_document(source) -> dict[str, Any]:
     }
 
 
+def grounded_annotation_fields(source) -> list[dict[str, Any]]:
+    """Build stable opaque IDs for scalar time/number values in one grounded source."""
+
+    result: list[dict[str, Any]] = []
+    counts = {"time": 0, "number": 0}
+
+    def visit(value: Any, path: str, labels: list[str]) -> None:
+        value_type = None
+        if isinstance(value, bool) or value is None:
+            return
+        if isinstance(value, (int, float)):
+            value_type = "number"
+        elif isinstance(value, str) and _is_time_coordinate(value):
+            value_type = "time"
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                escaped = str(key).replace("~", "~0").replace("/", "~1")
+                visit(item, f"{path}/{escaped}", [*labels, str(key)])
+            return
+        elif isinstance(value, list):
+            indexes = list(range(len(value))) if len(value) <= 4 else [0, 1, len(value) - 2, len(value) - 1]
+            for index in indexes:
+                item = value[index]
+                visit(item, f"{path}/{index}", [*labels, str(index)])
+            return
+        else:
+            return
+        counts[value_type] += 1
+        result.append({
+            "value_id": f"{value_type}_{counts[value_type]}",
+            "value_type": value_type,
+            "description": ".".join(labels),
+            "coordinate_group": ".".join(labels[:-1]),
+            "example_value": value,
+            "field": path,
+        })
+
+    visit(_value_grounding_document(source), "", [])
+    groups_by_value: dict[tuple[str, str], set[str]] = {}
+    for item in result:
+        identity = (str(item["value_type"]), json.dumps(item["example_value"], ensure_ascii=False, sort_keys=True))
+        groups_by_value.setdefault(identity, set()).add(str(item["coordinate_group"]))
+    for item in result:
+        identity = (str(item["value_type"]), json.dumps(item["example_value"], ensure_ascii=False, sort_keys=True))
+        item["compatible_groups"] = sorted(groups_by_value[identity])
+    return result[:64]
+
+
+def _validate_coordinate_pair(
+    first_source_ref: str,
+    first: dict[str, Any],
+    second_source_ref: str,
+    second: dict[str, Any],
+    pointer: str,
+    *,
+    require_same_source: bool = True,
+) -> None:
+    first_groups = set(first.get("compatible_groups") or [first.get("coordinate_group")])
+    second_groups = set(second.get("compatible_groups") or [second.get("coordinate_group")])
+    if (
+        (require_same_source and first_source_ref != second_source_ref)
+        or not (first_groups & second_groups)
+    ):
+        raise EChartsValidationError(
+            pointer,
+            "annotation coordinates must use a compatible coordinate_group"
+            + (" from the same Insight" if require_same_source else ""),
+        )
+
+
 def _insight_item_document(item) -> dict[str, Any]:
     return {
         key: value
@@ -692,8 +883,6 @@ def _validate_mark_coordinates(
 
 
 def _is_time_coordinate(value: Any) -> bool:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return math.isfinite(float(value))
     if not isinstance(value, str) or not value.strip():
         return False
     try:

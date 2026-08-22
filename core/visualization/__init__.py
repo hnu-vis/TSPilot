@@ -5,7 +5,7 @@ from core.visualization.materializer import (
     InvalidPresentationLineageError,
     PresentationCatalog,
 )
-from core.visualization.echarts import EChartsCompiler, EChartsValidationError
+from core.visualization.echarts import EChartsCompiler, EChartsValidationError, grounded_annotation_fields
 from core.visualization.artifact_store import VisualizationArtifactStore
 
 __all__ = [
@@ -14,5 +14,6 @@ __all__ = [
     "PresentationCatalog",
     "EChartsCompiler",
     "EChartsValidationError",
+    "grounded_annotation_fields",
     "VisualizationArtifactStore",
 ]
