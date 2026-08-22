@@ -48,7 +48,7 @@ def _attach_visualization(state, tmp_path):
             accessibility_description="Three daily prices.",
             option_json=json.dumps({
                 "dataset": {"source": {"$dataset": source}},
-                "xAxis": {"type": "time"}, "yAxis": {"type": "value"},
+                "xAxis": {"type": "time"}, "yAxis": {"type": "value", "scale": True},
                 "series": {"type": "line", "encode": {"x": "timestamp", "y": "value"}},
             }),
         )],

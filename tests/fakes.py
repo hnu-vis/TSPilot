@@ -981,10 +981,14 @@ def _prompt_json(text: str, marker: str):
 
 
 def _fake_echarts_plan(prompt_text: str) -> _FakeResponse:
+    grounded_input = _prompt_json(prompt_text, "Line Chart Grounded Input:") or {}
     inventory = _prompt_json(prompt_text, "Grounded Source Inventory:") or {}
     target_ids = _prompt_json(prompt_text, "Requested target Insight ids:") or []
     sources = [item for item in inventory.get("sources", []) if isinstance(item, dict)]
-    host = next((item for item in sources if item.get("kind") == "data_view" and any(
+    line_sources = [
+        item for item in grounded_input.get("eligible_line_sources", []) if isinstance(item, dict)
+    ]
+    host = line_sources[0] if line_sources else next((item for item in sources if item.get("kind") == "data_view" and any(
         field.get("data_type") == "time" for field in item.get("schema_fields", [])
     ) and any(field.get("data_type") == "number" for field in item.get("schema_fields", []))), None)
     if host is None:
@@ -998,8 +1002,16 @@ def _fake_echarts_plan(prompt_text: str) -> _FakeResponse:
             },
         }, ensure_ascii=False))
     fields = host.get("schema_fields") or []
-    x_field = next(str(item["name"]) for item in fields if item.get("data_type") == "time")
-    y_field = next(str(item["name"]) for item in fields if item.get("data_type") == "number")
+    x_field = (
+        str((host.get("time_fields") or [{}])[0].get("field") or "")
+        if line_sources
+        else next(str(item["name"]) for item in fields if item.get("data_type") == "time")
+    )
+    y_field = (
+        str((host.get("numeric_fields") or [{}])[0].get("field") or "")
+        if line_sources
+        else next(str(item["name"]) for item in fields if item.get("data_type") == "number")
+    )
     mark_points, mark_lines = [], []
     for target_id in target_ids:
         source = next((item for item in sources if item.get("source_ref") == f"insight:{target_id}"), None)
@@ -1032,7 +1044,7 @@ def _fake_echarts_plan(prompt_text: str) -> _FakeResponse:
     option = {
         "useUTC": True,
         "dataset": [{"id": "context", "source": {"$dataset": host["source_ref"]}}],
-        "xAxis": [{"type": "time"}], "yAxis": [{"type": "value"}],
+        "xAxis": [{"type": "time"}], "yAxis": [{"type": "value", "scale": True}],
         "tooltip": {"trigger": "axis"}, "series": [series],
     }
     return _FakeResponse(json.dumps({
@@ -1056,7 +1068,7 @@ def _query_generation_response(user_prompt: str, messages=None) -> _FakeResponse
         for message in (messages or [])
         if isinstance(message, (tuple, list)) and len(message) > 1
     )
-    if "complete native Apache ECharts 5 option JSON" in prompt_text:
+    if "complete native Apache ECharts 5 option JSON" in prompt_text or "Line Chart Grounded Input:" in prompt_text:
         return _fake_echarts_plan(prompt_text)
     try:
         internal_payload = json.loads(user_prompt)

@@ -37,7 +37,7 @@ class _HistoricalReplayLlm:
             "series": [{
                 "name": "USD price", "type": "line", "datasetId": "prices",
                 "encode": {"x": "timestamp", "y": "value"}, "showSymbol": False,
-                "markPoint": {"data": [
+                "markPoint": {"symbol": "circle", "symbolSize": 10, "label": {"show": False}, "data": [
                     {"name": "Monthly low", "coord": [
                         {"$value": {"source_ref": low_ref, "field": "timestamp"}},
                         {"$value": {"source_ref": low_ref, "field": "value"}},

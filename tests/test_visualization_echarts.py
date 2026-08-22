@@ -9,11 +9,18 @@ from app.settings import get_settings
 from core.visualization import EChartsCompiler, EChartsValidationError, PresentationCatalog, VisualizationArtifactStore
 from runtime.request_state import build_request_state
 from schemas.api import ChatRequest
+from schemas.analysis import DerivedEvidence
 from schemas.database import DatabaseEvidence
 from schemas.echarts_plan import EChartsChartPlan, EChartsPlan, StructuredEChartsPlan
 from schemas.key_insight import InsightEvidenceRef, InsightItem, KeyInsight
 from schemas.state import ConversationStateModel, RequestStateModel
-from tools.visualization import VisualizationInput, VisualizationTool
+from tools.visualization import (
+    VisualizationInput,
+    VisualizationTool,
+    _echarts_prompt_inventory,
+    _line_chart_grounded_input,
+    _validate_lineage_coverage,
+)
 
 
 def _state() -> RequestStateModel:
@@ -33,8 +40,13 @@ def _state() -> RequestStateModel:
     state.latest_database_evidence = evidence
     state.insight_set.insights = [KeyInsight(
         insight_id="insight_peak", insight_key="peak", name="peak", insight_type="maximum",
-        statement="The maximum is 15.", value_shape="collection", method="code_interpreter",
+        statement="The maximum is 15.", value=15.0, value_shape="collection", method="code_interpreter",
+        unit="USD",
         evidence_refs=[InsightEvidenceRef(source_type="query", source_id="evi_prices")],
+        calculation_trace={
+            "formula": "max(value)",
+            "operands": {"peak": {"timestamp": "2026-01-03T00:00:00Z", "value": 15.0}},
+        },
         items=[InsightItem(item_id="peak", label="peak", timestamp="2026-01-03T00:00:00Z", value=15.0)],
     )]
     return state
@@ -45,12 +57,13 @@ def _option(**updates):
         "useUTC": True,
         "dataset": [{"id": "prices", "source": {"$dataset": "view:evidence:evi_prices:default"}}],
         "xAxis": [{"type": "time"}],
-        "yAxis": [{"type": "value", "name": "USD"}],
+        "yAxis": [{"type": "value", "name": "USD", "scale": True}],
         "series": [{
             "name": "Price", "type": "line", "datasetId": "prices",
             "encode": {"x": "timestamp", "y": "value"}, "showSymbol": False,
             "markPoint": {"data": [{
                 "name": "Peak",
+                "symbol": "circle", "symbolSize": 12, "label": {"show": False},
                 "coord": [
                     {"$value": {"source_ref": "insight:insight_peak", "field": "timestamp"}},
                     {"$value": {"source_ref": "insight:insight_peak", "field": "value"}},
@@ -98,6 +111,75 @@ def test_structured_plan_is_closed_while_option_is_a_string():
     assert option_property["type"] == "string"
 
 
+def test_prompt_inventory_separates_renderable_data_from_full_insight_content():
+    catalog = PresentationCatalog(_state())
+    preferred, unknown = catalog.expand_preferences(["insight:insight_peak"])
+    assert not unknown
+    prompt_inventory = _echarts_prompt_inventory(catalog.targeted_planner_inventory(preferred))
+    assert any(source["source_ref"] == "view:evidence:evi_prices:default" for source in prompt_inventory["data_sources"])
+    peak = next(source for source in prompt_inventory["insights"] if source["source_ref"] == "insight:insight_peak")
+    assert peak["statement"] == "The maximum is 15." and peak["value"] == 15.0
+    assert peak["items"][0]["timestamp"] == "2026-01-03T00:00:00Z"
+    assert "query:evi_prices" in peak["evidence_refs"]
+    prices = next(source for source in prompt_inventory["data_sources"] if source["source_ref"] == "view:evidence:evi_prices:default")
+    assert "evidence:evi_prices" in prices["lineage"]
+    assert "projection_root" not in peak
+
+
+def test_line_chart_grounded_input_exposes_executable_sources_and_calculation_relationships():
+    catalog = PresentationCatalog(_state())
+    preferred, unknown = catalog.expand_preferences(["insight:insight_peak"])
+    assert not unknown
+    package = _line_chart_grounded_input(catalog.targeted_planner_inventory(preferred), catalog=catalog)
+    assert package["chart_scope"] == "line_chart"
+    assert len(package["eligible_line_sources"]) == 1
+    line = package["eligible_line_sources"][0]
+    assert line["source_ref"] == "view:evidence:evi_prices:default"
+    assert line["time_fields"] == [{"field": "timestamp", "meaning": None}]
+    assert line["numeric_fields"] == [{"field": "value", "meaning": None}]
+    assert line["supports_insight_refs"] == ["insight:insight_peak"]
+    insight = package["insights"][0]
+    assert insight["supporting_line_sources"] == ["view:evidence:evi_prices:default"]
+    assert insight["calculation"]["trace"]["formula"] == "max(value)"
+    assert insight["calculation"]["grounding_document"]["items"][0]["timestamp"] == "2026-01-03T00:00:00Z"
+
+
+def test_lineage_coverage_requires_each_distinct_renderable_derived_timeseries():
+    state = _state()
+    for suffix, offset in (("first", 0), ("second", 10)):
+        state.derived_evidence_artifacts[suffix] = DerivedEvidence(
+            evidence_id=suffix, name=f"{suffix} interval", shape="timeseries",
+            rows=[
+                {"timestamp": f"2026-01-{day + offset:02d}T00:00:00Z", "value": float(day)}
+                for day in (1, 2)
+            ], lineage=["evidence:evi_prices"], transform_summary=f"{suffix} interval records",
+        )
+        state.insight_set.insights.append(KeyInsight(
+            insight_id=f"insight_{suffix}", insight_key=f"mean_{suffix}", name=f"mean {suffix}",
+            insight_type="average", statement=f"Mean for {suffix} interval.", value=10.0 + offset,
+            method="code_interpreter",
+            evidence_refs=[InsightEvidenceRef(source_type="derived_evidence", source_id=suffix)],
+        ))
+    catalog = PresentationCatalog(state)
+    preferred, _ = catalog.expand_preferences(["insight:insight_first", "insight:insight_second"])
+    inventory = catalog.targeted_planner_inventory(preferred)
+    option = _option()
+    option["dataset"][0]["source"] = {"$dataset": "view:derived_evidence:first"}
+    option["series"][0].pop("markPoint")
+    plan = _plan(option).model_copy(update={"target_insight_ids": []})
+    payloads = EChartsCompiler(catalog).compile(plan)
+    with pytest.raises(Exception, match="/source_coverage"):
+        _validate_lineage_coverage(payloads, ["insight_first", "insight_second"], inventory, catalog)
+
+    option["dataset"].append({"id": "second", "source": {"$dataset": "view:derived_evidence:second"}})
+    option["series"].append({
+        "name": "Second", "type": "line", "datasetId": "second",
+        "encode": {"x": "timestamp", "y": "value"},
+    })
+    payloads = EChartsCompiler(catalog).compile(_plan(option).model_copy(update={"target_insight_ids": []}))
+    _validate_lineage_coverage(payloads, ["insight_first", "insight_second"], inventory, catalog)
+
+
 def test_compiler_injects_complete_records_and_propagates_bindings():
     payload = _compile()
     rows = payload.option["dataset"][0]["source"]
@@ -107,6 +189,34 @@ def test_compiler_injects_complete_records_and_propagates_bindings():
     assert mark["coord"] == ["2026-01-03T00:00:00Z", 15.0]
     assert mark["bindingId"]
     assert "insight:insight_peak" in payload.source_refs
+
+
+def test_data_view_only_chart_does_not_require_an_insight_target():
+    option = _option()
+    option["series"][0].pop("markPoint")
+    plan = _plan(option).model_copy(update={"target_insight_ids": []})
+    payload = EChartsCompiler(PresentationCatalog(_state())).compile(plan)[0]
+    assert payload.verification.target_insight_ids == []
+    assert payload.source_refs == ["view:evidence:evi_prices:default"]
+
+
+def test_compiler_rejects_supporting_chart_dominated_by_primary():
+    primary = _plan()
+    supporting_option = _option()
+    supporting_option["series"][0].pop("markPoint")
+    plan = primary.model_copy(update={
+        "charts": [
+            primary.charts[0],
+            EChartsChartPlan(
+                chart_id="redundant", purpose="repeat the same line", priority="supporting",
+                title="Repeated line", accessibility_description="The same line again.",
+                option_json=json.dumps(supporting_option),
+            ),
+        ],
+    })
+    with pytest.raises(EChartsValidationError, match="visually redundant") as error:
+        EChartsCompiler(PresentationCatalog(_state())).compile(plan)
+    assert error.value.pointer == "/charts/1"
 
 
 @pytest.mark.parametrize(("mutate", "pointer"), [
@@ -152,6 +262,121 @@ def test_value_placeholder_rejects_unknown_field_and_ambiguous_source():
         _compile(option)
 
 
+def test_value_placeholder_can_select_parent_scalar_when_insight_also_has_items():
+    option = _option()
+    option["series"][0]["markPoint"]["data"][0]["value"] = {
+        "$value": {"source_ref": "insight:insight_peak", "field": "value", "record_id": "scalar"}
+    }
+    payload = _compile(option)
+    assert payload.option["series"][0]["markPoint"]["data"][0]["value"] == 15.0
+
+
+def test_value_placeholder_resolves_nested_insight_calculation_with_json_pointer():
+    option = _option()
+    option["series"][0]["markPoint"]["data"][0]["coord"] = [
+        {
+            "$value": {
+                "source_ref": "insight:insight_peak",
+                "field": "/calculation_trace/operands/peak/timestamp",
+            }
+        },
+        {
+            "$value": {
+                "source_ref": "insight:insight_peak",
+                "field": "/calculation_trace/operands/peak/value",
+            }
+        },
+    ]
+    payload = _compile(option)
+    point = payload.option["series"][0]["markPoint"]["data"][0]
+    assert point["coord"] == ["2026-01-03T00:00:00Z", 15.0]
+    assert point["bindingId"]
+
+
+def test_value_placeholder_rejects_unknown_json_pointer():
+    option = _option()
+    option["series"][0]["markPoint"]["data"][0]["coord"][0] = {
+        "$value": {"source_ref": "insight:insight_peak", "field": "/calculation_trace/missing"}
+    }
+    with pytest.raises(EChartsValidationError, match="does not exist") as error:
+        _compile(option)
+    assert error.value.pointer.endswith("/$value/field")
+
+
+def test_value_placeholder_json_pointer_must_resolve_to_scalar():
+    option = _option()
+    option["series"][0]["markPoint"]["data"][0]["coord"][0] = {
+        "$value": {"source_ref": "insight:insight_peak", "field": "/calculation_trace/operands/peak"}
+    }
+    with pytest.raises(EChartsValidationError, match="must resolve to one scalar value"):
+        _compile(option)
+
+
+@pytest.mark.parametrize("series_type", ["bar", "scatter"])
+def test_compiler_is_line_chart_only(series_type):
+    option = _option()
+    option["series"][0]["type"] = series_type
+    with pytest.raises(EChartsValidationError, match=r"\['line'\]") as error:
+        _compile(option)
+    assert error.value.pointer == "/series/0/type"
+
+
+def test_compiler_rejects_unmatched_legend_and_incompatible_shared_scale():
+    option = _option(legend={"data": ["Missing"]})
+    with pytest.raises(EChartsValidationError) as legend_error:
+        _compile(option)
+    assert legend_error.value.pointer == "/legend/data/0"
+    state = _state()
+    state.derived_evidence_artifacts["tiny"] = DerivedEvidence(
+        evidence_id="tiny", name="Tiny values", shape="timeseries",
+        rows=[
+            {"timestamp": "2026-01-01T00:00:00Z", "tiny": 1.0},
+            {"timestamp": "2026-01-02T00:00:00Z", "tiny": 2.0},
+            {"timestamp": "2026-01-03T00:00:00Z", "tiny": 3.0},
+        ], lineage=["evidence:evi_prices"], transform_summary="Tiny comparison values.",
+    )
+    option = _option()
+    option["dataset"].append({
+        "id": "tiny", "source": {"$dataset": "view:derived_evidence:tiny"},
+    })
+    option["series"].append({
+        "name": "Tiny", "type": "line", "datasetId": "tiny", "encode": {"x": "timestamp", "y": "tiny"},
+    })
+    with pytest.raises(EChartsValidationError, match="incompatible visual scales"):
+        EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))
+
+
+def test_compiler_rejects_unreadable_internal_outlier_scale_and_wrong_time_field():
+    state = _state()
+    state.database_evidence_artifacts["evi_prices"].data["rows"][0]["value"] = 1_000_000.0
+    option = _option()
+    with pytest.raises(EChartsValidationError, match="filtered or cleaned source") as outlier_error:
+        EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))
+    assert outlier_error.value.pointer == "/series/0/datasetIndex"
+
+    option = _option()
+    option["series"][0]["encode"]["x"] = "bindingId"
+    with pytest.raises(EChartsValidationError, match="time axis") as time_error:
+        _compile(option)
+    assert time_error.value.pointer == "/series/0/encode/x"
+
+
+def test_compiler_rejects_markpoint_outside_series_visual_scale():
+    state = _state()
+    state.insight_set.insights.append(KeyInsight(
+        insight_id="insight_unrelated", insight_key="unrelated", name="unrelated",
+        insight_type="point_value", statement="An unrelated magnitude.", value=1_000_000.0,
+        method="code_interpreter",
+    ))
+    option = _option()
+    option["series"][0]["markPoint"]["data"][0]["coord"][1] = {
+        "$value": {"source_ref": "insight:insight_unrelated", "field": "value", "record_id": "scalar"}
+    }
+    with pytest.raises(EChartsValidationError, match="markPoint y coordinate") as mark_error:
+        EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))
+    assert mark_error.value.pointer.endswith("/coord/1")
+
+
 def test_artifact_descriptor_strips_sources_and_full_read_restores_them(tmp_path):
     store = VisualizationArtifactStore(tmp_path)
     descriptor = store.put(_compile())
@@ -195,5 +420,7 @@ async def test_tool_repairs_unknown_axis_using_precise_pointer_and_publishes(tmp
     )
     assert result["status"] == "created" and len(llm.calls) == 2
     assert "/series/0/yAxisIndex" in llm.calls[1]
+    assert "Line Chart Grounded Input" in llm.calls[1]
+    assert "regenerate a complete" in llm.calls[1]
     complete = VisualizationArtifactStore(tmp_path).get(result["visualization_ids"][0])
     assert complete is not None and len(complete.option["yAxis"]) == 1

@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+import statistics
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,7 +21,7 @@ MAX_DEPTH = 20
 MAX_DATASETS = 12
 MAX_SERIES = 12
 MAX_Y_AXES = 2
-ALLOWED_SERIES = {"line", "scatter", "bar"}
+ALLOWED_SERIES = {"line"}
 MARK_KEYS = {"markPoint", "markLine", "markArea"}
 FORBIDDEN_KEYS = {"transform", "renderItem", "javascript", "script", "html", "dom"}
 URL_PATTERN = re.compile(r"(?:https?|ftp|data|javascript):", re.IGNORECASE)
@@ -52,6 +55,7 @@ class EChartsCompiler:
             interpretation=str(plan.interpretation),
         )
         payloads = [self._compile_chart(chart, plan.target_insight_ids, verification) for chart in plan.charts]
+        _validate_nonredundant_charts(plan, payloads)
         covered = {
             target
             for payload in payloads
@@ -116,6 +120,12 @@ class EChartsCompiler:
             raise EChartsValidationError("/xAxis", "at least one x axis is required")
         if not y_axes or len(y_axes) > MAX_Y_AXES:
             raise EChartsValidationError("/yAxis", f"option requires 1-{MAX_Y_AXES} y axes")
+        for index, axis in enumerate(x_axes):
+            if not isinstance(axis, dict):
+                raise EChartsValidationError(f"/xAxis/{index}", "x axis must be an object")
+        for index, axis in enumerate(y_axes):
+            if not isinstance(axis, dict):
+                raise EChartsValidationError(f"/yAxis/{index}", "y axis must be an object")
 
         refs: list[str] = []
         bindings: dict[str, VisualizationBinding] = {}
@@ -123,6 +133,7 @@ class EChartsCompiler:
         table_rows: list[dict[str, Any]] = []
         resolved_datasets: list[dict[str, Any]] = []
         dataset_fields: list[set[str]] = []
+        dataset_field_types: list[dict[str, str]] = []
         dataset_row_counts: list[int] = []
         dataset_ids: dict[str, int] = {}
         for index, dataset in enumerate(datasets):
@@ -152,8 +163,10 @@ class EChartsCompiler:
                 output = {str(key): value for key, value in row.items() if not str(key).startswith("__")}
                 output["bindingId"] = binding_id
                 output_rows.append(output)
-            fields = {str(item["name"]) for item in _schema_fields(output_rows)} | {"bindingId"}
+            schema = _schema_fields(output_rows)
+            fields = {str(item["name"]) for item in schema} | {"bindingId"}
             dataset_fields.append(fields)
+            dataset_field_types.append({str(item["name"]): str(item.get("data_type") or "string") for item in schema})
             dataset_row_counts.append(len(output_rows))
             dataset_id = dataset.get("id")
             if dataset_id is not None:
@@ -168,7 +181,7 @@ class EChartsCompiler:
             table_rows.extend({"source": source.ref, **row} for row in output_rows[:12])
 
         geometries: set[str] = set()
-        has_comparison_series = False
+        has_continuous_series = False
         resolved_series = []
         for index, item in enumerate(series):
             path = f"/series/{index}"
@@ -185,8 +198,15 @@ class EChartsCompiler:
             encode = item.get("encode")
             if not isinstance(encode, dict) or not encode:
                 raise EChartsValidationError(path + "/encode", "dataset-backed series requires encode")
-            _validate_encode(encode, dataset_fields[dataset_index], path + "/encode")
-            has_comparison_series = has_comparison_series or dataset_row_counts[dataset_index] >= 2
+            _validate_encode(
+                encode,
+                dataset_fields[dataset_index],
+                dataset_field_types[dataset_index],
+                path + "/encode",
+                x_axis_type=str(x_axes[item.get("xAxisIndex", 0)].get("type") or "category"),
+            )
+            if dataset_row_counts[dataset_index] >= 2:
+                has_continuous_series = True
             signature = json.dumps(
                 [series_type, dataset_index, encode, item.get("xAxisIndex", 0), item.get("yAxisIndex", 0)],
                 sort_keys=True,
@@ -205,8 +225,18 @@ class EChartsCompiler:
                     target_ids.update(mark_targets)
             resolved_series.append(resolved_item)
 
-        if not has_comparison_series:
-            raise EChartsValidationError("/series", "at least one continuous or comparison series requires two grounded records")
+        if not has_continuous_series:
+            raise EChartsValidationError("/series", "at least one line series requires two grounded records")
+
+        _validate_legend(option.get("legend"), resolved_series)
+        _validate_visual_scales(
+            resolved_series,
+            resolved_datasets,
+            dataset_ids,
+            x_axes,
+            y_axes,
+            y_axes_are_list=isinstance(option.get("yAxis"), list),
+        )
 
         resolved = dict(option)
         resolved["dataset"] = resolved_datasets if isinstance(option.get("dataset"), list) else resolved_datasets[0]
@@ -241,18 +271,44 @@ class EChartsCompiler:
             spec = value["$value"]
             source_ref = str(spec.get("source_ref") or "")
             source = self._resolve_source(source_ref, path + "/$value/source_ref")
+            field = str(spec.get("field") or "")
+            if field.startswith("/"):
+                if spec.get("item_id") is not None or spec.get("record_id") is not None:
+                    raise EChartsValidationError(
+                        path + "/$value/field",
+                        "a JSON Pointer field addresses the unique grounding document and cannot use a record selector",
+                    )
+                resolved_value = _json_pointer_value(
+                    _value_grounding_document(source), field, path + "/$value/field",
+                )
+                if isinstance(resolved_value, (dict, list)):
+                    raise EChartsValidationError(
+                        path + "/$value/field",
+                        f"JSON Pointer '{field}' must resolve to one scalar value",
+                    )
+                binding_id = "value:" + hashlib.sha256(f"{source.ref}:grounding_document".encode()).hexdigest()[:16]
+                binding = _generic_binding(binding_id, source.ref, source.kind, 0)
+                return resolved_value, [source.ref], {binding_id: binding}, _source_insight_ids(source)
             rows, scalar = _source_data(source)
             records = [dict(row) for row in rows] or ([dict(scalar)] if scalar else [])
-            selector = spec.get("item_id") or spec.get("record_id")
-            if selector is not None:
-                records = [row for row in records if str(row.get("item_id") or row.get("record_id") or "") == str(selector)]
+            item_selector = spec.get("item_id")
+            record_selector = spec.get("record_id")
+            if record_selector == "scalar":
+                records = _scalar_records(source)
+            elif item_selector is not None:
+                records = [row for row in records if str(row.get("item_id") or "") == str(item_selector)]
+            elif record_selector is not None:
+                records = [
+                    row for row in records
+                    if str(row.get("item_id") or row.get("record_id") or "") == str(record_selector)
+                ]
             if len(records) != 1:
                 raise EChartsValidationError(path, f"$value source must select exactly one record, found {len(records)}")
-            field = str(spec.get("field") or "")
             if field not in records[0]:
                 raise EChartsValidationError(path + "/$value/field", f"unknown field '{field}' in source '{source.ref}'")
             source_bindings = _projection_bindings(source)
             original = source_bindings.get(str(records[0].get("item_id") or "")) or source_bindings.get("")
+            selector = item_selector or record_selector
             binding_id = "value:" + hashlib.sha256(f"{source.ref}:{selector}".encode()).hexdigest()[:16]
             binding = original.model_copy(update={"binding_id": binding_id}) if original else _generic_binding(
                 binding_id, source.ref, source.kind, 0,
@@ -286,6 +342,47 @@ class EChartsCompiler:
         if source.ref not in set(self.catalog.projection_refs()):
             raise EChartsValidationError(pointer, f"source '{ref}' is not exposed by the Grounded Source Inventory")
         return source
+
+
+def _validate_nonredundant_charts(plan: EChartsPlan, payloads: list[VisualizationPayload]) -> None:
+    if len(payloads) < 2:
+        return
+    primary_index = next(index for index, chart in enumerate(plan.charts) if chart.priority == "primary")
+    primary = payloads[primary_index]
+    primary_geometry = _chart_geometry(primary.option)
+    primary_refs = set(primary.source_refs)
+    for index, payload in enumerate(payloads):
+        if index == primary_index:
+            continue
+        if (
+            _chart_geometry(payload.option) <= primary_geometry
+            and set(payload.source_refs) <= primary_refs
+            and not _chart_has_marks(payload.option)
+        ):
+            raise EChartsValidationError(
+                f"/charts/{index}",
+                "supporting chart is visually redundant with the primary chart; remove it or use distinct grounded data",
+            )
+
+
+def _chart_geometry(option: dict[str, Any]) -> set[str]:
+    result: set[str] = set()
+    for item in _as_list(option.get("series")):
+        if not isinstance(item, dict):
+            continue
+        result.add(json.dumps(
+            [item.get("type"), item.get("datasetId"), item.get("datasetIndex", 0), item.get("encode")],
+            sort_keys=True,
+        ))
+    return result
+
+
+def _chart_has_marks(option: dict[str, Any]) -> bool:
+    return any(
+        any(key in item for key in MARK_KEYS)
+        for item in _as_list(option.get("series"))
+        if isinstance(item, dict)
+    )
 
 
 def _validate_tree(value: Any, path: str, depth: int) -> None:
@@ -352,7 +449,14 @@ def _axis_index(item: dict, key: str, count: int, path: str) -> None:
         raise EChartsValidationError(path + f"/{key}", f"axis index must be between 0 and {count - 1}")
 
 
-def _validate_encode(encode: dict, fields: set[str], path: str) -> None:
+def _validate_encode(
+    encode: dict,
+    fields: set[str],
+    field_types: dict[str, str],
+    path: str,
+    *,
+    x_axis_type: str,
+) -> None:
     selected = []
     for channel, value in encode.items():
         values = value if isinstance(value, list) else [value]
@@ -362,10 +466,241 @@ def _validate_encode(encode: dict, fields: set[str], path: str) -> None:
                     suffix = f"/{_escape(channel)}/{index}" if isinstance(value, list) else f"/{_escape(channel)}"
                     raise EChartsValidationError(path + suffix, f"unknown encoded field '{field}'")
                 selected.append(field)
+                if channel == "y" and field_types.get(field) != "number":
+                    raise EChartsValidationError(path + f"/{_escape(channel)}", f"y field '{field}' must be numeric")
+                if channel == "x" and x_axis_type == "time" and field_types.get(field) not in {"time", "number"}:
+                    raise EChartsValidationError(
+                        path + f"/{_escape(channel)}",
+                        f"x field '{field}' must be temporal or numeric for a time axis",
+                    )
             else:
                 raise EChartsValidationError(path + f"/{_escape(channel)}", "encode values must be grounded field names")
     if not selected:
         raise EChartsValidationError(path, "encode must select grounded fields")
+
+
+def _scalar_records(source) -> list[dict[str, Any]]:
+    if source.kind == "insight":
+        value = source.value.value
+        return [dict(value)] if isinstance(value, dict) else [{"label": source.value.name, "value": value}]
+    if source.kind == "view" and source.value.scalar is not None:
+        return [dict(source.value.scalar)]
+    return []
+
+
+def _value_grounding_document(source) -> dict[str, Any]:
+    """Expose one stable, read-only document for nested grounded Insight values."""
+
+    if source.kind == "insight":
+        insight = source.value
+        locator = {}
+        rows, _scalar = _source_data(source)
+        if len(rows) == 1 and not insight.items:
+            locator = dict(rows[0])
+        return {
+            "source_ref": source.ref,
+            "statement": insight.statement,
+            "value": insight.value,
+            "unit": insight.unit,
+            "time_range": insight.time_range,
+            "dimensions": insight.dimensions,
+            "selection": insight.selection,
+            "calculation_trace": insight.calculation_trace,
+            "items": [_insight_item_document(item) for item in insight.items],
+            "locator": locator or None,
+        }
+    if source.kind == "insight_item":
+        insight, item = source.value
+        return {
+            "source_ref": source.ref,
+            "value": item.value,
+            "unit": insight.unit,
+            "calculation_trace": insight.calculation_trace,
+            "item": _insight_item_document(item),
+        }
+    rows, scalar = _source_data(source)
+    return {
+        "source_ref": source.ref,
+        "rows": rows,
+        "scalar": scalar,
+    }
+
+
+def _insight_item_document(item) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in {
+            "item_id": item.item_id,
+            "value": item.value,
+            "label": item.label,
+            "rank": item.rank,
+            "timestamp": item.timestamp,
+            "source_item_ids": list(item.source_item_ids),
+            **item.dimensions,
+            **item.locator,
+        }.items()
+        if value is not None
+    }
+
+
+def _json_pointer_value(document: Any, pointer: str, error_path: str) -> Any:
+    current = document
+    for raw_token in pointer.split("/")[1:]:
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        if isinstance(current, list):
+            try:
+                index = int(token)
+            except ValueError as exc:
+                raise EChartsValidationError(error_path, f"JSON Pointer '{pointer}' has invalid list index '{token}'") from exc
+            if 0 <= index < len(current):
+                current = current[index]
+                continue
+        raise EChartsValidationError(error_path, f"JSON Pointer '{pointer}' does not exist in source grounding document")
+    return current
+
+
+def _validate_legend(legend: Any, series: list[dict[str, Any]]) -> None:
+    names = {str(item.get("name")) for item in series if item.get("name")}
+    for legend_index, item in enumerate(_as_list(legend)):
+        if not isinstance(item, dict) or "data" not in item:
+            continue
+        data = item.get("data")
+        if not isinstance(data, list):
+            continue
+        for index, entry in enumerate(data):
+            name = entry if isinstance(entry, str) else entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and name not in names:
+                prefix = f"/legend/{legend_index}" if isinstance(legend, list) else "/legend"
+                raise EChartsValidationError(prefix + f"/data/{index}", f"legend entry '{name}' has no matching series")
+
+
+def _validate_visual_scales(
+    series: list[dict[str, Any]],
+    datasets: list[dict[str, Any]],
+    dataset_ids: dict[str, int],
+    x_axes: list[dict[str, Any]],
+    y_axes: list[dict[str, Any]],
+    *,
+    y_axes_are_list: bool,
+) -> None:
+    by_axis: dict[int, list[tuple[int, float]]] = {}
+    for series_index, item in enumerate(series):
+        encode = item.get("encode") if isinstance(item.get("encode"), dict) else {}
+        y_fields = encode.get("y")
+        y_fields = y_fields if isinstance(y_fields, list) else [y_fields]
+        fields = [field for field in y_fields if isinstance(field, str)]
+        if not fields:
+            continue
+        dataset_index = dataset_ids.get(item.get("datasetId"), item.get("datasetIndex", 0))
+        if not isinstance(dataset_index, int) or dataset_index >= len(datasets):
+            continue
+        rows = datasets[dataset_index].get("source")
+        values = []
+        if isinstance(rows, list):
+            values = [
+                float(row[field])
+                for row in rows if isinstance(row, dict)
+                for field in fields
+                if isinstance(row.get(field), (int, float)) and not isinstance(row.get(field), bool)
+            ]
+        if values:
+            if any(not math.isfinite(value) for value in values):
+                raise EChartsValidationError(f"/series/{series_index}/encode/y", "series contains a non-finite y value")
+            series_median = abs(statistics.median(values))
+            nonzero = [abs(value) for value in values if value]
+            robust_center = statistics.median(nonzero) if nonzero else 0.0
+            if len(nonzero) >= 3 and robust_center > 0 and max(nonzero) / robust_center > 100:
+                raise EChartsValidationError(
+                    f"/series/{series_index}/datasetIndex",
+                    "series contains extreme values that make its main range unreadable; use the relevant filtered or cleaned source",
+                )
+            y_axis_index = int(item.get("yAxisIndex", 0))
+            if (
+                item.get("type") == "line"
+                and min(values) > 0
+                and max(values) / min(values) < 10
+                and y_axes[y_axis_index].get("scale") is not True
+            ):
+                prefix = f"/yAxis/{y_axis_index}" if y_axes_are_list else "/yAxis"
+                raise EChartsValidationError(
+                    prefix + "/scale",
+                    "positive line data with a narrow range requires scale=true to avoid an unreadable zero baseline",
+                )
+            by_axis.setdefault(int(item.get("yAxisIndex", 0)), []).append((series_index, series_median))
+            mark_line = item.get("markLine") if isinstance(item.get("markLine"), dict) else {}
+            for mark_index, mark in enumerate(mark_line.get("data") or []):
+                if not isinstance(mark, dict) or not isinstance(mark.get("yAxis"), (int, float)):
+                    continue
+                mark_value = abs(float(mark["yAxis"]))
+                low, high = sorted((series_median, mark_value))
+                if low > 0 and high / low > 4:
+                    raise EChartsValidationError(
+                        f"/series/{series_index}/markLine/data/{mark_index}/yAxis",
+                        "reference value is not visually compatible with the series y scale",
+                    )
+            _validate_mark_coordinates(item, series_index, series_median, x_axes)
+    for items in by_axis.values():
+        positive = [(index, median) for index, median in items if median > 0]
+        if len(positive) < 2:
+            continue
+        low_index, low = min(positive, key=lambda value: value[1])
+        _high_index, high = max(positive, key=lambda value: value[1])
+        if high / low > 4:
+            raise EChartsValidationError(
+                f"/series/{low_index}/yAxisIndex",
+                "series sharing one y axis have incompatible visual scales; remove the unrelated series or use a justified second axis",
+            )
+
+
+def _validate_mark_coordinates(
+    series: dict[str, Any],
+    series_index: int,
+    series_median: float,
+    x_axes: list[dict[str, Any]],
+) -> None:
+    mark_point = series.get("markPoint") if isinstance(series.get("markPoint"), dict) else {}
+    x_axis_index = int(series.get("xAxisIndex", 0))
+    x_axis_type = str(x_axes[x_axis_index].get("type") or "category")
+    for mark_index, mark in enumerate(mark_point.get("data") or []):
+        if not isinstance(mark, dict) or "coord" not in mark:
+            continue
+        symbol = mark.get("symbol", mark_point.get("symbol"))
+        symbol_size = mark.get("symbolSize", mark_point.get("symbolSize"))
+        label = mark.get("label", mark_point.get("label"))
+        style_pointer = f"/series/{series_index}/markPoint/data/{mark_index}"
+        if symbol != "circle":
+            raise EChartsValidationError(style_pointer + "/symbol", "markPoint symbol must be 'circle'")
+        if not isinstance(symbol_size, (int, float)) or isinstance(symbol_size, bool) or not 8 <= symbol_size <= 16:
+            raise EChartsValidationError(style_pointer + "/symbolSize", "markPoint symbolSize must be between 8 and 16")
+        if not isinstance(label, dict) or label.get("show") is not False:
+            raise EChartsValidationError(style_pointer + "/label/show", "markPoint labels must be hidden to prevent overlap")
+        coord = mark.get("coord")
+        pointer = f"/series/{series_index}/markPoint/data/{mark_index}/coord"
+        if not isinstance(coord, list) or len(coord) != 2:
+            raise EChartsValidationError(pointer, "markPoint coord must contain exactly [x, y]")
+        if x_axis_type == "time" and not _is_time_coordinate(coord[0]):
+            raise EChartsValidationError(pointer + "/0", "markPoint x coordinate is not valid for the time axis")
+        if not isinstance(coord[1], (int, float)) or isinstance(coord[1], bool) or not math.isfinite(float(coord[1])):
+            raise EChartsValidationError(pointer + "/1", "markPoint y coordinate must be a finite number")
+        mark_value = abs(float(coord[1]))
+        low, high = sorted((series_median, mark_value))
+        if low > 0 and high / low > 4:
+            raise EChartsValidationError(pointer + "/1", "markPoint y coordinate is not visually compatible with the series y scale")
+
+
+def _is_time_coordinate(value: Any) -> bool:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(float(value))
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_mark_data_grounding(value: Any, path: str) -> None:

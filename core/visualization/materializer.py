@@ -344,6 +344,8 @@ class PresentationCatalog:
                 expanded.add(source.ref)
                 if source.kind == "insight":
                     expanded.update(self._insight_context_refs(source.value, renderable))
+                elif source.kind == "insight_item":
+                    expanded.update(self._insight_context_refs(source.value[0], renderable))
                 continue
             expanded.update(self._views_for_lineage_ref(source.ref, renderable))
             if source.kind == "analysis":
@@ -427,6 +429,7 @@ class PresentationCatalog:
             description = self._source_inventory(source)
             description["preferred_by_caller"] = ref in preferred
             sources.append(description)
+        sources.sort(key=_planner_source_priority)
         return {
             "schema_version": "semantic-source-v1",
             "sources": sources,
@@ -656,6 +659,8 @@ class PresentationCatalog:
                 "insight_key": insight.insight_key, "name": insight.name,
                 "semantic_class": insight.semantic_class, "statement": insight.statement, "value_shape": insight.value_shape,
                 "value": _bounded_value(insight.value),
+                "unit": insight.unit, "time_range": insight.time_range, "dimensions": insight.dimensions,
+                "selection": insight.selection, "calculation_trace": _bounded_value(insight.calculation_trace),
                 "derived_from": insight.derived_from,
                 "evidence_refs": [f"{ref.source_type}:{ref.source_id}" for ref in insight.evidence_refs[:6]],
                 "item_refs": [f"{source.ref}#{item.item_id}" for item in insight.items[:12]],
@@ -687,6 +692,7 @@ class PresentationCatalog:
                 "source_ref": source.ref, "kind": "insight_item", "status": insight.status,
                 "insight_key": insight.insight_key, "insight_name": insight.name,
                 "label": item.label or insight.name, "timestamp": item.timestamp, "value": item.value,
+                "unit": insight.unit, "calculation_trace": _bounded_value(insight.calculation_trace),
                 "item": _bounded_value(_insight_item_row(item)),
                 "schema_fields": fields,
                 "render_capabilities": _render_capabilities(fields, scalar=False),
@@ -1195,6 +1201,23 @@ def _render_contract(value: DataViewValue) -> dict:
         "lower_fields": lower_fields,
         "upper_fields": upper_fields,
     }
+
+
+def _planner_source_priority(source: dict) -> tuple:
+    """Put executable full data before claims so chart planning starts from available geometry."""
+
+    is_view = source.get("kind") == "data_view"
+    semantic = source.get("semantic_contract") if isinstance(source.get("semantic_contract"), dict) else {}
+    transformed = bool(semantic.get("materializes_input_transformation"))
+    point_count = int((source.get("render_contract") or {}).get("point_count") or source.get("row_count") or 0)
+    return (
+        not bool(source.get("preferred_by_caller")),
+        not is_view,
+        not transformed if is_view else True,
+        point_count < 2,
+        -point_count,
+        str(source.get("source_ref") or ""),
+    )
 
 
 def _bounded_presentation_value(value: Any, *, depth: int = 0) -> Any:

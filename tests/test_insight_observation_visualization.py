@@ -116,7 +116,7 @@ def test_collection_insight_preserves_item_identity_for_visualization():
             accessibility_description="Three recent daily observations.",
             option_json=json.dumps({
                 "dataset": {"source": {"$dataset": source_ref}},
-                "xAxis": {"type": "time"}, "yAxis": {"type": "value"},
+                    "xAxis": {"type": "time"}, "yAxis": {"type": "value", "scale": True},
                 "series": {"type": "line", "encode": {"x": "timestamp", "y": "value"}},
             }),
         )],
