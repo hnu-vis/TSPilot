@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
-import { DATABASE_CATALOG, DATABASE_TYPES, databaseTypeLabel } from '../databaseCatalog';
+import { DATABASE_CATALOG, DATABASE_TYPES, databaseCatalogEntry, databaseTypeLabel } from '../databaseCatalog';
 import {
   createDatabase,
   deleteDatabase,
@@ -49,17 +49,7 @@ type PreviewState = {
 
 type FormMode = 'create' | 'edit' | null;
 
-const emptyForm: DatabaseConfigInput = {
-  name: '',
-  type: 'timescaledb',
-  host: '',
-  port: null,
-  database: '',
-  username: '',
-  password: '',
-  display_name: '',
-  ssl_enabled: false,
-};
+const emptyForm = databaseDefaultForm('timescaledb');
 
 export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabase, onDatabasesChange }: Props) {
   const { t } = useI18n();
@@ -159,7 +149,7 @@ export function DatabaseManager({ databases, selectedDatabaseId, onSelectDatabas
   };
 
   const selectDatabaseType = (type: string) => {
-    setFormValue({ ...emptyForm, type });
+    setFormValue(databaseDefaultForm(type));
     setCreateStep('form');
     setActionError(null);
   };
@@ -501,8 +491,20 @@ function DatabaseConfigForm({
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   const { t } = useI18n();
+  const catalogEntry = databaseCatalogEntry(value.type);
+  const extraFields = catalogEntry?.extraFields || [];
   const updateField = <Key extends keyof DatabaseConfigInput>(key: Key, nextValue: DatabaseConfigInput[Key]) => {
     onChange({ ...value, [key]: nextValue });
+  };
+  const updateExtraField = (key: string, nextValue: string | boolean | number | null) => {
+    onChange({ ...value, extra: { ...(value.extra || {}), [key]: nextValue } });
+  };
+  const changeDatabaseType = (type: string) => {
+    onChange({
+      ...databaseDefaultForm(type),
+      name: value.name,
+      display_name: value.display_name,
+    });
   };
 
   return (
@@ -547,7 +549,7 @@ function DatabaseConfigForm({
           {mode === 'create' ? (
             <span className="database-selected-type">{databaseTypeLabel(value.type)}</span>
           ) : (
-            <select value={value.type} onChange={(event) => updateField('type', event.target.value)}>
+            <select value={value.type} onChange={(event) => changeDatabaseType(event.target.value)}>
               {!DATABASE_TYPES.includes(value.type) && (
                 <option value={value.type} disabled>{databaseTypeLabel(value.type)}</option>
               )}
@@ -558,6 +560,7 @@ function DatabaseConfigForm({
         <label>
           <span>{t('Host')}</span>
           <input
+            required
             value={value.host || ''}
             onChange={(event) => updateField('host', event.target.value)}
             placeholder="localhost"
@@ -566,7 +569,8 @@ function DatabaseConfigForm({
         <label>
           <span>{t('Port')}</span>
           <input
-            min={0}
+            required
+            min={1}
             type="number"
             value={value.port ?? ''}
             onChange={(event) => updateField('port', event.target.value ? Number(event.target.value) : null)}
@@ -600,6 +604,49 @@ function DatabaseConfigForm({
           />
         </label>
       </div>
+
+      {extraFields.length > 0 && <section className="database-type-settings" aria-label={t('Database-specific settings')}>
+        <div className="database-type-settings-heading">
+          <strong>{t('Database-specific settings')}</strong>
+          <span>{t('Only settings used by {type} are shown.', { type: databaseTypeLabel(value.type) })}</span>
+        </div>
+        <div className="database-form-grid">
+          {extraFields.map((field) => {
+            const current = value.extra?.[field.key];
+            if (field.input === 'checkbox') {
+              return <label className="database-extra-checkbox" key={field.key}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(current)}
+                  onChange={(event) => updateExtraField(field.key, event.target.checked)}
+                />
+                <span>{t(field.label)}</span>
+              </label>;
+            }
+            return <label key={field.key}>
+              <span>{t(field.label)}</span>
+              {field.input === 'select' ? (
+                <select
+                  required={field.required}
+                  value={String(current ?? '')}
+                  onChange={(event) => updateExtraField(field.key, event.target.value)}
+                >
+                  {(field.options || []).map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
+                </select>
+              ) : (
+                <input
+                  required={field.required && mode === 'create'}
+                  type={field.input}
+                  value={String(current ?? '')}
+                  onChange={(event) => updateExtraField(field.key, event.target.value)}
+                  placeholder={field.secret && mode === 'edit' ? t('Leave blank to keep existing value') : field.placeholder}
+                  autoComplete={field.secret ? 'new-password' : undefined}
+                />
+              )}
+            </label>;
+          })}
+        </div>
+      </section>}
 
       <label className="database-checkbox-row">
         <input
@@ -834,10 +881,27 @@ function databaseToForm(database: DatabaseResource): DatabaseConfigInput {
     password: '',
     display_name: database.display_name || '',
     ssl_enabled: Boolean(database.ssl_enabled),
+    extra: { ...(database.extra || {}) },
   };
 }
 
-function normalizeFormPayload(value: DatabaseConfigInput, mode: FormMode): Partial<DatabaseConfigInput> {
+export function databaseDefaultForm(type: string): DatabaseConfigInput {
+  const defaults = databaseCatalogEntry(type)?.defaults;
+  return {
+    name: '',
+    type,
+    host: defaults?.host || '',
+    port: defaults?.port ?? null,
+    database: defaults?.database || '',
+    username: defaults?.username || '',
+    password: '',
+    display_name: '',
+    ssl_enabled: Boolean(defaults?.ssl_enabled),
+    extra: { ...(defaults?.extra || {}) },
+  };
+}
+
+export function normalizeFormPayload(value: DatabaseConfigInput, mode: FormMode): Partial<DatabaseConfigInput> {
   const payload: Partial<DatabaseConfigInput> = {
     name: value.name.trim(),
     type: value.type.trim(),
@@ -852,6 +916,18 @@ function normalizeFormPayload(value: DatabaseConfigInput, mode: FormMode): Parti
   if (password || mode === 'create') {
     payload.password = password;
   }
+  const secretFields = new Set(
+    (databaseCatalogEntry(value.type)?.extraFields || [])
+      .filter((field) => field.secret)
+      .map((field) => field.key),
+  );
+  const extra = Object.fromEntries(
+    Object.entries(value.extra || {}).filter(([key, raw]) => {
+      if (raw === null || raw === undefined || raw === '') return false;
+      return !(mode === 'edit' && secretFields.has(key) && !String(raw).trim());
+    }),
+  );
+  if (Object.keys(extra).length > 0) payload.extra = extra;
   return payload;
 }
 

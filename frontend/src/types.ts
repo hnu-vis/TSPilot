@@ -270,6 +270,7 @@ export type DatabaseResource = {
   config_source?: string | null;
   username?: string | null;
   ssl_enabled?: boolean;
+  extra?: Record<string, string | boolean | number | null>;
   insight_memory_summary?: {
     definition_count: number;
     recipe_count: number;
@@ -288,6 +289,7 @@ export type DatabaseConfigInput = {
   password?: string | null;
   display_name?: string | null;
   ssl_enabled?: boolean | null;
+  extra?: Record<string, string | boolean | number | null>;
 };
 
 export type DatabaseConnectionTest = {

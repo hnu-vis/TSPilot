@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DATABASE_CATALOG, DATABASE_TYPES } from '../databaseCatalog';
-import { mergeContextRecords } from './DatabaseManager';
+import { databaseDefaultForm, mergeContextRecords, normalizeFormPayload } from './DatabaseManager';
 
 describe('database catalog', () => {
   it('provides one real brand asset for every supported connector', () => {
@@ -40,6 +40,37 @@ describe('database catalog', () => {
       expect(database).not.toHaveProperty('mark');
       expect(database).not.toHaveProperty('hue');
     }
+  });
+
+  it('uses the shared defaults and submits InfluxDB-specific fields', () => {
+    const form = databaseDefaultForm('influxdb');
+    expect(form).toMatchObject({
+      type: 'influxdb',
+      host: 'localhost',
+      port: 8086,
+      extra: { version: '2' },
+    });
+
+    const payload = normalizeFormPayload({
+      ...form,
+      name: 'metrics',
+      extra: { version: '2', org: 'acme', bucket: 'telemetry', token: 'secret' },
+    }, 'create');
+    expect(payload.extra).toEqual({
+      version: '2',
+      org: 'acme',
+      bucket: 'telemetry',
+      token: 'secret',
+    });
+  });
+
+  it('does not erase a stored secret when an edit leaves it blank', () => {
+    const payload = normalizeFormPayload({
+      ...databaseDefaultForm('influxdb3'),
+      name: 'cloud',
+      extra: { token: '' },
+    }, 'edit');
+    expect(payload.extra).toBeUndefined();
   });
 });
 

@@ -2266,6 +2266,47 @@ input:focus-visible {
   font-size: 13px;
 }
 
+.database-type-settings {
+  display: grid;
+  gap: 9px;
+  border-top: 1px solid var(--border);
+  padding-top: 11px;
+}
+
+.database-type-settings-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.database-type-settings-heading strong {
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.database-type-settings-heading span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.database-form-grid .database-extra-checkbox {
+  display: flex;
+  grid-column: 1 / -1;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+}
+
+.database-form-grid .database-extra-checkbox input {
+  width: 15px;
+  min-height: 15px;
+  height: 15px;
+  padding: 0;
+  accent-color: var(--primary-strong);
+}
+
 .database-selected-type {
   display: flex;
   min-height: 34px;
