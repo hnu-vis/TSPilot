@@ -21,9 +21,12 @@ describe('TraceTimeline', () => {
     expect(markup).toContain('aria-label="LLM calls"');
     expect(markup).toContain('aria-current="true"');
     expect(markup).toContain('trace-llm-leaf running selected');
+    expect(markup).toContain('trace-llm-region open');
+    expect(markup).toContain('aria-hidden="false"');
     expect(markup).toContain('aria-label="Collapse execution process"');
     expect(markup).toContain('aria-expanded="true"');
     expect(markup).toContain('aria-controls=');
+    expect(markup).toContain('trace-process-region open');
     expect(markup).toContain('<button');
     expect(markup).not.toContain('qwen');
     expect(markup).not.toContain('gpt-');
@@ -41,8 +44,10 @@ describe('TraceTimeline', () => {
     );
 
     expect(markup).toContain('2 LLM calls');
-    expect(markup).not.toContain('Schema Linking');
-    expect(markup).not.toContain('SQL Generation');
+    expect(markup).toContain('Schema Linking');
+    expect(markup).toContain('SQL Generation');
+    expect(markup).toContain('class="trace-llm-region"');
+    expect(markup).toContain('aria-hidden="true"');
   });
 
   it('labels a policy-rejected proposal without presenting it as an execution success', () => {

@@ -49,8 +49,17 @@ export function TraceTimeline({ steps, selectedId, onSelect, nowMs = Date.now() 
           </span>
         </button>
       </header>
-      <ol id={treeId} className="trace-tree" hidden={isCollapsed}>
-        {visibleSteps.map((step) => {
+      <div
+        id={treeId}
+        className={`trace-process-region ${isCollapsed ? '' : 'open'}`}
+        aria-hidden={isCollapsed}
+        ref={(node) => {
+          if (node) node.inert = isCollapsed;
+        }}
+      >
+        <div className="trace-process-region-inner">
+          <ol className="trace-tree">
+            {visibleSteps.map((step) => {
           const displayStep = toDisplayStep(step);
           const title = step.phase === 'policy_decision' && step.status === 'error'
             ? `${step.tool || t(displayStep.title)} · ${t('Rejected')}`
@@ -105,23 +114,35 @@ export function TraceTimeline({ steps, selectedId, onSelect, nowMs = Date.now() 
                   : <CircleDot size={13} className="trace-open-icon" aria-hidden="true" />}
               </button>
 
-              {calls.length > 0 && isOpen && (
-                <ol className="trace-llm-list" aria-label={t('LLM calls')}>
-                  {calls.map((call) => (
-                    <LLMTraceLeaf
-                      key={call.id}
-                      call={call}
-                      selected={selectedId === call.id}
-                      onSelect={onSelect}
-                      nowMs={nowMs}
-                    />
-                  ))}
-                </ol>
+              {calls.length > 0 && (
+                <div
+                  className={isOpen ? 'trace-llm-region open' : 'trace-llm-region'}
+                  aria-hidden={!isOpen}
+                  ref={(node) => {
+                    if (node) node.inert = !isOpen;
+                  }}
+                >
+                  <div className="trace-llm-region-inner">
+                    <ol className="trace-llm-list" aria-label={t('LLM calls')}>
+                      {calls.map((call) => (
+                        <LLMTraceLeaf
+                          key={call.id}
+                          call={call}
+                          selected={selectedId === call.id}
+                          onSelect={onSelect}
+                          nowMs={nowMs}
+                        />
+                      ))}
+                    </ol>
+                  </div>
+                </div>
               )}
             </li>
           );
-        })}
-      </ol>
+            })}
+          </ol>
+        </div>
+      </div>
     </section>
   );
 }
