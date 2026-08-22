@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as echarts from 'echarts';
 import type { ECharts } from 'echarts';
 import type { Visualization } from '../types';
-import { buildVisualizationOption } from './VisualizationGallery';
+import { withTrustedDisplaySettings } from './VisualizationGallery';
 
 declare global {
   interface Window {
@@ -51,8 +51,7 @@ export function VisualizationAuditPage() {
       instance = echarts.init(chartHost.current, undefined, { renderer: 'canvas' });
       chart.current = instance;
       instance.on('finished', markReady);
-      const compact = chartHost.current.clientWidth < 520;
-      instance.setOption(buildVisualizationOption(visualization, null, compact), { notMerge: true, lazyUpdate: false });
+      instance.setOption(withTrustedDisplaySettings(visualization), { notMerge: true, lazyUpdate: false });
     } catch (error) {
       const renderError = error instanceof Error ? error : new Error(String(error));
       pendingRender.current?.reject(renderError);
