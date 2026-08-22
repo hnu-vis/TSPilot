@@ -201,3 +201,7 @@ See the [documentation index](docs/README.md) for the complete public documentat
 Issues and pull requests are welcome.
 
 Changes to agent behavior, tool contracts, database connectors, or public APIs should keep a clear scope, include relevant tests, and update the corresponding specification documents.
+
+## 📮 Contact
+
+For questions or collaboration, contact [feilv@hnu.edu.cn](mailto:feilv@hnu.edu.cn).
