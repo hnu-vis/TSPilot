@@ -163,7 +163,7 @@ class ReActLoop:
                     "iteration": request_state.iteration,
                     "status": "running",
                     "phase": "reasoning",
-                    "message": "正在理解当前状态并选择下一步工具。",
+                    "message": "Understanding the current state and choosing the next tool.",
                     "placeholder": True,
                     "started_at": decision_started_at,
                     "elapsed_seconds": 0.0,
@@ -184,7 +184,7 @@ class ReActLoop:
                         turn_wait_task,
                         emit_heartbeats=emit_heartbeats,
                         phase="reasoning",
-                        message="正在选择下一步工具。",
+                        message="Choosing the next tool.",
                         iteration=request_state.iteration,
                         trace_events=decision_trace_events,
                     ):
@@ -418,7 +418,7 @@ class ReActLoop:
                         prepare_task,
                         emit_heartbeats=emit_heartbeats,
                         phase=self._phase_for_action(turn.action),
-                        message=f"正在准备 {turn.action}",
+                        message="Preparing tool.",
                         iteration=request_state.iteration,
                         tool=turn.action,
                         trace_events=nested_trace_events,
@@ -450,7 +450,7 @@ class ReActLoop:
                         tool_task,
                         emit_heartbeats=emit_heartbeats,
                         phase=self._phase_for_action(turn.action),
-                        message=f"正在执行 {turn.action}",
+                        message="Executing tool.",
                         iteration=request_state.iteration,
                         tool=turn.action,
                         trace_events=nested_trace_events,
@@ -930,7 +930,7 @@ class ReActLoop:
                     "step": iteration,
                     "id": self._decision_step_event_id(iteration),
                     "title": f"react round {iteration}",
-                    "detail": payload.get("message") or "正在判断下一步。",
+                    "detail": payload.get("message") or "Choosing the next action.",
                     "phase": "reasoning",
                     "placeholder": True,
                     "started_at": payload.get("started_at"),
@@ -1023,7 +1023,7 @@ class ReActLoop:
                     "agent": "data_agent",
                     "status": "complete",
                     "phase": "reasoning",
-                    "message": payload.get("thought") or "正在判断下一步。",
+                    "message": payload.get("thought") or "Choosing the next action.",
                     "iteration": payload.get("iteration"),
                     "thought": payload.get("thought"),
                 },
@@ -1126,7 +1126,7 @@ class ReActLoop:
                     "agent": "data_agent",
                     "status": "complete",
                     "phase": "answer_assembly",
-                    "message": "最终答案已组装完成。",
+                    "message": "Final answer assembled.",
                     "iteration": request_state.iteration,
                 },
             )
@@ -1179,17 +1179,17 @@ class ReActLoop:
 
     def _message_for_action(self, action_name: str) -> str:
         mapping = {
-            "sql_query": "正在查询数据源。",
-            "code_interpreter": "正在执行数据分析。",
-            "visualization": "正在生成完整数据可视化。",
-            "terminate": "正在结束并组装最终回答。",
-            "forecast": "正在执行趋势预测。",
-            "anomaly": "正在检测异常。",
-            "rag": "正在补充外部知识。",
-            "skill": "正在执行预定义技能。",
-            "todowrite": "正在整理任务步骤。",
+            "sql_query": "Querying the data source.",
+            "code_interpreter": "Running data analysis.",
+            "visualization": "Generating the complete visualization.",
+            "terminate": "Assembling the final answer.",
+            "forecast": "Running trend forecast.",
+            "anomaly": "Checking anomalies.",
+            "rag": "Retrieving external knowledge.",
+            "skill": "Running predefined skill.",
+            "todowrite": "Organizing task steps.",
         }
-        return mapping.get(action_name, "正在处理请求。")
+        return mapping.get(action_name, "Processing request.")
 
     def _input_preview(self, action_name: str, action_input: dict) -> dict:
         if not isinstance(action_input, dict):

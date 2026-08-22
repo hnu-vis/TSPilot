@@ -8,5 +8,7 @@ describe('frontend i18n catalog', () => {
     expect(translateUi('zh-CN', 'Delete database connection "{name}"?', { name: 'metrics-prod' }))
       .toBe('删除数据库连接“metrics-prod”？');
     expect(translateUi('zh-CN', '用户输入的 query 保持原样')).toBe('用户输入的 query 保持原样');
+    expect(translateUi('en', 'Querying the data source.')).toBe('Querying the data source.');
+    expect(translateUi('zh-CN', 'Querying the data source.')).toBe('正在查询数据源。');
   });
 });

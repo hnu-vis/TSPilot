@@ -366,6 +366,29 @@ def test_chat_sse_path_returns_event_stream():
     assert sql_generation["parent_id"] == "iteration-1"
 
 
+def test_chat_sse_infrastructure_progress_uses_locale_neutral_message_keys():
+    client = _build_client(FakeLLM())
+    with client.stream(
+        "POST",
+        "/api/v1/chat",
+        json={
+            "message": "Analyze the appliances_energy_wh trend.",
+            "database_context": {
+                "database_id": "influxdb2-energydata",
+                "database_type": "influxdb",
+            },
+            "stream": True,
+        },
+    ) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+
+    assert response.status_code == 200
+    assert "Understanding the current state and choosing the next tool." in body
+    assert "Querying the data source." in body
+    assert "正在选择下一步工具" not in body
+    assert "正在查询数据源" not in body
+
+
 def test_chat_sse_policy_rejection_is_closed_without_a_phantom_tool_call():
     client = _build_client(PolicyRejectedActionLLM(), max_iterations=1)
     with client.stream(

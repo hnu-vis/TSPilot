@@ -95,7 +95,7 @@ export function TraceTimeline({ steps, selectedId, onSelect, nowMs = Date.now() 
                     <strong>{title}</strong>
                     {duration !== null && <time>{duration.toFixed(1)}s</time>}
                   </span>
-                  <small>{displayStep.summary}</small>
+                  <small>{t(displayStep.summary)}</small>
                   {calls.length > 0 && (
                     <span className="trace-call-count">{t('{count} LLM calls', { count: calls.length })}</span>
                   )}
