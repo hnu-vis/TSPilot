@@ -140,7 +140,7 @@ Select a connected database and ask a question in natural language. TSPilot will
 
 ## 🗄️ Database connectivity
 
-TSPilot provides unified access to multiple time-series databases. Databases can be added and tested in the Web interface or maintained as YAML files under `configs/databases/`. Once configured, users can query and analyze data from different sources through a consistent natural-language experience.
+TSPilot provides unified access to 24 time-series database connection types. Databases can be added and tested in the Web interface or maintained as YAML files under `configs/databases/`. Once configured, users can query and analyze data from different sources through a consistent natural-language experience.
 
 <h3 align="center">🔌 Supported databases</h3>
 
