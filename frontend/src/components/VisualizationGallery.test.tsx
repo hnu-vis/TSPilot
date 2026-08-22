@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { Visualization } from '../types';
 import {
+  annotationLegendItems,
   bindingIdFromClickData,
   bindingLocations,
   isRenderableVisualization,
@@ -37,11 +38,45 @@ describe('native ECharts V5 renderer', () => {
     expect(option.aria.description).toBe('Price over time.');
   });
 
+  it('formats UTC time axes with an explicit localized date', () => {
+    const option = withTrustedDisplaySettings(visualization(), 'zh-CN') as Record<string, any>;
+    const formatter = option.xAxis.axisLabel.formatter as (value: number) => string;
+    expect(formatter(Date.UTC(2026, 0, 2, 6, 30))).toBe('01月02日 06:30');
+    expect(option.xAxis.axisLabel.hideOverlap).toBe(true);
+  });
+
   it('finds dataset rows for evidence highlighting and click binding', () => {
     const chart = visualization();
     expect(bindingLocations(chart.option, 'b2')).toEqual([{ seriesIndex: 0, dataIndex: 1 }]);
     expect(bindingIdFromClickData({ value: 12, bindingId: 'b2' })).toBe('b2');
     expect(bindingIdFromClickData([12])).toBeNull();
+  });
+
+  it('builds a deduplicated legend for rendered Insight annotations', () => {
+    const chart = visualization({
+      option: {
+        color: ['#5470c6'],
+        dataset: [{ id: 'prices', source: [] }],
+        xAxis: { type: 'time' }, yAxis: { type: 'value' },
+        series: [{
+          name: 'Price', type: 'line', datasetId: 'prices', encode: { x: 'timestamp', y: 'value' },
+          markPoint: { data: [{ name: 'Monthly low' }, { name: 'Monthly low' }, { name: 'Rebound peak' }] },
+          markArea: { data: [[{ name: 'Rebound interval' }, {}]] },
+          markLine: { data: [{ name: 'Threshold' }] },
+        }],
+      },
+    });
+    expect(annotationLegendItems(chart.option)).toEqual([
+      { kind: 'point', name: 'Monthly low', color: '#5470c6' },
+      { kind: 'point', name: 'Rebound peak', color: '#5470c6' },
+      { kind: 'interval', name: 'Rebound interval', color: '#5470c6' },
+      { kind: 'reference', name: 'Threshold', color: '#5470c6' },
+    ]);
+    const markup = renderToStaticMarkup(<VisualizationGallery
+      visualizations={[chart]} activeBindingId={null} onSelectBinding={() => undefined}
+    />);
+    expect(markup).toContain('answer-annotation-legend');
+    expect(markup.match(/Monthly low/g)).toHaveLength(1);
   });
 
   it('keeps internal binding identifiers out of user-facing evidence detail', () => {

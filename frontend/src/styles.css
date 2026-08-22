@@ -5827,6 +5827,54 @@ details[open] > summary .collapsible-chevron {
   line-height: 1.5;
 }
 
+.answer-annotation-legend {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px 14px;
+  margin: 0;
+  padding: 0;
+  color: var(--muted-strong);
+  font-size: 11px;
+  line-height: 1.35;
+  list-style: none;
+}
+
+.answer-annotation-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.answer-annotation-legend i {
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.answer-annotation-legend i.is-point {
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--annotation-color);
+  border-radius: 50%;
+  background: var(--surface);
+}
+
+.answer-annotation-legend i.is-interval {
+  width: 13px;
+  height: 8px;
+  border: 1px solid var(--annotation-color);
+  background: color-mix(in oklch, var(--annotation-color) 22%, transparent);
+}
+
+.answer-annotation-legend i.is-reference {
+  width: 14px;
+  height: 0;
+  border-top: 2px dashed var(--annotation-color);
+}
+
 .answer-visualization-card-header > span {
   flex: 0 0 auto;
   border: 1px solid var(--border);

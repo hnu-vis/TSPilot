@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import * as echarts from 'echarts';
 import type { ECharts, EChartsOption } from 'echarts';
 import type { Visualization, VisualizationBinding } from '../types';
@@ -82,9 +82,64 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
     <div className="answer-visualization-card-header">
       <div><strong>{sanitizeUserFacingText(visualization.title)}</strong>{visualization.summary && <p>{sanitizeUserFacingText(visualization.summary)}</p>}</div>
     </div>
+    <AnnotationLegend option={visualization.option} />
     <EChartView visualization={visualization} activeBindingId={activeBindingId} onSelectBinding={onSelectBinding} />
     {(visualization.accessibility.table_rows?.length || 0) > 0 && <AccessibleTable visualization={visualization} onSelectBinding={onSelectBinding} />}
   </article>;
+}
+
+export type AnnotationLegendItem = {
+  kind: 'point' | 'interval' | 'reference';
+  name: string;
+  color: string;
+};
+
+export function annotationLegendItems(option: Record<string, unknown>): AnnotationLegendItem[] {
+  const items: AnnotationLegendItem[] = [];
+  const seen = new Set<string>();
+  const colors = asArray(option.color).filter((value): value is string => (
+    typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
+  ));
+  const append = (kind: AnnotationLegendItem['kind'], name: unknown, seriesIndex: number) => {
+    if (typeof name !== 'string' || !name.trim()) return;
+    const safeName = sanitizeUserFacingText(name.trim());
+    const color = colors[seriesIndex % colors.length] || '#5470c6';
+    const key = `${seriesIndex}:${kind}:${safeName}`;
+    if (!safeName || seen.has(key)) return;
+    seen.add(key);
+    items.push({ kind, name: safeName, color });
+  };
+  asArray(option.series).forEach((series, seriesIndex) => {
+    if (!isRecord(series)) return;
+    const markPoint = isRecord(series.markPoint) ? series.markPoint : {};
+    for (const point of asArray(markPoint.data)) {
+      if (isRecord(point)) append('point', point.name, seriesIndex);
+    }
+    const markArea = isRecord(series.markArea) ? series.markArea : {};
+    for (const area of asArray(markArea.data)) {
+      const start = Array.isArray(area) ? area[0] : area;
+      if (isRecord(start)) append('interval', start.name, seriesIndex);
+    }
+    const markLine = isRecord(series.markLine) ? series.markLine : {};
+    for (const reference of asArray(markLine.data)) {
+      if (isRecord(reference)) append('reference', reference.name, seriesIndex);
+    }
+  });
+  return items;
+}
+
+export function AnnotationLegend({ option }: { option: Record<string, unknown> }) {
+  const items = annotationLegendItems(option);
+  if (items.length === 0) return null;
+  return <ul className="answer-annotation-legend" aria-label="Chart annotations">
+    {items.map((item) => <li
+      key={`${item.kind}:${item.name}:${item.color}`}
+      style={{ '--annotation-color': item.color } as CSSProperties}
+    >
+      <i className={`is-${item.kind}`} aria-hidden="true" />
+      <span>{item.name}</span>
+    </li>)}
+  </ul>;
 }
 
 function EChartView({ visualization, activeBindingId, onSelectBinding }: {
@@ -103,7 +158,7 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
     try {
       chart = echarts.init(hostRef.current, undefined, { renderer: 'canvas', locale: locale === 'zh-CN' ? 'ZH' : 'EN' });
       chartRef.current = chart;
-      chart.setOption(withTrustedDisplaySettings(visualization), { notMerge: true, lazyUpdate: false });
+      chart.setOption(withTrustedDisplaySettings(visualization, locale), { notMerge: true, lazyUpdate: false });
       chart.on('click', (params) => {
         const bindingId = bindingIdFromClickData(params.data);
         if (bindingId) onSelectBinding(bindingId);
@@ -132,9 +187,11 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
   return <div ref={hostRef} className="answer-visualization-chart" style={{ height: 380 }} role="img" aria-label={sanitizeUserFacingText(visualization.accessibility.description)} />;
 }
 
-export function withTrustedDisplaySettings(visualization: Visualization): EChartsOption {
+export function withTrustedDisplaySettings(visualization: Visualization, locale: UiLocale = 'en-US'): EChartsOption {
+  const option = visualization.option as EChartsOption;
   return {
-    ...(visualization.option as EChartsOption),
+    ...option,
+    xAxis: withUtcDateAxes(option.xAxis, option.dataset, locale),
     useUTC: true,
     aria: {
       ...((isRecord(visualization.option.aria) ? visualization.option.aria : {}) as Record<string, unknown>),
@@ -142,6 +199,50 @@ export function withTrustedDisplaySettings(visualization: Visualization): EChart
       description: visualization.accessibility.description,
     },
   } as EChartsOption;
+}
+
+function withUtcDateAxes(xAxis: EChartsOption['xAxis'], dataset: EChartsOption['dataset'], locale: UiLocale) {
+  const includeTime = visualizationTimeSpan(dataset) <= 7 * 24 * 60 * 60 * 1000;
+  const axes = asArray(xAxis).map((axis) => {
+    if (!isRecord(axis) || axis.type !== 'time') return axis;
+    return {
+      ...axis,
+      axisLabel: {
+        ...(isRecord(axis.axisLabel) ? axis.axisLabel : {}),
+        hideOverlap: true,
+        formatter: (value: string | number) => formatUtcAxisTick(value, locale, includeTime),
+      },
+    };
+  });
+  return Array.isArray(xAxis) ? axes : axes[0];
+}
+
+function visualizationTimeSpan(dataset: EChartsOption['dataset']): number {
+  const timestamps = asArray(dataset).flatMap((item) => {
+    if (!isRecord(item) || !Array.isArray(item.source)) return [];
+    return item.source.flatMap((row) => {
+      if (!isRecord(row)) return [];
+      return Object.values(row).flatMap((value) => {
+        if (typeof value !== 'string' || !isIsoTimestamp(value)) return [];
+        const timestamp = Date.parse(value);
+        return Number.isFinite(timestamp) ? [timestamp] : [];
+      });
+    });
+  });
+  if (timestamps.length < 2) return Number.POSITIVE_INFINITY;
+  return Math.max(...timestamps) - Math.min(...timestamps);
+}
+
+function formatUtcAxisTick(value: string | number, locale: UiLocale, includeTime: boolean): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value);
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const datePart = locale === 'zh-CN' ? `${month}月${day}日` : `${month}-${day}`;
+  if (!includeTime) return datePart;
+  const hours = String(date.getUTCHours()).padStart(2, '0');
+  const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+  return `${datePart} ${hours}:${minutes}`;
 }
 
 export function bindingLocations(option: Record<string, unknown>, bindingId: string | null) {

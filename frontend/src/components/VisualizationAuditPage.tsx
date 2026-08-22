@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as echarts from 'echarts';
 import type { ECharts } from 'echarts';
 import type { Visualization } from '../types';
-import { withTrustedDisplaySettings } from './VisualizationGallery';
+import { AnnotationLegend, withTrustedDisplaySettings } from './VisualizationGallery';
 
 declare global {
   interface Window {
@@ -51,7 +51,8 @@ export function VisualizationAuditPage() {
       instance = echarts.init(chartHost.current, undefined, { renderer: 'canvas' });
       chart.current = instance;
       instance.on('finished', markReady);
-      instance.setOption(withTrustedDisplaySettings(visualization), { notMerge: true, lazyUpdate: false });
+      const locale = document.documentElement.lang.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US';
+      instance.setOption(withTrustedDisplaySettings(visualization, locale), { notMerge: true, lazyUpdate: false });
     } catch (error) {
       const renderError = error instanceof Error ? error : new Error(String(error));
       pendingRender.current?.reject(renderError);
@@ -77,6 +78,7 @@ export function VisualizationAuditPage() {
               <strong>{visualization.title}</strong>
               {visualization.summary && <p>{visualization.summary}</p>}
             </header>
+            <AnnotationLegend option={visualization.option} />
             <div
               ref={chartHost}
               className="visualization-audit-chart"
