@@ -35,7 +35,6 @@ class DatabaseType(str, Enum):
     PROMETHEUS = "prometheus"
     IOTDB = "iotdb"
     QUESTDB = "questdb"
-    CLICKHOUSE = "clickhouse"
     OPENMLDB = "openmldb"
     VICTORIAMETRICS = "victoriametrics"
     M3DB = "m3db"
@@ -48,21 +47,13 @@ class DatabaseType(str, Enum):
     INFLUXDB3 = "influxdb3"
     GRIDDB = "griddb"
     MACHBASE = "machbase"
-    NSDB = "nsdb"
-    AXIBASE = "axibase"
     OPENGEMINI = "opengemini"
     DB2 = "db2"
-    TIMESTREAM = "timestream"
     RIAK_TS = "riak_ts"
     DOLPHINDB = "dolphindb"
     KDB = "kdb"
-    RAIMADB = "raimadb"
-    EXTREMEDB = "extremedb"
-    ITTIADB = "ittiadb"
-    IRONDB = "irondb"
     BANGDB = "bangdb"
     ARC = "arc"
-    POSTGRESQL = "postgresql"
 
 
 @dataclass
@@ -128,7 +119,7 @@ class DBConnector(ABC):
     @property
     def database_type(self) -> DatabaseType:
         """Return database type."""
-        return DatabaseType.POSTGRESQL
+        raise NotImplementedError("database connector must declare its database_type")
 
     @abstractmethod
     async def connect(self) -> None:

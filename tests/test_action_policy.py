@@ -2506,7 +2506,7 @@ def test_runtime_completes_count_todo_with_explicit_count_table():
     request_state = RequestStateModel(
         request_id="req-policy-count-table",
         message="总共有多少条数据？",
-        database_context=DatabaseContext(database_id="demo", database_type="clickhouse"),
+        database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
         status="running",
         todo_list=[
             {
@@ -2863,7 +2863,7 @@ def test_runtime_completes_timeseries_todo_with_timestamp_value_table():
     request_state = RequestStateModel(
         request_id="req-policy-timeseries-table",
         message="查询时间序列。",
-        database_context=DatabaseContext(database_id="demo", database_type="clickhouse"),
+        database_context=DatabaseContext(database_id="demo", database_type="timescaledb"),
         status="running",
         todo_list=[
             {

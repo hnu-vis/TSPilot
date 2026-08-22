@@ -395,7 +395,7 @@ class PrometheusDialect(DatabaseDialect):
 
 
 class SqlFamilyDialect(DatabaseDialect):
-    def __init__(self, database_types: tuple[str, ...] = ("sql", "postgresql", "timescaledb", "questdb", "clickhouse", "openmldb", "greptimedb", "tdengine", "cnosdb", "arcadedb", "cratedb", "druid", "influxdb3", "griddb", "machbase", "nsdb", "axibase", "opengemini", "db2", "timestream", "riak_ts", "dolphindb", "kdb", "raimadb", "extremedb", "ittiadb", "irondb", "bangdb", "arc")):
+    def __init__(self, database_types: tuple[str, ...] = ("sql", "timescaledb", "questdb", "openmldb", "greptimedb", "tdengine", "cnosdb", "arcadedb", "cratedb", "druid", "influxdb3", "griddb", "machbase", "opengemini", "db2", "riak_ts", "dolphindb", "kdb", "bangdb", "arc")):
         super().__init__(
             database_types=database_types,
             query_language="sql",

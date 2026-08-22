@@ -14,7 +14,14 @@ from pydantic import BaseModel, Field
 from app.deps import get_insight_learning_schedule_store
 from app.settings import get_settings
 from app.model_config import get_model_config_store
-from core.database import DatabaseFactory, metric_list_preview, schema_preview
+from core.database import (
+    DatabaseFactory,
+    database_catalog,
+    metric_list_preview,
+    missing_required_config_fields,
+    public_extra_config,
+    schema_preview,
+)
 from core.key_insight.memory import (
     database_insight_memory_summary,
     memory_cards_view,
@@ -116,10 +123,11 @@ class ModelConnectionTestPayload(BaseModel):
 
 
 def _public_database_config(db_id: str, config: dict) -> dict:
+    db_type = config.get("type") or config.get("db_type") or "unknown"
     return {
         "id": db_id,
         "name": config.get("name") or db_id,
-        "type": config.get("type") or config.get("db_type") or "unknown",
+        "type": db_type,
         "status": config.get("status", "unknown"),
         "host": config.get("host"),
         "port": config.get("port"),
@@ -128,7 +136,15 @@ def _public_database_config(db_id: str, config: dict) -> dict:
         "config_source": config.get("config_source"),
         "username": config.get("username"),
         "ssl_enabled": bool(config.get("ssl_enabled", False)),
+        "extra": public_extra_config(str(db_type), config),
     }
+
+
+@router.get("/database-types")
+async def list_database_types() -> dict:
+    """Return the shared product catalog used by database configuration clients."""
+    catalog = list(database_catalog())
+    return {"database_types": catalog, "total": len(catalog)}
 
 
 @router.get("/databases")
@@ -142,6 +158,7 @@ async def list_database_resources() -> dict:
 async def create_database_resource(payload: DatabaseConfigPayload) -> dict:
     """Create a database connection config."""
     config = _editable_payload_to_config(payload.model_dump(exclude_unset=True))
+    _validate_complete_database_config(config)
     existing = await DatabaseFactory.get_database(str(config["name"]))
     if existing:
         raise HTTPException(status_code=409, detail=f"Database '{config['name']}' already exists.")
@@ -164,6 +181,10 @@ async def get_database_resource(database_id: str) -> dict:
 async def update_database_resource(database_id: str, payload: DatabaseConfigUpdatePayload) -> dict:
     """Update a database connection config."""
     updates = _editable_payload_to_config(payload.model_dump(exclude_unset=True))
+    current = await DatabaseFactory.get_database(database_id)
+    if not current:
+        raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
+    _validate_complete_database_config({**current, **updates})
     saved_config = await DatabaseFactory.update_database(database_id, **updates)
     if not saved_config:
         raise HTTPException(status_code=404, detail=f"Database '{database_id}' was not found.")
@@ -671,3 +692,12 @@ def _editable_payload_to_config(payload: dict) -> dict:
     if "display_name" in config:
         config["display_name"] = str(config["display_name"]).strip() or None
     return config
+
+
+def _validate_complete_database_config(config: dict) -> None:
+    missing = missing_required_config_fields(config)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing required configuration fields for {config.get('type') or 'database'}: {', '.join(missing)}",
+        )

@@ -18,6 +18,7 @@ from .engine import (
 from .schema import schema_preview, metric_list_preview
 from .query_errors import classify_query_error
 from .profile_cache import DEFAULT_PROFILE_TTL_SECONDS, profile_is_fresh, profile_path, read_profile, utc_now_iso, write_profile
+from .catalog import database_catalog, database_catalog_entry, missing_required_config_fields, public_extra_config, supported_database_types
 from .connectors import (
     InfluxDBConnector,
     InfluxDBConfig,
@@ -30,8 +31,6 @@ from .connectors import (
     IoTDBConfig,
     QuestDBConnector,
     QuestDBConfig,
-    ClickHouseConnector,
-    ClickHouseConfig,
     OpenMLDBConnector,
     OpenMLDBConfig,
     VictoriaMetricsConnector,
@@ -56,30 +55,16 @@ from .connectors import (
     GridDBConfig,
     MachbaseConnector,
     MachbaseConfig,
-    NSDbConnector,
-    NSDbConfig,
-    AxibaseConnector,
-    AxibaseConfig,
     OpenGeminiConnector,
     OpenGeminiConfig,
     DB2Connector,
     DB2Config,
-    TimestreamConnector,
-    TimestreamConfig,
     RiakTSConnector,
     RiakTSConfig,
     DolphinDBConnector,
     DolphinDBConfig,
     KdbConnector,
     KdbConfig,
-    RaimaDBConnector,
-    RaimaDBConfig,
-    ExtremeDBConnector,
-    ExtremeDBConfig,
-    ITTIADBConnector,
-    ITTIADBConfig,
-    IRONdbConnector,
-    IRONdbConfig,
     BangDBConnector,
     BangDBConfig,
     ArcConnector,
@@ -112,8 +97,6 @@ class DatabaseFactory:
     _TYPE_ALIASES = {
         "timescale": DatabaseType.TIMESCALEDB.value,
         "timescaledb": DatabaseType.TIMESCALEDB.value,
-        "clickhouse": DatabaseType.CLICKHOUSE.value,
-        "ch": DatabaseType.CLICKHOUSE.value,
     }
 
     @classmethod
@@ -123,7 +106,10 @@ class DatabaseFactory:
             return db_type.value
         normalized = str(db_type or "").strip().lower()
         normalized = cls._TYPE_ALIASES.get(normalized, normalized)
-        return DatabaseType(normalized).value
+        value = DatabaseType(normalized).value
+        if value not in supported_database_types():
+            raise ValueError(f"Unsupported database type: {value}")
+        return value
 
     @classmethod
     async def load_databases(cls) -> None:
@@ -589,7 +575,6 @@ class ConnectorFactory:
         DatabaseType.PROMETHEUS: (PrometheusConnector, PrometheusConfig),
         DatabaseType.IOTDB: (IoTDBConnector, IoTDBConfig),
         DatabaseType.QUESTDB: (QuestDBConnector, QuestDBConfig),
-        DatabaseType.CLICKHOUSE: (ClickHouseConnector, ClickHouseConfig),
         DatabaseType.OPENMLDB: (OpenMLDBConnector, OpenMLDBConfig),
         DatabaseType.VICTORIAMETRICS: (VictoriaMetricsConnector, VictoriaMetricsConfig),
         DatabaseType.M3DB: (M3DBConnector, M3DBConfig),
@@ -602,18 +587,11 @@ class ConnectorFactory:
         DatabaseType.INFLUXDB3: (InfluxDB3Connector, InfluxDB3Config),
         DatabaseType.GRIDDB: (GridDBConnector, GridDBConfig),
         DatabaseType.MACHBASE: (MachbaseConnector, MachbaseConfig),
-        DatabaseType.NSDB: (NSDbConnector, NSDbConfig),
-        DatabaseType.AXIBASE: (AxibaseConnector, AxibaseConfig),
         DatabaseType.OPENGEMINI: (OpenGeminiConnector, OpenGeminiConfig),
         DatabaseType.DB2: (DB2Connector, DB2Config),
-        DatabaseType.TIMESTREAM: (TimestreamConnector, TimestreamConfig),
         DatabaseType.RIAK_TS: (RiakTSConnector, RiakTSConfig),
         DatabaseType.DOLPHINDB: (DolphinDBConnector, DolphinDBConfig),
         DatabaseType.KDB: (KdbConnector, KdbConfig),
-        DatabaseType.RAIMADB: (RaimaDBConnector, RaimaDBConfig),
-        DatabaseType.EXTREMEDB: (ExtremeDBConnector, ExtremeDBConfig),
-        DatabaseType.ITTIADB: (ITTIADBConnector, ITTIADBConfig),
-        DatabaseType.IRONDB: (IRONdbConnector, IRONdbConfig),
         DatabaseType.BANGDB: (BangDBConnector, BangDBConfig),
         DatabaseType.ARC: (ArcConnector, ArcConfig),
     }
@@ -663,6 +641,19 @@ class ConnectorFactory:
         cls._CONNECTORS[db_type] = (connector_class, config_class)
 
 
+def _validate_product_connector_catalog() -> None:
+    catalog_types = set(supported_database_types())
+    enum_types = {item.value for item in DatabaseType}
+    connector_types = {item.value for item in ConnectorFactory._CONNECTORS}
+    if enum_types != catalog_types or connector_types != catalog_types:
+        raise RuntimeError(
+            "database catalog, DatabaseType, and ConnectorFactory must expose the same product-supported types"
+        )
+
+
+_validate_product_connector_catalog()
+
+
 __all__ = [
     "DBConnector",
     "QueryResult",
@@ -684,6 +675,11 @@ __all__ = [
     "MetricMetadata",
     "TableSizeInfo",
     "ConnectorFactory",
+    "database_catalog",
+    "database_catalog_entry",
+    "missing_required_config_fields",
+    "public_extra_config",
+    "supported_database_types",
     "InfluxDBConnector",
     "InfluxDBConfig",
     "TimescaleDBConnector",
