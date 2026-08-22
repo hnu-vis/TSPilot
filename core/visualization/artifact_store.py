@@ -24,16 +24,8 @@ class VisualizationArtifactStore:
     def put(self, visualization: VisualizationPayload) -> VisualizationPayload:
         artifact_id = self._validate_id(visualization.visualization_id)
         data_ref = f"/api/v1/visualizations/{artifact_id}/data"
-        complete_views = []
-        for view in visualization.data_views:
-            complete_views.append(view.model_copy(update={
-                "data_ref": data_ref,
-                "row_count": len(view.records),
-                "time_range": _view_time_range(view),
-            }, deep=True))
         complete = visualization.model_copy(update={
             "data_ref": data_ref,
-            "data_views": complete_views,
         }, deep=True)
         payload = complete.model_dump(mode="json")
         with self._lock:
@@ -54,26 +46,18 @@ class VisualizationArtifactStore:
                 payload = json.loads(target.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return None
-            if not isinstance(payload, dict) or payload.get("schema_version") != "4":
+            if not isinstance(payload, dict) or payload.get("schema_version") != "5":
                 return None
             try:
                 return VisualizationPayload.model_validate(payload)
             except ValidationError:
-                # Old V3 and pre-LineChart V4 artifacts remain on disk but are
-                # intentionally not migrated or interpreted by the new runtime.
+                # Older artifacts remain on disk but are intentionally not
+                # migrated or interpreted by the V5 runtime.
                 return None
 
     def descriptor(self, visualization: VisualizationPayload) -> VisualizationPayload:
-        views = []
-        for view in visualization.data_views:
-            views.append(view.model_copy(update={
-                "data_ref": visualization.data_ref,
-                "row_count": len(view.records),
-                "time_range": _view_time_range(view),
-                "records": [],
-            }, deep=True))
         return visualization.model_copy(update={
-            "data_views": views,
+            "option": _without_dataset_sources(visualization.option),
             "accessibility": visualization.accessibility.model_copy(update={"table_rows": []}),
         }, deep=True)
 
@@ -83,16 +67,11 @@ class VisualizationArtifactStore:
             raise ValueError("invalid visualization artifact id")
         return value
 
-
-def _view_time_range(view) -> dict | None:
-    time_fields = {field.name for field in view.fields if field.data_type == "time"}
-    values = [
-        record.values.get(field)
-        for record in view.records
-        for field in time_fields
-        if record.values.get(field) not in (None, "")
-    ]
-    if not values:
-        return None
-    ordered = sorted(values, key=str)
-    return {"start": ordered[0], "end": ordered[-1]}
+def _without_dataset_sources(option: dict) -> dict:
+    """Preserve native option structure while removing only full record arrays."""
+    clone = json.loads(json.dumps(option, ensure_ascii=False))
+    datasets = clone.get("dataset")
+    for dataset in datasets if isinstance(datasets, list) else ([datasets] if isinstance(datasets, dict) else []):
+        if isinstance(dataset, dict):
+            dataset["source"] = []
+    return clone

@@ -15,10 +15,7 @@ from schemas.visual_verification import VisualizationVerification
 from schemas.visualization import (
     VisualizationAccessibility,
     VisualizationBinding,
-    VisualizationDataView,
-    VisualizationField,
     VisualizationPayload,
-    VisualizationRecord,
 )
 
 

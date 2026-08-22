@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from schemas.action_output import ActionOutput
 from schemas.analysis import AnalysisResult, DerivedEvidence
@@ -65,6 +65,11 @@ class RequestStateModel(BaseModel):
     final_answer_draft: FinalAnswer | None = None
     visualizations: list[VisualizationPayload] = Field(default_factory=list)
 
+    @field_validator("visualizations", mode="before")
+    @classmethod
+    def filter_legacy_visualizations(cls, value):
+        return _v5_only(value)
+
     tool_history: list[ToolCall] = Field(default_factory=list)
     observations: list[ToolObservation] = Field(default_factory=list)
     react_transcript: list[ReActTranscriptStep] = Field(default_factory=list)
@@ -101,7 +106,18 @@ class ConversationStateModel(BaseModel):
     recent_insight_memory: list[KeyInsight] = Field(default_factory=list)
     insight_memory_summary: str | None = None
     recent_visualizations: list[VisualizationPayload] = Field(default_factory=list)
+
+    @field_validator("recent_visualizations", mode="before")
+    @classmethod
+    def filter_legacy_visualizations(cls, value):
+        return _v5_only(value)
     updated_at: str | None = None
     context_budget: dict | None = None
     recent_react_transcript: list[ReActTranscriptStep] = Field(default_factory=list)
     task_contract: TaskContract | None = None
+
+
+def _v5_only(value):
+    if not isinstance(value, list):
+        return value
+    return [item for item in value if not isinstance(item, dict) or item.get("schema_version") in {None, "5"}]

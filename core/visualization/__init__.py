@@ -5,14 +5,14 @@ from core.visualization.materializer import (
     InvalidPresentationLineageError,
     PresentationCatalog,
 )
-from core.visualization.linechart import LineChartCompiler, LineChartValidator
+from core.visualization.echarts import EChartsCompiler, EChartsValidationError
 from core.visualization.artifact_store import VisualizationArtifactStore
 
 __all__ = [
     "InvalidPresentationLineageError",
     "IncompatibleVisualDomainError",
     "PresentationCatalog",
-    "LineChartCompiler",
-    "LineChartValidator",
+    "EChartsCompiler",
+    "EChartsValidationError",
     "VisualizationArtifactStore",
 ]

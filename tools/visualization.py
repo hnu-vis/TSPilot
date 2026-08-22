@@ -1,4 +1,4 @@
-"""Two-stage, LineChart-first visualization tool."""
+"""Single-stage grounded native-ECharts visualization tool."""
 from __future__ import annotations
 
 import asyncio
@@ -9,21 +9,12 @@ from typing import Literal
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.visualization import LineChartCompiler, PresentationCatalog, VisualizationArtifactStore
-from core.visualization.planning_schema import (
-    build_linechart_response_schema,
-    content_line_capability_errors,
-)
+from core.visualization import EChartsCompiler, PresentationCatalog, VisualizationArtifactStore
 from runtime.llm_trace import llm_trace_span
 from runtime.prompt_locale import prompt_locale_instruction
 from runtime.token_usage import record_llm_token_usage
 from runtime.timeout_policy import load_timeout_policy
-from schemas.linechart_plan import (
-    LineChartPlan,
-    StructuredVisualContentPlan,
-    VisualContentPlan,
-    VisualizationEvidenceRequest,
-)
+from schemas.echarts_plan import EChartsPlan, StructuredEChartsPlan, VisualizationEvidenceRequest
 from schemas.state import RequestStateModel
 from schemas.visualization import VisualizationPayload
 from tools.base import BaseTool, StructuredToolError
@@ -47,16 +38,9 @@ class VisualizationResult(BaseModel):
 
 
 class VisualizationTool(BaseTool):
-    """Decide what the user needs to inspect, then compose grounded LineCharts."""
+    """Ask the LLM for native option JSON, then ground and validate it."""
 
-    def __init__(
-        self,
-        *,
-        llm,
-        artifact_store: VisualizationArtifactStore,
-        llm_timeout_seconds: float | None = None,
-        **_ignored,
-    ):
+    def __init__(self, *, llm, artifact_store: VisualizationArtifactStore, llm_timeout_seconds: float | None = None, **_ignored):
         self._llm = llm
         self._artifact_store = artifact_store
         self._llm_timeout_seconds = float(
@@ -68,148 +52,83 @@ class VisualizationTool(BaseTool):
     async def close(self) -> None:
         return None
 
-    async def execute(
-        self,
-        validated_input: VisualizationInput,
-        *,
-        request_state: RequestStateModel,
-        **kwargs,
-    ) -> dict:
-        request = validated_input.model_copy(update={
-            "constraints": _semantic_constraints(validated_input.constraints),
-        })
+    async def execute(self, validated_input: VisualizationInput, *, request_state: RequestStateModel, **kwargs) -> dict:
+        request = validated_input.model_copy(update={"constraints": _semantic_constraints(validated_input.constraints)})
         catalog = PresentationCatalog(request_state)
         preferred, unknown = catalog.expand_preferences(request.source_refs)
         if unknown:
             raise _tool_error(f"unknown visualization source refs: {sorted(unknown)}", stage="source_inventory")
         inventory = catalog.planner_inventory(preferred)
-        target_insight_ids = _requested_insight_ids(request.source_refs, catalog)
-
-        content = None
-        content_repair = None
+        target_ids = _requested_insight_ids(request.source_refs, catalog)
+        repair = None
         for attempt in range(3):
             try:
-                content = await self._plan_content(
-                    request, inventory, target_insight_ids, request_state, content_repair,
-                )
-                if content.required_data_request is not None:
-                    return _dependency_result(_normalize_dependency(content.required_data_request, catalog), request_state)
-                _validate_content_plan(content, inventory, target_insight_ids)
-                break
-            except (StructuredToolError, ValueError) as exc:
-                content_repair = _repair_context("content_planning", attempt, exc)
-        else:
-            return _unavailable_result(
-                "Visual content planning remained invalid after two LLM repair attempts: "
-                + str((content_repair or {}).get("error") or "unknown validation error")
-            )
-        assert content is not None
-
-        repair_context = None
-        for attempt in range(3):
-            try:
-                plan = await self._plan_linechart(request, inventory, content, request_state, repair_context)
+                plan = await self._plan(request, inventory, target_ids, request_state, repair)
                 if plan.required_data_request is not None:
                     return _dependency_result(_normalize_dependency(plan.required_data_request, catalog), request_state)
-                visualizations = LineChartCompiler(catalog).compile(content, plan)
-                descriptors = [self._artifact_store.put(item) for item in visualizations]
-                source_refs = list(dict.fromkeys(ref for item in descriptors for ref in item.source_refs))
+                _validate_plan_targets(plan, target_ids)
+                payloads = EChartsCompiler(catalog).compile(plan)
+                descriptors = [self._artifact_store.put(item) for item in payloads]
+                refs = list(dict.fromkeys(ref for item in descriptors for ref in item.source_refs))
                 return VisualizationResult(
-                    summary=f"Created {len(descriptors)} grounded LineChart artifact(s).",
+                    summary=f"Created {len(descriptors)} grounded native ECharts artifact(s).",
                     visualization_ids=[item.visualization_id for item in descriptors],
                     visualizations=descriptors,
-                    source_refs=source_refs,
+                    source_refs=refs,
                 ).model_dump(mode="json")
             except (StructuredToolError, ValueError) as exc:
-                repair_context = _repair_context("linechart_compilation", attempt, exc)
+                repair = _repair_context(attempt, exc)
         return _unavailable_result(
-            "LineChart composition remained invalid after two LLM repair attempts: "
-            + str((repair_context or {}).get("error") or "unknown validation error")
+            "Native ECharts composition remained invalid after two LLM repair attempts: "
+            + str((repair or {}).get("error") or "unknown validation error")
         )
 
-    async def _plan_content(self, request, inventory, target_ids, request_state, repair) -> VisualContentPlan:
+    async def _plan(self, request, inventory, target_ids, request_state, repair) -> EChartsPlan:
         prompt = prompt_locale_instruction(request_state.response_language) + (
-            "You are the visual-content planner for a LineChart-first analytical system. Decide what a human must see "
-            "to inspect the user's conclusions before choosing chart components. Return exactly one VisualContentPlan. "
-            "Prefer one primary chart with a complete time-series host and place every compatible target Insight with its "
-            "context in that goal. Create a supporting goal only when time domain, measure, or unit incompatibility would "
-            "make one chart misleading. Every content item must use an exact source_ref from the inventory. Include all "
-            "requested target Insight ids and their inspectable context. When returning goals, set required_data_request to "
-            "null; when returning required_data_request, return no goals and no target Insight ids. target_insight_ids must "
-            "contain exactly the requested target Insight ids, and every one must appear in at least one visible content "
-            "item's insight_ids. If that is impossible from the inventory, request the missing source instead. Do not output "
-            "lines, points, axes, fields, colors, "
-            "or renderer options. If a required relationship is not already materialized, return only required_data_request: "
-            "sql_query owns raw observations, code_interpreter owns derived series/calculations, forecast owns forecast output, "
-            "and anomaly owns anomaly output. Never invent a fallback.\n"
-            f"User request: {request.message}\n"
+            "You design one or more complete native Apache ECharts 5 option JSON objects for an analytical answer. "
+            "Return one closed EChartsPlan; put each option inside option_json as a JSON string. Use only line, scatter, "
+            "or bar series and native markPoint, markLine, and markArea. Bind complete records only with "
+            "dataset.source={\"$dataset\":\"EXACT_SOURCE_REF\"}; never emit literal dataset.source or series.data. "
+            "Bind a grounded scalar inside mark data with {\"$value\":{\"source_ref\":\"EXACT_SOURCE_REF\","
+            "\"field\":\"EXACT_FIELD\"}}. Every series must bind a dataset and use encode fields exactly from that "
+            "source schema. Use numeric xAxisIndex/yAxisIndex only when necessary and only for axes that exist. Prefer "
+            "one x axis, one y axis, one complete context line, concise legend names, UTC time axes, non-overlapping labels, "
+            "and exactly the endpoint/interval marks needed to verify the conclusion. Do not duplicate a series to simulate "
+            "points. Do not include transforms, functions, code, HTML, DOM, external assets, URLs, toolbox data views, or "
+            "calculated values. All requested target Insight ids must enter through a $dataset or $value placeholder. "
+            "source_refs are inferred by the compiler and must not be declared. If required values are absent, return only "
+            "required_data_request and let sql_query own raw data, code_interpreter own calculations, forecast own forecasts, "
+            "or anomaly own anomaly detection. Never invent or fall back to a generic chart. Repair errors contain exact JSON "
+            "Pointers; rebuild the complete option and correct those paths. Keep all user-visible chart text in the requested "
+            "response language.\n"
+            f"User visualization request: {request.message}\n"
             f"Original task: {request_state.message}\n"
             f"Requested target Insight ids: {json.dumps(target_ids, ensure_ascii=False)}\n"
-            f"User constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
-            f"Grounded source inventory: {json.dumps(inventory, ensure_ascii=False)}\n"
+            f"Constraints: {json.dumps(request.constraints, ensure_ascii=False)}\n"
+            f"Grounded Source Inventory: {json.dumps(inventory, ensure_ascii=False)}\n"
             f"Validation repair context: {json.dumps(repair, ensure_ascii=False) if repair else 'none'}"
         )
-        structured = await self._invoke_plan(
-            StructuredVisualContentPlan,
-            [("system", prompt), ("user", request.message)],
-            request_state,
-            title="Visual Content Planning",
-            summary="明确用户需要在 LineChart 中观察的内容",
-            source="visualization.content_planning",
-        )
-        return structured.to_runtime()
-
-    async def _plan_linechart(self, request, inventory, content, request_state, repair) -> LineChartPlan:
-        prompt = prompt_locale_instruction(request_state.response_language) + (
-            "You compose complete grounded LineChart plans from an already-fixed VisualContentPlan. Return exactly one "
-            "LineChartPlan. Produce one chart for every content goal and cover every content_id at least once. Each component "
-            "selects exactly one content_id; never output source_ref because the compiler derives its unique source from that "
-            "content item, and never output component_id because the compiler assigns stable component identity. Field values "
-            "are closed enums generated from that content item's real source. Every chart requires one host_line, whose "
-            "closed content enum guarantees that it renders the goal's declared host source with two or more grounded points. "
-            "Use additional lines for contextual or comparison series, point for located "
-            "observations/events, band for true lower/upper uncertainty, interval for grounded start/end ranges, reference_line "
-            "only for a scalar with the same measure and unit as its y axis, and annotation for text or semantically different "
-            "scalars. Prefer one y axis; use a second only when the content requires it and the visual comparison remains honest. "
-            "Enable requested standard interactions. Do not calculate, aggregate, rename sources, invent fields, or add charts. "
-            "If the fixed content cannot be expressed from available fields, return required_data_request instead of a fallback.\n"
-            f"User request: {request.message}\n"
-            f"Visual content plan: {json.dumps(content.model_dump(mode='json'), ensure_ascii=False)}\n"
-            f"Grounded source inventory: {json.dumps(inventory, ensure_ascii=False)}\n"
-            f"Validation repair context: {json.dumps(repair, ensure_ascii=False) if repair else 'none'}"
-        )
-        response_schema = build_linechart_response_schema(content, inventory)
-        structured = await self._invoke_plan(
-            response_schema,
-            [("system", prompt), ("user", request.message)],
-            request_state,
-            title="LineChart Composition",
-            summary="组装 LineChart 组件、字段、坐标轴与交互",
-            source="visualization.linechart_composition",
-        )
-        return structured.to_runtime()
-
-    async def _invoke_plan(self, schema, messages, request_state, *, title, summary, source):
         started = time.perf_counter()
+        messages = [("system", prompt), ("user", request.message)]
         response, content, parsed, error = await _invoke_structured(
             self._llm,
-            schema,
+            StructuredEChartsPlan,
             messages,
             timeout_seconds=self._llm_timeout_seconds,
-            trace_title=title,
-            trace_summary=summary,
+            trace_title="Native ECharts Planning",
+            trace_summary="生成并校验原生 ECharts option",
         )
         record_llm_token_usage(
             request_state,
-            source=source,
+            source="visualization.echarts_planning",
             response=response,
             messages=messages,
             output_text=content,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         if error is not None or parsed is None:
-            raise _tool_error(f"{title} returned an invalid structured plan: {error}", stage=source)
-        return parsed
+            raise _tool_error(f"Native ECharts Planning returned an invalid structured plan: {error}", stage="echarts_planning")
+        return parsed.to_runtime()
 
 
 async def _invoke_structured(llm, schema, messages, *, timeout_seconds, trace_title, trace_summary=None):
@@ -251,34 +170,22 @@ def _requested_insight_ids(refs: list[str], catalog: PresentationCatalog) -> lis
     return list(dict.fromkeys(result))
 
 
-def _validate_content_plan(content: VisualContentPlan, inventory: dict, required_ids: list[str]) -> None:
-    known_refs = {str(item.get("source_ref")) for item in inventory.get("sources", []) if isinstance(item, dict)}
-    used_refs = {item.source_ref for goal in content.goals for item in goal.content} | {goal.host_source_ref for goal in content.goals}
-    unknown = used_refs - known_refs
-    if unknown:
-        raise _tool_error(f"content plan references unknown sources: {sorted(unknown)}", stage="content_validation")
-    missing_targets = set(required_ids) - set(content.target_insight_ids)
-    if missing_targets:
-        raise _tool_error(f"content plan omitted requested Insights: {sorted(missing_targets)}", stage="content_validation")
-    content_targets = {insight_id for goal in content.goals for item in goal.content for insight_id in item.insight_ids}
-    if set(content.target_insight_ids) - content_targets:
-        raise _tool_error("target Insights must be attached to visible content items", stage="content_validation")
-    line_errors = content_line_capability_errors(content, inventory)
-    if line_errors:
+def _validate_plan_targets(plan: EChartsPlan, required_ids: list[str]) -> None:
+    if set(plan.target_insight_ids) != set(required_ids):
         raise _tool_error(
-            "content goals require a line-capable host: " + json.dumps(line_errors, ensure_ascii=False),
-            stage="content_validation",
+            f"/target_insight_ids: expected exactly {required_ids}, received {plan.target_insight_ids}",
+            stage="echarts_validation",
         )
 
 
-def _repair_context(stage: str, attempt: int, exc: Exception) -> dict:
-    diagnostics = getattr(exc, "diagnostics", None)
+def _repair_context(attempt: int, exc: Exception) -> dict:
+    pointer = getattr(exc, "pointer", None)
     return {
-        "stage": stage,
+        "stage": "echarts_compilation",
         "attempt": attempt + 1,
-        "error": str(exc)[:1800],
-        "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
-        "instruction": "Rebuild the complete plan from the closed source contract; do not invent a fallback.",
+        "error": str(exc)[:2400],
+        "json_pointer": pointer,
+        "instruction": "Rebuild the complete native option from grounded placeholders and correct the cited JSON Pointer.",
     }
 
 
@@ -302,7 +209,7 @@ def _dependency_result(requirement: VisualizationEvidenceRequest, request_state:
         break
     return VisualizationResult(
         status="needs_sources",
-        summary="Visualization requires an additional grounded source before LineChart composition.",
+        summary="Visualization requires an additional grounded source before native ECharts composition.",
         required_data_request=requirement,
     ).model_dump(mode="json")
 
@@ -315,11 +222,6 @@ def _dependency_signature(payload: dict) -> str:
         "required_fields": payload.get("required_fields") or [],
         "required_properties": payload.get("required_properties") or [],
         "input_source_refs": payload.get("input_source_refs") or [],
-        "insight_keys": sorted(
-            str(item.get("insight_key") or item.get("name") or "")
-            for item in payload.get("insight_requests") or []
-            if isinstance(item, dict)
-        ),
     }
     return json.dumps(stable, sort_keys=True, default=str)
 
@@ -327,7 +229,7 @@ def _dependency_signature(payload: dict) -> str:
 def _unavailable_result(reason: str) -> dict:
     return VisualizationResult(
         status="unavailable",
-        summary="No LineChart was published because grounded composition did not pass.",
+        summary="No chart was published because grounded native ECharts composition did not pass.",
         unavailable_reason=str(reason),
     ).model_dump(mode="json")
 
@@ -347,7 +249,7 @@ def _tool_error(message: str, *, stage: str) -> StructuredToolError:
         error_type="visualization_planning_error",
         retryable=True,
         diagnostics={"stage": stage},
-        recommended_next_action="Retry visualization with a corrected grounded plan.",
+        recommended_next_action="Retry visualization with a corrected grounded native option.",
     )
 
 
