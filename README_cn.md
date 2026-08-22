@@ -191,7 +191,7 @@ TSPilot 支持统一接入和管理多种时序数据库。数据库可以直接
 |:---:|---|---|
 | 🧭 | 了解系统设计与能力边界 | [系统架构](docs/architecture/system.md) |
 | 🔗 | 接入聊天 API | [聊天 API 契约](docs/contracts/api.md) |
-| 📈 | 了解折线图数据结构 | [可视化契约](docs/contracts/visualization.md) |
+| 📈 | 了解数据和 Insight 如何生成交互式图表 | [可视化说明](docs/contracts/visualization-v5.md) |
 | 🗄️ | 接入时序数据库 | [数据库配置指南](docs/guides/database-configuration.md) |
 
 全部公共文档请参阅[文档索引](docs/README.md)。

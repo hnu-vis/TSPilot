@@ -191,7 +191,7 @@ For setup details, see the [database configuration guide](docs/guides/database-c
 |:---:|---|---|
 | 🧭 | Understand system design and capability boundaries | [System architecture](docs/architecture/system.md) |
 | 🔗 | Integrate with the chat API | [Chat API contract](docs/contracts/api.md) |
-| 📈 | Understand the native ECharts payload | [Visualization contract](docs/contracts/visualization-v5.md) |
+| 📈 | Understand how data and Insights become interactive charts | [Visualization guide](docs/contracts/visualization-v5.md) |
 | 🗄️ | Connect a time-series database | [Database configuration guide](docs/guides/database-configuration.md) |
 
 See the [documentation index](docs/README.md) for the complete public documentation set.

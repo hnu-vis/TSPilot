@@ -27,7 +27,7 @@ the appropriate owner tool and retries visualization with the new observation.
 - `sql_query` discovers schemas, generates read-only queries, and returns database evidence.
 - `code_interpreter` calculates derived analytical results over existing evidence.
 - `forecast` and `anomaly` produce specialized time-series artifacts.
-- `visualization` creates grounded native ECharts V5 artifacts.
+- `visualization` turns existing data and Insights into a grounded interactive chart.
 - `rag` and `skill` provide additional context when required.
 - `format_answer` assembles the terminal response from verified state.
 
@@ -46,9 +46,10 @@ responsible for producing it; visualization does not invent missing data.
 
 ### Presentation
 
-Final answers and visualizations reference authoritative artifacts. Native
-ECharts visualization planning composes options, validates their source
-bindings, and persists the full payload for frontend hydration.
+Final answers and visualizations reference authoritative artifacts.
+Visualization receives concise descriptions of the available data and verified
+Insights, chooses the most useful series and annotations, validates that every
+visual element is supported, and stores the complete chart for frontend use.
 
 ## Core rules
 
@@ -57,7 +58,7 @@ bindings, and persists the full payload for frontend hydration.
 - Database access is read-only in the analytical workflow.
 - Claims and visual components must remain traceable to source artifacts.
 - Missing derived data is requested from the owning tool through `needs_sources`.
-- Visualization planning errors may be repaired by the model; no deterministic substitute chart is generated.
+- Visualization receives one initial planning attempt and two model repair attempts; no deterministic substitute chart is generated.
 - Unsupported historical visualization schemas are isolated instead of migrated at read time.
 - The runtime owns request termination after a final answer or terminal error exists.
 
@@ -74,7 +75,8 @@ bindings, and persists the full payload for frontend hydration.
 
 ## Current scope
 
-TSPilot v0.1 uses one outer data agent. Visualization uses grounded native
-ECharts options and supports primary and, only when necessary, supporting
-charts. Model and database connections are managed from the Web interface or
-local workspace configuration.
+TSPilot v0.1 uses one outer data agent. The current production visualization
+contract creates one primary line chart with one or two compatible series,
+grounded Insight annotations, a visible legend and tooltip, and time-axis zoom.
+Model and database connections are managed from the Web interface or local
+workspace configuration.

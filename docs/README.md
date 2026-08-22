@@ -10,7 +10,7 @@ current architecture, integration contracts, and setup guidance.
 ## Contracts
 
 - [Chat API contract](contracts/api.md) — stable chat request and response boundary.
-- [Native ECharts Visualization V5 contract](contracts/visualization-v5.md) — grounded option validation, persistence, and direct rendering.
+- [Visualization guide](contracts/visualization-v5.md) — how data and Insights become interactive charts, how failures are handled, and how to replay visualization tests.
 
 ## Guides
 
