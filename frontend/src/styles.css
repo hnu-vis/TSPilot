@@ -3829,6 +3829,28 @@ input:focus-visible {
   background: oklch(0.985 0.014 25 / 0.75);
 }
 
+.llm-call-context {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.llm-call-context span:first-child {
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-call-context i {
+  color: var(--border-strong);
+  font-style: normal;
+}
+
 .llm-call-status-icon {
   display: grid;
   width: 22px;
@@ -3902,6 +3924,14 @@ input:focus-visible {
 
 .llm-content-card {
   gap: 8px;
+}
+
+.llm-output-section {
+  border-color: oklch(0.82 0.04 170);
+}
+
+.llm-system-section > summary {
+  background: oklch(0.982 0.003 250);
 }
 
 .llm-content-note,
@@ -4015,6 +4045,83 @@ input:focus-visible {
 .llm-io-grid {
   display: grid;
   gap: 7px;
+}
+
+.llm-advanced-card {
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.llm-advanced-card > summary {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.llm-advanced-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.llm-advanced-card > summary span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.llm-advanced-card > summary small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.llm-advanced-card[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.llm-advanced-card[open] > summary .collapsible-chevron {
+  transform: rotate(180deg);
+}
+
+.llm-advanced-token-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin: 10px 10px 0;
+}
+
+.llm-advanced-token-grid > div {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 7px 8px;
+}
+
+.llm-advanced-token-grid span {
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.llm-advanced-token-grid strong {
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.llm-advanced-card .llm-io-grid {
+  margin: 7px 10px 10px;
 }
 
 .llm-io-panel {

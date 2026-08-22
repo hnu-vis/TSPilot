@@ -58,12 +58,14 @@ describe('InspectorPanel LLM lifecycle', () => {
     );
 
     expect(markup).toContain('ReAct Decision');
-    expect(markup).toContain('Model invocation');
     expect(markup).toContain('2 messages');
-    expect(markup).toContain('8,420');
     expect(markup).toContain('Waiting for output');
+    expect(markup).toContain('System instructions');
+    expect(markup).toContain('Advanced');
     expect(markup).toContain('Choose the next grounded action.');
     expect(markup).toContain('Analyze the selected time series.');
+    expect(markup).not.toContain('8,420');
+    expect(markup).not.toContain('Roles');
     expect(markup).not.toContain('Memory Reranking');
   });
 
@@ -114,13 +116,63 @@ describe('InspectorPanel LLM lifecycle', () => {
 
     expect(markup).toContain('SQL Generation');
     expect(markup).toContain('JSON');
-    expect(markup).toContain('1,106');
     expect(markup).toContain('320');
     expect(markup).toContain('sql_query');
     expect(markup).toContain('Generate SQL for the selected schema.');
     expect(markup).toContain('SELECT time, price FROM btc');
     expect(markup).toContain('Copy output content');
+    expect(markup.indexOf('Output content')).toBeLessThan(markup.indexOf('Input messages'));
+    expect(markup.indexOf('Input messages')).toBeLessThan(markup.indexOf('System instructions'));
+    expect(markup).not.toContain('1,106');
     expect(markup).not.toContain('Validation');
+  });
+
+  it('marks an identical earlier system prompt as reused and keeps it collapsed', () => {
+    const systemPrompt = 'Shared system instructions.';
+    const steps: TraceStep[] = [{
+      id: 'iteration-1',
+      iteration: 1,
+      agent: 'data_agent',
+      phase: 'tool_call',
+      tool: 'sql_query',
+      status: 'complete',
+      summary: 'Completed query calls.',
+      children: [{
+        id: 'llm-first',
+        parentId: 'iteration-1',
+        kind: 'llm',
+        title: 'Schema Linking',
+        status: 'complete',
+        inputPreview: [{ role: 'system', content: systemPrompt }],
+        updatedAt: '2026-08-18T00:00:01Z',
+      }, {
+        id: 'llm-second',
+        parentId: 'iteration-1',
+        kind: 'llm',
+        title: 'SQL Generation',
+        status: 'complete',
+        inputPreview: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'Generate the query.' },
+        ],
+        outputPreview: '{"query":"SELECT 1"}',
+        updatedAt: '2026-08-18T00:00:02Z',
+      }],
+      updatedAt: '2026-08-18T00:00:02Z',
+    }];
+
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        steps={steps}
+        selectedNodeId="llm-second"
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('Reused');
+    expect(markup).toContain('llm-system-section');
+    expect(markup).not.toContain('llm-system-section" open');
   });
 
   it('keeps a just-completed LLM call visible until a newer execution node arrives', () => {
@@ -156,7 +208,7 @@ describe('InspectorPanel LLM lifecycle', () => {
 
     expect(markup).toContain('SQL Generation');
     expect(markup).toContain('JSON');
-    expect(markup).toContain('88');
+    expect(markup).not.toContain('88');
   });
 });
 

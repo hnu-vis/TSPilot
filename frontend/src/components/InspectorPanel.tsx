@@ -1,4 +1,4 @@
-import { Activity, AlertCircle, ArrowRight, Check, CheckCircle2, ChevronDown, Clipboard, Code2, FileText, LineChart, ListChecks, Loader2, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
+import { Activity, AlertCircle, ArrowRight, CheckCircle2, ChevronDown, Clipboard, Code2, FileText, LineChart, ListChecks, Loader2, PanelRightClose, PanelRightOpen, Table2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { MarkdownContent } from './FinalAnswer';
 import { toDisplayStep } from '../lib/traceDisplay';
@@ -72,7 +72,7 @@ export function InspectorPanel({ steps, selectedNodeId, answer, collapsed, onTog
 
       <div className="inspector-body">
         {selection?.kind === 'step' && displayStep && <StepDetail step={displayStep} />}
-        {selection?.kind === 'llm' && <LLMCallDetail selection={selection} />}
+        {selection?.kind === 'llm' && <LLMCallDetail selection={selection} steps={steps} />}
         {!selection && answer?.references && answer.references.length > 0 && (
           <ReferenceList answer={answer} />
         )}
@@ -179,13 +179,16 @@ function ReactStepCard({ step }: { step: ReturnType<typeof toDisplayStep> }) {
   );
 }
 
-function LLMCallDetail({ selection }: { selection: Extract<InspectorSelection, { kind: 'llm' }> }) {
+function LLMCallDetail({ selection, steps }: {
+  selection: Extract<InspectorSelection, { kind: 'llm' }>;
+  steps: TraceStep[];
+}) {
   const { t } = useI18n();
   const { call, parent, stepIndex } = selection;
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (call.status !== 'running') return;
-    const interval = window.setInterval(() => setNowMs(Date.now()), 250);
+    const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(interval);
   }, [call.status]);
   const duration = elapsedSecondsForTrace(call, nowMs);
@@ -195,58 +198,32 @@ function LLMCallDetail({ selection }: { selection: Extract<InspectorSelection, {
   const parentTitle = parent.phase === 'reasoning' && !parent.tool
     ? t('ReAct decision')
     : parent.tool || t(parentDisplay.title);
+  const inputMessages = call.inputPreview || [];
+  const primaryInputMessages = inputMessages.filter((message) => message.role.toLowerCase() !== 'system');
+  const systemMessages = inputMessages.filter((message) => message.role.toLowerCase() === 'system');
+  const hasPrimaryMetrics = duration !== null || call.tokenUsage?.totalTokens !== undefined;
+  const hasTokenBreakdown = call.tokenUsage?.inputTokens !== undefined || call.tokenUsage?.outputTokens !== undefined;
+  const hasInputSummary = input?.messageCount !== undefined || Boolean(input?.multimodalPartCount);
+  const hasOutputSummary = Boolean(output?.format) || Boolean(output?.multimodalPartCount) || call.status === 'running';
+  const hasAdvanced = hasTokenBreakdown || hasInputSummary || hasOutputSummary;
   return (
     <div className="llm-call-detail" aria-live="polite">
       <section className={`inspector-card llm-call-overview ${call.status}`}>
-        <div className="inspector-card-title">
-          <span className="llm-call-status-icon" aria-hidden="true">
-            {call.status === 'running'
-              ? <Loader2 className="spin" size={14} />
-              : call.status === 'error'
-                ? <AlertCircle size={14} />
-                : <Check size={14} />}
-          </span>
-          <h3>{t('Model invocation')}</h3>
-          <span className={`status-line compact ${call.status}`}>{t(statusLabel(call.status))}</span>
+        <div className="llm-call-context">
+          <span>{parentTitle}</span>
+          <i aria-hidden="true">/</i>
+          <span>{t('Step')} {stepIndex + 1}</span>
         </div>
-        {call.summary && <p className="llm-call-summary">{t(call.summary)}</p>}
-        <div className="llm-call-metrics">
-          <LLMMetric label={t('Duration')} value={duration === null ? '—' : `${duration.toFixed(1)}s`} />
-          <LLMMetric label={t('Input tokens')} value={formatCount(call.tokenUsage?.inputTokens)} />
-          <LLMMetric label={t('Output tokens')} value={formatCount(call.tokenUsage?.outputTokens)} />
-          <LLMMetric label={t('Total tokens')} value={formatCount(call.tokenUsage?.totalTokens)} />
-        </div>
+        {hasPrimaryMetrics && <div className="llm-call-metrics">
+          {duration !== null && <LLMMetric label={t('Duration')} value={`${duration.toFixed(1)}s`} />}
+          {call.tokenUsage?.totalTokens !== undefined && <LLMMetric label={t('Total tokens')} value={formatCount(call.tokenUsage.totalTokens)} />}
+        </div>}
         {call.error && <p className="llm-call-failure"><AlertCircle size={13} /> {call.error}</p>}
       </section>
 
       <section className="inspector-card llm-content-card">
-        <div className="inspector-card-title">
-          <FileText size={16} />
-          <h3>{t('Call content')}</h3>
-        </div>
-        <p className="llm-content-note">{t('Text is bounded for display; binary and data URL payloads are omitted.')}</p>
-        {call.inputPreview?.length ? (
-          <details className="llm-content-section" open>
-            <summary>
-              <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Input messages')}</span>
-              <small>{call.inputPreview.length}</small>
-            </summary>
-            <div className="llm-message-list">
-              {call.inputPreview.map((message, index) => (
-                <LLMContentBlock
-                  key={`${message.role}-${index}`}
-                  label={message.role}
-                  content={message.content}
-                  copyLabel={t('Copy input message')}
-                />
-              ))}
-            </div>
-          </details>
-        ) : (
-          <p className="llm-content-empty">{t('No input content was captured.')}</p>
-        )}
         {call.outputPreview ? (
-          <details className="llm-content-section" open>
+          <details className="llm-content-section llm-output-section" open>
             <summary>
               <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Output content')}</span>
               <small>{call.outputSummary?.format ? formatLabel(call.outputSummary.format) : t('Text')}</small>
@@ -265,43 +242,93 @@ function LLMCallDetail({ selection }: { selection: Extract<InspectorSelection, {
         ) : (
           <p className="llm-content-empty">{t('No output content was captured.')}</p>
         )}
+
+        {primaryInputMessages.length > 0 && (
+          <details className="llm-content-section llm-primary-input-section" open>
+            <summary>
+              <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Input messages')}</span>
+              <small>{primaryInputMessages.length}</small>
+            </summary>
+            <div className="llm-message-list">
+              {primaryInputMessages.map((message, index) => (
+                <LLMContentBlock
+                  key={`${message.role}-${index}`}
+                  label={message.role}
+                  content={message.content}
+                  copyLabel={t('Copy input message')}
+                />
+              ))}
+            </div>
+          </details>
+        )}
+
+        {systemMessages.length > 0 && (
+          <details className="llm-content-section llm-system-section">
+            <summary>
+              <span><ChevronDown size={14} className="collapsible-chevron" /> {t('System instructions')}</span>
+              <small>{systemMessages.every((message) => isRepeatedSystemMessage(steps, selection, message.content)) ? t('Reused') : systemMessages.length}</small>
+            </summary>
+            <div className="llm-message-list">
+              {systemMessages.map((message, index) => (
+                <LLMContentBlock
+                  key={`${message.role}-${index}`}
+                  label={isRepeatedSystemMessage(steps, selection, message.content) ? `${message.role} · ${t('Reused')}` : message.role}
+                  content={message.content}
+                  copyLabel={t('Copy input message')}
+                />
+              ))}
+            </div>
+          </details>
+        )}
+
+        {inputMessages.length === 0 && <p className="llm-content-empty">{t('No input content was captured.')}</p>}
       </section>
 
-      <section className="inspector-card llm-io-card">
-        <div className="inspector-card-title">
-          <Activity size={16} />
-          <h3>{t('Invocation I/O')}</h3>
-        </div>
+      {hasAdvanced && <details className="inspector-card llm-advanced-card">
+        <summary>
+          <span><ChevronDown size={14} className="collapsible-chevron" /> {t('Advanced')}</span>
+          <small>{input?.messageCount === undefined ? '' : t('{count} messages', { count: input.messageCount })}</small>
+        </summary>
+        {hasTokenBreakdown && <div className="llm-advanced-token-grid">
+          {call.tokenUsage?.inputTokens !== undefined && <LLMMetric label={t('Input tokens')} value={formatCount(call.tokenUsage.inputTokens)} />}
+          {call.tokenUsage?.outputTokens !== undefined && <LLMMetric label={t('Output tokens')} value={formatCount(call.tokenUsage.outputTokens)} />}
+        </div>}
         <div className="llm-io-grid">
-          <div className="llm-io-panel">
+          {hasInputSummary && <div className="llm-io-panel">
             <span>{t('Input summary')}</span>
             <strong>{input?.messageCount === undefined ? '—' : t('{count} messages', { count: input.messageCount })}</strong>
-            <dl>
-              <LLMSummaryRow label={t('Characters')} value={formatCount(input?.characterCount)} />
-              <LLMSummaryRow label={t('Roles')} value={input?.roles?.length ? input.roles.join(' · ') : '—'} />
+            {Boolean(input?.multimodalPartCount) && <dl>
               <LLMSummaryRow label={t('Multimodal parts')} value={formatCount(input?.multimodalPartCount)} />
-            </dl>
-          </div>
-          <div className="llm-io-panel">
+            </dl>}
+          </div>}
+          {hasOutputSummary && <div className="llm-io-panel">
             <span>{t('Output summary')}</span>
             <strong>{output?.format ? t(formatLabel(output.format)) : call.status === 'running' ? t('Waiting for output') : '—'}</strong>
-            <dl>
-              <LLMSummaryRow label={t('Characters')} value={formatCount(output?.characterCount)} />
+            {Boolean(output?.multimodalPartCount) && <dl>
               <LLMSummaryRow label={t('Multimodal parts')} value={formatCount(output?.multimodalPartCount)} />
-            </dl>
-          </div>
+            </dl>}
+          </div>}
         </div>
-      </section>
-
-      <section className="inspector-card llm-parent-card">
-        <div>
-          <span>{t('Parent step')}</span>
-          <strong>{parentTitle}</strong>
-        </div>
-        <span>{t('Step')} {stepIndex + 1}</span>
-      </section>
+      </details>}
     </div>
   );
+}
+
+function isRepeatedSystemMessage(
+  steps: TraceStep[],
+  selection: Extract<InspectorSelection, { kind: 'llm' }>,
+  content: string,
+): boolean {
+  for (let stepIndex = 0; stepIndex <= selection.stepIndex; stepIndex += 1) {
+    const calls = steps[stepIndex].children || [];
+    const lastCallIndex = stepIndex === selection.stepIndex ? selection.callIndex - 1 : calls.length - 1;
+    for (let callIndex = 0; callIndex <= lastCallIndex; callIndex += 1) {
+      if ((calls[callIndex].inputPreview || []).some((message) => (
+        message.role.toLowerCase() === 'system' && message.content === content
+      ))) return true;
+    }
+  }
+  return false;
 }
 
 function LLMContentBlock({ label, content, copyLabel }: { label: string; content: string; copyLabel: string }) {
