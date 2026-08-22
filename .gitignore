@@ -20,6 +20,16 @@ dist/
 *.egg-info/
 cache_data/
 
+# Generated visualization, browser, and test artifacts.
+/artifacts/
+/coverage/
+/frontend/coverage/
+/htmlcov/
+/playwright-report/
+/test-results/
+.coverage
+.coverage.*
+
 .env
 .env.*
 
