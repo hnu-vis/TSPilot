@@ -34,7 +34,7 @@
 
 ## 📣 Updates
 
-- **August 21, 2026:** TSPilot v0.1 officially released 🎉🎉.
+- **August 23, 2026:** TSPilot v0.1 officially released 🎉🎉.
 
 ## 🧭 Why TSPilot
 
