@@ -23,7 +23,7 @@
 
 <p align="center">
   <a href="#-updates">Updates</a>&nbsp;&nbsp;•&nbsp;&nbsp;
-  <a href="#-product-interface">Product interface</a>&nbsp;&nbsp;•&nbsp;&nbsp;
+  <a href="#-product-demo">Product demo</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-core-capabilities">Core capabilities</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-quick-start">Quick start</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-database-connectivity">Database connectivity</a>&nbsp;&nbsp;•&nbsp;&nbsp;
@@ -44,16 +44,13 @@ TSPilot connects **natural-language interaction** with **time-series querying, a
 
 The artifacts and insights created during one analysis can be **reused in later questions**, allowing an investigation to continue naturally instead of starting from scratch.
 
-## 🖥️ Product interface
+## 🎬 Product demo
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <a href="tspilot-page.png"><img src="tspilot-page.png" alt="TSPilot time-series data interaction interface" width="1200"></a><br>
-      <sub>Connect time-series data, ask questions, and continue an analysis in one workspace · Click to view full size</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <video src="video-en.mov" controls width="1200" title="Product demo"></video><br>
+  <sub>Connect time-series data, ask questions, and continue an analysis in one workspace</sub><br>
+  <a href="video-en.mov">▶ Watch the demo</a>
+</p>
 
 <!-- <p align="center">
   <code>Connect</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>Ask</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>Analyze</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>Verify</code>

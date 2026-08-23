@@ -23,7 +23,7 @@
 
 <p align="center">
   <a href="#-最新动态">最新动态</a>&nbsp;&nbsp;•&nbsp;&nbsp;
-  <a href="#-产品界面">产品界面</a>&nbsp;&nbsp;•&nbsp;&nbsp;
+  <a href="#-产品演示">产品演示</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-核心能力">核心能力</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-快速开始">快速开始</a>&nbsp;&nbsp;•&nbsp;&nbsp;
   <a href="#-数据库接入">数据库接入</a>&nbsp;&nbsp;•&nbsp;&nbsp;
@@ -44,16 +44,13 @@ TSPilot 将**自然语言交互**与**时序数据查询、分析和可视化**�
 
 分析过程中产生的分析结论可以**在后续问题中继续复用**，让一次分析自然延伸为连续、深入的数据探索。
 
-## 🖥️ 产品界面
+## 🎬 产品演示
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <a href="tspilot-page.png"><img src="tspilot-page.png" alt="TSPilot 时序数据交互界面" width="1200"></a><br>
-      <sub>通过统一界面连接时序数据，发起查询并完成连续的数据分析 · 点击查看大图</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <video src="video-zh.mov" controls width="1200" title="产品演示"></video><br>
+  <sub>通过统一界面连接时序数据，发起查询并完成连续的数据分析</sub><br>
+  <a href="video-zh.mov">▶ 观看演示</a>
+</p>
 
 <!-- <p align="center">
   <code>连接</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>提问</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>分析</code>&nbsp;&nbsp;→&nbsp;&nbsp;<code>验证</code>
