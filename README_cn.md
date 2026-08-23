@@ -47,9 +47,7 @@ TSPilot 将**自然语言交互**与**时序数据查询、分析和可视化**�
 ## 🎬 产品演示
 
 <p align="center">
-  <video src="video-zh.mov" controls width="1200" title="产品演示"></video><br>
-  <sub>通过统一界面连接时序数据，发起查询并完成连续的数据分析</sub><br>
-  <a href="video-zh.mov">▶ 观看演示</a>
+  <img src="video-zh.gif" alt="产品演示" width="1200">
 </p>
 
 <!-- <p align="center">

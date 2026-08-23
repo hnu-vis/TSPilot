@@ -41,6 +41,7 @@ cache_data/
 .vscode/
 .idea/
 .DS_Store
+*.mov
 
 *.local.md
 notes/

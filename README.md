@@ -47,9 +47,7 @@ The artifacts and insights created during one analysis can be **reused in later 
 ## 🎬 Product demo
 
 <p align="center">
-  <video src="video-en.mov" controls width="1200" title="Product demo"></video><br>
-  <sub>Connect time-series data, ask questions, and continue an analysis in one workspace</sub><br>
-  <a href="video-en.mov">▶ Watch the demo</a>
+  <img src="video-en.gif" alt="Product demo" width="1200">
 </p>
 
 <!-- <p align="center">
