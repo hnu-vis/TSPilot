@@ -39,6 +39,7 @@ class VisualizationPayload(BaseModel):
     priority: Literal["primary", "supporting"] = "primary"
     title: str
     summary: str | None = None
+    warnings: list[str] = Field(default_factory=list)
     verification: VisualizationVerification | None = None
     option: dict[str, Any]
     source_refs: list[str] = Field(default_factory=list)

@@ -4,10 +4,10 @@ schema_version: "1"
 # therefore be larger than the longest individual Tool budget.
 runtime:
   request_deadline_seconds: 600
-  agent_turn_seconds: 45
+  agent_turn_seconds: 90
 
 services:
-  llm_transport_seconds: 60
+  llm_transport_seconds: 120
   embedding_request_seconds: 30
 
 tools:
@@ -24,9 +24,9 @@ tools:
       query_seconds: 60
 
   code_interpreter:
-    execution_seconds: 180
+    execution_seconds: 360
     stages:
-      llm_call_seconds: 30
+      llm_call_seconds: 90
       sandbox_seconds: 120
 
   forecast:
@@ -43,9 +43,9 @@ tools:
   visualization:
     execution_seconds: 300
     stages:
-      llm_call_seconds: 60
-      browser_navigation_seconds: 20
-      browser_render_seconds: 10
+      llm_call_seconds: 120
+      browser_navigation_seconds: 30
+      browser_render_seconds: 30
 
   rag:
     execution_seconds: 30

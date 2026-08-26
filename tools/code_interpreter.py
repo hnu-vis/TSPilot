@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import re
@@ -196,6 +197,7 @@ class CodeInterpreterTool(BaseTool):
                 preflight_error = _preflight_analysis_code(
                     code,
                     require_grounded_computation=generated_code,
+                    input_row_count=max(len(rows), len(points)),
                 )
                 if preflight_error:
                     raise AnalysisCodeError(preflight_error)
@@ -265,7 +267,7 @@ class CodeInterpreterTool(BaseTool):
                     requests=validated_input.insight_requests,
                     context=context,
                     response_language=response_language,
-                    repair_context={"validation_error": str(exc), "rejected_code": code},
+                    repair_context=_analysis_repair_context(str(exc), code),
                 )
         result = AnalysisResult(
             analysis_id=analysis_id,
@@ -407,6 +409,11 @@ class CodeInterpreterTool(BaseTool):
             "and schema fields as the planning interface; the complete referenced records exist only in the runtime variables above. "
             "Do not call globals, locals, vars, eval, exec, compile, __import__, getattr, setattr, or any introspection helper. "
             "Do not use try/except/raise; inspect the documented inputs directly with ordinary conditionals. "
+            "Choose algorithm complexity in proportion to the supplied source shapes. Prefer pandas/numpy vectorization, "
+            "sorting, groupby/rolling operations, or a single linear scan for large inputs. Pair/triple enumeration is "
+            "acceptable only for demonstrably small bounded inputs; do not use nested data-dependent loops when their "
+            "projected work is large. For peak/valley or interval searches over large series, use prefix/suffix extrema "
+            "or an equivalent linear-time algorithm. "
             "Do not access network, processes, environment variables, or clocks. All computed values must be produced by the Python program from the "
             "provided sandbox inputs. Generated code must read at least one grounded "
             "data input (for example df, rows, points, sources, source_by_ref, input_insights, or analysis_context); never hardcode computed answers or merely copy "
@@ -740,6 +747,7 @@ def _preflight_analysis_code(
     code: str | None,
     *,
     require_grounded_computation: bool = False,
+    input_row_count: int | None = None,
 ) -> str | None:
     try:
         prepared = prepare_analysis_code(str(code or ""))
@@ -764,7 +772,77 @@ def _preflight_analysis_code(
                 "generated analysis code must compute from grounded sandbox inputs; "
                 "hardcoded result literals are not accepted"
             )
+        complexity_error = _generated_complexity_error(
+            prepared.code,
+            input_row_count=input_row_count,
+        )
+        if complexity_error:
+            return complexity_error
     return None
+
+
+def _analysis_repair_context(error: str, rejected_code: str) -> dict:
+    """Give code repair an explicit optimization contract after sandbox timeouts."""
+
+    context = {"validation_error": error, "rejected_code": rejected_code}
+    normalized = error.casefold()
+    if "sandbox timeout" in normalized or ("exceeded" in normalized and "timeout" in normalized):
+        context.update({
+            "failure_type": "sandbox_timeout",
+            "required_repair": (
+                "Replace the algorithm; do not merely reformat or make small edits to the rejected code. "
+                "Use vectorized pandas/numpy operations, sorting plus prefix/suffix extrema, or one linear scan. "
+                "The replacement must be O(n log n) or better and must not enumerate observation pairs/triples "
+                "or contain nested data-dependent loops."
+            ),
+            "forbidden_patterns": [
+                "nested data-dependent loops",
+                "all-pairs enumeration",
+                "all-triples enumeration",
+                "retrying the same algorithm with cosmetic changes",
+            ],
+        })
+    return context
+
+
+_MAX_PROJECTED_LOOP_ITERATIONS = 10_000_000_000
+
+
+def _generated_complexity_error(code: str, *, input_row_count: int | None) -> str | None:
+    """Reject nested iteration only when the actual input size makes it unsafe."""
+
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError:
+        return None  # Syntax diagnostics are owned by the shared code policy.
+
+    if input_row_count is None or input_row_count <= 0:
+        return None
+
+    depth = _maximum_iteration_depth(tree)
+    if depth < 2:
+        return None
+    projected = input_row_count ** depth
+    if projected >= _MAX_PROJECTED_LOOP_ITERATIONS:
+        return (
+            f"generated analysis code has iteration depth {depth} over {input_row_count} input records "
+            f"(projected work about {projected:,} iterations), exceeding the safe preflight budget of "
+            f"{_MAX_PROJECTED_LOOP_ITERATIONS:,}; rewrite it with vectorized pandas/numpy operations, "
+            "sorting with prefix/suffix extrema, or a lower-complexity scan"
+        )
+    return None
+
+
+def _maximum_iteration_depth(tree: ast.AST) -> int:
+    def visit(node: ast.AST, depth: int) -> int:
+        if isinstance(node, (ast.For, ast.While, ast.comprehension)):
+            depth += 1
+        maximum = depth
+        for child in ast.iter_child_nodes(node):
+            maximum = max(maximum, visit(child, depth))
+        return maximum
+
+    return visit(tree, 0)
 
 
 def _authoritative_anomaly_usage_error(

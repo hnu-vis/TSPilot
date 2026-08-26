@@ -310,6 +310,7 @@ const zhCN: Record<string, string> = {
   'Unable to remove external model.': '无法移除外部模型。',
   'Unable to load chart data.': '无法加载图表数据。',
   'Unable to render this visualization.': '该可视化暂时无法显示。',
+  'This series contains extreme values; the main range may appear compressed on the linear y-axis.': '该序列包含极端值；在线性纵轴上，主要数值区间可能会显得被压缩。',
   '{count} saved visualizations cannot be displayed because the data schema is no longer supported.': '有 {count} 个已保存的可视化无法显示，因为其数据模式已不再受支持。',
   'Loading complete visualization data…': '正在加载完整可视化数据…',
   'Linked evidence': '关联证据',

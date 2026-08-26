@@ -79,6 +79,7 @@ export type Visualization = {
   priority: 'primary' | 'supporting';
   title: string;
   summary?: string | null;
+  warnings?: string[];
   verification?: {
     target_insight_ids?: string[];
     verification_question: string;

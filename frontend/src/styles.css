@@ -5450,6 +5450,19 @@ details[open] > summary .collapsible-chevron {
   margin-bottom: 0;
 }
 
+.answer-conclusion-details {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid oklch(0.86 0.025 165);
+  padding-top: 9px;
+}
+
+.answer-conclusion-details .answer-markdown-summary p {
+  font-size: 14px;
+  font-weight: 560;
+  line-height: 1.6;
+}
+
 .answer-markdown {
   display: grid;
   min-width: 0;
@@ -6020,6 +6033,16 @@ details[open] > summary .collapsible-chevron {
   line-height: 1.5;
 }
 
+.answer-visualization-warning {
+  min-width: 0;
+  margin: 0;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .answer-annotation-legend {
   display: flex;
   min-width: 0;
@@ -6036,10 +6059,30 @@ details[open] > summary .collapsible-chevron {
 }
 
 .answer-annotation-legend li {
+  min-width: 0;
+}
+
+.answer-annotation-legend button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  border: 0;
+  background: transparent;
+  padding: 2px 3px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.answer-annotation-legend button:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.answer-annotation-legend li.is-hidden button {
+  opacity: 0.42;
+  text-decoration: line-through;
 }
 
 .answer-annotation-legend i {
@@ -6047,12 +6090,18 @@ details[open] > summary .collapsible-chevron {
   flex: 0 0 auto;
 }
 
+.answer-annotation-legend i.is-series {
+  width: 14px;
+  height: 0;
+  border-top: 2px solid var(--annotation-color);
+}
+
 .answer-annotation-legend i.is-point {
   width: 8px;
   height: 8px;
   border: 2px solid var(--annotation-color);
   border-radius: 50%;
-  background: var(--surface);
+  background: var(--annotation-color);
 }
 
 .answer-annotation-legend i.is-interval {

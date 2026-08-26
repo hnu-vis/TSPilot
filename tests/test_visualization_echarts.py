@@ -453,13 +453,15 @@ def test_compiler_rejects_unmatched_legend_and_incompatible_shared_scale():
         EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))
 
 
-def test_compiler_rejects_unreadable_internal_outlier_scale_and_wrong_time_field():
+def test_compiler_preserves_finite_extreme_values_and_rejects_wrong_time_field():
     state = _state()
     state.database_evidence_artifacts["evi_prices"].data["rows"][0]["value"] = 1_000_000.0
     option = _option()
-    with pytest.raises(EChartsValidationError, match="filtered or cleaned source") as outlier_error:
-        EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))
-    assert outlier_error.value.pointer == "/series/0/datasetIndex"
+    payload = EChartsCompiler(PresentationCatalog(state)).compile(_plan(option))[0]
+    assert payload.option["dataset"][0]["source"][0]["value"] == 1_000_000.0
+    assert payload.warnings == [
+        "This series contains extreme values; the main range may appear compressed on the linear y-axis."
+    ]
 
     option = _option()
     option["series"][0]["encode"]["x"] = "bindingId"
@@ -566,7 +568,8 @@ async def test_tool_repairs_unknown_typed_field_using_precise_pointer_and_publis
     complete = VisualizationArtifactStore(tmp_path).get(result["visualization_ids"][0])
     assert complete is not None and complete.option["yAxis"] == {"type": "value", "scale": True, "name": "USD"}
     assert "title" not in complete.option
-    assert complete.option["legend"] == {"show": True, "top": 4, "data": ["Price"]}
+    assert complete.option["legend"] == {"show": False, "data": ["Price"]}
+    assert complete.option["series"][0]["markPoint"]["itemStyle"] == {"color": "#ee6666"}
     assert complete.option["tooltip"] == {"show": True, "trigger": "axis"}
     assert complete.option["dataZoom"] == [
         {"type": "inside", "xAxisIndex": 0},

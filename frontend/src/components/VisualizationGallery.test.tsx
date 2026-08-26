@@ -30,12 +30,44 @@ export function visualization(overrides: Partial<Visualization> = {}): Visualiza
 
 describe('native ECharts V5 renderer', () => {
   it('passes native chart semantics through and adds only trusted display settings', () => {
-    const chart = visualization();
+    const chart = visualization({ option: {
+      ...visualization().option,
+      legend: { show: true, data: ['Price'] },
+      series: [{
+        name: 'Price', type: 'line', datasetId: 'prices', encode: { x: 'timestamp', y: 'value' },
+        markPoint: { data: [{ name: 'Peak' }] },
+        markArea: { data: [[{ name: 'Interval' }, {}]] },
+      }],
+    } });
     const option = withTrustedDisplaySettings(chart) as Record<string, any>;
     expect(option.dataset).toBe(chart.option.dataset);
-    expect(option.series).toBe(chart.option.series);
+    expect(option.legend.show).toBe(false);
+    expect(option.series[0].markPoint.itemStyle.color).toBe('#ee6666');
+    expect(option.series[0].markArea.itemStyle).toMatchObject({ color: '#91cc75', opacity: 0.2 });
     expect(option.useUTC).toBe(true);
     expect(option.aria.description).toBe('Price over time.');
+  });
+
+  it('applies interactive external legend visibility to series and annotations', () => {
+    const chart = visualization({ option: {
+      ...visualization().option,
+      legend: { show: true, data: ['Price'] },
+      series: [{
+        name: 'Price', type: 'line', datasetId: 'prices', encode: { x: 'timestamp', y: 'value' },
+        markPoint: { data: [{ name: 'Peak' }] },
+        markArea: { data: [[{ name: 'Interval' }, {}]] },
+        markLine: { data: [{ name: 'Average' }] },
+      }],
+    } });
+    const option = withTrustedDisplaySettings(
+      chart,
+      'en',
+      new Set(['series:Price', 'point:Peak', 'interval:Interval', 'reference:Average']),
+    ) as Record<string, any>;
+    expect(option.legend.selected.Price).toBe(false);
+    expect(option.series[0].markPoint.data).toEqual([]);
+    expect(option.series[0].markArea.data).toEqual([]);
+    expect(option.series[0].markLine.data).toEqual([]);
   });
 
   it('formats UTC time axes with an explicit localized date', () => {
@@ -67,10 +99,11 @@ describe('native ECharts V5 renderer', () => {
       },
     });
     expect(annotationLegendItems(chart.option)).toEqual([
-      { kind: 'point', name: 'Monthly low', color: '#5470c6' },
-      { kind: 'point', name: 'Rebound peak', color: '#5470c6' },
-      { kind: 'interval', name: 'Rebound interval', color: '#5470c6' },
-      { kind: 'reference', name: 'Threshold', color: '#5470c6' },
+      { kind: 'series', name: 'Price', color: '#5470c6' },
+      { kind: 'point', name: 'Monthly low', color: '#ee6666' },
+      { kind: 'point', name: 'Rebound peak', color: '#ee6666' },
+      { kind: 'interval', name: 'Rebound interval', color: '#91cc75' },
+      { kind: 'reference', name: 'Threshold', color: '#fac858' },
     ]);
     const markup = renderToStaticMarkup(<VisualizationGallery
       visualizations={[chart]} activeBindingId={null} onSelectBinding={() => undefined}

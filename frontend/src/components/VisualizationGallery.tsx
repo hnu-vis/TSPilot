@@ -13,6 +13,10 @@ type GalleryProps = {
   onSelectBinding: (bindingId: string) => void;
 };
 
+const ANNOTATION_POINT_COLOR = '#ee6666';
+const ANNOTATION_INTERVAL_COLOR = '#91cc75';
+const ANNOTATION_REFERENCE_COLOR = '#fac858';
+
 export function VisualizationGallery({ visualizations, activeBindingId, onSelectBinding }: GalleryProps) {
   const { t } = useI18n();
   const [loaded, setLoaded] = useState<Record<string, Visualization>>({});
@@ -78,18 +82,31 @@ function VisualizationCard({ visualization, activeBindingId, onSelectBinding }: 
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
 }) {
+  const { t } = useI18n();
+  const [hiddenLegendItems, setHiddenLegendItems] = useState<Set<string>>(new Set());
+  const toggleLegendItem = (item: AnnotationLegendItem) => {
+    const key = legendItemKey(item.kind, item.name);
+    setHiddenLegendItems((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
   return <article className={`answer-visualization-card is-${visualization.priority}`}>
     <div className="answer-visualization-card-header">
-      <div><strong>{sanitizeUserFacingText(visualization.title)}</strong>{visualization.summary && <p>{sanitizeUserFacingText(visualization.summary)}</p>}</div>
+      <div><strong>{sanitizeUserFacingText(visualization.title)}</strong></div>
     </div>
-    <AnnotationLegend option={visualization.option} />
-    <EChartView visualization={visualization} activeBindingId={activeBindingId} onSelectBinding={onSelectBinding} />
+    {(visualization.warnings || []).map((warning) => (
+      <p className="answer-visualization-warning" key={warning}>{t(warning)}</p>
+    ))}
+    <AnnotationLegend option={visualization.option} hiddenItems={hiddenLegendItems} onToggle={toggleLegendItem} />
+    <EChartView visualization={visualization} hiddenLegendItems={hiddenLegendItems} activeBindingId={activeBindingId} onSelectBinding={onSelectBinding} />
     {(visualization.accessibility.table_rows?.length || 0) > 0 && <AccessibleTable visualization={visualization} onSelectBinding={onSelectBinding} />}
   </article>;
 }
 
 export type AnnotationLegendItem = {
-  kind: 'point' | 'interval' | 'reference';
+  kind: 'series' | 'point' | 'interval' | 'reference';
   name: string;
   color: string;
 };
@@ -100,50 +117,72 @@ export function annotationLegendItems(option: Record<string, unknown>): Annotati
   const colors = asArray(option.color).filter((value): value is string => (
     typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
   ));
-  const append = (kind: AnnotationLegendItem['kind'], name: unknown, seriesIndex: number) => {
+  const append = (kind: AnnotationLegendItem['kind'], name: unknown, color: string) => {
     if (typeof name !== 'string' || !name.trim()) return;
     const safeName = sanitizeUserFacingText(name.trim());
-    const color = colors[seriesIndex % colors.length] || '#5470c6';
-    const key = `${seriesIndex}:${kind}:${safeName}`;
+    const key = `${kind}:${safeName}:${color}`;
     if (!safeName || seen.has(key)) return;
     seen.add(key);
     items.push({ kind, name: safeName, color });
   };
   asArray(option.series).forEach((series, seriesIndex) => {
     if (!isRecord(series)) return;
+    const seriesStyle = isRecord(series.itemStyle) ? series.itemStyle : {};
+    const seriesColor = typeof seriesStyle.color === 'string'
+      ? seriesStyle.color
+      : colors[seriesIndex % colors.length] || '#5470c6';
+    append('series', series.name, seriesColor);
     const markPoint = isRecord(series.markPoint) ? series.markPoint : {};
+    const pointStyle = isRecord(markPoint.itemStyle) ? markPoint.itemStyle : {};
+    const pointColor = typeof pointStyle.color === 'string' ? pointStyle.color : ANNOTATION_POINT_COLOR;
     for (const point of asArray(markPoint.data)) {
-      if (isRecord(point)) append('point', point.name, seriesIndex);
+      if (isRecord(point)) append('point', point.name, pointColor);
     }
     const markArea = isRecord(series.markArea) ? series.markArea : {};
+    const areaStyle = isRecord(markArea.itemStyle) ? markArea.itemStyle : {};
+    const areaColor = typeof areaStyle.color === 'string' ? areaStyle.color : ANNOTATION_INTERVAL_COLOR;
     for (const area of asArray(markArea.data)) {
       const start = Array.isArray(area) ? area[0] : area;
-      if (isRecord(start)) append('interval', start.name, seriesIndex);
+      if (isRecord(start)) append('interval', start.name, areaColor);
     }
     const markLine = isRecord(series.markLine) ? series.markLine : {};
+    const lineStyle = isRecord(markLine.lineStyle) ? markLine.lineStyle : {};
+    const lineColor = typeof lineStyle.color === 'string' ? lineStyle.color : ANNOTATION_REFERENCE_COLOR;
     for (const reference of asArray(markLine.data)) {
-      if (isRecord(reference)) append('reference', reference.name, seriesIndex);
+      if (isRecord(reference)) append('reference', reference.name, lineColor);
     }
   });
   return items;
 }
 
-export function AnnotationLegend({ option }: { option: Record<string, unknown> }) {
+function legendItemKey(kind: AnnotationLegendItem['kind'], name: string): string {
+  return `${kind}:${sanitizeUserFacingText(name)}`;
+}
+
+export function AnnotationLegend({ option, hiddenItems = new Set(), onToggle }: {
+  option: Record<string, unknown>;
+  hiddenItems?: Set<string>;
+  onToggle?: (item: AnnotationLegendItem) => void;
+}) {
   const items = annotationLegendItems(option);
   if (items.length === 0) return null;
   return <ul className="answer-annotation-legend" aria-label="Chart annotations">
     {items.map((item) => <li
       key={`${item.kind}:${item.name}:${item.color}`}
+      className={hiddenItems.has(legendItemKey(item.kind, item.name)) ? 'is-hidden' : undefined}
       style={{ '--annotation-color': item.color } as CSSProperties}
     >
-      <i className={`is-${item.kind}`} aria-hidden="true" />
-      <span>{item.name}</span>
+      <button type="button" aria-pressed={!hiddenItems.has(legendItemKey(item.kind, item.name))} onClick={() => onToggle?.(item)}>
+        <i className={`is-${item.kind}`} aria-hidden="true" />
+        <span>{item.name}</span>
+      </button>
     </li>)}
   </ul>;
 }
 
-function EChartView({ visualization, activeBindingId, onSelectBinding }: {
+function EChartView({ visualization, hiddenLegendItems, activeBindingId, onSelectBinding }: {
   visualization: Visualization;
+  hiddenLegendItems: Set<string>;
   activeBindingId: string | null;
   onSelectBinding: (bindingId: string) => void;
 }) {
@@ -177,6 +216,16 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
+    const visibleOption = withTrustedDisplaySettings(visualization, locale, hiddenLegendItems) as Record<string, unknown>;
+    chart.setOption(
+      { legend: visibleOption.legend, series: visibleOption.series },
+      { notMerge: false, lazyUpdate: false },
+    );
+  }, [visualization, locale, hiddenLegendItems]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
     chart.dispatchAction({ type: 'downplay', seriesIndex: 'all' });
     for (const location of bindingLocations(visualization.option, activeBindingId)) {
       chart.dispatchAction({ type: 'highlight', ...location });
@@ -187,10 +236,16 @@ function EChartView({ visualization, activeBindingId, onSelectBinding }: {
   return <div ref={hostRef} className="answer-visualization-chart" style={{ height: 380 }} role="img" aria-label={sanitizeUserFacingText(visualization.accessibility.description)} />;
 }
 
-export function withTrustedDisplaySettings(visualization: Visualization, locale: UiLocale = 'en-US'): EChartsOption {
+export function withTrustedDisplaySettings(
+  visualization: Visualization,
+  locale: UiLocale = 'en',
+  hiddenLegendItems: Set<string> = new Set(),
+): EChartsOption {
   const option = visualization.option as EChartsOption;
   return {
     ...option,
+    legend: withHiddenNativeLegend(option.legend, hiddenLegendItems),
+    series: withTrustedAnnotationStyles(option.series, hiddenLegendItems),
     xAxis: withUtcDateAxes(option.xAxis, option.dataset, locale),
     useUTC: true,
     aria: {
@@ -199,6 +254,50 @@ export function withTrustedDisplaySettings(visualization: Visualization, locale:
       description: visualization.accessibility.description,
     },
   } as EChartsOption;
+}
+
+function withHiddenNativeLegend(legend: EChartsOption['legend'], hiddenItems: Set<string>): EChartsOption['legend'] {
+  const selected = Object.fromEntries(
+    [...hiddenItems].filter((key) => key.startsWith('series:')).map((key) => [key.slice(7), false]),
+  );
+  const legends = asArray(legend).map((item) => isRecord(item) ? { ...item, show: false, selected } : item);
+  return Array.isArray(legend) ? legends : legends[0];
+}
+
+function withTrustedAnnotationStyles(series: EChartsOption['series'], hiddenItems: Set<string>): EChartsOption['series'] {
+  const normalized = asArray(series).map((item) => {
+    if (!isRecord(item)) return item;
+    const markPoint = isRecord(item.markPoint) ? {
+      ...item.markPoint,
+      itemStyle: { color: ANNOTATION_POINT_COLOR, ...(isRecord(item.markPoint.itemStyle) ? item.markPoint.itemStyle : {}) },
+      data: asArray(item.markPoint.data).filter((mark) => !isRecord(mark)
+        || !hiddenItems.has(legendItemKey('point', String(mark.name || '')))),
+    } : item.markPoint;
+    const markArea = isRecord(item.markArea) ? {
+      ...item.markArea,
+      itemStyle: {
+        color: ANNOTATION_INTERVAL_COLOR,
+        opacity: 0.2,
+        ...(isRecord(item.markArea.itemStyle) ? item.markArea.itemStyle : {}),
+      },
+      data: asArray(item.markArea.data).filter((area) => {
+        const start = Array.isArray(area) ? area[0] : area;
+        return !isRecord(start) || !hiddenItems.has(legendItemKey('interval', String(start.name || '')));
+      }),
+    } : item.markArea;
+    const markLine = isRecord(item.markLine) ? {
+      ...item.markLine,
+      lineStyle: {
+        color: ANNOTATION_REFERENCE_COLOR,
+        type: 'dashed',
+        ...(isRecord(item.markLine.lineStyle) ? item.markLine.lineStyle : {}),
+      },
+      data: asArray(item.markLine.data).filter((mark) => !isRecord(mark)
+        || !hiddenItems.has(legendItemKey('reference', String(mark.name || '')))),
+    } : item.markLine;
+    return { ...item, markPoint, markArea, markLine };
+  });
+  return Array.isArray(series) ? normalized as EChartsOption['series'] : normalized[0] as EChartsOption['series'];
 }
 
 function withUtcDateAxes(xAxis: EChartsOption['xAxis'], dataset: EChartsOption['dataset'], locale: UiLocale) {

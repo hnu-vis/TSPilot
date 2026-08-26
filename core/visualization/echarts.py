@@ -22,6 +22,9 @@ MAX_DATASETS = 12
 MAX_SERIES = 12
 MAX_Y_AXES = 2
 ALLOWED_SERIES = {"line"}
+ANNOTATION_POINT_COLOR = "#ee6666"
+ANNOTATION_INTERVAL_COLOR = "#91cc75"
+ANNOTATION_REFERENCE_COLOR = "#fac858"
 MARK_KEYS = {"markPoint", "markLine", "markArea"}
 FORBIDDEN_KEYS = {"transform", "renderItem", "javascript", "script", "html", "dom"}
 URL_PATTERN = re.compile(r"(?:https?|ftp|data|javascript):", re.IGNORECASE)
@@ -42,6 +45,7 @@ class _Resolution:
     bindings: dict[str, VisualizationBinding]
     target_ids: set[str]
     table_rows: list[dict[str, Any]]
+    warnings: list[str]
 
 
 class EChartsCompiler:
@@ -83,6 +87,7 @@ class EChartsCompiler:
             priority=chart.priority,
             title=chart.title,
             summary=chart.summary,
+            warnings=resolution.warnings,
             verification=verification,
             option=resolution.option,
             source_refs=resolution.source_refs,
@@ -141,7 +146,8 @@ class EChartsCompiler:
                 f"/point_annotations/{index}",
             )
             mark = item.setdefault("markPoint", {
-                "symbol": "circle", "symbolSize": 12, "label": {"show": False}, "data": [],
+                "symbol": "circle", "symbolSize": 12, "label": {"show": False},
+                "itemStyle": {"color": ANNOTATION_POINT_COLOR}, "data": [],
             })
             mark["data"].append({
                 "name": annotation.name,
@@ -159,7 +165,11 @@ class EChartsCompiler:
                 f"/interval_annotations/{index}",
                 require_same_source=False,
             )
-            mark = item.setdefault("markArea", {"label": {"show": False}, "data": []})
+            mark = item.setdefault("markArea", {
+                "label": {"show": False},
+                "itemStyle": {"color": ANNOTATION_INTERVAL_COLOR, "opacity": 0.2},
+                "data": [],
+            })
             mark["data"].append([
                 {"name": annotation.name, "xAxis": start_value},
                 {"xAxis": end_value},
@@ -167,7 +177,8 @@ class EChartsCompiler:
         for index, annotation in enumerate(chart.reference_lines):
             item = target(annotation.series_id, f"/reference_lines/{index}/series_id")
             mark = item.setdefault("markLine", {
-                "symbol": "none", "label": {"position": "insideEndTop"}, "data": [],
+                "symbol": "none", "label": {"position": "insideEndTop"},
+                "lineStyle": {"color": ANNOTATION_REFERENCE_COLOR, "type": "dashed"}, "data": [],
             })
             resolved_value, _candidate = self._typed_value_placeholder(annotation.value)
             mark["data"].append({"name": annotation.name, "yAxis": resolved_value})
@@ -175,7 +186,7 @@ class EChartsCompiler:
         option: dict[str, Any] = {
             "useUTC": True,
             "color": ["#5470c6", "#91cc75"],
-            "legend": {"show": True, "top": 4, "data": [item["name"] for item in rendered_series]},
+            "legend": {"show": False, "data": [item["name"] for item in rendered_series]},
             "tooltip": {"show": True, "trigger": "axis"},
             "grid": {"left": 64, "right": 28, "top": 44, "bottom": 84},
             "dataZoom": [
@@ -350,7 +361,7 @@ class EChartsCompiler:
             raise EChartsValidationError("/series", "at least one line series requires two grounded records")
 
         _validate_legend(option.get("legend"), resolved_series)
-        _validate_visual_scales(
+        warnings = _validate_visual_scales(
             resolved_series,
             resolved_datasets,
             dataset_ids,
@@ -362,7 +373,7 @@ class EChartsCompiler:
         resolved = dict(option)
         resolved["dataset"] = resolved_datasets if isinstance(option.get("dataset"), list) else resolved_datasets[0]
         resolved["series"] = resolved_series if isinstance(option.get("series"), list) else resolved_series[0]
-        return _Resolution(resolved, list(dict.fromkeys(refs)), bindings, target_ids, table_rows)
+        return _Resolution(resolved, list(dict.fromkeys(refs)), bindings, target_ids, table_rows, warnings)
 
     def _resolve_mark(self, value: Any, path: str, mark_key: str):
         if not isinstance(value, dict):
@@ -776,7 +787,8 @@ def _validate_visual_scales(
     y_axes: list[dict[str, Any]],
     *,
     y_axes_are_list: bool,
-) -> None:
+) -> list[str]:
+    warnings: list[str] = []
     by_axis: dict[int, list[tuple[int, float]]] = {}
     for series_index, item in enumerate(series):
         encode = item.get("encode") if isinstance(item.get("encode"), dict) else {}
@@ -804,9 +816,8 @@ def _validate_visual_scales(
             nonzero = [abs(value) for value in values if value]
             robust_center = statistics.median(nonzero) if nonzero else 0.0
             if len(nonzero) >= 3 and robust_center > 0 and max(nonzero) / robust_center > 100:
-                raise EChartsValidationError(
-                    f"/series/{series_index}/datasetIndex",
-                    "series contains extreme values that make its main range unreadable; use the relevant filtered or cleaned source",
+                warnings.append(
+                    "This series contains extreme values; the main range may appear compressed on the linear y-axis."
                 )
             y_axis_index = int(item.get("yAxisIndex", 0))
             if (
@@ -844,6 +855,7 @@ def _validate_visual_scales(
                 f"/series/{low_index}/yAxisIndex",
                 "series sharing one y axis have incompatible visual scales; remove the unrelated series or use a justified second axis",
             )
+    return list(dict.fromkeys(warnings))
 
 
 def _validate_mark_coordinates(

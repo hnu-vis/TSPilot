@@ -49,8 +49,26 @@ describe('FinalAnswer', () => {
     })} />);
     expect(markup).toContain('视觉证据');
     expect(markup).toContain('价格上升。');
-    expect(markup).toContain('从首个点读到末个点。');
+    expect(markup).not.toContain('从首个点读到末个点。');
     expect(markup).not.toContain('<h3>可视化</h3>');
+  });
+
+  it('promotes only the most information-dense analysis into the conclusion and removes chart prose', () => {
+    const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
+      summary: '存在明显的先升后降区间。',
+      sections: [
+        { section_type: 'analysis', heading: '结论', content: '区间为1月25日21:47至22:33。' },
+        { section_type: 'analysis', heading: '区间特征', content: '起点23307.94，峰值23696.4752，终点23389.0217。' },
+      ],
+      visualizations: [visualization({ summary: '这是一段很长且重复的图表说明。' })],
+    })} />);
+    const conclusionEnd = markup.indexOf('</section>');
+    const conclusionMarkup = markup.slice(0, conclusionEnd);
+    expect(conclusionMarkup).toContain('起点23307.94，峰值23696.4752，终点23389.0217。');
+    expect(markup).not.toContain('区间为1月25日21:47至22:33。');
+    expect(markup).not.toContain('存在明显的先升后降区间。');
+    expect(markup).not.toContain('这是一段很长且重复的图表说明。');
+    expect((markup.match(/起点23307.94，峰值23696.4752，终点23389.0217。/g) || []).length).toBe(1);
   });
 
   it('shows one conclusion heading and keeps internal ids out of visible answer details', () => {

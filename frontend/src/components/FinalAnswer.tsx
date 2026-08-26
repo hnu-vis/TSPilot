@@ -100,6 +100,7 @@ export function FinalAnswer({
   const copy = ANSWER_COPY[locale];
   const summary = answer.summary?.trim() || copy.emptyAnswer;
   const sections = supportingSections(answer.sections, summary);
+  const conclusionDetail = bestConclusionDetail(sections);
   const evidenceItems = normalizeAnswerEvidence(answer);
   const references = deduplicateReferences(answer.references || []);
   const supportingReferences = references.filter((reference) => reference.source_type !== 'query');
@@ -138,15 +139,20 @@ export function FinalAnswer({
           <Lightbulb size={15} />
           <span>{copy.conclusion}</span>
         </div>
-        <MarkdownContent content={summary} variant="summary" />
+        {!conclusionDetail && <MarkdownContent content={summary} variant="summary" />}
+        {conclusionDetail && (
+          <div className="answer-conclusion-details">
+            <MarkdownContent content={conclusionDetail.section.content} variant="summary" />
+          </div>
+        )}
       </section>
 
       {sectionPresentations.length > 0 && (
         <div className="answer-sections">
           {sectionPresentations.map(({ section, sourceIndex, visualEvidence }) => (
             <section key={`${section.section_type}-${sourceIndex}`} className="answer-section">
-              <SectionHeading section={section} locale={locale} />
-              <StructuredSection section={section} summary={summary} />
+              {!isPromotedConclusionDetail(section) && <SectionHeading section={section} locale={locale} />}
+              {!isPromotedConclusionDetail(section) && <StructuredSection section={section} summary={summary} />}
               {visualEvidence.length > 0 && (
                 <div className="answer-section-visual-evidence" aria-label={locale === 'zh' ? '对应的视觉证据' : 'Related visual evidence'}>
                   {visualEvidence.map(({ visualization, claims }) => (
@@ -241,7 +247,6 @@ function ClaimEvidenceCard({
   onSelectBinding: (bindingId: string) => void;
   showClaims?: boolean;
 }) {
-  const verification = visualization.verification;
   return (
     <article className={`answer-claim-evidence-card ${showClaims ? '' : 'section-linked'}`}>
       {showClaims && (
@@ -257,16 +262,26 @@ function ClaimEvidenceCard({
         activeBindingId={activeBindingId}
         onSelectBinding={onSelectBinding}
       />
-      {verification && (
-        <div className="answer-claim-evidence-reading">
-          <div>
-            <strong>{locale === 'zh' ? '如何阅读' : 'How to read it'}</strong>
-            <p>{sanitizeUserFacingText(verification.interpretation)}</p>
-          </div>
-        </div>
-      )}
     </article>
   );
+}
+
+function isPromotedConclusionDetail(section: AnswerSection): boolean {
+  const content = section.content?.trim() || '';
+  return section.section_type === 'analysis' && content.length > 0 && content.length <= 320;
+}
+
+function bestConclusionDetail(sections: DisplayAnswerSection[]): DisplayAnswerSection | null {
+  const candidates = sections.filter(({ section }) => isPromotedConclusionDetail(section));
+  if (candidates.length === 0) return null;
+  const score = ({ section }: DisplayAnswerSection) => {
+    const content = section.content || '';
+    const numericFacts = content.match(/\d+(?:\.\d+)?/g)?.length || 0;
+    const measuredValues = content.match(/\d+\.\d+/g)?.length || 0;
+    const semanticFacts = content.match(/(?:起点|开始|峰值|终点|结束|上升|下降|回落|价格|幅度|UTC)/g)?.length || 0;
+    return measuredValues * 30 + numericFacts * 4 + semanticFacts * 5 + Math.min(content.length, 320) / 100;
+  };
+  return candidates.reduce((best, candidate) => score(candidate) > score(best) ? candidate : best);
 }
 
 function visualClaimEvidence(answer: FinalAnswerType): ClaimVisualEvidence[] {

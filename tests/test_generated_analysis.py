@@ -24,6 +24,7 @@ from tools.code_interpreter import (
     CodeInterpreterInput,
     CodeInterpreterTool,
     _authoritative_anomaly_usage_error,
+    _analysis_repair_context,
     _include_database_ancestor_source,
     _preflight_analysis_code,
 )
@@ -591,6 +592,90 @@ def test_preflight_requires_result_assignment_and_grounded_computation():
         "result = {'computed_insights': [{'value': float(value.iloc[0])}], 'derived_evidence': []}",
         require_grounded_computation=True,
     ) is None
+
+
+def test_generated_code_preflight_rejects_nested_iteration_for_large_input():
+    cubic_code = """
+best = None
+for i in range(len(points)):
+    for j in range(i + 1, len(points)):
+        for k in range(j + 1, len(points)):
+            best = (i, j, k)
+result = {'computed_insights': [], 'derived_evidence': []}
+"""
+    error = _preflight_analysis_code(
+        cubic_code,
+        require_grounded_computation=True,
+        input_row_count=2421,
+    )
+    assert "iteration depth 3" in str(error)
+    assert "10,000,000,000" in str(error)
+
+
+def test_generated_code_preflight_allows_nested_iteration_for_small_input():
+    cubic_code = """
+best = None
+for i in range(len(points)):
+    for j in range(i + 1, len(points)):
+        for k in range(j + 1, len(points)):
+            best = (i, j, k)
+result = {'computed_insights': [], 'derived_evidence': []}
+"""
+    assert _preflight_analysis_code(
+        cubic_code,
+        require_grounded_computation=True,
+        input_row_count=10,
+    ) is None
+
+
+def test_generated_code_preflight_allows_quadratic_iteration_below_budget():
+    quadratic_code = """
+best = None
+for i in range(len(points)):
+    for j in range(i + 1, len(points)):
+        best = (i, j)
+result = {'computed_insights': [], 'derived_evidence': []}
+"""
+    assert _preflight_analysis_code(
+        quadratic_code,
+        require_grounded_computation=True,
+        input_row_count=2421,
+    ) is None
+
+
+def test_generated_code_preflight_rejects_work_at_budget_boundary():
+    quadratic_code = """
+for i in range(len(points)):
+    for j in range(len(points)):
+        pair = (i, j)
+result = {'computed_insights': [], 'derived_evidence': []}
+"""
+    error = _preflight_analysis_code(
+        quadratic_code,
+        require_grounded_computation=True,
+        input_row_count=100_000,
+    )
+    assert "10,000,000,000" in str(error)
+
+
+def test_generated_code_preflight_allows_one_linear_scan():
+    linear_code = """
+best = None
+for point in points:
+    best = point
+result = {'computed_insights': [], 'derived_evidence': []}
+"""
+    assert _preflight_analysis_code(linear_code, require_grounded_computation=True) is None
+
+
+def test_sandbox_timeout_repair_context_requires_a_new_efficient_algorithm():
+    context = _analysis_repair_context(
+        "analysis_code exceeded 120.0s sandbox timeout",
+        "for i in range(len(points)): pass",
+    )
+    assert context["failure_type"] == "sandbox_timeout"
+    assert "O(n log n)" in context["required_repair"]
+    assert "nested data-dependent loops" in context["forbidden_patterns"]
 
 
 def test_code_interpreter_executes_redundant_safe_dataframe_imports_without_repair():
