@@ -63,7 +63,7 @@ export function HistorySidebar({
         </button>
       </div>
       <nav className="workspace-nav" aria-label={t('Workspace')}>
-        {workspaceNavItems.map((item) => {
+        {workspaceNavItems.filter((item) => item.enabled).map((item) => {
           const Icon = item.icon;
           const isActive = item.view === activeView;
           const isDisabled = !item.enabled;
@@ -195,7 +195,7 @@ const workspaceNavItems: Array<{
   },
   {
     id: 'insight-memory',
-    label: 'Key Insight Memory',
+    label: 'Memory',
     hint: 'Manage Key Insight definitions and playbooks',
     icon: BrainCircuit,
     enabled: true,

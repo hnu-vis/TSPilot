@@ -53,22 +53,28 @@ describe('FinalAnswer', () => {
     expect(markup).not.toContain('<h3>可视化</h3>');
   });
 
-  it('promotes only the most information-dense analysis into the conclusion and removes chart prose', () => {
+  it('renders the complete summary and hides analysis prose while preserving linked charts', () => {
+    const summary = 'For prices between $10,000 and $100,000, Jan 4–Jan 19 averaged $18,850.07 and Jan 20–Feb 3 averaged $22,979.70. The second half was $4,129.63 higher.';
+    const firstAnalysis = 'The first half average was $18,850.07.';
+    const longAnalysis = 'Additional analysis details. '.repeat(20);
     const markup = renderToStaticMarkup(<FinalAnswer answer={answer({
-      summary: '存在明显的先升后降区间。',
+      summary,
       sections: [
-        { section_type: 'analysis', heading: '结论', content: '区间为1月25日21:47至22:33。' },
-        { section_type: 'analysis', heading: '区间特征', content: '起点23307.94，峰值23696.4752，终点23389.0217。' },
+        { section_type: 'analysis', heading: 'First half analysis', content: firstAnalysis },
+        { section_type: 'analysis', heading: 'Long analysis', content: longAnalysis },
       ],
-      visualizations: [visualization({ summary: '这是一段很长且重复的图表说明。' })],
+      claims: [{ claim_id: 'claim_section_2', text: longAnalysis, visualization_ids: ['viz'] }],
+      visualizations: [visualization({ summary: 'Repeated chart explanation.' })],
     })} />);
-    const conclusionEnd = markup.indexOf('</section>');
-    const conclusionMarkup = markup.slice(0, conclusionEnd);
-    expect(conclusionMarkup).toContain('起点23307.94，峰值23696.4752，终点23389.0217。');
-    expect(markup).not.toContain('区间为1月25日21:47至22:33。');
-    expect(markup).not.toContain('存在明显的先升后降区间。');
-    expect(markup).not.toContain('这是一段很长且重复的图表说明。');
-    expect((markup.match(/起点23307.94，峰值23696.4752，终点23389.0217。/g) || []).length).toBe(1);
+    const conclusionMarkup = markup.slice(0, markup.indexOf('</section>'));
+    expect(conclusionMarkup).toContain(summary);
+    expect(markup).not.toContain(firstAnalysis);
+    expect(markup).not.toContain(longAnalysis);
+    expect(markup).not.toContain('First half analysis');
+    expect(markup).not.toContain('Long analysis');
+    expect(markup).not.toContain('Repeated chart explanation.');
+    expect(markup).toContain('Price trend');
+    expect(markup).toContain('Related visual evidence');
   });
 
   it('shows one conclusion heading and keeps internal ids out of visible answer details', () => {

@@ -13,6 +13,7 @@ const zhCN: Record<string, string> = {
   Workspace: '工作区',
   Database: '数据库',
   'Manage connections and inspect schema': '管理连接并查看数据模式',
+  Memory: '记忆',
   'Key Insight Memory': '关键洞察记忆',
   'Manage Key Insight definitions and playbooks': '管理关键洞察定义与 Playbook',
   Model: '模型',
